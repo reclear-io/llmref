@@ -1,16 +1,16 @@
 # fullcontext
 
-Public versioned documentation registry for [llm-txts](https://github.com/reclear-io/llm-txts).
+A free, public versioned documentation registry for AI tools, coding assistants, and retrieval systems.
 
-Each indexed project version stores three artifacts here:
+Each indexed project version produces three artifacts:
 
 | File | Description |
 |---|---|
 | `llms.txt` | Compact routing and summary file for models |
 | `llms-full.txt` | Full merged documentation artifact |
-| `meta.json` | Snapshot metadata, timestamps, content fingerprints |
+| `meta.json` | Snapshot metadata, timestamps, and content fingerprints |
 
-Large dump artifacts (chunks, embeddings) are stored in R2 — see `meta.json` for URLs.
+Large dump artifacts (chunks, embeddings) are stored separately — see `meta.json` for their URLs.
 
 ## Registry structure
 
@@ -25,15 +25,13 @@ registry/
 
 ## Usage
 
-Artifacts are served via the llm-txts API:
+Fetch artifacts directly via raw GitHub URLs, or through the API:
 
 ```
 GET /v1/projects/:slug/:version/llms.txt
 GET /v1/projects/:slug/:version/llms-full.txt
 GET /v1/projects/:slug/:version/meta.json
 ```
-
-Or fetched directly from this repo via raw GitHub URLs.
 
 ## License
 
