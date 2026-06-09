@@ -1,8 +1,8 @@
 ## Snapshot
 
-**Technology ID:** 
-**Version:** 
-**Docs root:** 
+**Technology ID:** <!-- e.g. svelte -->
+**Version:** <!-- e.g. 5.0.0 -->
+**Docs root:** <!-- e.g. https://svelte.dev -->
 
 **Change type** (tick one):
 - [ ] Addition — new project or version
@@ -19,9 +19,9 @@
 
 ## Checklist
 
-- [ ] `registry/<technology-id>/<version>/` contains `llms.txt`, `llms-full.txt`, and `meta.json`
-- [ ] `registry/index.json` updated
-- [ ] `python3 scripts/verify_registry.py` passes locally (CI will also run this)
+- [ ] registry/<technology-id>/<version>/ contains llms.txt, llms-full.txt, and meta.json (Contributions only)
+- [ ] registry/index.json updated (Contributions only)
+- [ ] python3 scripts/verify_registry.py passes locally (Contributions only, CI will also run this)
 - [ ] Official public documentation only
 - [ ] Upstream license/terms do not restrict redistribution of docs content
 
