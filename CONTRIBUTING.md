@@ -44,7 +44,7 @@ Use the [pull request template](.github/pull_request_template.md). Fill in every
 
 Complete all checklists before requesting review.
 
-Prefer opening a [request docs issue](.github/ISSUE_TEMPLATE/request-docs.yml) if you are not submitting artifacts yourself. Use [report registry issue](.github/ISSUE_TEMPLATE/report-registry-issue.yml) for incorrect or stale content.
+Prefer opening a [request docs issue](https://github.com/reclear-io/fullcontext/issues/new?template=request-docs.yml) if you are not submitting artifacts yourself. Use [report registry issue](https://github.com/reclear-io/fullcontext/issues/new?template=report-registry-issue.yml) for incorrect or stale content.
 
 See [SCHEMA.md](./SCHEMA.md) for the full `meta.json` specification.
 
