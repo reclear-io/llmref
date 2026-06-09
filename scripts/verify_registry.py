@@ -245,6 +245,9 @@ def validate_index(snapshots: list[tuple[str, str, Path]], metas: dict[tuple[str
             except json.JSONDecodeError as exc:
                 error(f"{INDEX_PATH}: invalid JSON ({exc})")
                 return False
+            if not isinstance(index, dict):
+                error(f"{INDEX_PATH}: must be a JSON object")
+                return False
             if index.get("projects"):
                 error(f"{INDEX_PATH}: lists projects but no snapshots exist under registry/")
                 return False
