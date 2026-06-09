@@ -16,23 +16,49 @@ Large dump artifacts (chunks, embeddings) are stored separately — see `meta.js
 
 ```
 registry/
-  <project>/
+  <technology-id>/
     <version>/
       llms.txt
       llms-full.txt
       meta.json
+  index.json
 ```
+
+See [SCHEMA.md](./SCHEMA.md) for naming rules, `meta.json` fields, and change detection.
 
 ## Usage
 
-Fetch artifacts directly via raw GitHub URLs, or through the API:
+Fetch artifacts via raw GitHub URLs:
 
 ```
-GET /v1/projects/:slug/:version/llms.txt
-GET /v1/projects/:slug/:version/llms-full.txt
-GET /v1/projects/:slug/:version/meta.json
+https://raw.githubusercontent.com/reclear-io/fullcontext/main/registry/<technology-id>/<version>/llms.txt
+https://raw.githubusercontent.com/reclear-io/fullcontext/main/registry/<technology-id>/<version>/llms-full.txt
+https://raw.githubusercontent.com/reclear-io/fullcontext/main/registry/<technology-id>/<version>/meta.json
 ```
+
+List all indexed projects and versions:
+
+```
+https://raw.githubusercontent.com/reclear-io/fullcontext/main/registry/index.json
+```
+
+Example — Svelte 5.0.0:
+
+```
+https://raw.githubusercontent.com/reclear-io/fullcontext/main/registry/svelte/5.0.0/llms.txt
+```
+
+## Contributing
+
+- [CONTRIBUTING.md](./CONTRIBUTING.md) — PR title format, registry layout, submission guidelines
+- [Request docs](https://github.com/reclear-io/fullcontext/issues/new?template=request-docs.yml) — ask maintainers to add or refresh a snapshot
+- [Report registry issue](https://github.com/reclear-io/fullcontext/issues/new?template=report-registry-issue.yml) — flag incorrect or stale content
+
+## Community
+
+- [Code of Conduct](./CODE_OF_CONDUCT.md)
+- [Security policy](./SECURITY.md)
 
 ## License
 
-MIT
+[MIT](./LICENSE)
