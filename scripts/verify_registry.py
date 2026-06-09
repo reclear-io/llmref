@@ -197,8 +197,8 @@ def validate_snapshot(tech_id: str, version: str, snapshot_dir: Path) -> tuple[b
     ok = True
 
     for entry in snapshot_dir.iterdir():
-        if entry.is_file() and entry.name not in ALLOWED_SNAPSHOT_FILES:
-            error(f"{snapshot_dir}: unexpected file '{entry.name}'")
+        if entry.name not in ALLOWED_SNAPSHOT_FILES:
+            error(f"{snapshot_dir}: unexpected {'directory' if entry.is_dir() else 'file'} '{entry.name}'")
             ok = False
 
     missing = [name for name in ALLOWED_SNAPSHOT_FILES if not (snapshot_dir / name).is_file()]
