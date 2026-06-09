@@ -51,8 +51,8 @@ https://raw.githubusercontent.com/reclear-io/fullcontext/main/registry/svelte/5.
 ## Contributing
 
 - [CONTRIBUTING.md](./CONTRIBUTING.md) — PR title format, registry layout, submission guidelines
-- [Request docs](.github/ISSUE_TEMPLATE/request-docs.yml) — ask maintainers to add or refresh a snapshot
-- [Report registry issue](.github/ISSUE_TEMPLATE/report-registry-issue.yml) — flag incorrect or stale content
+- [Request docs](https://github.com/reclear-io/fullcontext/issues/new?template=request-docs.yml) — ask maintainers to add or refresh a snapshot
+- [Report registry issue](https://github.com/reclear-io/fullcontext/issues/new?template=report-registry-issue.yml) — flag incorrect or stale content
 
 ## Community
 
