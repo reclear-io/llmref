@@ -28,6 +28,6 @@ Maintainers aim to acknowledge reports within 7 days and provide a remediation p
 
 ## Out of scope
 
-- Requests to add or update documentation snapshots (use [Request docs](.github/ISSUE_TEMPLATE/request-docs.yml) instead)
-- Content accuracy issues in upstream documentation (use [Report registry issue](.github/ISSUE_TEMPLATE/report-registry-issue.yml) instead)
+- Requests to add or update documentation snapshots (use [Request docs](https://github.com/reclear-io/fullcontext/issues/new?template=request-docs.yml) instead)
+- Content accuracy issues in upstream documentation (use [Report registry issue](https://github.com/reclear-io/fullcontext/issues/new?template=report-registry-issue.yml) instead)
 - General usage questions
