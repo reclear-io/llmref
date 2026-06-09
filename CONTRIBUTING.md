@@ -31,18 +31,7 @@ Update React 19.0.0 - corrected docs root
 
 ## Pull request body
 
-Use the [pull request template](.github/pull_request_template.md). Fill in every field in the registry table:
-
-| Field | Description |
-|---|---|
-| **Technology ID** | Registry slug, e.g. `svelte` |
-| **Version** | Project version, e.g. `5.0.0` |
-| **Docs root** | Official documentation URL, e.g. `https://svelte.dev` |
-| **Snapshot timestamp** | ISO 8601 value from `meta.json` |
-| **Change type** | Addition or Update |
-| **Submission type** | Request or Contribution |
-
-Complete all checklists before requesting review.
+Use the [pull request template](.github/pull_request_template.md). Fill in technology ID, version, docs root, change type, and submission type. Run `python3 scripts/verify_registry.py` locally before requesting review — CI enforces the rest.
 
 Prefer opening a [request docs issue](https://github.com/reclear-io/fullcontext/issues/new?template=request-docs.yml) if you are not submitting artifacts yourself. Use [report registry issue](https://github.com/reclear-io/fullcontext/issues/new?template=report-registry-issue.yml) for incorrect or stale content.
 
