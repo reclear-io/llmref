@@ -19,7 +19,7 @@ UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
     re.IGNORECASE,
 )
-FINGERPRINT_RE = re.compile(r"^[0-9a-f]{64}$")
+FINGERPRINT_RE = re.compile(r"^[0-9a-f]{64}$", re.IGNORECASE)
 LLMS_LINK_RE = re.compile(r"^\s*[-*]\s+\[[^\]]*\]\(([^)]+)\)", re.MULTILINE)
 MARKDOWN_LINK_RE = re.compile(r"\[[^\]]*\]\(([^)]+)\)")
 
@@ -78,23 +78,53 @@ def fingerprint_of(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def discover_snapshots() -> list[tuple[str, str, Path]]:
+def discover_snapshots() -> tuple[list[tuple[str, str, Path]], bool]:
     snapshots: list[tuple[str, str, Path]] = []
+    ok = True
+
     if not REGISTRY.exists():
-        return snapshots
+        return snapshots, ok
 
-    for project_dir in sorted(REGISTRY.iterdir()):
-        if not project_dir.is_dir():
+    for entry in sorted(REGISTRY.iterdir()):
+        if entry.is_file():
+            if entry.name not in ALLOWED_REGISTRY_ROOT_FILES:
+                error(f"{REGISTRY}: unexpected file '{entry.name}'")
+                ok = False
             continue
-        if project_dir.name in ALLOWED_REGISTRY_ROOT_FILES:
+
+        if not entry.is_dir():
             continue
 
-        tech_id = project_dir.name
-        for version_dir in sorted(project_dir.iterdir()):
-            if version_dir.is_dir():
-                snapshots.append((tech_id, version_dir.name, version_dir))
+        if entry.name in ALLOWED_REGISTRY_ROOT_FILES:
+            continue
 
-    return snapshots
+        tech_id = entry.name
+        project_ok, project_snapshots = _discover_project_snapshots(tech_id, entry)
+        ok = project_ok and ok
+        snapshots.extend(project_snapshots)
+
+    return snapshots, ok
+
+
+def _discover_project_snapshots(tech_id: str, project_dir: Path) -> tuple[bool, list[tuple[str, str, Path]]]:
+    snapshots: list[tuple[str, str, Path]] = []
+    ok = True
+    found_version = False
+
+    for entry in sorted(project_dir.iterdir()):
+        if entry.is_dir():
+            found_version = True
+            snapshots.append((tech_id, entry.name, entry))
+            continue
+
+        error(f"{project_dir}: unexpected file '{entry.name}' (only version directories allowed)")
+        ok = False
+
+    if not found_version:
+        error(f"{project_dir}: project has no version directories")
+        ok = False
+
+    return ok, snapshots
 
 
 def validate_slug(tech_id: str) -> bool:
@@ -168,11 +198,11 @@ def validate_meta(meta: dict, tech_id: str, version: str, snapshot_dir: Path, ll
 
     fingerprint = meta.get("content_fingerprint", "")
     if not isinstance(fingerprint, str) or not FINGERPRINT_RE.fullmatch(fingerprint):
-        error(f"{meta_path}: content_fingerprint must be a 64-character lowercase hex SHA-256 digest")
+        error(f"{meta_path}: content_fingerprint must be a 64-character hex SHA-256 digest")
         ok = False
     else:
         expected = fingerprint_of(llms_full)
-        if fingerprint != expected:
+        if fingerprint.lower() != expected:
             error(
                 f"{meta_path}: content_fingerprint does not match sha256(llms-full.txt); "
                 f"expected {expected}"
@@ -182,12 +212,16 @@ def validate_meta(meta: dict, tech_id: str, version: str, snapshot_dir: Path, ll
     linked_pages = len(LLMS_LINK_RE.findall(llms_txt))
     page_count = meta.get("page_count")
     expected_page_count = linked_pages if linked_pages > 0 else 1
-    if isinstance(page_count, int) and page_count != expected_page_count:
-        error(
-            f"{meta_path}: page_count {page_count} does not match llms.txt link count "
-            f"{expected_page_count}"
-        )
-        ok = False
+    if isinstance(page_count, int):
+        if page_count < 1:
+            error(f"{meta_path}: page_count must be at least 1")
+            ok = False
+        elif page_count != expected_page_count:
+            error(
+                f"{meta_path}: page_count {page_count} does not match llms.txt link count "
+                f"{expected_page_count}"
+            )
+            ok = False
 
     ok = validate_llms_txt(snapshot_dir, llms_txt, source_root) and ok
     return ok
@@ -208,6 +242,9 @@ def validate_snapshot(tech_id: str, version: str, snapshot_dir: Path) -> tuple[b
 
     llms_txt = (snapshot_dir / "llms.txt").read_text(encoding="utf-8")
     llms_full = (snapshot_dir / "llms-full.txt").read_text(encoding="utf-8")
+    if not llms_txt.strip():
+        error(f"{snapshot_dir}/llms.txt: must not be empty")
+        ok = False
     if not llms_full.strip():
         error(f"{snapshot_dir}/llms-full.txt: must not be empty")
         ok = False
@@ -278,6 +315,8 @@ def validate_index(snapshots: list[tuple[str, str, Path]], metas: dict[tuple[str
         return False
 
     indexed: set[tuple[str, str]] = set()
+    seen_project_ids: set[str] = set()
+
     for project in projects:
         if not isinstance(project, dict):
             error(f"{INDEX_PATH}: each project entry must be an object")
@@ -291,7 +330,16 @@ def validate_index(snapshots: list[tuple[str, str, Path]], metas: dict[tuple[str
             ok = False
             continue
 
+        if tech_id in seen_project_ids:
+            error(f"{INDEX_PATH}: duplicate project id '{tech_id}'")
+            ok = False
+        seen_project_ids.add(tech_id)
+
         if not validate_slug(tech_id):
+            ok = False
+
+        if not versions:
+            error(f"{INDEX_PATH}: project '{tech_id}' must include at least one version")
             ok = False
 
         for entry in versions:
@@ -301,18 +349,30 @@ def validate_index(snapshots: list[tuple[str, str, Path]], metas: dict[tuple[str
                 continue
 
             version = entry.get("version")
-            if not isinstance(version, str):
-                error(f"{INDEX_PATH}: version entries require version")
+            if not isinstance(version, str) or not version.strip():
+                error(f"{INDEX_PATH}: version entries require a non-empty version string")
                 ok = False
                 continue
 
-            indexed.add((tech_id, version))
-            meta = metas.get((tech_id, version))
+            key = (tech_id, version)
+            if key in indexed:
+                error(f"{INDEX_PATH}: duplicate entry for {tech_id}/{version}")
+                ok = False
+                continue
+            indexed.add(key)
+
+            meta = metas.get(key)
             if meta is None:
                 continue
 
             for field in ("source_root", "content_fingerprint"):
-                if entry.get(field) != meta.get(field):
+                index_value = entry.get(field)
+                meta_value = meta.get(field)
+                if field == "content_fingerprint" and isinstance(index_value, str) and isinstance(meta_value, str):
+                    if index_value.lower() != meta_value.lower():
+                        error(f"{INDEX_PATH}: {tech_id}/{version} {field} does not match meta.json")
+                        ok = False
+                elif index_value != meta_value:
                     error(f"{INDEX_PATH}: {tech_id}/{version} {field} does not match meta.json")
                     ok = False
 
@@ -341,9 +401,31 @@ def validate_index(snapshots: list[tuple[str, str, Path]], metas: dict[tuple[str
     return ok
 
 
+def validate_snapshot_ids(metas: dict[tuple[str, str], dict]) -> bool:
+    ok = True
+    seen_ids: dict[str, tuple[str, str]] = {}
+
+    for (tech_id, version), meta in metas.items():
+        snapshot_id = meta.get("snapshot_id")
+        if not isinstance(snapshot_id, str):
+            continue
+        if snapshot_id in seen_ids:
+            prior = seen_ids[snapshot_id]
+            error(
+                f"duplicate snapshot_id '{snapshot_id}' for {tech_id}/{version} "
+                f"and {prior[0]}/{prior[1]}"
+            )
+            ok = False
+            continue
+        seen_ids[snapshot_id] = (tech_id, version)
+
+    return ok
+
+
 def main() -> int:
     ok = True
-    snapshots = discover_snapshots()
+    snapshots, layout_ok = discover_snapshots()
+    ok = layout_ok and ok
     metas: dict[tuple[str, str], dict] = {}
 
     for tech_id, version, snapshot_dir in snapshots:
@@ -353,6 +435,7 @@ def main() -> int:
         if meta is not None:
             metas[(tech_id, version)] = meta
 
+    ok = validate_snapshot_ids(metas) and ok
     ok = validate_index(snapshots, metas) and ok
 
     if ok:
