@@ -6,6 +6,7 @@ import hashlib
 import json
 import re
 import sys
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -14,11 +15,28 @@ REGISTRY = ROOT / "registry"
 INDEX_PATH = REGISTRY / "index.json"
 
 TECH_ID_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
+UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
+FINGERPRINT_RE = re.compile(r"^[0-9a-f]{64}$")
+LLMS_LINK_RE = re.compile(r"^- \[[^\]]*\]\(([^)]+)\)", re.MULTILINE)
+MARKDOWN_LINK_RE = re.compile(r"\[[^\]]*\]\(([^)]+)\)")
+
 REQUIRED_META_FIELDS = {
-    "project",
-    "project_version",
-    "source_root",
+    "project": str,
+    "project_version": str,
+    "snapshot_id": str,
+    "snapshot_at": str,
+    "source_last_seen_at": str,
+    "content_fingerprint": str,
+    "page_count": int,
+    "source_root": str,
+    "embedding_model": str,
+    "chunking_profile": str,
+    "generator_version": str,
 }
+
 ALLOWED_SNAPSHOT_FILES = {"llms.txt", "llms-full.txt", "meta.json"}
 ALLOWED_REGISTRY_ROOT_FILES = {"index.json", ".gitkeep"}
 
@@ -27,18 +45,33 @@ def error(msg: str) -> None:
     print(f"ERROR: {msg}", file=sys.stderr)
 
 
-def warn(msg: str) -> None:
-    print(f"WARN: {msg}")
-
-
 def load_json(path: Path) -> dict:
     with path.open(encoding="utf-8") as f:
         return json.load(f)
 
 
+def _parse_iso8601(value: str) -> datetime | None:
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def parse_iso8601(value: str, field: str, path: Path) -> datetime | None:
+    parsed = _parse_iso8601(value)
+    if parsed is None:
+        error(f"{path}: {field} must be a valid ISO 8601 timestamp, got '{value}'")
+    return parsed
+
+
 def is_https_url(value: str) -> bool:
     parsed = urlparse(value)
     return parsed.scheme == "https" and bool(parsed.netloc)
+
+
+def is_valid_url(value: str) -> bool:
+    parsed = urlparse(value)
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
 
 
 def fingerprint_of(text: str) -> str:
@@ -71,7 +104,96 @@ def validate_slug(tech_id: str) -> bool:
     return ok
 
 
-def validate_snapshot(tech_id: str, version: str, snapshot_dir: Path) -> bool:
+def validate_llms_txt(path: Path, llms_txt: str, source_root: str) -> bool:
+    ok = True
+
+    links = MARKDOWN_LINK_RE.findall(llms_txt)
+    if not links:
+        error(f"{path}/llms.txt: must contain at least one markdown link")
+        ok = False
+
+    for link in links:
+        if not is_valid_url(link):
+            error(f"{path}/llms.txt: invalid link URL '{link}'")
+            ok = False
+
+    if source_root and not llms_txt.strip():
+        error(f"{path}/llms.txt: must not be empty")
+        ok = False
+
+    return ok
+
+
+def validate_meta(meta: dict, tech_id: str, version: str, snapshot_dir: Path, llms_full: str, llms_txt: str) -> bool:
+    ok = True
+    meta_path = snapshot_dir / "meta.json"
+
+    for field, expected_type in REQUIRED_META_FIELDS.items():
+        if field not in meta:
+            error(f"{meta_path}: missing required field '{field}'")
+            ok = False
+            continue
+        if not isinstance(meta[field], expected_type):
+            error(f"{meta_path}: field '{field}' must be {expected_type.__name__}")
+            ok = False
+        elif expected_type is str and not meta[field].strip():
+            error(f"{meta_path}: field '{field}' must not be empty")
+            ok = False
+
+    if meta.get("project") != tech_id:
+        error(f"{meta_path}: project '{meta.get('project')}' does not match directory '{tech_id}'")
+        ok = False
+
+    if meta.get("project_version") != version:
+        error(
+            f"{meta_path}: project_version '{meta.get('project_version')}' "
+            f"does not match directory '{version}'"
+        )
+        ok = False
+
+    source_root = meta.get("source_root", "")
+    if not isinstance(source_root, str) or not is_https_url(source_root):
+        error(f"{meta_path}: source_root must be an https URL")
+        ok = False
+
+    snapshot_id = meta.get("snapshot_id", "")
+    if isinstance(snapshot_id, str) and not UUID_RE.fullmatch(snapshot_id):
+        error(f"{meta_path}: snapshot_id must be a UUID")
+        ok = False
+
+    for ts_field in ("snapshot_at", "source_last_seen_at"):
+        value = meta.get(ts_field)
+        if isinstance(value, str) and parse_iso8601(value, ts_field, meta_path) is None:
+            ok = False
+
+    fingerprint = meta.get("content_fingerprint", "")
+    if not isinstance(fingerprint, str) or not FINGERPRINT_RE.fullmatch(fingerprint):
+        error(f"{meta_path}: content_fingerprint must be a 64-character lowercase hex SHA-256 digest")
+        ok = False
+    else:
+        expected = fingerprint_of(llms_full)
+        if fingerprint != expected:
+            error(
+                f"{meta_path}: content_fingerprint does not match sha256(llms-full.txt); "
+                f"expected {expected}"
+            )
+            ok = False
+
+    linked_pages = len(LLMS_LINK_RE.findall(llms_txt))
+    page_count = meta.get("page_count")
+    expected_page_count = linked_pages if linked_pages > 0 else 1
+    if isinstance(page_count, int) and page_count != expected_page_count:
+        error(
+            f"{meta_path}: page_count {page_count} does not match llms.txt link count "
+            f"{expected_page_count}"
+        )
+        ok = False
+
+    ok = validate_llms_txt(snapshot_dir, llms_txt, source_root) and ok
+    return ok
+
+
+def validate_snapshot(tech_id: str, version: str, snapshot_dir: Path) -> tuple[bool, dict | None]:
     ok = True
 
     for entry in snapshot_dir.iterdir():
@@ -82,13 +204,10 @@ def validate_snapshot(tech_id: str, version: str, snapshot_dir: Path) -> bool:
     missing = [name for name in ALLOWED_SNAPSHOT_FILES if not (snapshot_dir / name).is_file()]
     if missing:
         error(f"{snapshot_dir}: missing required files: {', '.join(sorted(missing))}")
-        return False
+        return False, None
 
     llms_txt = (snapshot_dir / "llms.txt").read_text(encoding="utf-8")
     llms_full = (snapshot_dir / "llms-full.txt").read_text(encoding="utf-8")
-    if not llms_txt.strip():
-        error(f"{snapshot_dir}/llms.txt: must not be empty")
-        ok = False
     if not llms_full.strip():
         error(f"{snapshot_dir}/llms-full.txt: must not be empty")
         ok = False
@@ -97,49 +216,26 @@ def validate_snapshot(tech_id: str, version: str, snapshot_dir: Path) -> bool:
         meta = load_json(snapshot_dir / "meta.json")
     except json.JSONDecodeError as exc:
         error(f"{snapshot_dir}/meta.json: invalid JSON ({exc})")
-        return False
+        return False, None
 
     if not isinstance(meta, dict):
         error(f"{snapshot_dir}/meta.json: must be a JSON object")
-        return False
+        return False, None
 
-    missing_fields = sorted(REQUIRED_META_FIELDS - set(meta))
-    if missing_fields:
-        error(f"{snapshot_dir}/meta.json: missing required fields: {', '.join(missing_fields)}")
-        ok = False
-
-    if meta.get("project") != tech_id:
-        error(
-            f"{snapshot_dir}/meta.json: project '{meta.get('project')}' "
-            f"does not match directory '{tech_id}'"
-        )
-        ok = False
-
-    if meta.get("project_version") != version:
-        error(
-            f"{snapshot_dir}/meta.json: project_version '{meta.get('project_version')}' "
-            f"does not match directory '{version}'"
-        )
-        ok = False
-
-    source_root = meta.get("source_root")
-    if not isinstance(source_root, str) or not is_https_url(source_root):
-        error(f"{snapshot_dir}/meta.json: source_root must be an https URL")
-        ok = False
-
-    fingerprint = meta.get("content_fingerprint")
-    if isinstance(fingerprint, str) and fingerprint:
-        expected = fingerprint_of(llms_full)
-        if fingerprint != expected:
-            warn(
-                f"{snapshot_dir}/meta.json: content_fingerprint does not match llms-full.txt "
-                "(maintainers may correct this on merge)"
-            )
-
-    return ok
+    ok = validate_meta(meta, tech_id, version, snapshot_dir, llms_full, llms_txt) and ok
+    return ok, meta
 
 
-def validate_index(snapshots: list[tuple[str, str, Path]]) -> bool:
+def find_index_entry(index: dict, tech_id: str, version: str) -> dict | None:
+    for project in index.get("projects", []):
+        if project.get("id") == tech_id:
+            for entry in project.get("versions", []):
+                if entry.get("version") == version:
+                    return entry
+    return None
+
+
+def validate_index(snapshots: list[tuple[str, str, Path]], metas: dict[tuple[str, str], dict]) -> bool:
     ok = True
 
     if not snapshots:
@@ -164,6 +260,11 @@ def validate_index(snapshots: list[tuple[str, str, Path]]) -> bool:
         error(f"{INDEX_PATH}: invalid JSON ({exc})")
         return False
 
+    generated_at = index.get("generated_at")
+    if not isinstance(generated_at, str) or parse_iso8601(generated_at, "generated_at", INDEX_PATH) is None:
+        error(f"{INDEX_PATH}: generated_at must be a valid ISO 8601 timestamp")
+        ok = False
+
     projects = index.get("projects")
     if not isinstance(projects, list):
         error(f"{INDEX_PATH}: projects must be an array")
@@ -183,17 +284,41 @@ def validate_index(snapshots: list[tuple[str, str, Path]]) -> bool:
             ok = False
             continue
 
+        if not validate_slug(tech_id):
+            ok = False
+
         for entry in versions:
             if not isinstance(entry, dict):
                 error(f"{INDEX_PATH}: version entries must be objects")
                 ok = False
                 continue
+
             version = entry.get("version")
             if not isinstance(version, str):
                 error(f"{INDEX_PATH}: version entries require version")
                 ok = False
                 continue
+
             indexed.add((tech_id, version))
+            meta = metas.get((tech_id, version))
+            if meta is None:
+                continue
+
+            for field in ("source_root", "content_fingerprint"):
+                if entry.get(field) != meta.get(field):
+                    error(f"{INDEX_PATH}: {tech_id}/{version} {field} does not match meta.json")
+                    ok = False
+
+            index_snapshot_at = entry.get("snapshot_at")
+            meta_snapshot_at = meta.get("snapshot_at")
+            if not isinstance(index_snapshot_at, str):
+                error(f"{INDEX_PATH}: {tech_id}/{version} snapshot_at is required")
+                ok = False
+            elif index_snapshot_at != meta_snapshot_at:
+                error(
+                    f"{INDEX_PATH}: {tech_id}/{version} snapshot_at must match meta.json exactly"
+                )
+                ok = False
 
     expected = {(tech_id, version) for tech_id, version, _ in snapshots}
     missing = sorted(expected - indexed)
@@ -212,12 +337,16 @@ def validate_index(snapshots: list[tuple[str, str, Path]]) -> bool:
 def main() -> int:
     ok = True
     snapshots = discover_snapshots()
+    metas: dict[tuple[str, str], dict] = {}
 
     for tech_id, version, snapshot_dir in snapshots:
         ok = validate_slug(tech_id) and ok
-        ok = validate_snapshot(tech_id, version, snapshot_dir) and ok
+        snapshot_ok, meta = validate_snapshot(tech_id, version, snapshot_dir)
+        ok = snapshot_ok and ok
+        if meta is not None:
+            metas[(tech_id, version)] = meta
 
-    ok = validate_index(snapshots) and ok
+    ok = validate_index(snapshots, metas) and ok
 
     if ok:
         print(f"Registry validation passed ({len(snapshots)} snapshot(s)).")
