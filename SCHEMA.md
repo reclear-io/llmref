@@ -1,0 +1,83 @@
+# Registry schema
+
+This document defines the public contract for snapshots stored under `registry/`.
+
+## Directory layout
+
+```
+registry/
+  <technology-id>/
+    <version>/
+      llms.txt
+      llms-full.txt
+      meta.json
+```
+
+### Naming rules
+
+| Segment | Rules |
+|---|---|
+| **technology-id** | Lowercase slug: letters, numbers, hyphens. No spaces or underscores. Example: `svelte`, `nextjs` |
+| **version** | Exact upstream version string. Example: `5.0.0`, `14.2.0` |
+
+## Artifacts
+
+### `llms.txt`
+
+Compact routing and summary file for models. Typically lists documentation sections with titles and canonical URLs.
+
+### `llms-full.txt`
+
+Full merged documentation artifact. Complete text content for the indexed version.
+
+### `meta.json`
+
+Snapshot metadata. Required fields:
+
+| Field | Type | Description |
+|---|---|---|
+| `project` | string | Technology ID. Must match the directory slug. |
+| `project_version` | string | Version string. Must match the version directory. |
+| `snapshot_id` | string | Unique identifier for this snapshot (UUID recommended). |
+| `snapshot_at` | string | ISO 8601 timestamp when this snapshot was generated. |
+| `source_last_seen_at` | string | ISO 8601 timestamp when the upstream docs were last observed. |
+| `content_fingerprint` | string | SHA-256 hex digest of the normalized docset content. Used for change detection. |
+| `page_count` | integer | Number of pages or linked entries in the snapshot. |
+| `source_root` | string | Official documentation root URL. |
+| `embedding_model` | string | Embedding model used for semantic indexes, if any. |
+| `chunking_profile` | string | Chunking strategy identifier. |
+| `generator_version` | string | Version of the tooling that produced this snapshot. |
+
+#### Example
+
+```json
+{
+  "project": "svelte",
+  "project_version": "5.0.0",
+  "snapshot_id": "1bf98f06-6cee-4d83-ae88-4730a4855168",
+  "snapshot_at": "2026-06-09T22:39:18Z",
+  "source_last_seen_at": "2026-06-09T22:39:18Z",
+  "content_fingerprint": "6a1e6dc6c06a8c504a0a4b7c2dff4088876270238a7e22b153a8dbcde838cb8c",
+  "page_count": 7,
+  "source_root": "https://svelte.dev",
+  "embedding_model": "text-embedding-3-small",
+  "chunking_profile": "docs-v1",
+  "generator_version": "0.1.0"
+}
+```
+
+#### Metadata maintenance
+
+Include `meta.json` with as many fields as you can, but don't worry if it is incomplete or slightly off. Maintainers routinely review and correct metadata during merge — timestamps, fingerprints, `page_count`, and other technical fields — because they know what each value should be and where it belongs. Focus on getting the artifacts and the core identifiers right (`project`, `project_version`, `source_root`); maintainers will handle the rest.
+
+## Catalog index
+
+`registry/index.json` is a machine-readable catalog of all indexed projects and versions. It is updated when snapshots are added or refreshed.
+
+## Change detection
+
+Snapshots are maintained by content fingerprint, not by schedule:
+
+1. Each normalized page produces a page-level fingerprint.
+2. Page fingerprints combine into a whole-docset `content_fingerprint`.
+3. On refresh, a changed fingerprint triggers an update; an unchanged fingerprint means the docset is current.
