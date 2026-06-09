@@ -263,6 +263,10 @@ def validate_index(snapshots: list[tuple[str, str, Path]], metas: dict[tuple[str
         error(f"{INDEX_PATH}: invalid JSON ({exc})")
         return False
 
+    if not isinstance(index, dict):
+        error(f"{INDEX_PATH}: must be a JSON object")
+        return False
+
     generated_at = index.get("generated_at")
     if not isinstance(generated_at, str) or parse_iso8601(generated_at, "generated_at", INDEX_PATH) is None:
         error(f"{INDEX_PATH}: generated_at must be a valid ISO 8601 timestamp")
