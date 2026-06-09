@@ -20,7 +20,7 @@ UUID_RE = re.compile(
     re.IGNORECASE,
 )
 FINGERPRINT_RE = re.compile(r"^[0-9a-f]{64}$")
-LLMS_LINK_RE = re.compile(r"^- \[[^\]]*\]\(([^)]+)\)", re.MULTILINE)
+LLMS_LINK_RE = re.compile(r"^\s*[-*]\s+\[[^\]]*\]\(([^)]+)\)", re.MULTILINE)
 MARKDOWN_LINK_RE = re.compile(r"\[[^\]]*\]\(([^)]+)\)")
 
 REQUIRED_META_FIELDS = {
