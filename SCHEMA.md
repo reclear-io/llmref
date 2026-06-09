@@ -68,7 +68,9 @@ Snapshot metadata. Required fields:
 
 #### Metadata maintenance
 
-CI validates every `meta.json` field, fingerprint consistency, `page_count`, `llms.txt` links, and `registry/index.json` sync. Fix any CI failures in the same PR before merge. If you are unsure about a value, run `python3 scripts/verify_registry.py` locally before opening the PR.
+Include `meta.json` with as many fields as you can, but don't worry if something is incomplete or slightly off on your first pass. Maintainers routinely review and correct metadata before merge — timestamps, fingerprints, `page_count`, and other technical fields — because they know what each value should be and where it belongs. Focus on getting the artifacts and core identifiers right (`project`, `project_version`, `source_root`).
+
+CI validates every `meta.json` field, fingerprint consistency, `page_count`, `llms.txt` links, and `registry/index.json` sync. Any failures must be fixed in the same PR before merge. If you are unsure about a value, run `python3 scripts/verify_registry.py` locally before opening the PR.
 
 ## Catalog index
 
