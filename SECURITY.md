@@ -12,7 +12,7 @@ If you discover a security issue related to this repository (for example: malici
 
 Instead:
 
-1. Email [fullcontext@reclear.io](mailto:fullcontext@reclear.io), or
+1. Email [wale@team.reclear.io](mailto:wale@team.reclear.io), or
 2. Open a [private security advisory](https://github.com/reclear-io/llm-txts/security/advisories/new) on GitHub.
 
 Include:
