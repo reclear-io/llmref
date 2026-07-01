@@ -1,0 +1,387 @@
+# Zod
+
+> Zod is a TypeScript-first schema validation library with static type inference. This documentation provides comprehensive coverage of Zod 4's features, API, and usage patterns.
+
+## Defining schemas
+
+- [Defining schemas](https://zod.dev/api): Complete API reference for all Zod schema types, methods, and validation features
+
+- [Primitives](https://zod.dev/api?id=primitives)
+- [Coercion](https://zod.dev/api?id=coercion)
+- [Literals](https://zod.dev/api?id=literals)
+- [Strings](https://zod.dev/api?id=strings)
+- [String formats](https://zod.dev/api?id=string-formats)
+- [Emails](https://zod.dev/api?id=emails)
+- [UUIDs](https://zod.dev/api?id=uuids)
+- [URLs](https://zod.dev/api?id=urls)
+- [Phone numbers](https://zod.dev/api?id=phone-numbers)
+- [ISO datetimes](https://zod.dev/api?id=iso-datetimes)
+- [ISO dates](https://zod.dev/api?id=iso-dates)
+- [ISO times](https://zod.dev/api?id=iso-times)
+- [IP addresses](https://zod.dev/api?id=ip-addresses)
+- [IP blocks (CIDR)](https://zod.dev/api?id=ip-blocks-cidr)
+- [MAC Addresses](https://zod.dev/api?id=mac-addresses)
+- [JWTs](https://zod.dev/api?id=jwts)
+- [Hashes](https://zod.dev/api?id=hashes)
+- [Custom formats](https://zod.dev/api?id=custom-formats)
+- [Template literals](https://zod.dev/api?id=template-literals)
+- [Numbers](https://zod.dev/api?id=numbers)
+- [Integers](https://zod.dev/api?id=integers)
+- [BigInts](https://zod.dev/api?id=bigints)
+- [Booleans](https://zod.dev/api?id=booleans)
+- [Dates](https://zod.dev/api?id=dates)
+- [Enums](https://zod.dev/api?id=enums)
+- [.enum](https://zod.dev/api?id=enum)
+- [.exclude()](https://zod.dev/api?id=exclude)
+- [.extract()](https://zod.dev/api?id=extract)
+- [Stringbools](https://zod.dev/api?id=stringbool)
+- [Optionals](https://zod.dev/api?id=optionals)
+- [Nullables](https://zod.dev/api?id=nullables)
+- [Nullish](https://zod.dev/api?id=nullish)
+- [Unknown](https://zod.dev/api?id=unknown)
+- [Never](https://zod.dev/api?id=never)
+- [Objects](https://zod.dev/api?id=objects)
+- [z.strictObject](https://zod.dev/api?id=zstrictobject)
+- [z.looseObject](https://zod.dev/api?id=zlooseobject)
+- [.catchall()](https://zod.dev/api?id=catchall)
+- [.shape](https://zod.dev/api?id=shape)
+- [.keyof()](https://zod.dev/api?id=keyof)
+- [.extend()](https://zod.dev/api?id=extend)
+- [.safeExtend()](https://zod.dev/api?id=safeextend)
+- [.pick()](https://zod.dev/api?id=pick)
+- [.omit()](https://zod.dev/api?id=omit)
+- [.partial()](https://zod.dev/api?id=partial)
+- [.required()](https://zod.dev/api?id=required)
+- [Recursive objects](https://zod.dev/api?id=recursive-objects)
+- [Circularity errors](https://zod.dev/api?id=circularity-errors)
+- [Arrays](https://zod.dev/api?id=arrays)
+- [Tuples](https://zod.dev/api?id=tuples)
+- [Unions](https://zod.dev/api?id=unions)
+- [Exclusive unions (XOR)](https://zod.dev/api?id=exclusive-unions-xor)
+- [Discriminated unions](https://zod.dev/api?id=discriminated-unions)
+- [Intersections](https://zod.dev/api?id=intersections)
+- [Records](https://zod.dev/api?id=records)
+- [z.record](https://zod.dev/api?id=zrecord)
+- [z.partialRecord](https://zod.dev/api?id=zpartialrecord)
+- [z.looseRecord](https://zod.dev/api?id=zlooserecord)
+- [Maps](https://zod.dev/api?id=maps)
+- [Sets](https://zod.dev/api?id=sets)
+- [Files](https://zod.dev/api?id=files)
+- [Promises](https://zod.dev/api?id=promises)
+- [Instanceof](https://zod.dev/api?id=instanceof)
+- [Property](https://zod.dev/api?id=property)
+- [Refinements](https://zod.dev/api?id=refinements)
+- [.refine()](https://zod.dev/api?id=refine)
+- [error](https://zod.dev/api?id=error)
+- [abort](https://zod.dev/api?id=abort)
+- [path](https://zod.dev/api?id=path)
+- [when](https://zod.dev/api?id=when)
+- [.superRefine()](https://zod.dev/api?id=superrefine)
+- [.check()](https://zod.dev/api?id=check)
+- [Codecs](https://zod.dev/api?id=codecs)
+- [Pipes](https://zod.dev/api?id=pipes)
+- [Transforms](https://zod.dev/api?id=transforms)
+- [.transform()](https://zod.dev/api?id=transform)
+- [.preprocess()](https://zod.dev/api?id=preprocess)
+- [Defaults](https://zod.dev/api?id=defaults)
+- [Prefaults](https://zod.dev/api?id=prefaults)
+- [Catch](https://zod.dev/api?id=catch)
+- [Branded types](https://zod.dev/api?id=branded-types)
+- [Readonly](https://zod.dev/api?id=readonly)
+- [JSON](https://zod.dev/api?id=json)
+- [Functions](https://zod.dev/api?id=functions)
+- [Custom](https://zod.dev/api?id=custom)
+- [Apply](https://zod.dev/api?id=apply)
+
+## Basic usage
+
+- [Basic usage](https://zod.dev/basics): Basic usage guide covering schema definition, parsing data, error handling, and type inference
+
+- [Defining a schema](https://zod.dev/basics?id=defining-a-schema)
+- [Parsing data](https://zod.dev/basics?id=parsing-data)
+- [Handling errors](https://zod.dev/basics?id=handling-errors)
+- [Inferring types](https://zod.dev/basics?id=inferring-types)
+
+## Codecs
+
+- [Codecs](https://zod.dev/codecs): Bidirectional transformations with encode and decode
+
+- [Inverting codecs](https://zod.dev/codecs?id=inverting-codecs)
+- [Composability](https://zod.dev/codecs?id=composability)
+- [Type-safe inputs](https://zod.dev/codecs?id=type-safe-inputs)
+- [Async and safe variants](https://zod.dev/codecs?id=async-and-safe-variants)
+- [How encoding works](https://zod.dev/codecs?id=how-encoding-works)
+- [Codecs](https://zod.dev/codecs?id=codecs)
+- [Pipes](https://zod.dev/codecs?id=pipes)
+- [Refinements](https://zod.dev/codecs?id=refinements)
+- [Defaults and prefaults](https://zod.dev/codecs?id=defaults-and-prefaults)
+- [Catch](https://zod.dev/codecs?id=catch)
+- [Stringbool](https://zod.dev/codecs?id=stringbool)
+- [Transforms](https://zod.dev/codecs?id=transforms)
+- [Useful codecs](https://zod.dev/codecs?id=useful-codecs)
+- [stringToNumber](https://zod.dev/codecs?id=stringtonumber)
+- [stringToInt](https://zod.dev/codecs?id=stringtoint)
+- [stringToBigInt](https://zod.dev/codecs?id=stringtobigint)
+- [numberToBigInt](https://zod.dev/codecs?id=numbertobigint)
+- [isoDatetimeToDate](https://zod.dev/codecs?id=isodatetimetodate)
+- [epochSecondsToDate](https://zod.dev/codecs?id=epochsecondstodate)
+- [epochMillisToDate](https://zod.dev/codecs?id=epochmillistodate)
+- [json(schema)](https://zod.dev/codecs?id=jsonschema)
+- [utf8ToBytes](https://zod.dev/codecs?id=utf8tobytes)
+- [bytesToUtf8](https://zod.dev/codecs?id=bytestoutf8)
+- [base64ToBytes](https://zod.dev/codecs?id=base64tobytes)
+- [base64urlToBytes](https://zod.dev/codecs?id=base64urltobytes)
+- [hexToBytes](https://zod.dev/codecs?id=hextobytes)
+- [stringToURL](https://zod.dev/codecs?id=stringtourl)
+- [stringToHttpURL](https://zod.dev/codecs?id=stringtohttpurl)
+- [uriComponent](https://zod.dev/codecs?id=uricomponent)
+
+## Ecosystem
+
+- [Ecosystem](https://zod.dev/ecosystem): Overview of the Zod ecosystem including integrations, tools, and community resources
+
+- [Resources](https://zod.dev/ecosystem?id=resources)
+- [API Libraries](https://zod.dev/ecosystem?id=api-libraries)
+- [Form Integrations](https://zod.dev/ecosystem?id=form-integrations)
+- [Zod to X](https://zod.dev/ecosystem?id=zod-to-x)
+- [X to Zod](https://zod.dev/ecosystem?id=x-to-zod)
+- [Mocking Libraries](https://zod.dev/ecosystem?id=mocking-libraries)
+- [Powered by Zod](https://zod.dev/ecosystem?id=powered-by-zod)
+- [Zod Utilities](https://zod.dev/ecosystem?id=zod-utilities)
+
+## Customizing errors
+
+- [Customizing errors](https://zod.dev/error-customization): Guide to customizing validation error messages and error handling patterns
+
+- [The error param](https://zod.dev/error-customization?id=the-error-param)
+- [Per-parse error customization](https://zod.dev/error-customization?id=per-parse-error-customization)
+- [Include input in issues](https://zod.dev/error-customization?id=include-input-in-issues)
+- [Global error customization](https://zod.dev/error-customization?id=global-error-customization)
+- [Internationalization](https://zod.dev/error-customization?id=internationalization)
+- [Locales](https://zod.dev/error-customization?id=locales)
+- [Error precedence](https://zod.dev/error-customization?id=error-precedence)
+
+## Formatting errors
+
+- [Formatting errors](https://zod.dev/error-formatting): Utilities for formatting and displaying Zod errors
+
+- [z.treeifyError()](https://zod.dev/error-formatting?id=ztreeifyerror)
+- [z.prettifyError()](https://zod.dev/error-formatting?id=zprettifyerror)
+- [z.formatError()](https://zod.dev/error-formatting?id=zformaterror)
+- [z.flattenError()](https://zod.dev/error-formatting?id=zflattenerror)
+
+## Intro
+
+- [Intro](https://zod.dev/): Introduction to Zod - TypeScript-first schema validation library with static type inference
+
+- [Introduction](https://zod.dev/?id=introduction)
+- [Features](https://zod.dev/?id=features)
+- [Installation](https://zod.dev/?id=installation)
+- [Requirements](https://zod.dev/?id=requirements)
+- ["strict"](https://zod.dev/?id=strict)
+- [Ecosystem](https://zod.dev/?id=ecosystem)
+- [Sponsors](https://zod.dev/?id=sponsors)
+- [Platinum](https://zod.dev/?id=platinum)
+- [Gold](https://zod.dev/?id=gold)
+- [Silver](https://zod.dev/?id=silver)
+- [Bronze](https://zod.dev/?id=bronze)
+
+## JSON Schema
+
+- [JSON Schema](https://zod.dev/json-schema): How to convert Zod schemas to JSON Schema
+
+- [z.fromJSONSchema()](https://zod.dev/json-schema?id=zfromjsonschema)
+- [z.toJSONSchema()](https://zod.dev/json-schema?id=ztojsonschema)
+- [io](https://zod.dev/json-schema?id=io)
+- [target](https://zod.dev/json-schema?id=target)
+- [metadata](https://zod.dev/json-schema?id=metadata)
+- [unrepresentable](https://zod.dev/json-schema?id=unrepresentable)
+- [cycles](https://zod.dev/json-schema?id=cycles)
+- [reused](https://zod.dev/json-schema?id=reused)
+- [override](https://zod.dev/json-schema?id=override)
+- [Conversion](https://zod.dev/json-schema?id=conversion)
+- [String formats](https://zod.dev/json-schema?id=string-formats)
+- [Numeric types](https://zod.dev/json-schema?id=numeric-types)
+- [Object schemas](https://zod.dev/json-schema?id=object-schemas)
+- [File schemas](https://zod.dev/json-schema?id=file-schemas)
+- [Nullability](https://zod.dev/json-schema?id=nullability)
+- [Registries](https://zod.dev/json-schema?id=registries)
+
+## For library authors
+
+- [For library authors](https://zod.dev/library-authors): Guidelines and best practices for library authors integrating with Zod
+
+- [Do I need to depend on Zod?](https://zod.dev/library-authors?id=do-i-need-to-depend-on-zod)
+- [How to configure peer dependencies?](https://zod.dev/library-authors?id=how-to-configure-peer-dependencies)
+- [Which subpaths should I import from?](https://zod.dev/library-authors?id=which-subpaths-should-i-import-from)
+- [How to support Zod 3 alongside Zod 4?](https://zod.dev/library-authors?id=how-to-support-zod-3-alongside-zod-4)
+- [How to support Zod and Zod Mini simultaneously?](https://zod.dev/library-authors?id=how-to-support-zod-and-zod-mini-simultaneously)
+- [How to accept user-defined schemas?](https://zod.dev/library-authors?id=how-to-accept-user-defined-schemas)
+
+## Metadata and registries
+
+- [Metadata and registries](https://zod.dev/metadata): Attaching and manipulatinvg metadata on Zod schemas
+
+- [Registries](https://zod.dev/metadata?id=registries)
+- [.register()](https://zod.dev/metadata?id=register)
+- [Metadata](https://zod.dev/metadata?id=metadata)
+- [z.globalRegistry](https://zod.dev/metadata?id=zglobalregistry)
+- [.meta()](https://zod.dev/metadata?id=meta)
+- [.describe()](https://zod.dev/metadata?id=describe)
+- [Custom registries](https://zod.dev/metadata?id=custom-registries)
+- [Referencing inferred types](https://zod.dev/metadata?id=referencing-inferred-types)
+- [Constraining schema types](https://zod.dev/metadata?id=constraining-schema-types)
+
+## Joining Clerk as an OSS Fellow to work on Zod 4
+
+- [Joining Clerk as an OSS Fellow to work on Zod 4](https://zod.dev/blog/clerk-fellowship): Announcing my Clerk OSS Fellowship and what's coming in Zod 4.
+
+- [On deck: Zod 4](https://zod.dev/blog/clerk-fellowship?id=on-deck-zod-4)
+- [Zod's current funding story](https://zod.dev/blog/clerk-fellowship?id=zods-current-funding-story)
+- [The Clerk fellowship](https://zod.dev/blog/clerk-fellowship?id=the-clerk-fellowship)
+- [OSS, funding models, and trying new things](https://zod.dev/blog/clerk-fellowship?id=oss-funding-models-and-trying-new-things)
+
+## Migration guide
+
+- [Migration guide](https://zod.dev/v4/changelog): Complete changelog and migration guide for upgrading from Zod 3 to Zod 4
+
+- [Error customization](https://zod.dev/v4/changelog?id=error-customization)
+- [deprecates message parameter](https://zod.dev/v4/changelog?id=deprecates-message-parameter)
+- [drops invalid_type_error and required_error](https://zod.dev/v4/changelog?id=drops-invalid_type_error-and-required_error)
+- [drops errorMap](https://zod.dev/v4/changelog?id=drops-errormap)
+- [ZodError](https://zod.dev/v4/changelog?id=zoderror)
+- [updates issue formats](https://zod.dev/v4/changelog?id=updates-issue-formats)
+- [changes error map precedence](https://zod.dev/v4/changelog?id=changes-error-map-precedence)
+- [deprecates .format()](https://zod.dev/v4/changelog?id=deprecates-format)
+- [deprecates .flatten()](https://zod.dev/v4/changelog?id=deprecates-flatten)
+- [drops .formErrors](https://zod.dev/v4/changelog?id=drops-formerrors)
+- [drops .errors](https://zod.dev/v4/changelog?id=drops-errors)
+- [deprecates .addIssue() and .addIssues()](https://zod.dev/v4/changelog?id=deprecates-addissue-and-addissues)
+- [z.number()](https://zod.dev/v4/changelog?id=znumber)
+- [no infinite values](https://zod.dev/v4/changelog?id=no-infinite-values)
+- [.safe() no longer accepts floats](https://zod.dev/v4/changelog?id=safe-no-longer-accepts-floats)
+- [.int() accepts safe integers only](https://zod.dev/v4/changelog?id=int-accepts-safe-integers-only)
+- [z.string() updates](https://zod.dev/v4/changelog?id=zstring-updates)
+- [deprecates .email() etc](https://zod.dev/v4/changelog?id=deprecates-email-etc)
+- [stricter .uuid()](https://zod.dev/v4/changelog?id=stricter-uuid)
+- [no padding in .base64url()](https://zod.dev/v4/changelog?id=no-padding-in-base64url)
+- [drops z.string().ip()](https://zod.dev/v4/changelog?id=drops-zstringip)
+- [updates z.string().ipv6()](https://zod.dev/v4/changelog?id=updates-zstringipv6)
+- [drops z.string().cidr()](https://zod.dev/v4/changelog?id=drops-zstringcidr)
+- [z.coerce updates](https://zod.dev/v4/changelog?id=zcoerce-updates)
+- [.default() updates](https://zod.dev/v4/changelog?id=default-updates)
+- [z.object()](https://zod.dev/v4/changelog?id=zobject)
+- [defaults applied within optional fields](https://zod.dev/v4/changelog?id=defaults-applied-within-optional-fields)
+- [deprecates .strict() and .passthrough()](https://zod.dev/v4/changelog?id=deprecates-strict-and-passthrough)
+- [deprecates .strip()](https://zod.dev/v4/changelog?id=deprecates-strip)
+- [drops .nonstrict()](https://zod.dev/v4/changelog?id=drops-nonstrict)
+- [drops .deepPartial()](https://zod.dev/v4/changelog?id=drops-deeppartial)
+- [changes z.unknown() optionality](https://zod.dev/v4/changelog?id=changes-zunknown-optionality)
+- [deprecates .merge()](https://zod.dev/v4/changelog?id=deprecates-merge)
+- [z.nativeEnum() deprecated](https://zod.dev/v4/changelog?id=znativeenum-deprecated)
+- [z.array()](https://zod.dev/v4/changelog?id=zarray)
+- [changes .nonempty() type](https://zod.dev/v4/changelog?id=changes-nonempty-type)
+- [z.promise() deprecated](https://zod.dev/v4/changelog?id=zpromise-deprecated)
+- [z.function()](https://zod.dev/v4/changelog?id=zfunction)
+- [adds .implementAsync()](https://zod.dev/v4/changelog?id=adds-implementasync)
+- [.refine()](https://zod.dev/v4/changelog?id=refine)
+- [ignores type predicates](https://zod.dev/v4/changelog?id=ignores-type-predicates)
+- [drops ctx.path](https://zod.dev/v4/changelog?id=drops-ctxpath)
+- [drops function as second argument](https://zod.dev/v4/changelog?id=drops-function-as-second-argument)
+- [z.ostring(), etc dropped](https://zod.dev/v4/changelog?id=zostring-etc-dropped)
+- [z.literal()](https://zod.dev/v4/changelog?id=zliteral)
+- [drops symbol support](https://zod.dev/v4/changelog?id=drops-symbol-support)
+- [static .create() factories dropped](https://zod.dev/v4/changelog?id=static-create-factories-dropped)
+- [z.record()](https://zod.dev/v4/changelog?id=zrecord)
+- [drops single argument usage](https://zod.dev/v4/changelog?id=drops-single-argument-usage)
+- [improves enum support](https://zod.dev/v4/changelog?id=improves-enum-support)
+- [z.intersection()](https://zod.dev/v4/changelog?id=zintersection)
+- [throws Error on merge conflict](https://zod.dev/v4/changelog?id=throws-error-on-merge-conflict)
+- [Internal changes](https://zod.dev/v4/changelog?id=internal-changes)
+- [updates generics](https://zod.dev/v4/changelog?id=updates-generics)
+- [adds z.core](https://zod.dev/v4/changelog?id=adds-zcore)
+- [moves ._def](https://zod.dev/v4/changelog?id=moves-_def)
+- [drops ZodEffects](https://zod.dev/v4/changelog?id=drops-zodeffects)
+- [adds ZodTransform](https://zod.dev/v4/changelog?id=adds-zodtransform)
+- [drops ZodPreprocess](https://zod.dev/v4/changelog?id=drops-zodpreprocess)
+- [drops ZodBranded](https://zod.dev/v4/changelog?id=drops-zodbranded)
+
+## Release notes
+
+- [Release notes](https://zod.dev/v4): Zod 4 release notes and new features including performance improvements and breaking changes
+
+- [Versioning](https://zod.dev/v4?id=versioning)
+- [Why a new major version?](https://zod.dev/v4?id=why-a-new-major-version)
+- [Benchmarks](https://zod.dev/v4?id=benchmarks)
+- [14x faster string parsing](https://zod.dev/v4?id=14x-faster-string-parsing)
+- [7x faster array parsing](https://zod.dev/v4?id=7x-faster-array-parsing)
+- [6.5x faster object parsing](https://zod.dev/v4?id=65x-faster-object-parsing)
+- [100x reduction in tsc instantiations](https://zod.dev/v4?id=100x-reduction-in-tsc-instantiations)
+- [2x reduction in core bundle size](https://zod.dev/v4?id=2x-reduction-in-core-bundle-size)
+- [Introducing Zod Mini](https://zod.dev/v4?id=introducing-zod-mini)
+- [6.6x reduction in core bundle size](https://zod.dev/v4?id=66x-reduction-in-core-bundle-size)
+- [Metadata](https://zod.dev/v4?id=metadata)
+- [The global registry](https://zod.dev/v4?id=the-global-registry)
+- [.meta()](https://zod.dev/v4?id=meta)
+- [JSON Schema conversion](https://zod.dev/v4?id=json-schema-conversion)
+- [Recursive objects](https://zod.dev/v4?id=recursive-objects)
+- [File schemas](https://zod.dev/v4?id=file-schemas)
+- [Internationalization](https://zod.dev/v4?id=internationalization)
+- [Error pretty-printing](https://zod.dev/v4?id=error-pretty-printing)
+- [Top-level string formats](https://zod.dev/v4?id=top-level-string-formats)
+- [Custom email regex](https://zod.dev/v4?id=custom-email-regex)
+- [Template literal types](https://zod.dev/v4?id=template-literal-types)
+- [Number formats](https://zod.dev/v4?id=number-formats)
+- [Stringbool](https://zod.dev/v4?id=stringbool)
+- [Simplified error customization](https://zod.dev/v4?id=simplified-error-customization)
+- [Upgraded z.discriminatedUnion()](https://zod.dev/v4?id=upgraded-zdiscriminatedunion)
+- [Multiple values in z.literal()](https://zod.dev/v4?id=multiple-values-in-zliteral)
+- [Refinements live inside schemas](https://zod.dev/v4?id=refinements-live-inside-schemas)
+- [.overwrite()](https://zod.dev/v4?id=overwrite)
+- [An extensible foundation: zod/v4/core](https://zod.dev/v4?id=an-extensible-foundation-zodv4core)
+- [Wrapping up](https://zod.dev/v4?id=wrapping-up)
+
+## Versioning
+
+- [Versioning](https://zod.dev/v4/versioning): Versioning strategy and compatibility information for Zod 4
+
+- [Update — July 8th, 2025](https://zod.dev/v4/versioning?id=update--july-8th-2025)
+- [Versioning in Zod 4](https://zod.dev/v4/versioning?id=versioning-in-zod-4)
+- [Why?](https://zod.dev/v4/versioning?id=why)
+- [Why can't libraries just support v3 and v4 simultaneously?](https://zod.dev/v4/versioning?id=why-cant-libraries-just-support-v3-and-v4-simultaneously)
+
+## Zod Core
+
+- [Zod Core](https://zod.dev/packages/core): Zod Core package - minimal core functionality for custom implementations
+
+- [Schemas](https://zod.dev/packages/core?id=schemas)
+- [Internals](https://zod.dev/packages/core?id=internals)
+- [Parsing](https://zod.dev/packages/core?id=parsing)
+- [Checks](https://zod.dev/packages/core?id=checks)
+- [Errors](https://zod.dev/packages/core?id=errors)
+- [Issues](https://zod.dev/packages/core?id=issues)
+
+## Zod Mini
+
+- [Zod Mini](https://zod.dev/packages/mini): Zod Mini - a tree-shakable Zod
+
+- [Tree-shaking](https://zod.dev/packages/mini?id=tree-shaking)
+- [When (not) to use Zod Mini](https://zod.dev/packages/mini?id=when-not-to-use-zod-mini)
+- [DX](https://zod.dev/packages/mini?id=dx)
+- [Backend development](https://zod.dev/packages/mini?id=backend-development)
+- [Internet speed](https://zod.dev/packages/mini?id=internet-speed)
+- [ZodMiniType](https://zod.dev/packages/mini?id=zodminitype)
+- [.parse](https://zod.dev/packages/mini?id=parse)
+- [.check()](https://zod.dev/packages/mini?id=check)
+- [.register()](https://zod.dev/packages/mini?id=register)
+- [.brand()](https://zod.dev/packages/mini?id=brand)
+- [.clone(def)](https://zod.dev/packages/mini?id=clonedef)
+- [No default locale](https://zod.dev/packages/mini?id=no-default-locale)
+
+## Zod
+
+- [Zod](https://zod.dev/packages/zod): Internals and structure of the Zod library
+
+---
+
+This documentation covers Zod v4, a TypeScript-first schema validation library. Use the URLs above to access specific pages and sections for detailed information about schema definition, validation, error handling, and advanced patterns.
