@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate fullcontext registry snapshots and catalog index."""
+"""Validate llm-txts registry snapshots and catalog index."""
 from __future__ import annotations
 
 import hashlib
