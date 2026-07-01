@@ -2,6 +2,8 @@
 
 This document defines the public contract for snapshots stored under `registry/`.
 
+> **Most snapshots are generated automatically** when a [documentation request](https://github.com/reclear-io/llmref/issues/new?template=request-docs.yml) is approved - you do not hand-write them. This document is the contract those artifacts follow, useful if you are submitting or reviewing a snapshot PR.
+
 ## Directory layout
 
 ```
@@ -60,7 +62,7 @@ Snapshot metadata. Required fields:
   "content_fingerprint": "6a1e6dc6c06a8c504a0a4b7c2dff4088876270238a7e22b153a8dbcde838cb8c",
   "page_count": 7,
   "source_root": "https://svelte.dev",
-  "embedding_model": "text-embedding-3-small",
+  "embedding_model": "voyage-3-lite",
   "chunking_profile": "docs-v1",
   "generator_version": "0.1.0"
 }
