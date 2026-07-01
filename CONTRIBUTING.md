@@ -45,9 +45,9 @@ Each snapshot lives at:
 registry/
   <technology-id>/
     <version>/
-      llms.txt
-      llms-full.txt
-      meta.json
+      llms.txt        # always
+      llms-full.txt   # only when the license permits redistribution
+      meta.json       # always (includes a license block)
 ```
 
 ### `meta.json` requirements
@@ -62,7 +62,9 @@ registry/
 
 - Use the official public documentation source only.
 - Do not include proprietary or non-public documentation.
-- Upstream license/terms must not restrict redistribution of docs content.
+- Licensing is detected automatically and recorded in `meta.json` `license`. Docs
+  whose license does not permit redistribution are still indexed for search, but
+  ship without `llms-full.txt` (see [SCHEMA.md](./SCHEMA.md#license)).
 - For updates, ensure `content_fingerprint` has changed from the prior snapshot.
 - Do not overwrite an existing version unless the PR is an intentional refresh.
 

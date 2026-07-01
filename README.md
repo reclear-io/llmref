@@ -91,10 +91,14 @@ API required:
 ```
 registry/<technology-id>/<version>/
   llms.txt        # compact routing/summary file for models
-  llms-full.txt   # full merged documentation
-  meta.json       # snapshot metadata + content fingerprint
+  llms-full.txt   # full merged documentation (only when the license permits it)
+  meta.json       # snapshot metadata + content fingerprint + license
 registry/index.json
 ```
+
+`llms-full.txt` is published only when the upstream license permits redistributing
+full text; reserved-license snapshots ship `llms.txt` + `meta.json` and stay
+searchable via snippets. See [SCHEMA.md](./SCHEMA.md#license).
 
 ```
 https://raw.githubusercontent.com/reclear-io/llmref/main/registry/drizzle/0.45.2/llms.txt
