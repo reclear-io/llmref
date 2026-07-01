@@ -1,226 +1,115 @@
-# llm-txts
+<div align="center">
 
-A free, public, **versioned** documentation registry and retrieval API for AI tools, coding assistants, and retrieval systems. Built on the [`llms.txt`](https://llmstxt.org) convention.
+# LLM Reference
 
-There are two ways to consume it:
+**Versioned, model-ready documentation and semantic search for AI tools.**
 
-1. **Hosted API** — deterministic artifacts, semantic search, and an MCP endpoint at `https://llm-txts.reclear.io`.
-2. **Raw registry files** — read the artifacts straight from this repo (small, diffable, auditable).
+Give your AI accurate, version-correct docs instead of stale training data.
+Free, deterministic, and open - built on the [`llms.txt`](https://llmstxt.org) standard.
 
-Each indexed project version produces three artifacts:
+[**Docs**](https://llmref.org) · [**API**](https://api.llmref.org/v1/projects) · [**MCP registry**](https://registry.modelcontextprotocol.io/?q=llmref) · [**npm**](https://www.npmjs.com/package/@llmref/cli)
 
-| File | Description |
-|---|---|
-| `llms.txt` | Compact routing and summary file for models |
-| `llms-full.txt` | Full merged documentation artifact |
-| `meta.json` | Snapshot metadata, timestamps, and content fingerprints |
-
-Large dump artifacts (chunks, embeddings) are stored separately — see a snapshot's `dumps` endpoint or `meta.json` for their URLs.
+</div>
 
 ---
 
-## Hosted API
+## Connect it to your AI tool
 
-Base URL: **`https://llm-txts.reclear.io`**
-
-Free by default. Anonymous access has conservative rate limits; API keys (sent as `Authorization: Bearer <key>`) raise them. The underlying data stays free.
-
-### Deterministic routes
+The quickest way to use LLM Reference is its **MCP server** - a remote endpoint that
+gives assistants four tools: `list_projects`, `list_versions`, `resolve_docs`, and
+`search_docs`.
 
 ```
-GET /v1/projects
-GET /v1/projects/:slug
-GET /v1/projects/:slug/:version/llms.txt
-GET /v1/projects/:slug/:version/llms-full.txt
-GET /v1/projects/:slug/:version/meta.json
-GET /v1/projects/:slug/:version/dumps
-GET /v1/resolve?project=<slug>&version=<version|latest>
+https://api.llmref.org/v1/mcp
 ```
 
-**List projects**
+| Client | Setup |
+| --- | --- |
+| **Claude Code** | `claude mcp add --transport http llmref https://api.llmref.org/v1/mcp` |
+| **Cursor** | [![Add to Cursor](https://cursor.com/deeplink/mcp-install-dark.svg)](cursor://anysphere.cursor-deeplink/mcp/install?name=llmref&config=eyJ1cmwiOiJodHRwczovL2FwaS5sbG1yZWYub3JnL3YxL21jcCJ9) or add to `.cursor/mcp.json` |
+| **Codex** | `~/.codex/config.toml`: `[mcp_servers.llmref]` then `url = "https://api.llmref.org/v1/mcp"` |
+| **Claude Desktop / Windsurf / VS Code** | see the [MCP guide](https://llmref.org/guides/mcp/) |
 
-```bash
-curl https://llm-txts.reclear.io/v1/projects
-```
-```json
-{
-  "projects": [
-    { "slug": "svelte", "versions": ["5.0.0"] },
-    { "slug": "vite", "versions": ["8.0.16"] }
-  ]
-}
-```
-
-**Resolve a version** (accepts `latest`) and get artifact URLs:
-
-```bash
-curl "https://llm-txts.reclear.io/v1/resolve?project=svelte&version=latest"
-```
-```json
-{
-  "project": "svelte",
-  "requested_version": "latest",
-  "resolved_version": "5.0.0",
-  "artifacts": {
-    "llms.txt": "/v1/projects/svelte/5.0.0/llms.txt",
-    "llms-full.txt": "/v1/projects/svelte/5.0.0/llms-full.txt",
-    "meta.json": "/v1/projects/svelte/5.0.0/meta.json",
-    "dumps": "/v1/projects/svelte/5.0.0/dumps"
-  }
-}
-```
-
-**Fetch an artifact** (`llms.txt` / `llms-full.txt` are `text/plain`):
-
-```bash
-curl https://llm-txts.reclear.io/v1/projects/svelte/5.0.0/llms.txt
-```
-
-**Snapshot metadata** (`meta.json`):
+For any JSON-configured client:
 
 ```json
-{
-  "project": "svelte",
-  "project_version": "5.0.0",
-  "snapshot_id": "7ddd5989-1888-4fcc-8908-e3bb8877eda7",
-  "snapshot_at": "2026-06-12T07:52:39.572274+00:00",
-  "source_last_seen_at": "2026-06-30T21:17:09.400213+00:00",
-  "content_fingerprint": "7a2de2e589bd2c9b9b7008677d3d9d2be4f9cf9e18718e65c0cf56eea4c7140b",
-  "page_count": 7,
-  "source_root": "https://svelte.dev",
-  "embedding_model": "voyage-3-lite",
-  "chunking_profile": "docs-v1",
-  "generator_version": "0.1.0"
-}
+{ "mcpServers": { "llmref": { "type": "http", "url": "https://api.llmref.org/v1/mcp" } } }
 ```
 
-**Dump URLs** (chunks / embeddings / manifest; `{}` when a snapshot has no published dumps):
+Full per-client setup lives at **[llmref.org/guides/mcp](https://llmref.org/guides/mcp/)**.
 
-```bash
-curl https://llm-txts.reclear.io/v1/projects/svelte/5.0.0/dumps
-```
-```json
-{ "dump_urls": { "chunks": "...", "embeddings": "...", "manifest": "..." } }
-```
+## Or use the API, SDK, or CLI
 
-### Semantic search
+One free public API at `api.llmref.org` - no account required.
 
-```
-POST /v1/search
-POST /v1/search/semantic
-```
+```sh
+# List indexed projects
+curl https://api.llmref.org/v1/projects
 
-Request body:
+# Fetch a library's docs, version-pinned and model-ready
+curl https://api.llmref.org/v1/projects/drizzle/0.45.2/llms.txt
 
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `project` | string | yes | Project slug |
-| `version` | string | yes | Concrete version (resolve `latest` first) |
-| `query` | string | yes | Natural-language query |
-| `top_k` | number | no | Max chunks to return |
-| `token_budget` | number | no | Cap total returned tokens instead of count |
-
-```bash
-curl -X POST https://llm-txts.reclear.io/v1/search/semantic \
-  -H 'Content-Type: application/json' \
-  -d '{"project":"svelte","version":"5.0.0","query":"how do runes work","top_k":1}'
-```
-```json
-{
-  "chunks": [
-    {
-      "id": "00cdafc7cca227e4b1e4b05c92cee7a8",
-      "project": "svelte",
-      "version": "5.0.0",
-      "page_url": "https://svelte.dev/docs/svelte/llms.txt",
-      "heading": "What are runes?",
-      "content": "# What are runes?\n\nRunes are symbols that you use in `.svelte` ...",
-      "token_count": 215,
-      "score": 0.5887165
-    }
-  ]
-}
+# Semantic search
+curl -X POST https://api.llmref.org/v1/search/semantic \
+  -H 'content-type: application/json' \
+  -d '{"project":"drizzle","version":"0.45.2","query":"define a table schema"}'
 ```
 
-### MCP
+Typed clients:
 
-A [Model Context Protocol](https://modelcontextprotocol.io) endpoint is exposed over **Streamable HTTP**:
-
-```
-https://llm-txts.reclear.io/v1/mcp
-```
-
-Add it to an MCP-capable client (Claude, Cursor, etc.):
-
-```json
-{
-  "mcpServers": {
-    "llm-txts": {
-      "type": "http",
-      "url": "https://llm-txts.reclear.io/v1/mcp"
-    }
-  }
-}
+```sh
+bun add @llmref/sdk       # TypeScript SDK
+bun add -g @llmref/cli    # the `llmref` command-line tool
 ```
 
-Tools:
+Every route, method, and type is documented at **[llmref.org](https://llmref.org)**.
 
-| Tool | Purpose |
-|---|---|
-| `list_projects` | List indexed projects and versions |
-| `list_versions` | List versions for a project |
-| `resolve_docs` | Resolve a version and return artifact URLs |
-| `search_docs` | Semantic search over a project version |
+## What's indexed
 
----
+Browse everything at [`/v1/projects`](https://api.llmref.org/v1/projects) or in
+[`registry/index.json`](./registry/index.json).
 
-## Raw registry access (no API)
+**Missing a library?** [**Request it**](https://github.com/reclear-io/llmref/issues/new?template=request-docs.yml) -
+you don't prepare anything; approved requests are ingested automatically into a
+versioned, searchable snapshot.
 
-Every artifact is also a plain file in this repo, fetchable over raw GitHub:
+## Request or fix documentation
 
-```
-https://raw.githubusercontent.com/reclear-io/llm-txts/main/registry/<technology-id>/<version>/llms.txt
-https://raw.githubusercontent.com/reclear-io/llm-txts/main/registry/<technology-id>/<version>/llms-full.txt
-https://raw.githubusercontent.com/reclear-io/llm-txts/main/registry/<technology-id>/<version>/meta.json
-```
+Open an issue and the pipeline does the work - no setup on your end.
 
-List everything indexed:
+- 📥 [**Request docs**](https://github.com/reclear-io/llmref/issues/new?template=request-docs.yml) - add a new project or version.
+- 🐛 [**Report a problem**](https://github.com/reclear-io/llmref/issues/new?template=report-registry-issue.yml) - flag incorrect or stale content.
 
-```
-https://raw.githubusercontent.com/reclear-io/llm-txts/main/registry/index.json
-```
+Approved requests become a versioned snapshot pull request that a maintainer reviews
+and merges before it goes live. Details: [Contribute guide](https://llmref.org/contribute/).
 
-Example — Svelte 5.0.0:
+## The registry (raw files)
+
+Every artifact is also a plain, diffable file you can read straight from GitHub - no
+API required:
 
 ```
-https://raw.githubusercontent.com/reclear-io/llm-txts/main/registry/svelte/5.0.0/llms.txt
+registry/<technology-id>/<version>/
+  llms.txt        # compact routing/summary file for models
+  llms-full.txt   # full merged documentation
+  meta.json       # snapshot metadata + content fingerprint
+registry/index.json
 ```
 
-## Registry structure
-
 ```
-registry/
-  <technology-id>/
-    <version>/
-      llms.txt
-      llms-full.txt
-      meta.json
-  index.json
+https://raw.githubusercontent.com/reclear-io/llmref/main/registry/drizzle/0.45.2/llms.txt
 ```
 
-See [SCHEMA.md](./SCHEMA.md) for naming rules, `meta.json` fields, and change detection.
+Large dump artifacts (chunks, embeddings) live off-repo; see a snapshot's `dumps`
+endpoint. Format: [SCHEMA.md](./SCHEMA.md) · PR flow: [CONTRIBUTING.md](./CONTRIBUTING.md).
 
-## Contributing
+## Links
 
-- [CONTRIBUTING.md](./CONTRIBUTING.md) — PR title format, registry layout, submission guidelines
-- [Request docs](https://github.com/reclear-io/llm-txts/issues/new?template=request-docs.yml) — ask maintainers to add or refresh a snapshot
-- [Report registry issue](https://github.com/reclear-io/llm-txts/issues/new?template=report-registry-issue.yml) — flag incorrect or stale content
-
-## Community
-
-- [Code of Conduct](./CODE_OF_CONDUCT.md)
-- [Security policy](./SECURITY.md)
+- **Documentation** - https://llmref.org
+- **MCP registry** - [`org.llmref/llmref`](https://registry.modelcontextprotocol.io/?q=llmref)
+- **npm** - [`@llmref/sdk`](https://www.npmjs.com/package/@llmref/sdk) · [`@llmref/cli`](https://www.npmjs.com/package/@llmref/cli)
+- [Code of Conduct](./CODE_OF_CONDUCT.md) · [Security policy](./SECURITY.md)
 
 ## License
 
-[MIT](./LICENSE)
+[MIT](./LICENSE) · Open Source by [Reclear.io](https://reclear.io)
