@@ -138,14 +138,13 @@ def validate_llms_txt(path: Path, llms_txt: str, source_root: str) -> bool:
     ok = True
 
     links = MARKDOWN_LINK_RE.findall(llms_txt)
-    if not links:
-        error(f"{path}/llms.txt: must contain at least one markdown link")
+    # Real-world llms.txt files (ingested verbatim from a site) legitimately mix
+    # doc links with mailto:, tel:, and in-page #anchor links. Require at least
+    # one http(s) doc link; ignore the non-http ones rather than failing.
+    http_links = [link for link in links if is_valid_url(link)]
+    if not http_links:
+        error(f"{path}/llms.txt: must contain at least one http(s) documentation link")
         ok = False
-
-    for link in links:
-        if not is_valid_url(link):
-            error(f"{path}/llms.txt: invalid link URL '{link}'")
-            ok = False
 
     if source_root and not llms_txt.strip():
         error(f"{path}/llms.txt: must not be empty")
@@ -212,19 +211,14 @@ def validate_meta(meta: dict, tech_id: str, version: str, snapshot_dir: Path, ll
             )
             ok = False
 
-    linked_pages = len(LLMS_LINK_RE.findall(llms_txt))
+    # page_count is informational metadata. For native llms.txt the number of
+    # sections the pipeline fetched rarely equals the raw link count (files list
+    # more links than are fetched as pages), so require only a sane lower bound
+    # rather than an exact match.
     page_count = meta.get("page_count")
-    expected_page_count = linked_pages if linked_pages > 0 else 1
-    if isinstance(page_count, int):
-        if page_count < 1:
-            error(f"{meta_path}: page_count must be at least 1")
-            ok = False
-        elif page_count != expected_page_count:
-            error(
-                f"{meta_path}: page_count {page_count} does not match llms.txt link count "
-                f"{expected_page_count}"
-            )
-            ok = False
+    if isinstance(page_count, int) and page_count < 1:
+        error(f"{meta_path}: page_count must be at least 1")
+        ok = False
 
     ok = validate_llms_txt(snapshot_dir, llms_txt, source_root) and ok
     return ok
