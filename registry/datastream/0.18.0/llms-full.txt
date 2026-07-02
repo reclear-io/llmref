@@ -1,0 +1,2961 @@
+# datastream · v0.18.0
+
+Source: https://datastream.hexdocs.pm/
+
+# datastream
+
+datastream is a pull-based stream library for Gleam.
+
+A `Stream(a)` is a pipeline definition, not a materialized collection.
+Each terminal operation runs the source again from the beginning, so the
+library fits work that should stay lazy, repeatable, and explicit about
+effects.
+
+## Install
+
+```
+gleam add datastream
+```
+API reference: [https://hexdocs.pm/datastream](https://hexdocs.pm/datastream)
+
+## When to use it
+
+Use `datastream` when you need one or more of these:
+
+- the input is large or unbounded and should not be loaded all at once
+- the pipeline owns a real resource such as a file handle, socket, or cursor
+- the work is naturally chunked text or bytes
+- the Erlang target needs bounded parallel work or time-based stream operators
+
+For a hands-on tour, jump to the runnable
+[Log-ingest example](https://datastream.hexdocs.pm#log-ingest-example-bytes--lines--per-level-counts)
+or the [NDJSON example](https://datastream.hexdocs.pm#ndjson-example-chunked-bytes--typed-records).
+The full catalog of compile-checked end-to-end pipelines lives under
+[Example pipelines](https://datastream.hexdocs.pm#example-pipelines).
+
+Stay with `gleam/list` when the whole input is already in memory and you
+do not need lazy pulls, replayable pipelines, or deterministic cleanup.
+
+## Quick start
+
+```
+import datastream/sink
+import datastream/source
+import datastream/stream
+import gleam/io
+pub fn main() {
+  let result =
+    source.iterate(from: 1, with: fn(x) { x + 1 })
+    |> stream.map(with: fn(x) { x * 2 })
+    |> stream.take(up_to: 5)
+    |> sink.to_list
+  io.debug(result)
+  // [2, 4, 6, 8, 10]
+}
+```
+## Log-ingest example: bytes -> lines -> per-level counts
+
+A common shape: bytes arrive in arbitrary chunks (file, socket), the
+pipeline reassembles them into lines, drops malformed rows, and produces
+per-level counts in a single pass. `text.lines` owns the line buffering,
+so the chunk boundaries shown below never split a record across two
+emitted strings.
+
+```
+import datastream/fold
+import datastream/source
+import datastream/stream
+import datastream/text
+import gleam/dict
+import gleam/io
+import gleam/option.{type Option, None, Some}
+import gleam/string
+pub type Level {
+  Info
+  Warn
+  LogError
+}
+pub fn main() {
+  // Real-world input arrives in arbitrary chunks. Note how `WARN` and
+  // `INFO` records straddle chunk boundaries — `text.lines` reassembles.
+  let chunks = [
+    "INFO  user_id=42 logged in\nWARN  ", "user_id=42 retry\nERROR ",
+    "user_id=99 timeout\nbogus line with no level\nINFO ",
+    "user_id=42 ok\n",
+  ]
+  source.from_list(chunks)
+  |> text.lines
+  |> stream.filter_map(with: parse_line)
+  |> fold.fold(from: dict.new(), with: bump)
+  |> io.debug
+  // dict.from_list([#(Info, 2), #(Warn, 1), #(LogError, 1)])
+}
+fn parse_line(line: String) -> Option(Level) {
+  case string.split_once(line, on: " ") {
+    Ok(#("INFO", _)) -> Some(Info)
+    Ok(#("WARN", _)) -> Some(Warn)
+    Ok(#("ERROR", _)) -> Some(LogError)
+    _ -> None
+  }
+}
+fn bump(acc: dict.Dict(Level, Int), level: Level) -> dict.Dict(Level, Int) {
+  let current = case dict.get(acc, level) {
+    Ok(n) -> n
+    Error(Nil) -> 0
+  }
+  dict.insert(acc, level, current + 1)
+}
+```
+Production callers swap `source.from_list(chunks)` for a
+`source.resource` over a real file handle or socket — the rest of the
+pipeline is unchanged. Full source:
+[ test/examples/log_pipeline_example.gleam](https://github.com/nao1215/datastream/blob/main/test/examples/log_pipeline_example.gleam).
+
+## NDJSON example: chunked bytes -> typed records
+
+Newline-delimited JSON (one record per line) over a chunked byte source. The same lazy pass does UTF-8 decode, line framing, and per-record parsing without holding the whole payload in memory.
+
+```
+import datastream/fold
+import datastream/source
+import datastream/stream
+import datastream/text
+import gleam/int
+import gleam/io
+import gleam/string
+pub type Record {
+  Record(id: Int, body: String)
+}
+pub type ParseError {
+  EmptyLine
+  MissingId(line: String)
+  BadId(raw: String)
+}
+pub fn main() {
+  // The first chunk ends mid-line; the second completes that record.
+  let chunks =
+    source.from_list([
+      <<"1 first record\n2 second">>,
+      <<" record\n3 third record\n">>,
+    ])
+  chunks
+  |> text.utf8_decode_lossy
+  |> text.lines
+  |> stream.map(with: parse_record)
+  |> fold.collect_result
+  |> io.debug
+  // Ok([Record(1, "first record"), Record(2, "second record"), ...])
+}
+fn parse_record(line: String) -> Result(Record, ParseError) {
+  case line {
+    "" -> Error(EmptyLine)
+    _ ->
+      case string.split_once(line, on: " ") {
+        Error(_) -> Error(MissingId(line: line))
+        Ok(#(raw_id, body)) ->
+          case int.parse(raw_id) {
+            Ok(id) -> Ok(Record(id: id, body: body))
+            Error(_) -> Error(BadId(raw: raw_id))
+          }
+      }
+  }
+}
+```
+`fold.collect_result` short-circuits at the first parse failure; swap in
+`fold.partition_result` to surface every successful record alongside
+every error. Drop in your JSON decoder of choice at `parse_record`.
+Full source:
+[ test/examples/ndjson_pipeline_example.gleam](https://github.com/nao1215/datastream/blob/main/test/examples/ndjson_pipeline_example.gleam).
+
+## Resource-backed streams
+
+`source.resource` opens lazily on the first pull, yields values one by
+one, and closes exactly once on normal completion and on the early-stop
+paths the library controls.
+
+```
+import datastream.{Done, Next}
+import datastream/fold
+import datastream/source
+import datastream/stream
+import gleam/io
+pub fn main() {
+  let numbers =
+    source.resource(
+      open: fn() { 1 },
+      next: fn(state) {
+        case state <= 3 {
+          True -> Next(element: state, state: state + 1)
+          False -> Done
+        }
+      },
+      close: fn(_state) { Nil },
+    )
+  numbers
+  |> stream.take(up_to: 2)
+  |> fold.to_list
+  |> io.debug
+  // [1, 2]
+}
+```
+Use `source.try_resource` when opening or reading can fail and you want
+the failure on the typed path as `Result`.
+
+## JavaScript async I/O
+
+The core `Stream(a)` stays synchronous on both targets. That is a
+deliberate design choice: each pull either returns the next element
+immediately or reports `Done`.
+
+Because of that, the official JavaScript boundary is:
+
+- async input stays in host JavaScript until it has been reduced to a bounded value or batch, then enters `datastream`through`source.once`,`source.from_list`,`source.from_bit_array`, or a resource constructor
+- synchronous `Stream(a)`pipelines leave`datastream`through`datastream/javascript/async.to_async_iterable`
+
+This means `datastream` does not pretend that a host-side
+`AsyncIterable` is the same thing as a pure `Stream(a)`. The adapter is
+honest about where `await` lives.
+
+Gleam:
+
+```
+import datastream/javascript/async as js_async
+import datastream/source
+import datastream/stream
+import gleam/string
+pub fn lines_for_host() -> js_async.AsyncIterable(String) {
+  source.from_list(["a", "b", "c"])
+  |> stream.map(with: string.uppercase)
+  |> js_async.to_async_iterable
+}
+```
+Host JavaScript:
+
+```
+import { lines_for_host } from "./build/dev/javascript/app/app.mjs";
+for await (const line of lines_for_host()) {
+  console.log(line);
+  if (line === "B") break;
+}
+```
+Breaking out of the `for await` loop closes the underlying stream once,
+so resource-backed pipelines still release handles promptly.
+
+## Example pipelines
+
+Compile-checked examples live under `test/examples/` and run in CI. The
+log-ingest and NDJSON entries are inlined above; the rest are linked
+straight to source.
+
+| Example | Shape |
+|---|---|
+| `log_pipeline_example.gleam` | bytes -> `text.lines`-> validation -> per-level counts |
+| `ndjson_pipeline_example.gleam` | bytes -> UTF-8 decode -> lines -> per-record parse |
+| `length_prefixed_pipeline_example.gleam` | chunked bytes -> `binary.length_prefixed_with`-> collection |
+| `parallel_pipeline_example.gleam` | BEAM-only bounded parallel map |
+| `dataprep_pipeline_example.gleam` | per-row validation with accumulated errors |
+
+## Module guide
+
+- `datastream`: defines- `Stream(a)`and- `Step(a, state)`
+- `datastream/source`: constructors for list-backed, generated, and resource-backed streams
+- `datastream/stream`: lazy combinators such as- `map`,- `filter`,- `flat_map`,- `zip`,- `take`, and- `chunks_of`
+- `datastream/sink`: every terminal — pure reductions (- `to_list`,- `count`,- `fold`,- `first`,- `find`,- `collect_result`, …) and side-effecting consumers (- `each`,- `try_each`,- `println`)
+- `datastream/fold`: legacy alias for the pure-reduction subset of- `sink`. Re-exports the same functions for backward compatibility; new code should reach for- `datastream/sink`instead
+- `datastream/chunk`: opaque finite batches
+- `datastream/text`: chunk-aware UTF-8 decode and line splitting
+- `datastream/binary`: byte and framing helpers
+- `datastream/erlang/source`: BEAM-only subject, timer, and timeout helpers
+- `datastream/erlang/sink`: BEAM-only subject sink
+- `datastream/erlang/par`: BEAM-only bounded parallel combinators and- `race`
+- `datastream/erlang/time`: BEAM-only time-based combinators
+- `datastream/javascript/async`: JavaScript-only async iterable adapter for leaving the synchronous core
+
+## Target support
+
+- Erlang target: the full package
+- JavaScript target: the cross-target core and `datastream/javascript/async`
+- `datastream/erlang/*`modules are BEAM-only
+
+## Checked constructors
+
+Some constructors reject invalid numeric arguments at construction time.
+Use the panicking variants when the value is a trusted constant in your
+own code. Use the matching `*_checked` variant when the value comes from
+CLI flags, config files, request parameters, or any other dynamic input.
+
+The main checked families are:
+
+- `stream.take_checked`,- `stream.drop_checked`
+- `stream.buffer_checked`,- `stream.chunks_of_checked`
+- `binary.length_prefixed_checked`,- `binary.length_prefixed_with_checked`,- `binary.fixed_size_checked`
+- `datastream/erlang/par.*_checked`
+
+## Backpressure
+
+Two combinators interact with backpressure between a producer and one or more consumers:
+
+- `stream.buffer(stream, prefetch:)`- `prefetch`elements ahead of the consumer, so a latency-bound upstream (HTTP body bytes, slow disk reads) does not serialise the consumer’s per-element work. The buffer is bounded by- `prefetch`; a slow consumer cannot blow it past that capacity.
+- `stream.broadcast(stream, n)`- `n`independent consumers, each pulling at its own pace. Per-consumer queues are- **unbounded**: if one consumer pulls aggressively while another pauses, the slow consumer’s queue grows by the per-consumer pull-distance. The worst-case memory footprint is- `O(max_pull_distance × n)`. For cardinality-unbounded sources (- `source.iterate`,- `source.repeat`) this is a silent memory hazard.
+- `stream.broadcast_bounded(stream, n, max_queue:)`- `max_queue`triggers a structured panic on the next upstream pull. Use it in production fan-outs (HTTP multicast, websocket pub/sub, Kafka producer tees, …) where a stalled slow consumer must surface as a crash instead of an OOM.
+
+If you only have one consumer and just want to overlap producer work
+with consumer work, reach for `buffer`. If you genuinely need fan-out
+to multiple consumers and your source is bounded, `broadcast` is fine.
+If the source is unbounded or production-critical, default to
+`broadcast_bounded`.
+
+## Web framework compatibility
+
+`datastream` depends on `gleam_erlang >= 1.3.0` and
+`gleam_stdlib >= 0.44.0`. Older releases of some web packages pin
+`gleam_erlang < 1.0.0`, which conflicts with `datastream`.
+
+Use these versions or newer when combining `datastream` with a web stack:
+
+| Package | Minimum compatible version |
+|---|---|
+| `wisp` | `>= 2.0.0` |
+| `mist` | `>= 6.0.0` |
+| `gleam_httpc` | `>= 5.0.0` |
+
+---
+
+# datastream · v0.18.0
+
+Source: https://datastream.hexdocs.pm/index.html
+
+# datastream
+
+datastream is a pull-based stream library for Gleam.
+
+A `Stream(a)` is a pipeline definition, not a materialized collection.
+Each terminal operation runs the source again from the beginning, so the
+library fits work that should stay lazy, repeatable, and explicit about
+effects.
+
+## Install
+
+```
+gleam add datastream
+```
+API reference: [https://hexdocs.pm/datastream](https://hexdocs.pm/datastream)
+
+## When to use it
+
+Use `datastream` when you need one or more of these:
+
+- the input is large or unbounded and should not be loaded all at once
+- the pipeline owns a real resource such as a file handle, socket, or cursor
+- the work is naturally chunked text or bytes
+- the Erlang target needs bounded parallel work or time-based stream operators
+
+For a hands-on tour, jump to the runnable
+[Log-ingest example](https://datastream.hexdocs.pm#log-ingest-example-bytes--lines--per-level-counts)
+or the [NDJSON example](https://datastream.hexdocs.pm#ndjson-example-chunked-bytes--typed-records).
+The full catalog of compile-checked end-to-end pipelines lives under
+[Example pipelines](https://datastream.hexdocs.pm#example-pipelines).
+
+Stay with `gleam/list` when the whole input is already in memory and you
+do not need lazy pulls, replayable pipelines, or deterministic cleanup.
+
+## Quick start
+
+```
+import datastream/sink
+import datastream/source
+import datastream/stream
+import gleam/io
+pub fn main() {
+  let result =
+    source.iterate(from: 1, with: fn(x) { x + 1 })
+    |> stream.map(with: fn(x) { x * 2 })
+    |> stream.take(up_to: 5)
+    |> sink.to_list
+  io.debug(result)
+  // [2, 4, 6, 8, 10]
+}
+```
+## Log-ingest example: bytes -> lines -> per-level counts
+
+A common shape: bytes arrive in arbitrary chunks (file, socket), the
+pipeline reassembles them into lines, drops malformed rows, and produces
+per-level counts in a single pass. `text.lines` owns the line buffering,
+so the chunk boundaries shown below never split a record across two
+emitted strings.
+
+```
+import datastream/fold
+import datastream/source
+import datastream/stream
+import datastream/text
+import gleam/dict
+import gleam/io
+import gleam/option.{type Option, None, Some}
+import gleam/string
+pub type Level {
+  Info
+  Warn
+  LogError
+}
+pub fn main() {
+  // Real-world input arrives in arbitrary chunks. Note how `WARN` and
+  // `INFO` records straddle chunk boundaries — `text.lines` reassembles.
+  let chunks = [
+    "INFO  user_id=42 logged in\nWARN  ", "user_id=42 retry\nERROR ",
+    "user_id=99 timeout\nbogus line with no level\nINFO ",
+    "user_id=42 ok\n",
+  ]
+  source.from_list(chunks)
+  |> text.lines
+  |> stream.filter_map(with: parse_line)
+  |> fold.fold(from: dict.new(), with: bump)
+  |> io.debug
+  // dict.from_list([#(Info, 2), #(Warn, 1), #(LogError, 1)])
+}
+fn parse_line(line: String) -> Option(Level) {
+  case string.split_once(line, on: " ") {
+    Ok(#("INFO", _)) -> Some(Info)
+    Ok(#("WARN", _)) -> Some(Warn)
+    Ok(#("ERROR", _)) -> Some(LogError)
+    _ -> None
+  }
+}
+fn bump(acc: dict.Dict(Level, Int), level: Level) -> dict.Dict(Level, Int) {
+  let current = case dict.get(acc, level) {
+    Ok(n) -> n
+    Error(Nil) -> 0
+  }
+  dict.insert(acc, level, current + 1)
+}
+```
+Production callers swap `source.from_list(chunks)` for a
+`source.resource` over a real file handle or socket — the rest of the
+pipeline is unchanged. Full source:
+[ test/examples/log_pipeline_example.gleam](https://github.com/nao1215/datastream/blob/main/test/examples/log_pipeline_example.gleam).
+
+## NDJSON example: chunked bytes -> typed records
+
+Newline-delimited JSON (one record per line) over a chunked byte source. The same lazy pass does UTF-8 decode, line framing, and per-record parsing without holding the whole payload in memory.
+
+```
+import datastream/fold
+import datastream/source
+import datastream/stream
+import datastream/text
+import gleam/int
+import gleam/io
+import gleam/string
+pub type Record {
+  Record(id: Int, body: String)
+}
+pub type ParseError {
+  EmptyLine
+  MissingId(line: String)
+  BadId(raw: String)
+}
+pub fn main() {
+  // The first chunk ends mid-line; the second completes that record.
+  let chunks =
+    source.from_list([
+      <<"1 first record\n2 second">>,
+      <<" record\n3 third record\n">>,
+    ])
+  chunks
+  |> text.utf8_decode_lossy
+  |> text.lines
+  |> stream.map(with: parse_record)
+  |> fold.collect_result
+  |> io.debug
+  // Ok([Record(1, "first record"), Record(2, "second record"), ...])
+}
+fn parse_record(line: String) -> Result(Record, ParseError) {
+  case line {
+    "" -> Error(EmptyLine)
+    _ ->
+      case string.split_once(line, on: " ") {
+        Error(_) -> Error(MissingId(line: line))
+        Ok(#(raw_id, body)) ->
+          case int.parse(raw_id) {
+            Ok(id) -> Ok(Record(id: id, body: body))
+            Error(_) -> Error(BadId(raw: raw_id))
+          }
+      }
+  }
+}
+```
+`fold.collect_result` short-circuits at the first parse failure; swap in
+`fold.partition_result` to surface every successful record alongside
+every error. Drop in your JSON decoder of choice at `parse_record`.
+Full source:
+[ test/examples/ndjson_pipeline_example.gleam](https://github.com/nao1215/datastream/blob/main/test/examples/ndjson_pipeline_example.gleam).
+
+## Resource-backed streams
+
+`source.resource` opens lazily on the first pull, yields values one by
+one, and closes exactly once on normal completion and on the early-stop
+paths the library controls.
+
+```
+import datastream.{Done, Next}
+import datastream/fold
+import datastream/source
+import datastream/stream
+import gleam/io
+pub fn main() {
+  let numbers =
+    source.resource(
+      open: fn() { 1 },
+      next: fn(state) {
+        case state <= 3 {
+          True -> Next(element: state, state: state + 1)
+          False -> Done
+        }
+      },
+      close: fn(_state) { Nil },
+    )
+  numbers
+  |> stream.take(up_to: 2)
+  |> fold.to_list
+  |> io.debug
+  // [1, 2]
+}
+```
+Use `source.try_resource` when opening or reading can fail and you want
+the failure on the typed path as `Result`.
+
+## JavaScript async I/O
+
+The core `Stream(a)` stays synchronous on both targets. That is a
+deliberate design choice: each pull either returns the next element
+immediately or reports `Done`.
+
+Because of that, the official JavaScript boundary is:
+
+- async input stays in host JavaScript until it has been reduced to a bounded value or batch, then enters `datastream`through`source.once`,`source.from_list`,`source.from_bit_array`, or a resource constructor
+- synchronous `Stream(a)`pipelines leave`datastream`through`datastream/javascript/async.to_async_iterable`
+
+This means `datastream` does not pretend that a host-side
+`AsyncIterable` is the same thing as a pure `Stream(a)`. The adapter is
+honest about where `await` lives.
+
+Gleam:
+
+```
+import datastream/javascript/async as js_async
+import datastream/source
+import datastream/stream
+import gleam/string
+pub fn lines_for_host() -> js_async.AsyncIterable(String) {
+  source.from_list(["a", "b", "c"])
+  |> stream.map(with: string.uppercase)
+  |> js_async.to_async_iterable
+}
+```
+Host JavaScript:
+
+```
+import { lines_for_host } from "./build/dev/javascript/app/app.mjs";
+for await (const line of lines_for_host()) {
+  console.log(line);
+  if (line === "B") break;
+}
+```
+Breaking out of the `for await` loop closes the underlying stream once,
+so resource-backed pipelines still release handles promptly.
+
+## Example pipelines
+
+Compile-checked examples live under `test/examples/` and run in CI. The
+log-ingest and NDJSON entries are inlined above; the rest are linked
+straight to source.
+
+| Example | Shape |
+|---|---|
+| `log_pipeline_example.gleam` | bytes -> `text.lines`-> validation -> per-level counts |
+| `ndjson_pipeline_example.gleam` | bytes -> UTF-8 decode -> lines -> per-record parse |
+| `length_prefixed_pipeline_example.gleam` | chunked bytes -> `binary.length_prefixed_with`-> collection |
+| `parallel_pipeline_example.gleam` | BEAM-only bounded parallel map |
+| `dataprep_pipeline_example.gleam` | per-row validation with accumulated errors |
+
+## Module guide
+
+- `datastream`: defines- `Stream(a)`and- `Step(a, state)`
+- `datastream/source`: constructors for list-backed, generated, and resource-backed streams
+- `datastream/stream`: lazy combinators such as- `map`,- `filter`,- `flat_map`,- `zip`,- `take`, and- `chunks_of`
+- `datastream/sink`: every terminal — pure reductions (- `to_list`,- `count`,- `fold`,- `first`,- `find`,- `collect_result`, …) and side-effecting consumers (- `each`,- `try_each`,- `println`)
+- `datastream/fold`: legacy alias for the pure-reduction subset of- `sink`. Re-exports the same functions for backward compatibility; new code should reach for- `datastream/sink`instead
+- `datastream/chunk`: opaque finite batches
+- `datastream/text`: chunk-aware UTF-8 decode and line splitting
+- `datastream/binary`: byte and framing helpers
+- `datastream/erlang/source`: BEAM-only subject, timer, and timeout helpers
+- `datastream/erlang/sink`: BEAM-only subject sink
+- `datastream/erlang/par`: BEAM-only bounded parallel combinators and- `race`
+- `datastream/erlang/time`: BEAM-only time-based combinators
+- `datastream/javascript/async`: JavaScript-only async iterable adapter for leaving the synchronous core
+
+## Target support
+
+- Erlang target: the full package
+- JavaScript target: the cross-target core and `datastream/javascript/async`
+- `datastream/erlang/*`modules are BEAM-only
+
+## Checked constructors
+
+Some constructors reject invalid numeric arguments at construction time.
+Use the panicking variants when the value is a trusted constant in your
+own code. Use the matching `*_checked` variant when the value comes from
+CLI flags, config files, request parameters, or any other dynamic input.
+
+The main checked families are:
+
+- `stream.take_checked`,- `stream.drop_checked`
+- `stream.buffer_checked`,- `stream.chunks_of_checked`
+- `binary.length_prefixed_checked`,- `binary.length_prefixed_with_checked`,- `binary.fixed_size_checked`
+- `datastream/erlang/par.*_checked`
+
+## Backpressure
+
+Two combinators interact with backpressure between a producer and one or more consumers:
+
+- `stream.buffer(stream, prefetch:)`- `prefetch`elements ahead of the consumer, so a latency-bound upstream (HTTP body bytes, slow disk reads) does not serialise the consumer’s per-element work. The buffer is bounded by- `prefetch`; a slow consumer cannot blow it past that capacity.
+- `stream.broadcast(stream, n)`- `n`independent consumers, each pulling at its own pace. Per-consumer queues are- **unbounded**: if one consumer pulls aggressively while another pauses, the slow consumer’s queue grows by the per-consumer pull-distance. The worst-case memory footprint is- `O(max_pull_distance × n)`. For cardinality-unbounded sources (- `source.iterate`,- `source.repeat`) this is a silent memory hazard.
+- `stream.broadcast_bounded(stream, n, max_queue:)`- `max_queue`triggers a structured panic on the next upstream pull. Use it in production fan-outs (HTTP multicast, websocket pub/sub, Kafka producer tees, …) where a stalled slow consumer must surface as a crash instead of an OOM.
+
+If you only have one consumer and just want to overlap producer work
+with consumer work, reach for `buffer`. If you genuinely need fan-out
+to multiple consumers and your source is bounded, `broadcast` is fine.
+If the source is unbounded or production-critical, default to
+`broadcast_bounded`.
+
+## Web framework compatibility
+
+`datastream` depends on `gleam_erlang >= 1.3.0` and
+`gleam_stdlib >= 0.44.0`. Older releases of some web packages pin
+`gleam_erlang < 1.0.0`, which conflicts with `datastream`.
+
+Use these versions or newer when combining `datastream` with a web stack:
+
+| Package | Minimum compatible version |
+|---|---|
+| `wisp` | `>= 2.0.0` |
+| `mist` | `>= 6.0.0` |
+| `gleam_httpc` | `>= 5.0.0` |
+
+---
+
+# datastream · datastream · v0.18.0
+
+Source: https://datastream.hexdocs.pm/datastream.html
+
+`datastream` is a compositional, resource-safe stream library for
+Gleam. The cross-target core (`datastream/source`, `datastream/stream`,
+`datastream/fold`, `datastream/sink`, `datastream/chunk`,
+`datastream/text`, `datastream/binary`) runs on both the Erlang
+and JavaScript targets. Target-specific extensions live under
+`datastream/erlang/*` and `datastream/javascript/*`.
+
+This module defines the foundational types every later module builds
+on: the opaque pipeline value `Stream(a)` and the pull-result enum
+`Step(a, state)`.
+
+## Invalid-argument policy
+
+Across the library, any `size` / `count` / `prefix_size`
+argument that cannot have a meaningful interpretation is rejected
+at construction time with a `panic` rather than silently
+normalised — silent normalisation produces results that look
+plausible but lose information the caller cannot recover. The
+per-function docstring states the exact accepted range; the
+general rule is:
+
+- A “size” argument that controls how many elements form one
+chunk / frame (`stream.chunks_of`,`binary.fixed_size`,`binary.length_prefixed`’s`prefix_size`) MUST be`>= 1`(and`prefix_size`is further restricted to`{1, 2, 4, 8}`).
+- A “count” argument that says how many elements to take or
+drop (`stream.take`,`stream.drop`) MUST be`>= 0`. The`0`case has a single mathematically natural answer (the empty stream / the identity respectively) and is accepted; negative counts are programmer error.
+
+Every violation is a programmer error: the only sensible response is to crash so a bogus value cannot quietly produce surprising data downstream.
+
+The result of pulling one element from a stream-like producer.
+
+`Next(element, state)` carries the produced element together with the
+continuation needed to pull the next one. `Done` signals end-of-stream.
+Once `Done` is observed the producer MUST NOT be pulled again.
+
+There is intentionally no `Error` variant: the core does not impose a
+failure model. Callers that need errors carry them as element-shaped
+values (`Stream(Result(a, e))`, `Stream(Validated(a, e))`, …).
+
+Unlike `Stream(a)`, `Step` is a transparent public type: callers
+return `Next` / `Done` from the `next` callback passed to
+`source.resource` and `source.try_resource`. The enum shape is
+stable from v0.1.0 onward.
+
+```
+pub type Step(a, state) {
+  Next(element: a, state: state)
+  Done
+}
+```
+### Constructors
+
+-
+          `Next(element: a, state: state)`
+-
+          `Done`
+
+A lazy, pull-based pipeline that yields elements of type `a`.
+
+Values of this type are pipeline *definitions*, not materialised
+collections. Each terminal operation (in `fold` / `sink`) re-runs the
+pipeline from its source — there is no implicit caching. Callers that
+want replay should materialise once with `fold.to_list`.
+
+The internal representation is intentionally hidden so the library is
+free to change it (list-backed, function-batched, chunk-batched, …)
+without a breaking change. `==` / `!=` carry no specified meaning;
+observational equality is via terminal reduction.
+
+The library threads a cleanup callback through every stream value so
+resource-safe sources from `source.resource` can be released on every
+termination path (normal end, downstream early-exit, early-exit
+folds, `try_each` failure). Pure (`unfold`-built) streams use a
+no-op cleanup.
+
+`pub opaque type Stream(a)`
+
+---
+
+# datastream/binary · datastream · v0.18.0
+
+Source: https://datastream.hexdocs.pm/datastream/binary.html
+
+Framing operations on `Stream(BitArray)`.
+
+Real byte sources (sockets, files, pipes) deliver bytes in arbitrary chunks. A frame may straddle chunks, several frames may sit in one chunk, or a chunk may end mid-prefix. Every framing combinator here owns the buffer needed to reassemble.
+
+All combinators are lazy and chunk-boundary-aware; none of them materialises the full input.
+
+Why a checked binary framing constructor refused its argument.
+
+Returned by `length_prefixed_checked`, `length_prefixed_with_checked`,
+and `fixed_size_checked`. Lets the caller surface argument
+validation failures through `Result` instead of crashing the
+process — useful when the numeric argument comes from CLI flags,
+config files, or request parameters.
+
+`function` names the constructor that rejected the value
+(`"length_prefixed"`, `"fixed_size"`) so a caller routing many
+checked constructors through the same handler can produce a
+meaningful error message.
+
+```
+pub type BinaryArgError {
+  InvalidPrefixSize(function: String, given: Int)
+  NotPositiveSize(function: String, given: Int)
+}
+```
+### Constructors
+
+-
+          `InvalidPrefixSize(function: String, given: Int)``length_prefixed`requires`prefix_size`to be one of`{1, 2, 4, 8}`.`given`is the value the caller passed.
+-
+          `NotPositiveSize(function: String, given: Int)``fixed_size`requires`size`to be`>= 1`.`given`is the value the caller passed.
+
+Truncation surfaced by `length_prefixed` when the input ends
+mid-frame.
+
+`expected` is the number of bytes the combinator was waiting for —
+either `prefix_size` (when the prefix itself was short) or the
+declared payload length (when the prefix was complete but the
+payload was short). `got` is the number of bytes the stream
+actually delivered toward that requirement (always `< expected`).
+
+```
+pub type IncompleteFrame {
+  IncompleteFrame(expected: Int, got: Int)
+  FrameTooLarge(claimed: Int, max: Int)
+}
+```
+### Constructors
+
+-
+          `IncompleteFrame(expected: Int, got: Int)`
+-
+          `FrameTooLarge(claimed: Int, max: Int)`The prefix declared a payload length exceeding `max_frame_size`.
+
+```
+pub fn bytes(
+  over stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(BitArray),
+) -> [datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(Int)Yield each byte of each chunk in order, as `Int` in `0..255`.
+
+The trivial degenerate framing: bridges from `Stream(BitArray)` to
+`Stream(Int)` so callers can move into the byte-stream-shaped world
+without writing the per-byte `unfold` themselves.
+
+```
+pub fn delimited(
+  over stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(BitArray),
+  on delimiter: BitArray,
+) -> [datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(BitArray)Yield delimiter-separated frames in source order, preserving empty frames between consecutive delimiters and the trailing frame after a trailing delimiter. The delimiter itself is NOT included in any emitted frame.
+
+If the input does not end with a delimiter, the trailing partial frame is emitted as the last element.
+
+```
+pub fn fixed_size(
+  over stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(BitArray),
+  size size: Int,
+) -> [datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(BitArray)Yield successive `size`-byte frames in source order. The trailing
+partial frame on EOF is discarded — by definition a fixed-size
+framing combinator cannot emit a frame of fewer than `size` bytes.
+
+`size` MUST be `>= 1`. Other values are rejected at construction
+time with a panic per the `datastream` module-level
+invalid-argument policy.
+
+```
+pub fn fixed_size_checked(
+  over stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(BitArray),
+  size size: Int,
+) -> Result([datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(BitArray), [BinaryArgError](https://datastream.hexdocs.pm#BinaryArgError))Like `fixed_size`, but returns the argument-validation failure as
+a `Result` instead of panicking. Use this when `size` comes from
+dynamic input (CLI, config, request parameters); the panicking
+`fixed_size` remains the right tool for trusted constants.
+
+On success the stream behaves identically to
+`fixed_size(over: stream, size: size)`.
+
+The caller is responsible for closing `stream` if the
+constructor returns `Error`.
+
+```
+pub fn length_prefixed(
+  over stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(BitArray),
+  prefix_size prefix_size: Int,
+) -> [datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(Result(BitArray, [IncompleteFrame](https://datastream.hexdocs.pm#IncompleteFrame)))```
+pub fn length_prefixed_checked(
+  over stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(BitArray),
+  prefix_size prefix_size: Int,
+) -> Result(
+  [datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(Result(BitArray, [IncompleteFrame](https://datastream.hexdocs.pm#IncompleteFrame))),
+  [BinaryArgError](https://datastream.hexdocs.pm#BinaryArgError),
+)Like `length_prefixed`, but returns the argument-validation
+failure as a `Result` instead of panicking. Use this when
+`prefix_size` comes from dynamic input (CLI, config, request
+parameters); the panicking `length_prefixed` remains the right
+tool for trusted constants.
+
+On success the stream behaves identically to
+`length_prefixed(over: stream, prefix_size: prefix_size)`.
+
+The caller is responsible for closing `stream` if the
+constructor returns `Error`.
+
+```
+pub fn length_prefixed_with(
+  over stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(BitArray),
+  prefix_size prefix_size: Int,
+  max_frame_size max_frame_size: Int,
+) -> [datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(Result(BitArray, [IncompleteFrame](https://datastream.hexdocs.pm#IncompleteFrame)))Like `length_prefixed`, but with an explicit `max_frame_size` limit.
+Frames whose prefix claims more than `max_frame_size` bytes are
+rejected immediately with `Error(FrameTooLarge(claimed:, max:))`
+without buffering the payload.
+
+```
+pub fn length_prefixed_with_checked(
+  over stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(BitArray),
+  prefix_size prefix_size: Int,
+  max_frame_size max_frame_size: Int,
+) -> Result(
+  [datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(Result(BitArray, [IncompleteFrame](https://datastream.hexdocs.pm#IncompleteFrame))),
+  [BinaryArgError](https://datastream.hexdocs.pm#BinaryArgError),
+)Like `length_prefixed_with`, but returns the argument-validation
+failure as a `Result` instead of panicking. Use this when
+`prefix_size` comes from dynamic input.
+
+---
+
+# datastream/chunk · datastream · v0.18.0
+
+Source: https://datastream.hexdocs.pm/datastream/chunk.html
+
+`Chunk(a)` is an opaque, finite, immutable batch of elements.
+
+Chunks are the element type of stream operations that produce
+batches (`stream.chunks_of`, `stream.group_adjacent`,
+`erlang/time.window_time`, …). The type is intentionally opaque so
+the internal representation can change later (for example a
+contiguous byte buffer for `Chunk(Int)`) without breaking callers.
+
+The accessor surface is intentionally narrow: `to_list`, `size`,
+`is_empty`. Anything else is expressed by going through `to_list`,
+keeping `Chunk` from re-mirroring the entire list API.
+
+Chunks are finite by design. Infinite-ness is the responsibility
+of `Stream`, not of a self-contained value.
+
+```
+pub fn filter(
+  over chunk:
+```
+[Chunk](https://datastream.hexdocs.pm#Chunk)(a),
+  keeping predicate: fn(a) -> Bool,
+) -> [Chunk](https://datastream.hexdocs.pm#Chunk)(a)Keep only the elements for which `predicate` returns `True`. Order
+is preserved.
+
+`pub fn from_list(elements: List(a)) -> `[Chunk](https://datastream.hexdocs.pm#Chunk)(a)Build a chunk from a list of elements.
+
+Round-trips with `to_list`: `to_list(from_list(xs)) == xs`.
+
+`pub fn map(over chunk: `[Chunk](https://datastream.hexdocs.pm#Chunk)(a), with f: fn(a) -> b) -> [Chunk](https://datastream.hexdocs.pm#Chunk)(b)Apply `f` to every element. The result has the same size as the
+input; order is preserved.
+
+---
+
+# datastream/erlang/internal/pump · datastream · v0.18.0
+
+Source: https://datastream.hexdocs.pm/datastream/erlang/internal/pump.html
+
+Internal helpers for BEAM extension worker pumps.
+
+A pump is a process that pulls from an upstream `Stream(a)` and
+forwards each element to a result subject. Combinators in
+`datastream/erlang/par` and `datastream/erlang/time` use this to
+drive an upstream concurrently with their own coordinator loop.
+
+Each pump is paired with a stop subject. Sending `Stop` to that
+subject causes the worker to close the upstream and exit at the
+start of its next iteration. A worker blocked inside
+`datastream.pull` only stops after that pull returns; pulls that
+never return leave the worker resident.
+
+---
+
+# datastream/erlang/par · datastream · v0.18.0
+
+Source: https://datastream.hexdocs.pm/datastream/erlang/par.html
+
+BEAM-only bounded-concurrency combinators.
+
+This module is the single place where multiple processes get involved, so callers can tell at the import site whether a pipeline runs in parallel.
+
+Every public function in this module is gated on
+`@target(erlang)`. On the JavaScript target the module still
+compiles, so `import datastream/erlang/par` itself does not fail,
+but calling any function fails at the call site. The
+`beam_only_marker` constant exists solely to keep the module
+non-empty on the JavaScript target.
+
+## Concurrency knobs
+
+- `max_workers`: degree of parallelism. The maximum number of BEAM processes that run the user function at once. Only- `map_*`and- `each_*`accept this knob;- `merge`is fixed at one worker per input stream.
+- `max_buffer`: in-flight ceiling. The maximum number of elements pulled from the upstream(s) but not yet emitted to the downstream. Workers in flight (mid-- `f(x)`) count toward this ceiling.
+
+`max_buffer >= max_workers` is required where both apply; otherwise
+the buffer would fill before parallelism is reached.
+
+## What happens when `max_buffer` is reached
+
+| function | behaviour |
+|---|---|
+| `map_unordered` | bound collapses to `max_workers`(results emit on receive); new dispatch is paused |
+| `map_ordered` | new dispatch is paused; pending dict + workers cap |
+| `merge` | per-worker `Continue`ack is withheld; workers wait |
+
+## Defaults
+
+`default_max_workers = 4` and `default_max_buffer = 16` are the
+values used by the no-argument `merge`, `map_unordered`,
+`map_ordered`, `each_unordered`, `each_ordered`. They aim at the
+common case (mixed CPU + IO work, modest cardinality). Tune via
+the `_with` variants when:
+
+- workload is IO-bound (consider `max_workers`of 16-128 and a correspondingly larger`max_buffer`)
+- workload is CPU-bound (consider `max_workers`equal to`erlang:system_info(schedulers_online)`)
+- upstream is rate-limited or memory-pressured (lower
+`max_buffer`to throttle pull rate)
+
+## Notes
+
+- A `f(x)`that`panic`s terminates the stream with`Done`. The crashed worker is detected via`process.monitor`, so the pipeline does not deadlock.
+- `merge`workers poll for a coordinator-liveness signal every- `merge_worker_liveness_check_ms`ms. If the caller of- `merge`/- `merge_with`drops the returned stream without reaching- `close`(e.g. by losing a reference inside a long-running process), the workers stay resident: the caller is still alive, so the liveness probe says “keep going”. Always drive the stream to a terminal or call- `close`explicitly.
+- Unbounded concurrency is intentionally not offered.
+
+## Limitation: incompatible with `from_subject`
+
+Every combinator in this module pulls from its upstream inside a
+spawned worker process. Streams built from
+`datastream/erlang/source.from_subject` cannot survive that, since
+an Erlang `Subject` can only be received by its owning process —
+the worker would `panic` on the first pull. Wrap subject streams
+outside the parallel layer (e.g. materialise to a list first) or
+route them through a non-`par.*` pipeline.
+
+Why a checked `par.*` constructor refused its arguments.
+
+Returned by `map_unordered_with_checked`,
+`map_ordered_with_checked`, `each_unordered_with_checked`,
+`each_ordered_with_checked`, and `merge_with_checked`. Lets the
+caller surface argument-validation failures through `Result`
+instead of crashing the process — useful when the numeric
+arguments come from CLI flags, config files, or request
+parameters.
+
+`function` names the constructor that rejected the value
+(`"map_unordered_with"`, `"map_ordered_with"`,
+`"each_unordered_with"`, `"each_ordered_with"`, `"merge_with"`)
+so a caller routing many checked constructors through the same
+handler can produce a meaningful error message.
+
+```
+pub type ParArgError {
+  InvalidMaxWorkers(function: String, given: Int)
+  BufferLessThanWorkers(
+    function: String,
+    max_workers: Int,
+    max_buffer: Int,
+  )
+  InvalidMaxBuffer(function: String, given: Int)
+}
+```
+### Constructors
+
+-
+          `InvalidMaxWorkers(function: String, given: Int)``max_workers`was less than 1.`given`is the value the caller passed.
+-
+          `BufferLessThanWorkers( function: String, max_workers: Int, max_buffer: Int, )``max_buffer`was less than`max_workers`for`map_*_with`/`each_*_with`. Both values are reported so the caller can fix either side.
+-
+          `InvalidMaxBuffer(function: String, given: Int)``max_buffer`was less than 1 for`merge_with`.`given`is the value the caller passed.
+
+`pub const default_max_buffer: Int`Default `max_buffer` for the no-argument variants of `merge`,
+`map_*`, and `each_*`.
+
+`pub const default_max_workers: Int`Sentinel value documenting that this module is BEAM-only.
+Default `max_workers` for the no-argument variants of `map_*` and
+`each_*`.
+
+```
+pub fn each_ordered(
+  over stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a),
+  with effect: fn(a) -> Nil,
+) -> NilSide-effect-only variant of `map_ordered`. Uses
+`default_max_workers` and `default_max_buffer`.
+
+```
+pub fn each_ordered_with(
+  over stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a),
+  with effect: fn(a) -> Nil,
+  max_workers max_workers: Int,
+  max_buffer max_buffer: Int,
+) -> NilSide-effect-only variant of `map_ordered_with`.
+
+```
+pub fn each_ordered_with_checked(
+  over stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a),
+  with effect: fn(a) -> Nil,
+  max_workers max_workers: Int,
+  max_buffer max_buffer: Int,
+) -> Result(Nil, [ParArgError](https://datastream.hexdocs.pm#ParArgError))Like `each_ordered_with`, but returns the argument-validation
+failure as a `Result` instead of panicking. The effect runs only
+when the arguments validate; on `Error` no upstream pull happens
+and the caller is responsible for closing `stream`.
+
+```
+pub fn each_unordered(
+  over stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a),
+  with effect: fn(a) -> Nil,
+) -> NilSide-effect-only variant of `map_unordered`. Uses
+`default_max_workers` and `default_max_buffer`.
+
+```
+pub fn each_unordered_with(
+  over stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a),
+  with effect: fn(a) -> Nil,
+  max_workers max_workers: Int,
+  max_buffer max_buffer: Int,
+) -> NilSide-effect-only variant of `map_unordered_with`.
+
+```
+pub fn each_unordered_with_checked(
+  over stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a),
+  with effect: fn(a) -> Nil,
+  max_workers max_workers: Int,
+  max_buffer max_buffer: Int,
+) -> Result(Nil, [ParArgError](https://datastream.hexdocs.pm#ParArgError))Like `each_unordered_with`, but returns the argument-validation
+failure as a `Result` instead of panicking. The effect runs only
+when the arguments validate; on `Error` no upstream pull happens
+and the caller is responsible for closing `stream`.
+
+```
+pub fn map_ordered(
+  over stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a),
+  with f: fn(a) -> b,
+) -> [datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(b)Run `f` in parallel using `default_max_workers` BEAM processes,
+emitting results in input order.
+
+See `map_ordered_with` for tunable concurrency.
+
+```
+pub fn map_ordered_with(
+  over stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a),
+  with f: fn(a) -> b,
+  max_workers max_workers: Int,
+  max_buffer max_buffer: Int,
+) -> [datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(b)Run `f` in parallel across at most `max_workers` BEAM processes,
+emitting results in input order.
+
+`max_buffer >= max_workers` is REQUIRED: if `max_buffer` were
+smaller, the buffer would fill while waiting for an early result
+and ordering could not be enforced without stalling. Violation
+panics at construction. `in_flight = workers_busy + pending dict size`; dispatch is paused once it reaches `max_buffer`.
+
+```
+pub fn map_ordered_with_checked(
+  over stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a),
+  with f: fn(a) -> b,
+  max_workers max_workers: Int,
+  max_buffer max_buffer: Int,
+) -> Result([datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(b), [ParArgError](https://datastream.hexdocs.pm#ParArgError))Like `map_ordered_with`, but returns the argument-validation
+failure as a `Result` instead of panicking. Use this when
+`max_workers` or `max_buffer` come from dynamic input (CLI,
+config, request parameters); the panicking `map_ordered_with`
+remains the right tool for trusted constants.
+
+On success the stream behaves identically to
+`map_ordered_with(over: stream, with: f, max_workers: ..., max_buffer: ...)`.
+
+The caller is responsible for closing `stream` if the
+constructor returns `Error`.
+
+```
+pub fn map_unordered(
+  over stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a),
+  with f: fn(a) -> b,
+) -> [datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(b)Run `f` in parallel using `default_max_workers` BEAM processes,
+emitting results in the order they finish.
+
+See `map_unordered_with` for tunable concurrency.
+
+```
+pub fn map_unordered_with(
+  over stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a),
+  with f: fn(a) -> b,
+  max_workers max_workers: Int,
+  max_buffer max_buffer: Int,
+) -> [datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(b)Run `f` in parallel across at most `max_workers` BEAM processes.
+Results are emitted in the order they finish, NOT input order.
+
+`max_workers >= 1` and `max_buffer >= max_workers` are required;
+violations `panic` at construction. The `max_buffer >= max_workers`
+rule is enforced uniformly across `par.*` so callers can swap
+between `map_unordered_with`, `map_ordered_with`, and `merge_with`
+without re-tuning. Note however that `map_unordered` emits each
+result the moment it arrives, so `in_flight = workers_busy` and
+`max_buffer` adds no extra ceiling beyond `max_workers` here. See
+`default_max_workers` and `default_max_buffer` for sensible
+starting values.
+
+```
+pub fn map_unordered_with_checked(
+  over stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a),
+  with f: fn(a) -> b,
+  max_workers max_workers: Int,
+  max_buffer max_buffer: Int,
+) -> Result([datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(b), [ParArgError](https://datastream.hexdocs.pm#ParArgError))Like `map_unordered_with`, but returns the argument-validation
+failure as a `Result` instead of panicking. Use this when
+`max_workers` or `max_buffer` come from dynamic input (CLI,
+config, request parameters); the panicking `map_unordered_with`
+remains the right tool for trusted constants.
+
+On success the stream behaves identically to
+`map_unordered_with(over: stream, with: f, max_workers: ..., max_buffer: ...)`.
+
+The caller is responsible for closing `stream` if the
+constructor returns `Error`.
+
+```
+pub fn merge(
+  streams streams: List(
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a)),
+) -> [datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a)Interleave elements from every input stream in arrival order. Uses
+`default_max_buffer` as the in-flight ceiling.
+
+See `merge_with` for tunable buffering.
+
+```
+pub fn merge_with(
+  streams streams: List(
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a)),
+  max_buffer max_buffer: Int,
+) -> [datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a)Interleave elements from every input stream in arrival order.
+
+Order from each individual source is preserved relative to that source; cross-source order follows whichever worker process happens to deliver first.
+
+`max_buffer` bounds the number of in-flight elements: pulled by
+any worker but not yet emitted to the downstream. Implementation:
+at startup at most `max_buffer` workers are issued a `Continue`
+signal; the rest wait. Each worker pulls one element, sends it,
+and waits for the next `Continue`. The coordinator hands a
+`Continue` to the next waiting worker every time it emits an
+element downstream. If `max_buffer < len(streams)`, the late-
+starting workers wait until earlier ones drain.
+
+`max_buffer >= 1` is required.
+
+```
+pub fn merge_with_checked(
+  streams streams: List(
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a)),
+  max_buffer max_buffer: Int,
+) -> Result([datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a), [ParArgError](https://datastream.hexdocs.pm#ParArgError))Like `merge_with`, but returns the argument-validation failure
+as a `Result` instead of panicking. Use this when `max_buffer`
+comes from dynamic input (CLI, config, request parameters); the
+panicking `merge_with` remains the right tool for trusted
+constants.
+
+On success the stream behaves identically to
+`merge_with(streams: streams, max_buffer: max_buffer)`.
+
+The caller is responsible for closing each stream in `streams`
+if the constructor returns `Error`.
+
+```
+pub fn race(
+  streams streams: List(
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a)),
+) -> [datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a)Wait for the first source to emit; signal the other workers to stop, then continue with the winning source until it halts.
+
+Implementation: spawn one worker per source. Each worker checks
+for a stop signal, then does a single `datastream.pull` and
+reports back on a shared subject. The first `RaceNext` wins; the
+coordinator drains any loser messages already in its mailbox and
+closes the `rest` they carry, then sends a stop signal to every
+other worker.
+
+**Best-effort loser cleanup.** A loser worker that was still
+inside its `datastream.pull` when the stop signal arrived has no
+way to observe it and will go on to send its `RaceNext` after the
+coordinator has stopped reading. Such a `RaceNext` is dropped and
+its `rest` is not closed. BEAM-internal resources held by the
+abandoned `rest` are reclaimed by the runtime; external resources
+(file descriptors, sockets) may leak. Pass external-resource
+streams to `race` only when this trade-off is acceptable.
+
+---
+
+# datastream/erlang/sink · datastream · v0.18.0
+
+Source: https://datastream.hexdocs.pm/datastream/erlang/sink.html
+
+BEAM-only sink for delivering a stream’s elements onto a `Subject(a)`.
+
+This is the dual of `datastream/erlang/source.from_subject`:
+together they let two parts of a system talk over a process-based
+channel without either side having to know the other’s stream
+representation.
+
+Every public function in this module is gated on
+`@target(erlang)`. On the JavaScript target the module still
+compiles, so `import datastream/erlang/sink` itself does not
+fail, but calling any function fails at the call site. The
+`beam_only_marker` constant exists solely to keep the module
+non-empty on the JavaScript target.
+
+```
+pub fn into_subject(
+  over stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a),
+  into subject: [process.Subject](https://hexdocs.pm/gleam_erlang/1.3.0/gleam/erlang/process.html#Subject)(a),
+) -> NilDrive `stream` to completion, sending each element to `subject`
+in source order. Returns `Nil`.
+
+The function does not own the subject: it never closes or otherwise
+modifies it. Lifecycle (creation, naming, hand-off) stays with the
+caller, identical to `from_subject` on the source side.
+
+---
+
+# datastream/erlang/source · datastream · v0.18.0
+
+Source: https://datastream.hexdocs.pm/datastream/erlang/source.html
+
+BEAM-only source constructors.
+
+These bridge between Erlang’s process / timer primitives and the
+cross-target `Stream(a)` value. The cross-target core has no
+business knowing about `Subject`, monotonic time, or BEAM timers,
+so they live here in `datastream/erlang/source`.
+
+Every public function in this module is gated on
+`@target(erlang)`. On the JavaScript target the module still
+compiles, so `import datastream/erlang/source` itself does not
+fail, but calling any function fails at the call site. The
+`beam_only_marker` constant exists solely to keep the module
+non-empty on the JavaScript target.
+
+```
+pub fn bridge_subject_stream(
+  over stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a),
+) -> [datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a)Materialise a `from_subject`-backed stream into a process-safe
+`Stream(a)` so the result can be composed with `par.*` /
+`time.*` / `source.timeout`.
+
+The pull happens in the calling process — the same process that
+owns the `Subject` — so the owner-only receive constraint is
+respected. Once the upstream returns `Done`, the materialised
+`List(a)` is reopened as a list-backed stream, which is pure and
+can safely be pulled from any worker process.
+
+**Caveat:** materialises the entire upstream into memory before
+emitting any element. Only use this on bounded subjects (a
+`keep_running` callback that eventually returns `False`, or a
+finite source). For an unbounded subject, route the parallel
+stage outside the subject pipeline instead — there is no
+process-safe way to lazily forward an Erlang `Subject` across a
+process boundary.
+
+This is the official workaround for the
+`from_subject` × `par.*` / `time.*` incompatibility documented
+on `from_subject`, `par`, and `source.timeout`.
+
+```
+pub fn from_subject(
+  from subject:
+```
+[process.Subject](https://hexdocs.pm/gleam_erlang/1.3.0/gleam/erlang/process.html#Subject)(a),
+  while keep_running: fn() -> Bool,
+) -> [datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a)Bridge a process `Subject(a)` into a `Stream(a)`.
+
+Each pull blocks on `process.receive` until either a message
+arrives — emitted as the next element — or `keep_running()`
+returns `False` between receives. The receive uses a short
+internal poll interval so `keep_running` stays responsive.
+
+The `Subject`’s lifecycle is owned by the caller: this stream
+only reads, it never closes the subject. The terminal completing
+is sufficient to release the stream’s hold.
+
+**Limitation:** the resulting stream cannot be passed directly
+to any combinator in `datastream/erlang/par` or
+`datastream/erlang/time`, nor to
+`datastream/erlang/source.timeout` — those run the pull in a
+worker process and the `Subject`’s owner-only receive constraint
+causes a `panic` in the worker. Use `bridge_subject_stream`
+below to materialise the subject side in the owning process
+before handing it off.
+
+`pub fn interval(every period_ms: Int) -> `[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(Nil)Emit `Nil` every `period_ms` ms. Same first-emission timing as
+`ticks`; differs only in element type.
+
+`pub fn ticks(every period_ms: Int) -> `[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(Int)Emit a monotonic millisecond timestamp every `period_ms` ms.
+
+The first element is emitted `period_ms` after the first pull.
+Pair with `stream.take` (or any early-exit terminal) to bound
+the run.
+
+```
+pub fn timeout(
+  over stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a),
+  within ms: Int,
+) -> [datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(Result(a, Nil))Wrap an upstream and add a per-element deadline.
+
+Each element of `stream` that arrives within `ms` ms surfaces as
+`Ok(element)`. If the upstream produces nothing for longer than
+`ms` ms, exactly one `Error(Nil)` element is emitted and the
+stream halts.
+
+Implementation: each pull spawns an unlinked worker process that
+performs the `datastream.pull` and forwards the step on a
+dedicated subject; the parent waits with `process.receive(_, within: ms)`. On a deadline trip the abandoned worker may still
+complete the `pull` afterwards; its result is silently discarded
+and any resource it had partially acquired is left to the BEAM
+runtime to reclaim.
+
+Downstream early-exit closes the upstream the next pull would have read from; an abandoned worker is not waited on.
+
+**Limitation:** because the pull happens in a different process
+than the one that built the upstream, this combinator MUST NOT
+be composed with `from_subject`: a `Subject` can only be received
+by its owning process, so the worker would `panic`. Wrap subject
+streams with their own application-level timeout instead.
+
+---
+
+# datastream/erlang/time · datastream · v0.18.0
+
+Source: https://datastream.hexdocs.pm/datastream/erlang/time.html
+
+BEAM-only time-based combinators.
+
+Every combinator here observes wall-clock behaviour: bursts get debounced / throttled / sampled / windowed against BEAM monotonic time, never against the wall clock that can jump backwards.
+
+Implementation strategy: each combinator spawns one worker
+process that pumps the upstream into a shared subject. The main
+process drives the consuming `Stream` and uses
+`process.receive(within: ms)` to wait simultaneously for the next
+element and for a timer deadline.
+
+Every public function in this module is gated on
+`@target(erlang)`. On the JavaScript target the module still
+compiles, so `import datastream/erlang/time` itself does not fail,
+but calling any function fails at the call site. The
+`beam_only_marker` constant exists solely to keep the module
+non-empty on the JavaScript target.
+
+## Limitation: incompatible with `from_subject`
+
+Because every combinator pulls inside a spawned worker process,
+streams built from `datastream/erlang/source.from_subject` cannot
+be passed through this layer — an Erlang `Subject` can only be
+received by its owning process and the worker would `panic` on
+the first pull. The same constraint applies to
+`datastream/erlang/par`.
+
+```
+pub fn debounce(
+  over stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a),
+  quiet_for ms: Int,
+) -> [datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a)Emit only after the upstream has been silent for at least
+`quiet_for` ms following the last seen element. The element
+emitted is the LAST element seen before the silence.
+
+Useful for collapsing UI events (typing, resize) into a single “settled” notification.
+
+```
+pub fn rate_limit(
+  over stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a),
+  max_per_window count: Int,
+  window_ms ms: Int,
+) -> [datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a)Emit elements no faster than `count` per `ms`-wide window.
+Excess elements are delayed (sleeping the calling pull), NOT
+dropped. Loss-free.
+
+```
+pub fn sample(
+  over stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a),
+  every ms: Int,
+) -> [datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a)At each `ms`-wide window boundary, emit the most recent element
+seen during the window. If no element arrived during the window,
+the boundary emits nothing and the next window begins.
+
+```
+pub fn throttle(
+  over stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a),
+  every ms: Int,
+) -> [datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a)Emit the FIRST element of each `ms`-wide window; drop the rest.
+
+Windows start at the moment the first element is emitted.
+
+```
+pub fn window_time(
+  over stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a),
+  span ms: Int,
+) -> [datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)([chunk.Chunk](https://datastream.hexdocs.pm/chunk.html#Chunk)(a))Divide time into `ms`-wide windows. At each boundary, emit a
+`Chunk(a)` containing every element that arrived during that
+window. Empty windows emit empty chunks.
+
+---
+
+# datastream/fold · datastream · v0.18.0
+
+Source: https://datastream.hexdocs.pm/datastream/fold.html
+
+Pure terminal reductions over `Stream(a)`.
+
+This module is the `fold` half of the terminal layer: every function
+here drives a stream to completion (or until an early-exit decision)
+and returns a plain value. Side-effecting terminals live in `sink`.
+
+Building combinators alone has no observable effect — calling one of these functions is what actually pulls elements from the source. Pipelines re-run the source on every terminal call; there is no implicit caching.
+
+```
+pub fn all(
+  over stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a),
+  satisfying predicate: fn(a) -> Bool,
+) -> BoolReturn `True` only when `predicate` holds for every element.
+
+Returns `True` on an empty stream and short-circuits on the first
+`False`, so `all` terminates on infinite sources whose first failure
+is reachable.
+
+```
+pub fn any(
+  over stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a),
+  satisfying predicate: fn(a) -> Bool,
+) -> BoolReturn `True` as soon as `predicate` holds for some element.
+
+Returns `False` on an empty stream and short-circuits on the first
+`True`, so `any` terminates on infinite sources whose first match is
+reachable.
+
+```
+pub fn collect_result(
+  stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(Result(a, e)),
+) -> Result(List(a), e)Walk a `Stream(Result(a, e))`, returning `Ok(values)` if every
+element is `Ok`, or short-circuiting with the first `Error(e)`.
+
+Order is preserved: `Ok` values land in the returned list in source
+order. Pulling stops the moment the first `Error` is seen, so this
+is safe to use on infinite streams whose first failure is reachable.
+
+`pub fn count(stream: `[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a)) -> IntCount the number of elements the stream produces.
+
+Drives the stream to completion without retaining elements. Returns
+`0` on an empty stream.
+
+`pub fn drain(stream: `[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a)) -> NilDrive the stream to completion and discard every element.
+
+Useful when the pipeline is built purely for traversal (for example
+to walk a `tap`-instrumented chain) and the caller does not want to
+import `sink` for a no-op consumer.
+
+```
+pub fn find(
+  over stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a),
+  satisfying predicate: fn(a) -> Bool,
+) -> [option.Option](https://hexdocs.pm/gleam_stdlib/1.0.0/gleam/option.html#Option)(a)Return the first element satisfying `predicate`, or `None`.
+
+Stops pulling upstream the moment a match is observed.
+
+`pub fn first(stream: `[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a)) -> [option.Option](https://hexdocs.pm/gleam_stdlib/1.0.0/gleam/option.html#Option)(a)Return the first element produced by the stream, if any.
+
+Pulls at most one element from upstream, closes the unconsumed
+continuation, and stops. This makes `first` safe on infinite
+resource-backed streams. Returns `None` if the stream is empty.
+
+```
+pub fn fold(
+  over stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a),
+  from initial: b,
+  with step: fn(b, a) -> b,
+) -> bLeft-fold over the stream, seeded with `initial`.
+
+Returns `initial` unchanged on an empty stream. The accumulator is
+updated by `step(acc, element)` in source order.
+
+`pub fn last(stream: `[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a)) -> [option.Option](https://hexdocs.pm/gleam_stdlib/1.0.0/gleam/option.html#Option)(a)Return the last element produced by the stream, if any.
+
+Drives the stream to completion. Returns `None` on an empty stream.
+Does not terminate on an infinite stream.
+
+```
+pub fn partition_map(
+  over stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a),
+  with split: fn(a) -> Result(b, c),
+) -> #(List(b), List(c))Route each element through `split` and accumulate the two outputs
+separately, both in source order.
+
+`Ok(left)` lands in the first list, `Error(right)` in the second.
+Drives the stream to completion.
+
+```
+pub fn partition_result(
+  stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(Result(a, e)),
+) -> #(List(a), List(e))Split a `Stream(Result(a, e))` into `#(oks, errors)`, both in
+source order.
+
+Drives the stream to completion: this is a full-traversal reducer,
+not a short-circuiting one. Use `collect_result` when you want to
+stop on the first failure.
+
+`pub fn product_int(stream: `[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(Int)) -> IntMultiply a stream of `Int`s. Returns `1` on the empty stream.
+
+```
+pub fn reduce(
+  over stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a),
+  with step: fn(a, a) -> a,
+) -> [option.Option](https://hexdocs.pm/gleam_stdlib/1.0.0/gleam/option.html#Option)(a)Left-fold without an explicit seed: the head element seeds the fold.
+
+Returns `None` on an empty stream, `Some(only)` on a one-element
+stream, and `Some(fold_of_tail_seeded_with_head)` otherwise.
+
+`pub fn sum_float(stream: `[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(Float)) -> FloatSum a stream of `Float`s. Returns `0.0` on the empty stream.
+
+`pub fn sum_int(stream: `[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(Int)) -> IntSum a stream of `Int`s. Returns `0` on the empty stream.
+
+```
+pub fn to_bit_array(
+  stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(BitArray),
+) -> BitArrayMaterialise a `Stream(BitArray)` into a single concatenated `BitArray`.
+
+Internally accumulates into a `BytesTree`, which bridges to Erlang’s
+`iolist_to_binary` on the BEAM and concatenates incrementally on
+JavaScript — both avoid the quadratic cost of materialising into a
+list and concatenating after the fact. Pulls every element; for
+terminating streams only. Returns `<<>>` on an empty stream.
+
+`pub fn to_list(stream: `[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a)) -> List(a)Materialise the stream into a list, preserving source order.
+
+Pulls every element. On a `Stream` of `n` elements this allocates
+`O(n)` cons cells. For terminating streams only.
+
+`pub fn to_string(stream: `[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(String)) -> StringMaterialise a `Stream(String)` into a single concatenated `String`.
+
+Internally accumulates into a `StringTree`, so concatenation is
+`O(total length)` rather than the `O(n²)` shape that
+`to_list |> string.concat` produces on long streams. Pulls every
+element; for terminating streams only. Returns `""` on an empty stream.
+
+```
+pub fn to_string_join(
+  stream stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(String),
+  with separator: String,
+) -> StringMaterialise a `Stream(String)` into a single `String` with `separator`
+inserted between consecutive elements (but not before the first or
+after the last). Streaming counterpart of `gleam/string.join/2`.
+
+Internally accumulates into a `StringTree`, so the cost stays
+`O(total length)` even for long streams — no intermediate list
+materialisation. Returns `""` on an empty stream and the lone
+element on a single-element stream (no separator).
+
+Use when emitting CSV / NDJSON / log lines / single-line digests that need a fixed delimiter between elements without breaking the laziness of the upstream pipeline. (#213)
+
+```
+pub fn to_string_tree(
+  stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(String),
+) -> [string_tree.StringTree](https://hexdocs.pm/gleam_stdlib/1.0.0/gleam/string_tree.html#StringTree)Materialise a `Stream(String)` into a `StringTree`, preserving source
+order without flattening.
+
+Useful when the caller wants to keep building the tree — prepending a
+header, joining with another tree — before producing the final
+`String`. Returns the empty tree on an empty stream.
+
+```
+pub fn to_string_tree_join(
+  stream stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(String),
+  with separator: String,
+) -> [string_tree.StringTree](https://hexdocs.pm/gleam_stdlib/1.0.0/gleam/string_tree.html#StringTree)`StringTree` variant of `to_string_join` for callers that want to
+keep building the tree — prepending a header, joining with another
+tree — before producing the final `String`. Same separator
+semantics as `to_string_join`. (#213)
+
+---
+
+# datastream/javascript/async · datastream · v0.18.0
+
+Source: https://datastream.hexdocs.pm/datastream/javascript/async.html
+
+JavaScript-only async edge adapters.
+
+The cross-target `Stream(a)` core is synchronous and pull-based:
+each pull either yields the next element immediately or reports
+`Done`. That contract keeps the core small and predictable across
+Erlang and JavaScript, but it also means a true JavaScript
+`AsyncIterable(a)` cannot be represented as a `Stream(a)` without
+buffering or polling.
+
+The official boundary is therefore:
+
+- async input stays in host JavaScript until it has been reduced to
+a bounded value or batch, then enters the core through the normal
+constructors (`source.once`,`source.from_list`,`source.from_bit_array`,`source.resource`, …);
+- synchronous `Stream(a)`pipelines leave the core through`to_async_iterable`, which exposes them to`for await ... of`and other host-side async consumers.
+
+This keeps the core honest about its synchronous pull contract while still giving JavaScript applications a first-party interop point.
+
+---
+
+# datastream/sink · datastream · v0.18.0
+
+Source: https://datastream.hexdocs.pm/datastream/sink.html
+
+Terminal consumers over `Stream(a)` — pure reductions and
+side-effecting drivers.
+
+`sink` is the unified terminal layer: every operation that drives
+a stream to completion (or until an early-exit decision) lives
+here. Pure reductions (`to_list`, `count`, `fold`, …) and
+side-effecting consumers (`each`, `try_each`, `println`) sit
+side-by-side; the import path is one line regardless of whether
+the caller’s terminal returns a value or runs a `Nil`-typed
+effect.
+
+## Choosing a sink
+
+Sinks that require a specific stream element type. Pipe through the listed adapter when the upstream type does not match.
+
+| Sink | Requires | Adapter for other element types |
+|---|---|---|
+| `to_string` | `Stream(String)` | — |
+| `to_string_tree` | `Stream(String)` | — |
+| `to_string_join` | `Stream(String)` | — |
+| `to_string_tree_join` | `Stream(String)` | — |
+| `println` | `Stream(String)` | — |
+| `to_bit_array` | `Stream(BitArray)` | `Stream(String)`→ pipe through`text.utf8_encode/1` |
+| `sum_int` | `Stream(Int)` | — |
+| `product_int` | `Stream(Int)` | — |
+| `sum_float` | `Stream(Float)` | — |
+| `collect_result` | `Stream(Result(a, e))` | — |
+| `partition_result` | `Stream(Result(a, e))` | — |
+
+Sinks below accept any `Stream(a)` (and any `Stream(Result(a, e))`
+for `partition_map`), so they never need an adapter: `to_list`,
+`count`, `first`, `last`, `fold`, `reduce`, `drain`, `all`, `any`,
+`find`, `each`, `try_each`, `partition_map`.
+
+Example — writing a `Stream(String)` out as bytes:
+
+```
+import datastream/sink
+import datastream/source
+import datastream/text
+source.from_list(["a,b,c\n", "1,2,3\n"])
+|> text.utf8_encode
+|> sink.to_bit_array
+```
+The pure reductions are also exported from `datastream/fold` for
+backward compatibility with code written against earlier
+versions of this library. Prefer the `datastream/sink` import
+path for new code; the `fold` aliases are kept for now and may
+be removed in a future major release.
+
+```
+pub fn all(
+  over stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a),
+  satisfying predicate: fn(a) -> Bool,
+) -> BoolReturn `True` when every element satisfies `predicate`; `True` for
+an empty stream. Short-circuits on the first `False`. Re-exported
+from `datastream/fold.all`.
+
+```
+pub fn any(
+  over stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a),
+  satisfying predicate: fn(a) -> Bool,
+) -> BoolReturn `True` when at least one element satisfies `predicate`;
+`False` for an empty stream. Short-circuits on the first `True`.
+Re-exported from `datastream/fold.any`.
+
+```
+pub fn collect_result(
+  stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(Result(a, e)),
+) -> Result(List(a), e)Collect a `Stream(Result(a, e))` into `Result(List(a), e)` with
+short-circuit semantics on the first `Error(e)`. Re-exported from
+`datastream/fold.collect_result`.
+
+`pub fn count(stream: `[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a)) -> IntCount the number of elements the stream produces.
+Re-exported from `datastream/fold.count`.
+
+`pub fn drain(stream: `[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a)) -> NilDrive the stream to completion and discard every element.
+Re-exported from `datastream/fold.drain`.
+
+```
+pub fn each(
+  over stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a),
+  with effect: fn(a) -> Nil,
+) -> NilDrive the stream to completion, calling `effect` once per element
+in source order. Returns `Nil`.
+
+Use this when the work the consumer does is infallible. For
+fallible consumers use `try_each`.
+
+```
+pub fn find(
+  over stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a),
+  satisfying predicate: fn(a) -> Bool,
+) -> [option.Option](https://hexdocs.pm/gleam_stdlib/1.0.0/gleam/option.html#Option)(a)Return the first element that satisfies `predicate`, or `None`.
+Re-exported from `datastream/fold.find`.
+
+`pub fn first(stream: `[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a)) -> [option.Option](https://hexdocs.pm/gleam_stdlib/1.0.0/gleam/option.html#Option)(a)Pull until the first element and return it as `Some(a)`, or `None`
+for an empty stream. Re-exported from `datastream/fold.first`.
+
+```
+pub fn fold(
+  over stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a),
+  from initial: acc,
+  with step: fn(acc, a) -> acc,
+) -> accLeft-fold the stream with an explicit accumulator. Re-exported
+from `datastream/fold.fold`.
+
+`pub fn last(stream: `[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a)) -> [option.Option](https://hexdocs.pm/gleam_stdlib/1.0.0/gleam/option.html#Option)(a)Drive the stream to completion and return the final element as
+`Some(a)`, or `None` for an empty stream. Re-exported from
+`datastream/fold.last`.
+
+```
+pub fn partition_map(
+  over stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a),
+  with split: fn(a) -> Result(b, c),
+) -> #(List(b), List(c))Map every element to a `Result(b, c)` and partition the outcomes
+into a `(lefts, rights)` pair. Re-exported from
+`datastream/fold.partition_map`.
+
+```
+pub fn partition_result(
+  stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(Result(a, e)),
+) -> #(List(a), List(e))Partition a `Stream(Result(a, e))` into a `(oks, errs)` pair.
+Re-exported from `datastream/fold.partition_result`.
+
+`pub fn println(stream: `[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(String)) -> NilPrint every element of `stream` followed by a newline to standard
+output, in source order.
+
+Cross-target convenience over `gleam/io.println`. Target-aware
+sinks (file, socket, …) belong outside the cross-target core.
+
+`pub fn product_int(stream: `[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(Int)) -> IntMultiply every `Int` element. Returns 1 for an empty stream.
+Re-exported from `datastream/fold.product_int`.
+
+```
+pub fn reduce(
+  over stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a),
+  with step: fn(a, a) -> a,
+) -> [option.Option](https://hexdocs.pm/gleam_stdlib/1.0.0/gleam/option.html#Option)(a)Left-fold using the first element as the seed; returns `None` on
+an empty stream. Re-exported from `datastream/fold.reduce`.
+
+`pub fn sum_float(stream: `[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(Float)) -> FloatSum every `Float` element. Returns 0.0 for an empty stream.
+Re-exported from `datastream/fold.sum_float`.
+
+`pub fn sum_int(stream: `[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(Int)) -> IntSum every `Int` element. Returns 0 for an empty stream.
+Re-exported from `datastream/fold.sum_int`.
+
+```
+pub fn to_bit_array(
+  stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(BitArray),
+) -> BitArrayMaterialise a `Stream(BitArray)` into a single concatenated
+`BitArray`. Re-exported from `datastream/fold.to_bit_array`.
+
+`pub fn to_list(stream: `[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a)) -> List(a)Materialise the stream into a list, preserving source order.
+Re-exported from `datastream/fold.to_list`.
+
+`pub fn to_string(stream: `[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(String)) -> StringMaterialise a `Stream(String)` into a single concatenated `String`.
+Re-exported from `datastream/fold.to_string`.
+
+```
+pub fn to_string_join(
+  stream stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(String),
+  with separator: String,
+) -> StringMaterialise a `Stream(String)` into a single `String` with
+`separator` between consecutive elements. Streaming counterpart of
+`gleam/string.join/2`. Re-exported from
+`datastream/fold.to_string_join`. (#213)
+
+```
+pub fn to_string_tree(
+  stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(String),
+) -> [string_tree.StringTree](https://hexdocs.pm/gleam_stdlib/1.0.0/gleam/string_tree.html#StringTree)Materialise a `Stream(String)` into a `StringTree`, preserving
+source order. Re-exported from `datastream/fold.to_string_tree`.
+
+```
+pub fn to_string_tree_join(
+  stream stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(String),
+  with separator: String,
+) -> [string_tree.StringTree](https://hexdocs.pm/gleam_stdlib/1.0.0/gleam/string_tree.html#StringTree)`StringTree` variant of `to_string_join`. Re-exported from
+`datastream/fold.to_string_tree_join`. (#213)
+
+```
+pub fn try_each(
+  over stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a),
+  with effect: fn(a) -> Result(Nil, e),
+) -> Result(Nil, e)Drive the stream while `effect` returns `Ok(Nil)`, halting on the
+first `Error(e)` and returning that error.
+
+On all-`Ok` returns `Ok(Nil)`. On the first `Error(e)`, no further
+element is pulled from upstream and the upstream’s `close` callback
+is invoked before `Error(e)` is returned, so resource-backed
+sources are released even on the early-exit path.
+
+---
+
+# datastream/source · datastream · v0.18.0
+
+Source: https://datastream.hexdocs.pm/datastream/source.html
+
+Stream constructors: every public way to *produce* a `Stream(a)`.
+
+The constructors split into two kinds:
+
+- **Adapters**wrap an existing data structure:- `from_list`,- `once`,- `empty`.
+- **Generative**constructors build a stream from a rule:- `range`,- `repeat`,- `iterate`,- `unfold`.
+
+`repeat` and `iterate` are infinite by design; pair them with
+`stream.take` / `stream.take_while` (or `fold.first` / `fold.find`)
+to terminate. `unfold`’s step is expected to be pure — effectful
+generators belong in the resource constructors introduced later.
+
+Every constructor produces a stream that re-runs from the beginning on every terminal call: there is no implicit caching.
+
+Reasons a directional range constructor can refuse the inputs.
+
+`DescendingNotAllowed` is returned by `range_strict` when
+`from > to`. `AscendingNotAllowed` is returned by `range_descending`
+when `from < to`. Both keep `from == to` as the empty-stream case
+(success) so callers do not have to special-case zero-width ranges.
+
+```
+pub type RangeError {
+  DescendingNotAllowed
+  AscendingNotAllowed
+}
+```
+### Constructors
+
+-
+          `DescendingNotAllowed`
+-
+          `AscendingNotAllowed`
+
+Unified failure shape for `try_resource`.
+
+`OpenError(e)` carries the error returned by `open`; the stream
+emits exactly one of these and halts. `NextError(e)` wraps a
+per-element read error returned by `next`; the stream continues
+after one of these unless the caller stops it.
+
+Pair with `fold.collect_result` to stop on the first error, or
+with `fold.partition_result` to drive the stream to completion
+and split successes from errors.
+
+```
+pub type ResourceError(open_error, next_error) {
+  OpenError(open_error)
+  NextError(next_error)
+}
+```
+### Constructors
+
+-
+          `OpenError(open_error)`
+-
+          `NextError(next_error)`
+
+`pub fn from_bit_array(bytes: BitArray) -> `[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(Int)Yield each byte of a `BitArray` in order as an `Int` in `0..255`.
+
+An empty `BitArray` produces the empty stream. This is the natural
+shape for the upcoming `binary` and `text.utf8_decode` work.
+
+The input MUST be byte-aligned (its bit length MUST be a multiple
+of 8). A non-byte-aligned input is rejected at construction time
+with a panic, matching the policy `binary.length_prefixed` and
+`binary.fixed_size` already use for invalid arguments — silently
+dropping the trailing sub-byte tail would be data loss the caller
+could not observe.
+
+```
+pub fn from_dict(
+  d:
+```
+[dict.Dict](https://hexdocs.pm/gleam_stdlib/1.0.0/gleam/dict.html#Dict)(k, v),
+) -> [datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(#(k, v))Yield each `#(key, value)` entry of a `Dict` exactly once.
+
+Iteration order is not specified — it follows whatever order
+`dict.to_list` returns for the underlying target. Callers that need
+a deterministic order should funnel through `dict.to_list` and sort
+before constructing the stream.
+
+`pub fn from_list(list: List(a)) -> `[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a)A stream that yields the elements of `list` in order.
+
+```
+pub fn from_option(
+  option:
+```
+[option.Option](https://hexdocs.pm/gleam_stdlib/1.0.0/gleam/option.html#Option)(a),
+) -> [datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a)Lift an `Option(a)` to a stream: `Some(x)` becomes a one-element
+stream, `None` becomes the empty stream.
+
+```
+pub fn from_result(
+  result: Result(a, e),
+) ->
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(Result(a, e))Lift a `Result(a, e)` to a one-element `Stream(Result(a, e))`.
+
+The `Error(e)` case is preserved as a single element rather than
+collapsed to the empty stream so the failure information survives
+through the pipeline. Callers that want to drop the error can chain
+a later `filter_map` or `collect_result`.
+
+```
+pub fn iterate(
+  from seed: a,
+  with next: fn(a) -> a,
+) ->
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a)Iterate `next` from `seed`: yields `seed`, `next(seed)`,
+`next(next(seed))`, … infinitely.
+
+Pair with `stream.take` / `stream.take_while` to terminate.
+
+`pub fn once(value: a) -> `[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a)A stream that yields exactly one element and then stops.
+
+```
+pub fn range(
+  from start: Int,
+  to stop: Int,
+) ->
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(Int)Stop-EXCLUSIVE integer range.
+
+Counts up by 1 when `start < stop`, down by 1 when `start > stop`,
+and is empty when `start == stop`. Step-by-`n` sequences belong in
+`iterate` or `unfold`.
+
+Examples:
+
+```
+source.range(from: 1, to: 5) |> fold.to_list  // [1, 2, 3, 4]
+source.range(from: 0, to: 0) |> fold.to_list  // []
+source.range(from: 5, to: 1) |> fold.to_list  // [5, 4, 3, 2]
+```
+## Surprising behaviour: argument order signals direction
+
+`range` is **direction-implicit**: passing `from > to` produces a
+**descending** stream, not the empty stream. Callers who think they
+are guarding against negative iteration with
+`source.range(from: end, to: start)` get a backwards stream of
+indices instead.
+
+Pick the variant that matches your intent:
+
+- Want **ascending only**and an explicit failure on swapped arguments? Use`range_strict`— it returns`Error(DescendingNotAllowed)`when`from > to`.
+- Want **descending only**and an explicit failure on swapped arguments? Use`range_descending`— it returns`Error(AscendingNotAllowed)`when`from < to`.
+- Don’t care about direction? Stick with `range`.
+
+## Stop-EXCLUSIVE vs. stop-INCLUSIVE in the stdlib
+
+Stdlib has two `range` shapes with different conventions:
+
+- `gleam/int.range`(fold form) is- **stop-EXCLUSIVE**, matching this function.- `int.range`also rejects- `from > to`by yielding the empty fold rather than reversing direction.
+- `gleam/list.range`is- **stop-INCLUSIVE**- *and*direction-implicit:- `list.range(1, 5)`yields- `[1, 2, 3, 4, 5]`,- `list.range(5, 1)`yields- `[5, 4, 3, 2, 1]`.
+- `gleam/yielder.range`(pull-based stream form) is- **stop-INCLUSIVE**—- `yielder.range(from: 1, to: 5)`yields- `[1, 2, 3, 4, 5]`and- `yielder.range(from: 0, to: 0)`yields- `[0]`, not the empty list.
+
+`Stream(a)` is the closer analog of `Yielder(a)`, so be aware of
+the off-by-one when porting code between the two. Add `+ 1` to
+`to:` (or use `iterate` / `unfold` for full control) when you want
+inclusive semantics.
+
+```
+pub fn range_descending(
+  from start: Int,
+  to stop: Int,
+) -> Result(
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(Int), [RangeError](https://datastream.hexdocs.pm#RangeError))Stop-EXCLUSIVE **descending-only** integer range.
+
+Mirrors `range` for `from >= to` and rejects `from < to` with
+`Error(AscendingNotAllowed)`. Use this when descending iteration is
+the deliberate intent (reverse traversal, countdowns) and an
+accidentally ascending pair of inputs should fail loudly.
+
+`from == to` produces `Ok(empty())`, matching `range`’s zero-width
+behaviour.
+
+Examples:
+
+```
+source.range_descending(from: 5, to: 1)
+// Ok(<stream of [5, 4, 3, 2]>)
+source.range_descending(from: 3, to: 3)
+// Ok(<empty stream>)
+source.range_descending(from: 1, to: 5)
+// Error(AscendingNotAllowed)
+```
+```
+pub fn range_strict(
+  from start: Int,
+  to stop: Int,
+) -> Result(
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(Int), [RangeError](https://datastream.hexdocs.pm#RangeError))Stop-EXCLUSIVE **ascending-only** integer range.
+
+Mirrors `range` for `from <= to` and rejects `from > to` with
+`Error(DescendingNotAllowed)`. Reach for this when “swapped
+arguments” should be a hard error rather than a silent backwards
+stream — the typical case when `from`/`to` are derived from caller
+state (buffer indices, time bounds, paginated offsets).
+
+`from == to` produces `Ok(empty())`, matching `range`’s zero-width
+behaviour.
+
+Examples:
+
+```
+source.range_strict(from: 1, to: 5)
+// Ok(<stream of [1, 2, 3, 4]>)
+source.range_strict(from: 3, to: 3)
+// Ok(<empty stream>)
+source.range_strict(from: 5, to: 1)
+// Error(DescendingNotAllowed)
+```
+`pub fn repeat(value: a) -> `[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a)A stream that yields `value` infinitely.
+
+Pair with `stream.take` (or any early-exit terminal) to bound the
+pull count.
+
+```
+pub fn resource(
+  open open: fn() -> state,
+  next next: fn(state) ->
+```
+[datastream.Step](https://datastream.hexdocs.pm/datastream.html#Step)(a, state),
+  close close: fn(state) -> Nil,
+) -> [datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a)Build a resource-backed stream that opens lazily and closes deterministically.
+
+`open` runs on the first pull (NOT at construction), so holding a
+`Stream` value never holds a real-world handle until evaluation
+begins. Each terminal call re-runs `open`: a `Stream` is a pipeline
+definition, not a one-shot iterator.
+
+`close` is honoured on every termination path the library controls
+— *provided  open has run*. With lazy-open semantics, terminals
+that never pull (
+
+`stream.take(up_to: 0)`, an `interrupt_when`
+signal that fires before the first pull, etc.) skip both `open`
+and `close`: there is no opened state, so there is nothing to
+close. A close callback that needs to run unconditionally must be
+arranged at a higher level than the `Stream`.When `open` *has* run, the termination paths covered are: normal
+end (when `next` returns `Done`), downstream early-exit
+(`stream.take`, `stream.take_while`), early-exit folds
+(`fold.first`, `fold.find`, `fold.any`, `fold.all`,
+`fold.collect_result`), and `sink.try_each` failure. Termination
+caused by user-code panicking is best-effort.
+
+`close` returns `Nil`. Errors that happen at close time are not
+propagated through the terminal’s return value; callers that must
+observe close failures should use a sink that owns the lifecycle.
+
+```
+pub fn try_resource(
+  open open: fn() -> Result(state, open_error),
+  next next: fn(state) ->
+```
+[datastream.Step](https://datastream.hexdocs.pm/datastream.html#Step)(
+    Result(a, next_error),
+    state,
+  ),
+  close close: fn(state) -> Nil,
+) -> [datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(
+  Result(a, [ResourceError](https://datastream.hexdocs.pm#ResourceError)(open_error, next_error)),
+)Build a resource-backed stream whose `open` and per-element `next`
+can both fail.
+
+The two failure shapes are unified into the element type via
+`ResourceError`:
+
+- When `open`returns`Error(e)`, the stream emits exactly one element`Error(OpenError(e))`and halts.`close`is NOT called (there is no opened state to close).
+- When `open`returns`Ok(state)`, behaviour follows the contract of`resource`.`next`returning`Next(Ok(x), state')`yields element`Ok(x)`;`Next(Error(e), state')`yields`Error(NextError(e))`and continues;`Done`halts and triggers`close(state)`.
+
+Lazy: `open` runs on the first pull, NOT at construction. Each
+terminal call re-attempts `open`. As with `resource`, terminals
+that never trigger a pull (`stream.take(up_to: 0)` and similar)
+skip both `open` and `close`.
+
+Downstream sees a single `Stream(Result(a, ResourceError(o, n)))`,
+so `fold.collect_result` and `fold.partition_result` work without
+further adaptation.
+
+`open` is responsible for rolling back any partial acquisition
+itself: when `open` returns `Error(e)`, the library has no state
+to close.
+
+```
+pub fn unfold(
+  from initial: state,
+  with step: fn(state) ->
+```
+[datastream.Step](https://datastream.hexdocs.pm/datastream.html#Step)(a, state),
+) -> [datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a)Build a stream from an initial state and a step function.
+
+`step` is invoked once per pull; returning `Next(element, next)`
+emits the element and supplies the state for the following pull,
+returning `Done` ends the stream. The state type is hidden in the
+produced `Stream(a)` so callers can pick whatever shape suits the
+generator.
+
+---
+
+# datastream/stream · datastream · v0.18.0
+
+Source: https://datastream.hexdocs.pm/datastream/stream.html
+
+Single-stream middle and composition combinators over `Stream(a)`.
+
+All combinators are lazy and order-preserving (unless documented
+otherwise). Building a pipeline with these combinators triggers no
+user callbacks; callbacks fire only when a terminal in `fold` or
+`sink` pulls the result.
+
+Early-exit combinators (`take`, `take_while`) stop pulling upstream
+the moment their result is determined, which is what makes them
+safe on infinite sources.
+
+Every combinator here forwards the upstream’s `close` callback so
+resource-backed streams (`source.resource`) are released on every
+termination path. Combinators that observe a `Done` from the
+upstream do NOT call `close` again — the source closed itself when
+it returned `Done`. Combinators that hold multiple upstreams open
+at once close them in the order specified in the spec
+(`flat_map`: inner before outer; `zip`: right before left).
+
+Why a checked stream constructor refused its argument.
+
+Returned by `take_checked`, `drop_checked`, `buffer_checked`,
+`chunks_of_checked`, and any future non-panicking variant of a
+constructor that would otherwise reject its argument with a
+`panic`. Lets the caller surface argument-validation failures
+through `Result` instead of crashing the process — useful when
+the numeric argument comes from CLI flags, config files, or
+request parameters.
+
+`function` names the constructor that rejected the value
+(`"take"`, `"drop"`, `"buffer"`, `"chunks_of"`) so a caller
+routing many checked constructors through the same handler can
+produce a meaningful error message.
+
+- `NegativeCount`covers constructors whose contract is- `>= 0`(- `take`,- `drop`).
+- `NotPositive`covers constructors whose contract is- `>= 1`(- `buffer`,- `chunks_of`).
+
+```
+pub type StreamArgError {
+  NegativeCount(function: String, given: Int)
+  NotPositive(function: String, given: Int)
+}
+```
+### Constructors
+
+-
+          `NegativeCount(function: String, given: Int)`
+-
+          `NotPositive(function: String, given: Int)`
+
+```
+pub fn append(
+  first:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a),
+  second: [datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a),
+) -> [datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a)Yield all of `first`, then all of `second`. If `first` is infinite,
+`second` is never opened.
+
+Honours the spec close ordering: `second` is opened only after
+`first` returns `Done` (and so has already closed itself); on early
+exit before `first` finishes, `second` is never opened.
+
+**Close contract:** `first` self-closes when it returns `Done`;
+`append` does not call `close` on it again. After `first` is
+exhausted, `second`’s elements are yielded directly — when `second`
+itself returns `Done`, it self-closes in the same way. On early
+exit mid-`second`, the downstream’s `close` call propagates to the
+active `second` node.
+
+```
+pub fn broadcast(
+  over stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a),
+  into n: Int,
+) -> List([datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a))Split `stream` into `n` independent consumer streams that share a
+single underlying source.
+
+Each consumer pulls at its own pace; any element the source produces is observed by every still-alive consumer in order. A consumer that lags behind sees the same prefix as a fast consumer, just later. This is the fan-out / pub-sub combinator: an observability tap can run in parallel with the main pipeline without forcing the source to be re-evaluated, which matters for resource-backed and otherwise non-replayable sources.
+
+`n <= 0` is treated as “no consumers”: the upstream is closed
+immediately and `broadcast` returns the empty list. The lenient
+convention matches `stream.take` / `stream.drop` and lets callers
+hand `broadcast` an arithmetic result without first guarding
+against an off-by-one underflow.
+
+**Buffer size — unbounded by design.** Per-consumer queues grow
+without limit. The worst-case memory footprint is
+`O(max_pull_distance × n)`, where `max_pull_distance` is the
+difference between the fastest and slowest consumer’s pull count
+at any point in time, and `n` is the consumer count. Concretely:
+if consumer A pulls 1 000 000 elements while B is paused, B’s
+queue holds 1 000 000 elements until B catches up.
+
+For resource-backed sources of bounded cardinality this is fine.
+For cardinality-unbounded sources (`source.iterate`,
+`source.repeat`, `source.unfold` of an infinite seed) it is a
+silent memory hazard. Two safer composition patterns:
+
+- **Cap each consumer**:- `broadcast(s, n) |> list.map(stream.take(_, k))`so the slowest consumer’s queue is bounded by- `k - 1`.
+- **Use**for an explicit per-consumer queue limit. Exceeding the limit panics with a structured message rather than letting the process OOM in production.- `broadcast_bounded(s, n, max_queue)`
+
+**Cross-target:** implemented via a small FFI-backed mutable
+reference (`datastream/internal/ref`). On Erlang the cell is a
+process-dictionary slot; on JavaScript it is a one-field mutable
+object. No `gleam_erlang` processes are spawned; no shared global
+state. The `Ref(_)` is local to each `broadcast` call.
+
+**Close contract:** every consumer’s `close` is recorded; the
+upstream is closed exactly once, on whichever call brings the
+active-consumer count to zero. If the upstream returns `Done`
+first it self-closes, and the close callbacks are no-ops.
+
+```
+pub fn broadcast_bounded(
+  over stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a),
+  into n: Int,
+  max_queue max_queue: Int,
+) -> List([datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a))Like `broadcast`, but each per-consumer queue is capped at
+`max_queue` elements. If a fanned-out element would push any
+consumer’s queue beyond that bound, the next upstream pull panics
+with a structured message naming the limit. Use this in
+production wiring (HTTP fan-out, websocket multicast, Kafka
+producer tees, …) where a stalled slow consumer must surface as a
+crash instead of an OOM.
+
+`n <= 0` is treated as “no consumers” (the upstream is closed
+immediately and the function returns the empty list), matching
+`broadcast`’s lenient convention. `max_queue` MUST still be
+`>= 1` — a non-positive buffer capacity has no meaningful
+interpretation — and is rejected at construction time with a
+panic that names the function.
+
+Behaviour on success is identical to `broadcast(s, n)` until the
+queue bound is hit. Until then there is no overhead beyond a
+per-pull `list.length` check on the freshly-enqueued queues.
+
+**What “exceeded” means.** The check fires *after* the producing
+pull has already enqueued the element to every still-alive
+consumer that wasn’t the puller. A consumer queue that was at
+`max_queue - 1` and gets one more element is fine; one that was
+at `max_queue` and would become `max_queue + 1` triggers the
+panic. The slowest consumer therefore has up to `max_queue`
+elements in its queue before the next overflowing pull stops the
+pipeline.
+
+Pair with `broadcast`’s docstring above for the queue-growth
+formula and the unbounded baseline.
+
+```
+pub fn buffer(
+  over stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a),
+  prefetch capacity: Int,
+) -> [datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a)Eagerly pull `capacity` elements ahead from `stream` and yield them
+to the consumer at its pace, refilling the internal queue back to
+`capacity` after every consumer pull.
+
+`buffer` is the *prefetch* combinator: it decouples the consumer’s
+pull cadence from upstream latency. For latency-bound upstreams
+(HTTP body bytes, cold reads from disk) the consumer can do its own
+per-element work in parallel with the next upstream pull instead of
+blocking serially on each one.
+
+`capacity` MUST be `>= 1`. A `capacity < 1` is rejected at
+construction time with a panic per the `datastream` module-level
+invalid-argument policy — `capacity == 0` would defeat the point
+of buffering, and a negative capacity is programmer error.
+
+Element type, order, and cardinality are preserved. When upstream
+returns `Done`, any already-buffered elements are still drained
+before the buffered stream itself emits `Done`. On consumer-side
+early termination the upstream is closed once and any unconsumed
+buffered elements are discarded — the upstream produced them in
+good faith but resource cleanup wins over delivery, matching
+`take`’s behaviour.
+
+```
+pub fn buffer_checked(
+  over stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a),
+  prefetch capacity: Int,
+) -> Result([datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a), [StreamArgError](https://datastream.hexdocs.pm#StreamArgError))Like `buffer`, but returns the argument-validation failure as a
+`Result` instead of panicking. Use this when `capacity` comes
+from dynamic input (CLI, config, request parameters); the
+panicking `buffer` remains the right tool for trusted constants.
+
+On success the stream behaves identically to
+`buffer(over: stream, prefetch: capacity)`.
+
+The caller is responsible for closing `stream` if the
+constructor returns `Error` — no upstream pull happens, but the
+upstream is otherwise untouched.
+
+```
+pub fn chunks_of(
+  over stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a),
+  into size: Int,
+) -> [datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)([chunk.Chunk](https://datastream.hexdocs.pm/chunk.html#Chunk)(a))Group adjacent elements into fixed-size chunks.
+
+`size` MUST be `>= 1`. A `size < 1` is rejected at construction
+time with a panic per the `datastream` module-level
+invalid-argument policy.
+
+The trailing chunk may be smaller than `size` when the source
+length is not divisible.
+
+```
+pub fn chunks_of_checked(
+  over stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a),
+  into size: Int,
+) -> Result([datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)([chunk.Chunk](https://datastream.hexdocs.pm/chunk.html#Chunk)(a)), [StreamArgError](https://datastream.hexdocs.pm#StreamArgError))Like `chunks_of`, but returns the argument-validation failure as
+a `Result` instead of panicking. Use this when `size` comes from
+dynamic input (CLI, config, request parameters); the panicking
+`chunks_of` remains the right tool for trusted constants.
+
+On success the stream behaves identically to
+`chunks_of(over: stream, into: size)`.
+
+The caller is responsible for closing `stream` if the
+constructor returns `Error`.
+
+```
+pub fn concat(
+  streams: List(
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a)),
+) -> [datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a)Walk a `List(Stream(a))` in list order, yielding every element of
+every stream.
+
+Each inner stream is closed (by reaching its own `Done`) before the
+next one is opened. On early exit, the active stream is closed.
+
+```
+pub fn dedupe_adjacent(
+  stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a),
+) -> [datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a)Collapse runs of `==`-equal adjacent values to a single occurrence.
+
+```
+pub fn drop(
+  over stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a),
+  up_to n: Int,
+) -> [datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a)Discard the first `n` elements; `n == 0` is the identity.
+
+Negative `n` is treated as `0` (identity stream, no upstream
+pulls, no close). This matches `gleam/list.drop`’s lenient
+convention so callers can hand `drop` an arithmetic result
+without first clamping it. If you want the previous “reject
+and surface the bad value” behaviour, reach for `drop_checked`,
+which returns `Error(NegativeCount(...))` on negative input.
+
+**Resource handling at  n == 0** — identity semantics: no
+upstream pull, no close. Asymmetric with
+
+`take(s, 0)` (which
+closes eagerly). Callers building `drop(s, 0)` for unknown `n`
+and discarding the result without consuming it are responsible
+for closing `s` themselves. See `take`’s “Asymmetry of `take(s, 0)` and `drop(s, 0)`” subsection above for the side-by-side table
+and recommended practice.```
+pub fn drop_checked(
+  over stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a),
+  up_to n: Int,
+) -> Result([datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a), [StreamArgError](https://datastream.hexdocs.pm#StreamArgError))Like `drop`, but returns the argument-validation failure as a
+`Result` instead of panicking. Use this when `n` comes from
+dynamic input.
+
+On success the stream behaves identically to
+`drop(over: stream, up_to: n)`.
+
+The caller is responsible for closing `stream` if the
+constructor returns `Error`.
+
+```
+pub fn drop_while(
+  over stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a),
+  satisfying predicate: fn(a) -> Bool,
+) -> [datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a)Discard the longest prefix where `predicate` holds, then yield the rest.
+
+```
+pub fn filter(
+  over stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a),
+  keeping predicate: fn(a) -> Bool,
+) -> [datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a)Keep only the elements for which `predicate` returns `True`.
+
+Relative order of the survivors is preserved.
+
+```
+pub fn filter_map(
+  over stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a),
+  with f: fn(a) -> [option.Option](https://hexdocs.pm/gleam_stdlib/1.0.0/gleam/option.html#Option)(b),
+) -> [datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(b)Apply `f` to each element and keep only the `Some(x)` results.
+
+```
+pub fn flat_map(
+  over stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a),
+  with f: fn(a) -> [datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(b),
+) -> [datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(b)Apply `f` to each element and concatenate the inner streams it
+produces.
+
+Pulls one inner stream at a time; the next inner stream is not
+constructed until the previous one is exhausted. On early exit
+before the outer is `Done`, the active inner is closed first, then
+the outer.
+
+**Close contract:** when an inner stream returns `Done`, `flat_map`
+does NOT call `close` on it — the source is expected to have
+released its resources when it returned `Done` (the self-close
+convention followed by `source.resource`). Custom streams built
+with `make` must release resources inside `next` on the `Done`
+path if they hold any.
+
+```
+pub fn flatten(
+  streams:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)([datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a)),
+) -> [datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a)Flatten a stream of streams into a single stream.
+
+Equivalent to `flat_map(s, fn(x) { x })`; the close ordering is the
+same.
+
+```
+pub fn group_adjacent(
+  over stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a),
+  by key: fn(a) -> k,
+) -> [datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(#(k, [chunk.Chunk](https://datastream.hexdocs.pm/chunk.html#Chunk)(a)))Group consecutive elements that share `key(element)`.
+
+```
+pub fn interrupt_when(
+  over stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a),
+  signal signal: [datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(Bool),
+) -> [datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a)Terminate `stream` on the first `True` element from `signal`.
+
+`interrupt_when` is the *external* counterpart of `take_while`:
+`take_while` ends a stream when a *pulled* element fails a
+predicate; `interrupt_when` ends it when an *unrelated* stream
+produces a fire signal — typically a timer expiry, a parent-
+shutdown probe, or a cancel-token bridge built with
+`from_subject`.
+
+On every consumer pull, `signal` is checked first:
+
+- `signal`yields- `True`→ both- `stream`and the rest of- `signal`are closed and the consumer sees- `Done`immediately.
+- `signal`yields- `False`→ that signal element is consumed; the pull descends into- `stream`and yields its next element. Subsequent consumer pulls see the rest of- `signal`.
+- `signal`returns- `Done`→ the consumer pull descends into- `stream`.- `signal`is then ignored on subsequent pulls; a- `Done`producer is never re-pulled per the- `Step`contract.
+
+The `Stream(Bool)` shape (rather than `Stream(Nil)`) is what
+makes counted / time-based signals representable in the pull
+model — `Done` cannot mean “not yet, ask again later” because
+`Done` is terminal, so a “fire after N consumer pulls” signal
+is built as `False`-stream-of-length-N followed by `True`.
+
+**Close ordering:** on consumer-side early termination `signal`
+is closed first, then `stream` — right-before-left, matching
+`zip` and `flat_map`.
+
+```
+pub fn intersperse(
+  over stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a),
+  with separator: a,
+) -> [datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a)Insert `separator` between adjacent elements.
+
+Empty and single-element streams are unchanged.
+
+```
+pub fn map(
+  over stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a),
+  with f: fn(a) -> b,
+) -> [datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(b)Apply `f` to every element. Cardinality and order are preserved.
+
+```
+pub fn map_accum(
+  over stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a),
+  from initial: state,
+  with step: fn(state, a) -> #(state, b),
+) -> [datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(b)Thread a state through the stream while emitting elements of a possibly different type.
+
+```
+pub fn scan(
+  over stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a),
+  from initial: b,
+  with step: fn(b, a) -> b,
+) -> [datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(b)Left-fold the stream, emitting one output per input.
+
+The seed itself is NOT emitted, so output cardinality equals input cardinality. On empty input the output is empty.
+
+```
+pub fn take(
+  over stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a),
+  up_to n: Int,
+) -> [datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a)Yield at most the first `n` elements; `n == 0` yields the empty
+stream.
+
+Negative `n` is treated as `0` (the empty stream, with the same
+eager-close semantics as `take(s, 0)`). This matches
+`gleam/list.take`’s lenient convention so callers can hand
+`take` an arithmetic result without first clamping it. If you
+want the previous “reject and surface the bad value” behaviour,
+reach for `take_checked`, which returns `Error(NegativeCount(...))`
+on negative input.
+
+Stops pulling upstream the moment the `n`th element has been
+emitted, and closes the upstream on that early exit. This is what
+makes `take` safe on infinite resource-backed sources.
+
+**Resource handling at  n == 0** — early-exit semantics extend to
+the degenerate case: the first
+
+`pull` returns `Done` *and*closes the upstream. This is asymmetric with
+
+`drop(s, 0)`, which is the
+identity (no close, no pull). For dynamic-`n` pipelines built from
+`take_checked` / `drop_checked` where `n` may end up `0`, see the
+“Asymmetry of `take(s, 0)` and `drop(s, 0)`” subsection below for
+guidance.## Asymmetry of `take(s, 0)` and `drop(s, 0)`
+
+| Constructor | Pull behaviour at `n == 0` | Resource handling |
+|---|---|---|
+| `take(s, 0)` | First pull returns `Done` | Closes `s`eagerly |
+| `drop(s, 0)` | Identity (first pull pulls from `s`) | Does notpre-close |
+
+Both choices follow each constructor’s primary semantics
+(`take` is early-exit; `drop` is identity), but the combination
+surprises callers who treat the two as duals. Practical
+consequences:
+
+- `take(s, 0)`discarded without consumption
+- `drop(s, 0)`discarded without consumption- `drop(s, 0)`and throw away the result must close- `s`themselves to avoid leaking resource-backed sources (- `source.try_resource`, file handles, sockets).
+
+When `n` comes from config / CLI / request parameters and may be
+`0`, prefer driving the resulting stream through a terminal
+(`fold.to_list`, `sink.each`, …) so the close path runs
+regardless of which branch the runtime took.
+
+```
+pub fn take_checked(
+  over stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a),
+  up_to n: Int,
+) -> Result([datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a), [StreamArgError](https://datastream.hexdocs.pm#StreamArgError))Like `take`, but returns the argument-validation failure as a
+`Result` instead of panicking. Use this when `n` comes from
+dynamic input (CLI, config, request parameters).
+
+On success the stream behaves identically to
+`take(over: stream, up_to: n)`.
+
+The caller is responsible for closing `stream` if the
+constructor returns `Error` — no upstream pull happens, but the
+upstream is otherwise untouched.
+
+Example: case stream.take_checked(over: src, up_to: configured_limit) { Ok(s) -> … Error(stream.NegativeCount(function: _, given: g)) -> … }
+
+```
+pub fn take_while(
+  over stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a),
+  satisfying predicate: fn(a) -> Bool,
+) -> [datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a)Yield the longest prefix where `predicate` holds, then stop.
+
+Stops pulling upstream and closes it as soon as `predicate` returns
+`False`, so `take_while` terminates on infinite resource-backed
+sources whose prefix eventually fails the predicate.
+
+```
+pub fn tap(
+  over stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a),
+  with effect: fn(a) -> Nil,
+) -> [datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a)Call `effect` once per element and re-emit the element unchanged.
+
+```
+pub fn unzip(
+  stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(#(a, b)),
+) -> #([datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a), [datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(b))Counterpart of `zip`: split a `Stream(#(a, b))` into a pair of
+independent component streams.
+
+Both component streams see the same elements (left projections
+for the first, right projections for the second) in the same
+order. Each consumer pulls at its own pace, sharing the upstream
+via `broadcast` under the hood.
+
+**Cross-target:** same FFI-backed shared state as `broadcast`,
+so `unzip` runs on both Erlang and JavaScript.
+
+**Buffer size:** unbounded per consumer, inherited from
+`broadcast`. A pipeline that drives one half of the unzipped pair
+to completion while the other half stays unpulled will accumulate
+the entire stream in the lagging half’s queue.
+
+```
+pub fn zip(
+  left:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a),
+  right: [datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(b),
+) -> [datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(#(a, b))Pair-wise zip two streams; halts the moment either source halts.
+
+Both upstreams may be open at once. On halt, closes `right` first,
+then `left`, matching the spec.
+
+```
+pub fn zip_with(
+  left:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(a),
+  right: [datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(b),
+  with combiner: fn(a, b) -> c,
+) -> [datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(c)Combine two streams element-wise with `combiner`; halts the moment
+either source halts.
+
+Same close ordering as `zip`: right then left.
+
+---
+
+# datastream/text · datastream · v0.18.0
+
+Source: https://datastream.hexdocs.pm/datastream/text.html
+
+Chunk-boundary-aware text stream operations on `Stream(String)`.
+
+Real text inputs arrive in arbitrary chunks (file reads, network
+reads). A naïve `string.split` per chunk is wrong because line
+terminators and delimiters land on chunk boundaries. The functions
+here absorb that with a small, bounded amount of internal buffering
+— they never materialise the full input.
+
+Both functions consume `Stream(String)` rather than
+`Stream(BitArray)`. The byte → string boundary is owned by
+`text.utf8_decode` (separate issue) so the cost lives in one place.
+
+```
+pub fn lines(
+  over stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(String),
+) -> [datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(String)Split a stream of strings into a stream of lines, treating `\n`,
+`\r\n`, and lone `\r` as terminators (matching Python’s
+`str.splitlines()`).
+
+The terminator is NOT included in emitted lines. A trailing partial line (input that does not end with a terminator) is emitted as a final element so callers do not silently drop the last record.
+
+Chunk-boundary handling: when a `\r` lands at the end of one chunk
+and the next chunk starts with `\n`, the pair is treated as a
+single `\r\n` boundary. A lone `\r` with no following `\n` (either
+because the next chunk does not start with `\n`, or because the
+stream ended) is treated as a line terminator.
+
+```
+pub fn records(
+  over stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(String),
+) -> [datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(List(String))Group a stream of lines into records separated by blank lines.
+
+Each emitted `List(String)` carries the lines of one record in
+source order. Blank lines act as record separators and are not
+included in any record. Multiple consecutive blank lines collapse
+(no empty records are emitted, no spurious record at the start of
+the stream when the input begins with a blank line). A trailing
+record without a terminating blank line is still emitted so the
+last record is not silently dropped.
+
+Pair with `text.lines` for SSE (Server-Sent Events),
+blank-line-separated NDJSON variants, mbox / RFC 822-style
+envelopes, and similar wire formats:
+
+```
+stream
+|> text.lines
+|> text.records
+|> stream.map(parse_event)
+```
+Chunk-boundary handling: this operator runs entirely on the line
+stream, so it inherits the chunk-boundary correctness of `lines`
+— a record terminator that lands across two chunks is still
+recognised because `lines` already absorbed the boundary before
+emitting.
+
+```
+pub fn split(
+  over stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(String),
+  on delimiter: String,
+) -> [datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(String)Split a stream of strings on `delimiter`, emitting every separated
+piece including the empty pieces between consecutive delimiters and
+at the start / end of the input.
+
+`delimiter == ""` triggers the grapheme-cluster splitter: each
+emitted element is exactly one Unicode grapheme cluster of the
+input, in source order.
+
+Chunk-boundary handling: pieces that span a chunk boundary are joined; the trailing in-flight piece is held in a small buffer and emitted only when a delimiter or end-of-stream is reached.
+
+```
+pub fn utf8_decode(
+  over stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(BitArray),
+) -> [datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(Result(String, Nil))Decode a stream of UTF-8 byte chunks into a stream of decoded strings, reassembling multi-byte codepoints split across chunks.
+
+Each successfully decoded codepoint surfaces as `Ok(string)`. An
+invalid byte (lead byte that is not a valid UTF-8 start, or a
+missing/invalid continuation) emits exactly one `Error(Nil)` and
+decoding resumes from the next byte. An incomplete trailing
+sequence at end-of-stream emits a final `Error(Nil)` before halting.
+
+The decoder holds a small internal buffer for partial multi-byte codepoints; it never materialises the full input.
+
+```
+pub fn utf8_decode_lossy(
+  over stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(BitArray),
+) -> [datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(String)Decode a stream of UTF-8 byte chunks into a stream of decoded strings, silently dropping any chunk that fails to decode.
+
+Convenience wrapper for the common “I just want strings” pipeline:
+`chunks |> text.utf8_decode_lossy |> text.lines |> ...` typechecks
+without a hand-rolled `Result(String, Nil) -> Option(String)` shim.
+
+Use this when invalid UTF-8 should be tolerated as data corruption
+the caller does not need to observe (most file/socket reads of
+known-good text). Use `utf8_decode` directly when the caller needs
+to surface decode errors — for example via
+`fold.partition_result` to log them while still streaming the
+successful records through.
+
+```
+pub fn utf8_encode(
+  over stream:
+```
+[datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(String),
+) -> [datastream.Stream](https://datastream.hexdocs.pm/datastream.html#Stream)(BitArray)Encode a stream of strings as UTF-8 byte chunks.
+
+Each input string maps to its UTF-8 encoding as a single
+`BitArray` element; an empty input string maps to the empty
+`BitArray`.
+
+---

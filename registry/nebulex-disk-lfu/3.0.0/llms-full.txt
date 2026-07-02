@@ -1,0 +1,750 @@
+# Persistent LFU Cache Adapter for Nebulex
+
+Source: https://nebulex-disk-lfu.hexdocs.pm/architecture.md
+
+# Persistent LFU Cache Adapter for Nebulex
+
+`Nebulex.Adapters.DiskLFU` is a
+**persistent LFU (Least Frequently Used) cache adapter**
+for [Nebulex](https://hexdocs.pm/nebulex), designed to provide an SSD-backed
+cache with disk persistence, TTL support, and LFU-based eviction.
+This adapter is ideal for workloads that require:
+
+- High-capacity caching without exhausting memory.
+- File-based persistence with cache recovery after restarts.
+- Concurrency-safe operations for both reads and writes.
+- Customizable eviction strategies.
+
+---
+
+## Architecture Overview
+
+The adapter is composed of several key modules:
+
+### 1. **Store Module ([Nebulex.Adapters.DiskLFU.Store][store_mod])**
+
+[store_mod]: https://github.com/elixir-nebulex/nebulex_disk_lfu/blob/main/lib/nebulex/adapters/disk_lfu/store.ex
+
+Responsible for:
+
+- Disk read/write operations for `.cache` and `.meta` files
+- Managing metadata: `key`, `raw_key`, `checksum`, `size_bytes`,
+  `access_count`, `inserted_at`, `last_accessed_at`, `expires_at`,
+  and `metadata`.
+- LFU-based eviction.
+- TTL expiration handling.
+- Atomic updates using `:global.trans/4` for per-key and cache-wide locking.
+- Persist metadata to disk asynchronously and periodically (configurable).
+  This enables concurrent reads since the metadata is not persisted
+  immediately. The metadata is updated in memory, but it is dumped to disk
+  later.
+
+Files are stored on disk using SHA256-hashed keys:
+
+- `HASH.cache` - contains the binary value
+- `HASH.meta` - contains metadata in Erlang term format
+
+Where `HASH` is the Base16-encoded SHA256 hash of the original key.
+
+### 2. **Adapter Module (**`Nebulex.Adapters.DiskLFU`**)**
+
+Implements the Nebulex adapter behavior:
+
+- Delegates operations to `Store`
+- Manages cache lifecycle (init, cleanup, child spec)
+- Supports Nebulex features like `get`, `put`, `delete`, `has_key?`, `all`,
+  `size`, etc.
+
+### 3. **ETS + Counters for Performance**
+
+- Metadata for all keys is loaded into an ETS table on startup
+- A fast `:counters` instance tracks total size of the cache
+- Concurrency-safe and highly efficient
+
+---
+
+## Eviction Strategy
+
+The adapter implements **eager eviction** based on total disk usage:
+
+- Configurable via `:max_bytes`.
+- Triggered on `put/4` if the write would exceed the size limit
+
+### Eviction Order
+
+Eviction candidates are selected from ETS using a two-phase approach:
+
+1. **Priority: Expired Entries** - First attempts to evict entries where
+   `expires_at <= now()`, sorted by expiration time and size.
+2. **Fallback: LFU Strategy** - If no expired entries exist, selects least
+   frequently used entries, sorted by `access_count` (ascending) and
+   `last_accessed_at` (oldest first).
+
+Eviction is incremental:
+
+- Uses `:ets.select` with a configurable sample size (`:eviction_victim_sample_size`)
+- Evicts up to `:eviction_victim_limit` entries per operation
+- Stops once enough space is reclaimed
+
+### Atomicity
+
+The adapter uses `:global.trans/4` with two-level locking:
+
+1. **Per-key locking** - Individual operations (read, write, delete) acquire
+   locks on specific keys to prevent concurrent modifications of the same entry.
+2. **Cache-wide locking** - Eviction operations acquire a lock on the entire
+   cache directory to prevent multiple concurrent evictions, which could lead
+   to race conditions.
+
+This ensures data consistency and prevents write conflicts under high
+concurrency.
+
+### Periodic Expiration Cleanup
+
+In addition to the eager eviction mechanism triggered by size constraints, the
+adapter supports **proactive background cleanup** of expired entries using the
+`:eviction_timeout` option.
+
+When `:eviction_timeout` is configured at startup, the Store process starts a
+background timer that periodically runs and removes all expired entries from the
+cache without requiring explicit API calls. This is useful for applications that
+want to keep the cache clean without implementing their own background job.
+
+**Configuration Example:**
+
+```elixir
+config :my_app, MyApp.Cache,
+  root_path: "/tmp/my_cache",
+  eviction_timeout: :timer.minutes(5)  # Clean expired entries every 5 minutes
+```
+
+**How It Works:**
+
+1. The timer is set during Store initialization.
+2. At each interval, a `:evict_expired_entries` message is sent to the Store
+   process.
+3. The Store locates all entries where `expires_at <= now()`.
+4. Expired entries are removed from disk and their metadata is updated.
+5. The cache size counter is decremented accordingly.
+6. The timer is reset for the next interval.
+7. The entire operation is wrapped in a telemetry span for observability.
+
+**Alternative: Manual Cleanup**
+
+If you prefer not to use background cleanup, you can manually evict expired
+entries at any time using the queryable API:
+
+```elixir
+MyCache.delete_all(query: :expired)
+```
+
+This allows for more control over when cleanup occurs, such as during
+low-traffic periods.
+
+---
+
+## TTL Expiration
+
+Each entry supports a TTL (`expires_at` field in metadata). The adapter handles
+expiration in multiple ways:
+
+1. **Lazy expiration** - On `get`, if the entry is expired:
+   - It is deleted (cache miss)
+   - Metadata and file are removed
+
+2. **Eager eviction** - During size-based eviction, expired entries are
+   prioritized for removal before applying LFU strategy.
+
+3. **Periodic cleanup** - When `:eviction_timeout` is configured, a background
+   timer automatically removes all expired entries at the specified interval
+   (see "Periodic Expiration Cleanup" section above).
+
+---
+
+## Concurrency Model
+
+The design favors **read concurrency**:
+
+- Multiple processes can read `.cache` files concurrently.
+- Reads use ETS for fast metadata access.
+- Writes and evictions are serialized for safety.
+
+Atomic disk writes are ensured by:
+
+- Using temporary files and atomic `File.rename/2`.
+- Serialized eviction logic.
+
+---
+
+## File Structure Example
+
+```
+/root_path/
+  A1B2C3...XYZ.cache      # value as binary (SHA256 hash of key1)
+  A1B2C3...XYZ.meta       # metadata: access_count, size, etc
+  D4E5F6...UVW.cache      # value as binary (SHA256 hash of key2)
+  D4E5F6...UVW.meta       # metadata for key2
+```
+
+Each file is named using the Base16-encoded SHA256 hash of the original key,
+ensuring filesystem-safe names and avoiding collisions.
+
+---
+
+## Configuration
+
+```elixir
+defmodule MyApp.Cache do
+  use Nebulex.Cache,
+    otp_app: :my_app,
+    adapter: Nebulex.Adapters.DiskLFU
+end
+```
+
+```elixir
+config :my_app, MyCache,
+  root_path: "/tmp/my_cache",
+  max_bytes: 10_000_000,  # 10MB
+```
+
+---
+
+## Future Enhancements
+
+### Performance Optimizations
+
+- **Replace `:global.trans` with local locking** - The current implementation uses
+  `:global.trans/4` for atomic operations, which is designed for distributed
+  systems. For single-node deployments, a local locking mechanism (e.g.,
+  Registry-based or process-pool locks) would provide better performance at
+  high concurrency.
+- **Directory sharding** - All cache files currently reside in a single directory.
+  For caches with 100K+ entries, filesystem performance may degrade. Sharding
+  into subdirectories based on hash prefixes (e.g., first 2 characters) would
+  improve scalability.
+- **Incremental metadata persistence** - Current implementation persists all
+  metadata entries periodically. Tracking and persisting only dirty entries
+  would reduce I/O overhead for large caches.
+
+### Feature Enhancements
+
+- Smarter multi-tier eviction (e.g., based on age buckets)
+- Optional compression for `.cache` files
+- Support for `Nebulex.Adapters.Common.Info` behaviour (cache introspection)
+- Support for `Nebulex.Adapter.Observable` behaviour (cache entry events)
+
+---
+
+---
+
+# Nebulex.Adapters.DiskLFU
+
+Source: https://nebulex-disk-lfu.hexdocs.pm/Nebulex.Adapters.DiskLFU.md
+
+# `Nebulex.Adapters.DiskLFU`
+[🔗](https://github.com/elixir-nebulex/nebulex_disk_lfu/blob/v3.0.0/lib/nebulex/adapters/disk_lfu.ex#L1)
+
+`Nebulex.Adapters.DiskLFU` is a
+**persistent LFU (Least Frequently Used) cache adapter** for
+[Nebulex](https://hexdocs.pm/nebulex), designed to provide an SSD-backed
+cache with disk persistence, TTL support, and LFU-based eviction.
+
+This adapter is ideal for workloads that require:
+
+- High-capacity caching without exhausting memory.
+- File-based persistence with cache recovery after restarts.
+- Concurrency-safe operations for both reads and writes.
+- Customizable eviction strategies.
+
+For example, imagine an application that downloads large files from S3 to
+process them. These files are reusable across different operations or
+requests. In such cases, it can be significantly more efficient to cache the
+files locally—ideally on an SSD—rather than repeatedly fetching them from S3.
+Using `Nebulex.Adapters.DiskLFU`, these files can be stored and accessed from
+the local file system with LFU eviction and TTL handling, reducing latency
+and cloud egress costs.
+
+See the [Architecture](architecture.html) document for more information.
+
+## Features
+
+- **LFU Eviction** - Least Frequently Used eviction when disk capacity is
+  exceeded.
+- **TTL Support** - Per-entry time-to-live with lazy and proactive cleanup.
+- **Proactive Eviction** - Automatic periodic cleanup of expired entries via
+  `:eviction_timeout`.
+- **Manual Cleanup** - Direct API for explicit expired entry removal with
+  `delete_all(query: :expired)`.
+- **Concurrent Access** - Safe read/write operations with atomic guarantees
+  per key.
+- **Persistent** - Survives application restarts with fast recovery from disk.
+
+## Usage
+
+Define your cache module:
+
+```elixir
+defmodule MyApp.Cache do
+  use Nebulex.Cache,
+    otp_app: :my_app,
+    adapter: Nebulex.Adapters.DiskLFU
+end
+```
+
+Configure your cache in `config/config.exs`:
+
+```elixir
+config :my_app, MyApp.Cache,
+  root_path: "/var/cache",
+  max_bytes: 10_000_000,               # 10MB capacity
+  eviction_timeout: :timer.minutes(5)  # Clean expired entries every 5 minutes
+```
+
+Add the cache to your application supervision tree:
+
+```elixir
+def start(_type, _args) do
+  children = [
+    {MyApp.Cache, []},
+    # ... other children
+  ]
+
+  Supervisor.start_link(children, strategy: :one_for_one)
+end
+```
+
+Then use it in your application:
+
+```elixir
+# Write a value with TTL
+MyApp.Cache.put(:key, "value", ttl: :timer.hours(1))
+
+# Read a value
+MyApp.Cache.get(:key)
+
+# Delete expired entries manually
+MyApp.Cache.delete_all(query: :expired)
+```
+
+## Startup options
+
+The following options are available for the adapter at startup:
+
+* `:root_path` (`t:String.t/0`) - Required. The root directory where cache files are stored.
+
+  Cache files (`.cache` and `.meta` files) are created as direct children
+  of this directory. This directory will be created if it does not exist.
+
+* `:max_bytes` - The maximum cache size in bytes. When exceeded, LFU eviction is triggered
+  to remove the least frequently used entries until the size falls below
+  this limit.
+
+  When `nil` (default), the cache has no size-based eviction limit. Note
+  that TTL-based expiration still applies if entries have `:ttl` set.
+
+  The default value is `nil`.
+
+* `:eviction_victim_limit` (`t:pos_integer/0`) - The maximum number of entries to evict in a single operation.
+
+  When size limit is exceeded, eviction selects up to this many entries
+  (victims) to delete based on the LFU strategy.
+
+  The default value is `100`.
+
+* `:eviction_victim_sample_size` (`t:pos_integer/0`) - The number of candidate entries to sample when selecting victims.
+
+  A larger sample size provides better eviction decisions (more accurate LFU)
+  but requires more scanning. The sampled entries are then sorted by
+  frequency and age, and the worst `:eviction_victim_limit` entries are
+  removed.
+
+  The default value is `1000`.
+
+* `:metadata_persistence_timeout` - The interval in milliseconds at which to persist metadata to disk.
+
+  Metadata is updated in memory for performance, then periodically written
+  to disk at this interval to minimize I/O overhead. When `nil`, metadata
+  is not persisted periodically, but is still persisted during graceful
+  shutdown to ensure consistency on restart.
+
+  The default value is `60000`.
+
+* `:eviction_timeout` - The interval in milliseconds to evict expired entries periodically.
+
+  When set, a background timer triggers automatic cleanup of all expired
+  entries at the specified interval. When `nil` (default), expired entries
+  are removed lazily (on access) or manually via
+  `delete_all(query: :expired)`.
+
+  **Example:**
+
+  ```elixir
+  config :my_app, MyApp.Cache,
+    root_path: "/tmp/my_cache",
+    eviction_timeout: :timer.minutes(5)
+  ```
+
+  The default value is `nil`.
+
+## Shared runtime options
+
+The following options are available for all operations:
+
+* `:retries` - The maximum number of times to retry an operation when blocked by locks.
+
+  Operations retry when another process holds a lock on the same key or
+  resource. Set to a non-negative integer for a maximum retry count, or
+  `:infinity` (default) to retry indefinitely until the lock is released.
+
+  The default value is `:infinity`.
+
+## Read options
+
+The following options are available for the read operations
+(e.g., `fetch`, `get`, `take`):
+
+* `:return` - The value to return from read operations (`fetch`, `get`, `take`).
+
+  Supported values:
+
+  - `:binary` (default) - Returns the cache value as a binary.
+  - `:metadata` - Returns the entry metadata instead of the value.
+  - `:symlink` - Returns a temporary read-only symlink to the cached file.
+    **Only supported for `fetch` and `get` operations.** The symlink is
+    automatically cleaned up after use. Useful for passing large files to
+    external tools without loading them into memory. Do not modify the file.
+  - A function/2 - A callback receiving `(binary, metadata)` that transforms
+    and returns a custom value.
+
+  The default value is `:binary`.
+
+## Write options
+
+The following options are available for the write operations
+(e.g., `put`, `put_new`, `replace`, `put_all`, `put_new_all`):
+
+* `:metadata` (`t:map/0`) - Custom metadata to attach to the cached entry.
+
+  This data is stored alongside the value and can be retrieved using
+  the `return: :metadata` option on read operations.
+
+  The default value is `%{}`.
+
+## Adapter-specific telemetry events
+
+This adapter exposes the following Telemetry events grouped by category:
+
+### Eviction Events
+
+* `telemetry_prefix ++ [:eviction, :start]` - Dispatched when eviction begins.
+
+  * Measurements: `%{system_time: non_neg_integer()}`
+  * Metadata:
+
+    ```
+    %{
+      stored_bytes: non_neg_integer(),
+      max_bytes: non_neg_integer(),
+      victim_sample_size: non_neg_integer(),
+      victim_limit: non_neg_integer()
+    }
+    ```
+
+* `telemetry_prefix ++ [:eviction, :stop]` - Dispatched when eviction
+  completes.
+
+  * Measurements: `%{duration: non_neg_integer()}`
+  * Metadata:
+
+    ```
+    %{
+      stored_bytes: non_neg_integer(),
+      max_bytes: non_neg_integer(),
+      victim_sample_size: non_neg_integer(),
+      victim_limit: non_neg_integer(),
+      result: term()
+    }
+    ```
+
+* `telemetry_prefix ++ [:eviction, :exception]` - Dispatched when eviction
+  fails.
+
+  * Measurements: `%{duration: non_neg_integer()}`
+  * Metadata:
+
+    ```
+    %{
+      stored_bytes: non_neg_integer(),
+      max_bytes: non_neg_integer(),
+      victim_sample_size: non_neg_integer(),
+      victim_limit: non_neg_integer(),
+      kind: :error | :exit | :throw,
+      reason: term(),
+      stacktrace: [term()]
+    }
+    ```
+
+### Expired Entry Eviction Events
+
+* `telemetry_prefix ++ [:evict_expired_entries, :start]` - Dispatched when
+  the periodic background timer begins evicting expired entries.
+
+  * Measurements: `%{system_time: non_neg_integer()}`
+  * Metadata:
+
+    ```
+    %{
+      store_pid: pid()
+    }
+    ```
+
+* `telemetry_prefix ++ [:evict_expired_entries, :stop]` - Dispatched when
+  expired entry eviction completes.
+
+  * Measurements: `%{duration: non_neg_integer()}`
+  * Metadata:
+
+    ```
+    %{
+      store_pid: pid(),
+      count: non_neg_integer()
+    }
+    ```
+
+* `telemetry_prefix ++ [:evict_expired_entries, :exception]` - Dispatched when
+  expired entry eviction fails.
+
+  * Measurements: `%{duration: non_neg_integer()}`
+  * Metadata:
+
+    ```
+    %{
+      store_pid: pid(),
+      kind: :error | :exit | :throw,
+      reason: term(),
+      stacktrace: [term()]
+    }
+    ```
+
+### Metadata Persistence Events
+
+* `telemetry_prefix ++ [:persist_meta, :start]` - Dispatched when metadata
+  persistence begins.
+
+  * Measurements: `%{system_time: non_neg_integer()}`
+  * Metadata:
+
+    ```
+    %{
+      store_pid: pid()
+    }
+    ```
+
+* `telemetry_prefix ++ [:persist_meta, :stop]` - Dispatched when metadata
+  persistence completes.
+
+  * Measurements: `%{duration: non_neg_integer()}`
+  * Metadata:
+
+    ```
+    %{
+      store_pid: pid(),
+      count: non_neg_integer()
+    }
+    ```
+
+* `telemetry_prefix ++ [:persist_meta, :exception]` - Dispatched when metadata
+  persistence fails.
+
+  * Measurements: `%{duration: non_neg_integer()}`
+  * Metadata:
+
+    ```
+    %{
+      store_pid: pid(),
+      kind: :error | :exit | :throw,
+      reason: term(),
+      stacktrace: [term()]
+    }
+    ```
+
+### Metadata Loading Events
+
+* `telemetry_prefix ++ [:load_metadata, :error]` - Dispatched when metadata
+  loading fails for a file.
+
+  * Measurements: `%{system_time: non_neg_integer()}`
+  * Metadata:
+
+    ```
+    %{
+      filename: String.t(),
+      reason: term()
+    }
+    ```
+
+## Queryable API
+
+This adapter supports the `Nebulex.Adapter.Queryable` behaviour with a limited
+query interface. The following query options are available for queryable
+operations like `delete_all/2`, `count_all/2`, and `get_all/2`:
+
+### Query Option: Match All Keys
+
+Delete, count, or retrieve all keys in the cache:
+
+```elixir
+MyCache.delete_all()
+MyCache.count_all()
+MyCache.get_all()
+```
+
+### Query Option: Match Specific Keys
+
+Delete, count, or retrieve specific keys using the `in` operator:
+
+```elixir
+MyCache.delete_all(in: [:key1, :key2, :key3])
+MyCache.count_all(in: [:key1, :key2])
+MyCache.get_all(in: [:key1, :key2, :key3])
+```
+
+### Query Option: Match Expired Entries
+
+Delete expired entries using `query: :expired`:
+
+```elixir
+MyCache.delete_all(query: :expired)
+```
+
+This query matches all entries whose TTL (`expires_at`) is less than or equal
+to the current time. It is only supported for `delete_all/2` and is
+particularly useful for proactive cleanup of stale entries, either manually
+via the API or automatically by configuring the `:eviction_timeout` option
+at startup.
+
+For more information about automatic eviction, see the
+[Architecture](guides/learning/architecture.md) guide.
+
+## Limitations and Considerations
+
+### Unsupported Operations
+
+- `incr/3` and `decr/3` are not supported.
+- `put_new/3`, `replace/3`, and `put_new_all/2` are not supported. They work
+  as `put` operations instead. Support is planned for a future release.
+- The `Nebulex.Adapters.Common.Info` behaviour is not implemented. Support
+  for cache introspection and statistics is planned for a future release.
+- The `Nebulex.Adapter.Observable` behaviour is not implemented. Support for
+  cache entry events is planned for a future release.
+
+### Query Operation Limitations
+
+- `count_all/1` supports counting all keys or given keys, but is **not atomic**.
+  Errors are skipped and the count may be inaccurate.
+- `delete_all/1` supports deleting all keys, given keys, or expired entries
+  (`query: :expired`), but is **not atomic**. Errors are skipped and deletion
+  may be incomplete.
+- `get_all/1` supports retrieving all keys or given keys only.
+- `stream/1` supports streaming all keys or given keys only.
+
+### Performance Characteristics
+
+- Write and delete operations (`put`, `put_all`, `delete`, `take`) are
+  **blocking and atomic per key**. This ensures consistency and prevents
+  race conditions or write conflicts.
+- Read operations may block briefly if a key is expired and requires cleanup
+  from the cache.
+
+# `return_fn`
+
+```elixir
+@type return_fn() :: (binary(), Nebulex.Adapters.DiskLFU.Meta.t() -&gt; any())
+```
+
+The return function for the fetch operation.
+
+---
+
+*Consult [api-reference.md](api-reference.md) for complete listing*
+
+---
+
+# Nebulex.Adapters.DiskLFU.Helpers
+
+Source: https://nebulex-disk-lfu.hexdocs.pm/Nebulex.Adapters.DiskLFU.Helpers.md
+
+# `Nebulex.Adapters.DiskLFU.Helpers`
+[🔗](https://github.com/elixir-nebulex/nebulex_disk_lfu/blob/v3.0.0/lib/nebulex/adapters/disk_lfu/helpers.ex#L1)
+
+Helper functions for the disk LFU adapter.
+
+# `checksum`
+
+```elixir
+@spec checksum(binary()) :: binary()
+```
+
+Calculates the checksum for the given data.
+
+# `expires_at`
+
+```elixir
+@spec expires_at(timeout()) :: timeout()
+```
+
+Calculates the expiration time for the given TTL.
+
+# `hash_key`
+
+```elixir
+@spec hash_key(binary()) :: binary()
+```
+
+Hashes the given key.
+
+# `remaining_ttl`
+
+```elixir
+@spec remaining_ttl(timeout()) :: timeout()
+```
+
+Calculates the remaining TTL for the given expiration time.
+
+---
+
+*Consult [api-reference.md](api-reference.md) for complete listing*
+
+---
+
+# Nebulex.Adapters.DiskLFU.Meta
+
+Source: https://nebulex-disk-lfu.hexdocs.pm/Nebulex.Adapters.DiskLFU.Meta.md
+
+# `Nebulex.Adapters.DiskLFU.Meta`
+[🔗](https://github.com/elixir-nebulex/nebulex_disk_lfu/blob/v3.0.0/lib/nebulex/adapters/disk_lfu/meta.ex#L1)
+
+Metadata for the cache.
+
+# `t`
+
+```elixir
+@type t() :: %Nebulex.Adapters.DiskLFU.Meta{
+  access_count: non_neg_integer(),
+  checksum: binary(),
+  expires_at: timeout(),
+  inserted_at: non_neg_integer(),
+  key: String.t(),
+  last_accessed_at: non_neg_integer(),
+  metadata: map(),
+  size_bytes: non_neg_integer()
+}
+```
+
+Metadata structure for the cache.
+
+---
+
+*Consult [api-reference.md](api-reference.md) for complete listing*
+
+---
