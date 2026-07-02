@@ -1,0 +1,303 @@
+# NexusMCP
+
+Source: https://nexus-mcp.hexdocs.pm/readme.md
+
+# NexusMCP
+
+MCP ([Model Context Protocol](https://modelcontextprotocol.io)) server library for Elixir.
+
+Implements the **2025-11-25** spec over the Streamable HTTP transport, with a GenServer-per-session architecture and concurrent tool execution via `Task.Supervisor`.
+
+Supports the three MCP server primitives:
+
+- **Tools** — model-controlled functions (`deftool`)
+- **Prompts** — user-controlled message templates (`defprompt`)
+- **Resources** — application-controlled context (`defresource`, `defresource_template`)
+
+## Installation
+
+```elixir
+def deps do
+  [
+    {:nexus_mcp, "~> 0.3.1"}
+  ]
+end
+```
+
+## Quick start
+
+```elixir
+defmodule MyApp.MCP do
+  use NexusMCP.Server,
+    name: "my-app",
+    version: "1.0.0"
+
+  deftool "hello", "Say hello",
+    params: [name: {:string!, "Person's name"}] do
+    {:ok, "Hello, #{params["name"]}!"}
+  end
+end
+```
+
+Add the supervisor to your application:
+
+```elixir
+children = [
+  {NexusMCP.Supervisor, []},
+  # ...
+]
+```
+
+Route requests to the transport:
+
+```elixir
+forward "/mcp", NexusMCP.Transport, server: MyApp.MCP
+```
+
+## Tools
+
+Tools are exposed to MCP clients via `tools/list` and `tools/call`. Inside the `do` block, `params` and `session` are bound.
+
+```elixir
+deftool "get_page", "Get a page by ID",
+  params: [id: {:string!, "Page ID"}] do
+  page = CMS.get_page!(params["id"])
+  {:ok, Map.take(page, [:id, :title, :slug, :body])}
+end
+```
+
+Tool calls execute concurrently in supervised Task processes — slow tools don't block other RPCs on the same session.
+
+### Param types
+
+`:string`, `:integer`, `:number`, `:boolean`, `:object`, plus `{:array, type}`. Append `!` to mark required (`:string!`, `:integer!`, …). Pair with a description: `{:string!, "Page ID"}`.
+
+### Annotations
+
+Add MCP [tool annotations](https://modelcontextprotocol.io/specification/2025-11-25/server/tools#annotations) to hint behavior:
+
+```elixir
+deftool "delete_item", "Delete an item",
+  params: [id: {:string!, "Item ID"}],
+  annotations: %{readOnlyHint: false, destructiveHint: true, idempotentHint: true} do
+  Items.delete!(params["id"])
+  {:ok, %{deleted: true}}
+end
+```
+
+Supported keys: `readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`, `title`.
+
+## Prompts
+
+Prompts are user-invoked templates (e.g. slash commands) surfaced via `prompts/list` and `prompts/get`. The handler returns a list of MCP messages.
+
+```elixir
+defprompt "code_review", "Ask the model to review code",
+  arguments: [code: {:string!, "The code to review"}] do
+  {:ok, [
+    %{role: "user",
+      content: %{type: "text", text: "Please review:\n" <> params["code"]}}
+  ]}
+end
+```
+
+Required arguments are validated before the handler runs — missing required args produce a `-32602` JSON-RPC error.
+
+## Resources
+
+Resources are application-controlled context surfaced via `resources/list`, `resources/templates/list`, and `resources/read`.
+
+### Static resources
+
+```elixir
+defresource "config://app",
+  name: "app_config",
+  description: "Application configuration",
+  mime_type: "application/json" do
+  {:ok, Jason.encode!(MyApp.config())}
+end
+```
+
+The handler can return:
+
+- `{:ok, binary}` — wrapped as `text` if `mime_type` is textual (`text/*` or `application/json`), otherwise base64-encoded as `blob`
+- `{:ok, %{text: string}}` or `{:ok, %{blob: base64}}` — passed through
+- `{:error, :not_found}` — surfaces as JSON-RPC `-32002`
+
+### Templated resources
+
+Use RFC 6570 URI templates with `{var}` (single segment) or `{+var}` (multi-segment, reserved expansion):
+
+```elixir
+defresource_template "file:///{path}",
+  name: "project_files",
+  description: "Files in the project directory",
+  mime_type: "text/plain" do
+  {:ok, File.read!(params["path"])}
+end
+
+defresource_template "tree:///{+path}",
+  name: "tree_node",
+  mime_type: "application/json" do
+  {:ok, Jason.encode!(Tree.fetch(params["path"]))}
+end
+```
+
+URI captures land in `params` keyed by the template variable name.
+
+### Subscriptions (not yet supported)
+
+Per-resource subscriptions (`resources/subscribe`, `notifications/resources/updated`) are not implemented in this release. Resources are advertised with `"subscribe": false` at initialization.
+
+## Per-session setup
+
+Override `init/1` to validate or enrich the session at connection time, and `wrap_tool_call/2` to install process-local context (tenant ID, request span, etc.) before every tool runs:
+
+```elixir
+defmodule MyApp.MCP do
+  use NexusMCP.Server, name: "my-app", version: "1.0.0"
+
+  @impl true
+  def init(session) do
+    case authenticate(session.assigns[:api_key]) do
+      {:ok, user} -> {:ok, put_in(session.assigns[:user], user)}
+      :error      -> {:error, "unauthorized"}
+    end
+  end
+
+  @impl true
+  def wrap_tool_call(session, fun) do
+    MyApp.Context.put_user_id(session.assigns[:user].id)
+    fun.()
+  rescue
+    Ecto.NoResultsError -> {:error, "Not found"}
+  end
+
+  deftool "me", "Return the current user", params: [] do
+    {:ok, %{id: session.assigns[:user].id}}
+  end
+end
+```
+
+## Transport options
+
+```elixir
+forward "/mcp", NexusMCP.Transport,
+  server: MyApp.MCP,
+  allowed_origins: ["https://myapp.com", "https://studio.myapp.com"]
+```
+
+When `allowed_origins` is set, requests with an `Origin` header not in the list are rejected with `403`. Requests without an `Origin` header are allowed (e.g. server-to-server).
+
+## Distributed deployments
+
+Session registry is swappable. Provide your own implementation of `NexusMCP.SessionRegistry` (e.g. backed by `:global`, `:pg`, or Horde) and configure it:
+
+```elixir
+config :nexus_mcp, registry: MyApp.DistributedRegistry
+```
+
+## Spec coverage
+
+This release implements the **MCP 2025-11-25** server spec for:
+
+- `initialize` + `notifications/initialized`
+- `ping`
+- `tools/list`, `tools/call` (with annotations)
+- `prompts/list`, `prompts/get`
+- `resources/list`, `resources/templates/list`, `resources/read`
+
+Out of scope for this release (tracked separately):
+
+- `resources/subscribe`, `resources/unsubscribe`, `notifications/resources/updated`
+- `notifications/{prompts,resources}/list_changed`
+- `completion/complete`
+- Pagination cursors on `*/list` methods (whole list returned in one page)
+- Full RFC 6570 URI template grammar (currently `{var}` and `{+var}`)
+
+## License
+
+MIT
+
+---
+
+# NexusMCP
+
+Source: https://nexus-mcp.hexdocs.pm/NexusMCP.md
+
+# `NexusMCP`
+[🔗](https://github.com/dmkenney/nexus_mcp/blob/main/lib/nexus_mcp.ex#L1)
+
+MCP ([Model Context Protocol](https://modelcontextprotocol.io)) server library for Elixir.
+
+Implements the **2025-11-25** spec over the Streamable HTTP transport, with a
+GenServer-per-session architecture. Each client gets its own process, tool
+calls execute concurrently in supervised Tasks, and SSE connections are
+monitored for cleanup.
+
+Supports all three MCP server primitives:
+
+- **Tools** — model-controlled functions (`NexusMCP.Server.Tool.deftool/4`)
+- **Prompts** — user-controlled message templates (`NexusMCP.Server.Prompt.defprompt/4`)
+- **Resources** — application-controlled context
+  (`NexusMCP.Server.Resource.defresource/3`,
+  `NexusMCP.Server.Resource.defresource_template/3`)
+
+## Quick start
+
+    defmodule MyApp.MCP do
+      use NexusMCP.Server,
+        name: "my-app",
+        version: "1.0.0"
+
+      deftool "hello", "Say hello",
+        params: [name: {:string!, "Person's name"}] do
+        {:ok, "Hello, #{params["name"]}!"}
+      end
+
+      defprompt "greet", "Greet someone formally",
+        arguments: [name: {:string!, "Name"}] do
+        {:ok, [%{role: "user",
+                 content: %{type: "text",
+                            text: "Compose a formal greeting for " <> params["name"]}}]}
+      end
+
+      defresource "config://app",
+        name: "app_config",
+        mime_type: "application/json" do
+        {:ok, Jason.encode!(MyApp.config())}
+      end
+    end
+
+Add the supervisor to your application:
+
+    children = [
+      {NexusMCP.Supervisor, []},
+      # ...
+    ]
+
+Route requests to the transport:
+
+    forward "/mcp", NexusMCP.Transport, server: MyApp.MCP
+
+See `NexusMCP.Server` for the full behaviour reference.
+
+## Spec coverage
+
+This release implements the **MCP 2025-11-25** server spec for:
+
+- `initialize` + `notifications/initialized`
+- `ping`
+- `tools/list`, `tools/call` (with annotations)
+- `prompts/list`, `prompts/get`
+- `resources/list`, `resources/templates/list`, `resources/read`
+
+Not yet implemented: resource subscriptions, list_changed notifications,
+`completion/complete`, and pagination cursors. The library advertises
+`subscribe: false` and `listChanged: false` for the relevant capabilities.
+
+---
+
+*Consult [api-reference.md](api-reference.md) for complete listing*
+
+---
