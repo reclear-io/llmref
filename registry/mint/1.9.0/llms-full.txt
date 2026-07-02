@@ -1,0 +1,2445 @@
+# Architecture
+
+Source: https://mint.hexdocs.pm/architecture.md
+
+# Architecture
+
+Mint is an HTTP client with a process-less architecture. Mint provides an API where the HTTP connection is represented by a functional and immutable data structure, a **connection**. Every operation you do on the connection (like sending a request) returns an updated connection. A connection wraps a socket that is in active mode (with `active: :once`). Messages coming from the socket are delivered to the process that created the connection. You can hand those messages to Mint so that they can be parsed into responses.
+
+Having a process-less architecture makes Mint a powerful and composable HTTP client. The developer has more flexibility compared to a client that forces an interface that includes processes. A Mint connection can be stored inside any kind of process, such as GenServers or GenStage processes.
+
+Another important feature enabled by the Mint architecture is that a single process can store and manage multiple Mint connections since they are simple data structures. When a message comes from a socket, it's easy to identify which connection it belongs to since that's the only connection that will return a response different from `:unknown` when the messages are parsed. This enables developers to use Mint in fine-tailored ways that suit their needs.
+
+## Pooling
+
+The Mint connection architecture is low level. This means that it doesn't provide things like connection pooling out of the box. This is by design: it's hard to write a general purpose HTTP connection pool that fits all use cases and it's often better to write simple pools that better fit your own use case. In this page, we'll see a few possible uses of Mint including some simple connection pools that you can use as a base for writing your own.
+
+## Usage examples
+
+Let's see a few example of how to use Mint connections.
+
+### Wrapping a Mint connection in a GenServer
+
+In this example we will look at wrapping a single connection in a GenServer. This architecture can be useful if you only need to issue a few requests to the same host, or if you plan to have many connections spread over just as many processes.
+
+The way this architecture works is that a GenServer process holds the connection. The connection is started when the `ConnectionProcess` GenServer starts (in the `init/1` callback). When a request is made, the request is sent but the GenServer keeps processing stuff and doesn't directly reply to the process that asked to send the request. The GenServer will only reply to the caller once a response comes from the server. This allows the GenServer to keep sending requests and processing responses while making the request blocking for the caller.
+
+This asynchronous architecture also makes the GenServer usable from different processes. If you use HTTP/1, requests will appear to be concurrent to the callers of our GenServer, but the GenServer will pipeline the requests. If you use HTTP/2, the requests will be actually concurrent.
+If you want to avoid pipelining requests you need to manually queue them or reject them in case there's already an ongoing request.
+
+In this code we don't handle closed connections and failed requests (for brevity). For example, you could handle closed connections by having the GenServer try to reconnect after a backoff time.
+
+```elixir
+defmodule ConnectionProcess do
+  use GenServer
+
+  require Logger
+
+  defstruct [:conn, requests: %{}]
+
+  def start_link({scheme, host, port}) do
+    GenServer.start_link(__MODULE__, {scheme, host, port})
+  end
+
+  def request(pid, method, path, headers, body) do
+    GenServer.call(pid, {:request, method, path, headers, body})
+  end
+
+  ## Callbacks
+
+  @impl true
+  def init({scheme, host, port}) do
+    case Mint.HTTP.connect(scheme, host, port) do
+      {:ok, conn} ->
+        state = %__MODULE__{conn: conn}
+        {:ok, state}
+
+      {:error, reason} ->
+        {:stop, reason}
+    end
+  end
+
+  @impl true
+  def handle_call({:request, method, path, headers, body}, from, state) do
+    # In both the successful case and the error case, we make sure to update the connection
+    # struct in the state since the connection is an immutable data structure.
+    case Mint.HTTP.request(state.conn, method, path, headers, body) do
+      {:ok, conn, request_ref} ->
+        state = put_in(state.conn, conn)
+        # We store the caller this request belongs to and an empty map as the response.
+        # The map will be filled with status code, headers, and so on.
+        state = put_in(state.requests[request_ref], %{from: from, response: %{}})
+        {:noreply, state}
+
+      {:error, conn, reason} ->
+        state = put_in(state.conn, conn)
+        {:reply, {:error, reason}, state}
+    end
+  end
+
+  @impl true
+  def handle_info(message, state) do
+    # We should handle the error case here as well, but we're omitting it for brevity.
+    case Mint.HTTP.stream(state.conn, message) do
+      :unknown ->
+        _ = Logger.error(fn -> "Received unknown message: " <> inspect(message) end)
+        {:noreply, state}
+
+      {:ok, conn, responses} ->
+        state = put_in(state.conn, conn)
+        state = Enum.reduce(responses, state, &process_response/2)
+        {:noreply, state}
+    end
+  end
+
+  defp process_response({:status, request_ref, status}, state) do
+    put_in(state.requests[request_ref].response[:status], status)
+  end
+
+  defp process_response({:headers, request_ref, headers}, state) do
+    put_in(state.requests[request_ref].response[:headers], headers)
+  end
+
+  defp process_response({:data, request_ref, new_data}, state) do
+    update_in(state.requests[request_ref].response[:data], fn data -> (data || "") <> new_data end)
+  end
+
+  # When the request is done, we use GenServer.reply/2 to reply to the caller that was
+  # blocked waiting on this request.
+  defp process_response({:done, request_ref}, state) do
+    {%{response: response, from: from}, state} = pop_in(state.requests[request_ref])
+    GenServer.reply(from, {:ok, response})
+    state
+  end
+
+  # A request can also error, but we're not handling the erroneous responses for
+  # brevity.
+end
+```
+
+---
+
+# Decompression
+
+Source: https://mint.hexdocs.pm/decompression.md
+
+# Decompression
+
+Many web servers use compression to reduce the size of the payload to speed up delivery to clients, expecting clients to decompress the body of the request. Some of the common compression algorithms used are [gzip], [brotli], [zstd], or no compression at all.
+
+Clients may specify acceptable compression algorithms through the [`accept-encoding`][accept-encoding] request header. It's common for clients to supply one or more values in `accept-encoding`, for example `accept-encoding: gzip, br` in the order of preference.
+
+Servers will read the `accept-encoding` and `TE` request headers, and respond appropriately indicating which compression is used in the response body through the [`content-encoding`][content-encoding] or [`transfer-encoding`][transfer-encoding] response headers respectively. It's not as common to use multiple compression algorithms, but it is possible: for example, `content-encoding: gzip` or `content-encoding: br, gzip` (meaning it was compressed with `br` first, and then `gzip`).
+
+Mint is a low-level client so it doesn't have built-in support for decompression. In this guide we'll explore how to add support for decompression when using Mint.
+
+## Decompressing the response body
+
+Starting with the [architecture example](Architecture.md#content), we're going add some logic to handle a finished request's compressed body. With some compression algorithms, it's possible to decompress body chunks as they come (in a streaming way), but let's look at an example that works for every compression algorithm by decompressing the whole response body when the response is done.
+
+This is where we start:
+
+```elixir
+defp process_response({:done, request_ref}, state) do
+  {%{response: response, from: from}, state} = pop_in(state.requests[request_ref])
+  GenServer.reply(from, {:ok, response})
+  state
+end
+```
+
+This function handles the response back to the blocked process that's waiting for the HTTP response. You'll see that it returns `{:ok, response}` with `response` being a map with `:status`, `:headers`, and `:data` fields.
+
+We need to attempt to decompress the data if the `content-encoding` header is present. We're going to work with `content-encoding`, but the same applies if compression is used in `transfer-encoding`. Let's add a function that finds all applied compression algorithms.
+
+```elixir
+# Returns a list of found compressions or [] if none found.
+defp get_content_encoding_header(headers) do
+  headers
+  |> Enum.flat_map(fn {name, value} ->
+    if String.downcase(name, :ascii) == "content-encoding" do
+      value
+      |> String.downcase()
+      |> String.split(",", trim: true)
+      |> Stream.map(&String.trim/1)
+    else
+      []
+    end
+  end)
+  |> Enum.reverse()
+end
+```
+
+We use a combination of `Enum.flat_map/2` and `String.split/3` because the values can be comma-separated and spread over multiple headers. Now we should have a list like `["gzip"]`. We reversed the compression algorithms so that we decompress from the last one to the first one. Let's use this in another function that handles the decompression. Thankfully, Erlang ships with built-in support for gzip algorithm.
+
+```elixir
+defp decompress_data(data, algorithms) do
+  Enum.reduce(algorithms, data, &decompress_with_algorithm/2)
+end
+
+defp decompress_with_algorithm(gzip, data) when gzip in ["gzip", "x-gzip"],
+  do: :zlib.gunzip(data)
+
+defp decompress_with_algorithm("identity", data),
+  do: data
+
+defp decompress_with_algorithm(algorithm, data),
+  do: raise "unsupported decompression algorithm: #{inspect(algorithm)}"
+```
+
+In case you come across an unsupported algorithm, you might want to log or raise an exception so you can see where you may be lacking support.
+
+Now let's put it together. We can use these new functions when the request is done and pass the result back to the client.
+
+```elixir
+defp process_response({:done, request_ref}, state) do
+  {%{response: response, from: from}, state} = pop_in(state.requests[request_ref])
+
+  # Handle compression here.
+  compression_algorithms = get_content_encoding_header(response.headers)
+  response = update_in(response.data, &decompress_data(&1, compression_algorithms))
+
+  GenServer.reply(from, {:ok, response})
+
+  state
+end
+```
+
+Now you can decompress responses! Above is a simple approach to a potentially complex response, so there is room for error. For example, this guide does not handle decompression errors or compression through `transfer-encoding` (although the code stays very similar in that case).
+
+
+[gzip]: https://tools.ietf.org/html/rfc1952
+[brotli]: https://tools.ietf.org/html/rfc7932
+[zstd]: https://tools.ietf.org/html/rfc8478
+[accept-encoding]: https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Accept-Encoding
+[content-encoding]: https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Content-Encoding
+[transfer-encoding]: https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Transfer-Encoding
+
+---
+
+# Mint.HTTP
+
+Source: https://mint.hexdocs.pm/Mint.HTTP.md
+
+# `Mint.HTTP`
+[🔗](https://github.com/elixir-mint/mint/blob/v1.9.0/lib/mint/http.ex#L1)
+
+Process-less HTTP connection data structure and functions.
+
+Single interface for `Mint.HTTP1` and `Mint.HTTP2` with support for version
+negotiation and proxies.
+
+## Usage
+
+To establish a connection with a given server, use `connect/4`. This will
+return an opaque data structure that represents the connection
+to the server. To send a request, you can use `request/5`. Sending a request
+does not take care of the response to that request, instead we use `Mint.HTTP.stream/2`
+to process the response, which we will look at in just a bit. The connection is a
+wrapper around a TCP (`:gen_tcp` module) or SSL (`:ssl` module) socket that is
+set in **active mode** (with `active: :once`). This means that TCP/SSL messages
+will be delivered to the process that started the connection.
+
+The process that owns the connection is responsible for receiving the messages
+(for example, a GenServer is responsible for defining `handle_info/2`). However,
+`Mint.HTTP` makes it easy to identify TCP/SSL messages that are coming from the
+connection with the server with the `stream/2` function. This function takes the
+connection and a term and returns `:unknown` if the term is not a TCP/SSL message
+belonging to the connection. If the term *is* a message for the connection, then
+a response and a new connection are returned. It's important to store the new
+returned connection data structure over the old one since the connection is an
+immutable data structure.
+
+Let's see an example of a common workflow of connecting to a server, sending a
+request, and processing the response. We start by using `connect/3` to connect
+to a server.
+
+    {:ok, conn} = Mint.HTTP.connect(:http, "httpbin.org", 80)
+
+`conn` is a data structure that represents the connection.
+
+To send a request, we use `request/5`.
+
+    {:ok, conn, request_ref} = Mint.HTTP.request(conn, "GET", "/", [], nil)
+
+As you can see, sending a request returns a new updated `conn` struct and a
+`request_ref`. The updated connection struct is returned because the connection
+is an immutable structure keeping the connection state, so every action we do on it must return a new,
+possibly updated, connection that we're responsible for storing over the old
+one. `request_ref` is a unique reference that can be used to identify which
+request a given response belongs to.
+
+Now that we sent our request, we're responsible for receiving the messages that
+the TCP/SSL socket will send to our process. For example, in a GenServer
+we would do that with a `handle_info/2` callback. In our case, we're going to
+use a simple `receive`. `Mint.HTTP` provides a way to tell if a message comes
+from the socket wrapped by our connection or not: the `stream/2` function. If
+the message we pass to it is not destined for our connection, this function returns
+`:unknown`. Otherwise, it returns an updated connection and one or more responses.
+
+    receive do
+      message ->
+        case Mint.HTTP.stream(conn, message) do
+          :unknown -> handle_normal_message(message)
+          {:ok, conn, responses} -> handle_responses(conn, responses)
+        end
+    end
+
+`responses` is a list of possible responses. The most common responses are:
+
+  * `{:status, request_ref, status_code}` for the status code
+  * `{:headers, request_ref, headers}` for the response headers
+  * `{:data, request_ref, binary}` for pieces of the response body
+  * `{:done, request_ref}` for the end of the response
+
+As you can see, all responses have the unique request reference as the second
+element of the tuple, so that we know which request the response belongs to.
+See `t:Mint.Types.response/0` for the full list of responses returned by `Mint.HTTP.stream/2`.
+
+## Architecture
+
+A processless architecture like the one here requires a few modifications to how
+we use this HTTP client. Usually, you will want to create this data structure
+in a process that acts as *connection manager*. Sometimes, you might want to
+have a single process responsible for multiple connections, either to just one
+host or multiple hosts. For more discussion on architectures based off of this
+HTTP client, see the [*Architecture*](architecture.html) page in the docs.
+
+## SSL certificates
+
+When using SSL, you can pass in your own CA certificate store or use one provided by Mint. Mint
+doesn't ship with the certificate store itself, but it has an optional dependency on
+[CAStore](https://github.com/elixir-mint/castore), which provides an up-to-date certificate store. If
+you don't want to use your own certificate store, just add `:castore` to your dependencies.
+
+Starting [from OTP
+25](https://www.erlang.org/blog/my-otp-25-highlights/#ca-certificates-can-be-fetched-from-the-os-standard-place),
+you can also load certificates from a file
+([`:public_key.cacerts_load/1`](https://www.erlang.org/doc/man/public_key.html#cacerts_load-1)).
+You can also get certificate from the OS trust store using
+[`:public_key.cacerts_get/0`](https://www.erlang.org/doc/man/public_key.html#cacerts_get-0).
+If you are using OTP 25+ it is recommended to set this option.
+
+    Mint.HTTP.connect(:https, host, port, transport_opts: [cacerts: :public_key.cacerts_get()])
+
+## Mode
+
+By default Mint operates in **active mode** meaning that the process that started the
+connection receives socket messages. Mint also supports **passive mode**, where no messages
+are sent to the process and the process needs to fetch data out of the socket manually.
+The mode can be controlled at connection time through the `:mode` option in `connect/4`
+or changed dynamically through `set_mode/2`. Passive mode is generally only recommended
+for special use cases.
+
+## Logging
+
+Mint uses the `Logger` module to log information about the connection. Most logs are
+emitted *since version 1.5.0*. The logs are not emitted by default, since we consider
+Mint to be too low level. However, you can enable logging by passing `log: true` to
+`connect/4`.
+
+> #### Changes to the Format of Logs {: .warning}
+>
+> The format of logs emitted by Mint might change without notice between any versions,
+> without it being considered a breaking change. You are only meant to control what
+> gets logged by using the `Logger` API and Erlang's `:logger` module.
+
+# `t`
+
+```elixir
+@type t() :: Mint.HTTP1.t() | Mint.HTTP2.t() | Mint.UnsafeProxy.t()
+```
+
+# `close`
+
+```elixir
+@spec close(t()) :: {:ok, t()}
+```
+
+Closes the given connection.
+
+This function closes the socket wrapped by the given connection. Once the socket
+is closed, the connection goes into the "closed" state and `open?/1` returns `false`.
+You can throw away a closed connection.
+
+Closing a connection does not guarantee that data that is in flight gets delivered
+to the server.
+
+Always returns `{:ok, conn}` where `conn` is the updated connection.
+
+## Examples
+
+    {:ok, conn} = Mint.HTTP.close(conn)
+
+# `connect`
+
+```elixir
+@spec connect(
+  Mint.Types.scheme(),
+  Mint.Types.address(),
+  :inet.port_number(),
+  keyword()
+) ::
+  {:ok, t()} | {:error, Mint.Types.error()}
+```
+
+Creates a new connection to a given server.
+
+Creates a new connection struct and establishes the connection to the given server,
+identified by the given `host` and `port` combination. Both HTTP and HTTPS are supported
+by passing respectively `:http` and `:https` as the `scheme`.
+
+The connection struct wraps a socket, which is created once the connection
+is established inside this function. If HTTP is used, then the created socket is a TCP
+socket and the `:gen_tcp` module is used to create that socket. If HTTPS is used, then
+the created socket is an SSL socket and the `:ssl` module is used to create that socket.
+The socket is created in active mode (with `active: :once`), which is why it is important
+to know the type of the socket: messages from the socket will be delivered directly to the
+process that creates the connection and tagged appropriately by the socket module (see the
+`:gen_tcp` and `:ssl` modules). See `stream/2` for more information on the messages and
+how to process them and on the socket mode.
+
+## Options
+
+  * `:hostname` - (string) explicitly provide the hostname used for the `Host` header,
+    hostname verification, SNI, and so on. **Required when `address` is not a string.**
+
+  * `:transport_opts` - (keyword) options to be given to the transport being used.
+    These options will be merged with some default options that cannot be overridden.
+    For more details, refer to the "Transport options" section below.
+
+  * `:mode` - (`:active` or `:passive`) whether to set the socket to active or
+    passive mode. See the "Mode" section in the module documentation and `set_mode/2`.
+
+  * `:protocols` - (list of atoms) a list of protocols to try when connecting to the
+    server. The possible values in the list are `:http1` for HTTP/1 and HTTP/1.1 and
+    `:http2` for HTTP/2. If only one protocol is present in the list, then the connection
+    will be forced to use that protocol. If both `:http1` and `:http2` are present in the
+    list, then Mint will negotiate the protocol. See the section "Protocol negotiation"
+    below for more information. Defaults to `[:http1, :http2]`.
+
+  * `:proxy_headers` - a list of headers (`t:Mint.Types.headers/0`) to pass when using
+    a proxy. They will be used for the `CONNECT` request in tunnel proxies or merged
+    with every request for forward proxies.
+
+  * `:log` - (boolean) whether this connection logs or not. See the ["Logging"
+    section](#module-logging) in the module documentation. Defaults to `false`.
+    *Available since v1.5.0*.
+
+The following options are HTTP/1-specific and will force the connection
+to be an HTTP/1 connection.
+
+  * `:proxy` - a `{scheme, address, port, opts}` tuple that identifies a proxy to
+    connect to. See the "Proxying" section below for more information.
+
+The following options are HTTP/2-specific and will only be used on HTTP/2 connections.
+
+  * `:client_settings` - (keyword) a list of client HTTP/2 settings to send to the
+    server. See `Mint.HTTP2.put_settings/2` for more information. This is only used
+    in HTTP/2 connections.
+
+  * `:connection_window_size` - (integer) the initial size of the connection-level
+    HTTP/2 receive window, in bytes. Sent to the server as a `WINDOW_UPDATE` frame
+    on stream 0 as part of the connection preface. Defaults to 16 MB. Can be
+    raised later with `Mint.HTTP2.set_window_size/3`. *Available since v1.8.0*.
+
+  * `:receive_window_update_threshold` - (integer) the minimum number of bytes of receive
+    window that must remain on a connection or stream before a `WINDOW_UPDATE`
+    frame is sent to refill it. Lower values send more frequent, smaller updates;
+    higher values batch updates into fewer, larger ones. Defaults to 160_000
+    (approximately 10× the default max frame size). The same threshold applies
+    to both the connection and per-stream windows; when a window's peak size is
+    at or below the threshold, the client refills after every DATA frame on
+    that window. *Available since v1.8.0*.
+
+There may be further protocol specific options that only take effect when the corresponding
+connection is established. Check `Mint.HTTP1.connect/4` and `Mint.HTTP2.connect/4` for
+details.
+
+## Protocol negotiation
+
+If both `:http1` and `:http2` are present in the list passed in the `:protocols` option,
+the protocol negotiation happens in the following way:
+
+  * If the scheme used to connect to the server is `:http`, then HTTP/1 or HTTP/1.1 is used.
+
+  * If the scheme is `:https`, then ALPN negotiation is used to determine the right
+    protocol. This means that the server will decide whether to use HTTP/1 or
+    HTTP/2. If the server doesn't support protocol negotiation, we will fall back to
+    HTTP/1. If the server negotiates a protocol that we don't know how to handle,
+    `{:error, {:bad_alpn_protocol, protocol}}` is returned.
+
+## Proxying
+
+You can set up proxying through the `:proxy` option, which is a tuple
+`{scheme, address, port, opts}` that identifies the proxy to connect to.
+Once a proxied connection is returned, the proxy is transparent to you and you
+can use the connection like a normal HTTP/1 connection.
+
+If the `scheme` is `:http`, we will connect to the host in the most compatible
+way, supporting older proxy servers. Data will be sent in clear text.
+
+If the connection scheme is `:https`, we will connect to the host with a tunnel
+through the proxy. Using `:https` for both the proxy and the connection scheme
+is not supported, it is recommended to use `:https` for the end host connection
+instead of the proxy.
+
+## Transport options
+
+The options specified in `:transport_opts` are passed to the module that
+implements the socket interface: `:gen_tcp` when the scheme is `:http`, and
+`:ssl` when the scheme is `:https`. Please refer to the documentation for those
+modules, as well as for `:inet.setopts/2`, for a detailed description of all
+available options.
+
+The behaviour of some options is modified by Mint, as described below.
+
+A special case is the `:timeout` option, which is passed to the transport
+module's `connect` function to limit the amount of time to wait for the
+network connection to be established.
+
+Common options for `:http` and `:https`:
+
+  * `:active` - controlled by the `:mode` option. Cannot be overridden.
+
+  * `:mode` - set to `:binary`. Cannot be overridden.
+
+  * `:packet` - set to `:raw`. Cannot be overridden.
+
+  * `:timeout` - connect timeout in milliseconds. Defaults to `30_000` (30
+    seconds), and may be overridden by the caller. Set to `:infinity` to
+    disable the connect timeout.
+
+  * `:inet6` - if set to `true` enables IPv6 connection. Defaults to `false`
+    and may be overridden by the caller.
+
+  * `:inet4` - if set to `true` falls back to IPv4 if IPv6 connection fails.
+    Defaults to `true` and may be overridden by the caller. *Available since
+    v1.6.0*.
+
+Options for `:https` only:
+
+  * `:alpn_advertised_protocols` - managed by Mint. Cannot be overridden.
+
+  * `:cacerts` - certificates of types `:ssl.client_cacerts()`.
+    If `:verify` is set to `:verify_peer` (the default) and
+    no CA trust store is specified using the `:cacertfile` or `:cacerts`
+    option, Mint will attempt to use the trust store from the
+    [CAStore](https://github.com/elixir-mint/castore) package or raise an
+    exception if this package is not available. It is recommended to set this
+    option to `:public_key.cacerts_get()`.
+
+  * `:cacertfile` - path to a file containing PEM-encoded CA certificates.
+    See the `:cacerts` option for the defaults to this value.
+
+  * `:ciphers` - defaults to the lists returned by
+    `:ssl.filter_cipher_suites(:ssl.cipher_suites(:all, version), [])`
+    where `version` is each value in the `:versions` setting. This list is
+    then filtered according to the blocklist in
+    [RFC7540 appendix A](https://tools.ietf.org/html/rfc7540#appendix-A);
+    May be overridden by the caller. See the "Supporting older cipher suites"
+    section below for some examples.
+
+  * `:depth` - defaults to `4`. May be overridden by the caller.
+
+  * `:partial_chain` - unless a custom `:partial_chain` function is specified,
+    Mint will enable its own partial chain handler, which accepts server
+    certificate chains containing a certificate that was issued by a
+    CA certificate in the CA trust store, even if that certificate is not
+    last in the chain. This improves interoperability with some servers
+    (for example, with a cross-signed intermediate CA or some misconfigured servers),
+    but is a less strict interpretation of the TLS specification than the
+    Erlang/OTP default behaviour.
+
+  * `:reuse_sessions` - defaults to `true`. May be overridden by the caller. If
+    `:"tlsv1.3"` is the only TLS version specified, `:reuse_sessions` will be
+    removed from the options.
+
+  * `:secure_renegotiate` - defaults to `true`. May be overridden by the
+    caller. If `:"tlsv1.3"` is the only TLS version specified, `:secure_renegotiate`
+    will be removed from the options.
+
+  * `:server_name_indication` - defaults to specified destination hostname.
+    May be overridden by the caller.
+
+  * `:verify` - defaults to `:verify_peer`. May be overridden by the caller.
+
+  * `:verify_fun` - unless a custom `:verify_fun` is specified, or `:verify`
+    is set to `:verify_none`, Mint will enable hostname verification with
+    support for wildcards in the server's 'SubjectAltName' extension, similar
+    to the behaviour implemented in
+    `:public_key.pkix_verify_hostname_match_fun(:https)` in recent Erlang/OTP
+    releases. This improves compatibility with recently issued wildcard
+    certificates also on older Erlang/OTP releases.
+
+  * `:versions` - defaults to `[:"tlsv1.2"]` (TLS v1.2 only). May be
+    overridden by the caller.
+
+### Supporting older cipher suites
+
+By default only a small list of modern cipher suites is enabled, in compliance
+with the HTTP/2 specification. Some servers, in particular HTTP/1 servers, may
+not support any of these cipher suites, resulting in TLS handshake failures or
+closed connections.
+
+To select the default cipher suites of Erlang/OTP (including for example
+AES-CBC), use the following `:transport_opts`:
+
+    # Erlang/OTP 20.3 or later:
+    transport_opts: [ciphers: :ssl.cipher_suites(:default, :"tlsv1.2")]
+    # Older versions:
+    transport_opts: [ciphers: :ssl.cipher_suites()]
+
+Recent Erlang/OTP releases do not enable RSA key exchange by default, due to
+known weaknesses. If necessary, you can build a cipher list with RSA exchange
+and use it in `:transport_opts`:
+
+    ciphers =
+      :ssl.cipher_suites(:all, :"tlsv1.2")
+      |> :ssl.filter_cipher_suites(
+        key_exchange: &(&1 == :rsa),
+        cipher: &(&1 in [:aes_256_gcm, :aes_128_gcm, :aes_256_cbc, :aes_128_cbc])
+      )
+      |> :ssl.append_cipher_suites(:ssl.cipher_suites(:default, :"tlsv1.2"))
+
+## Examples
+
+    {:ok, conn} = Mint.HTTP.connect(:http, "httpbin.org", 80)
+
+Using a proxy:
+
+    proxy = {:http, "myproxy.example.com", 80, []}
+    {:ok, conn} = Mint.HTTP.connect(:https, "httpbin.org", 443, proxy: proxy)
+
+Forcing the connection to be an HTTP/2 connection:
+
+    {:ok, conn} = Mint.HTTP.connect(:https, "httpbin.org", 443, protocols: [:http2])
+
+Enable all default cipher suites of Erlang/OTP (release 20.3 or later):
+
+    opts = [transport_opts: [ciphers: :ssl.cipher_suites(:default, :"tlsv1.2")]]
+    {:ok, conn} = Mint.HTTP.connect(:https, "httpbin.org", 443, opts)
+
+# `controlling_process`
+
+```elixir
+@spec controlling_process(t(), pid()) :: {:ok, t()} | {:error, Mint.Types.error()}
+```
+
+Changes the *controlling process* of the given connection to `new_pid`.
+
+The **controlling process** is a concept that comes from the Erlang TCP and
+SSL implementations. The controlling process of a connection is the process
+that started the connection and that receives the messages for that connection.
+You can change the controlling process of a connection through this function.
+
+This function also takes care of "transferring" all the connection messages
+that are in the mailbox of the current controlling process to the new
+controlling process.
+
+Remember that the connection is a data structure, so if you
+change the controlling process it doesn't mean you "transferred" the
+connection data structure itself to the other process, which you have
+to do manually (for example by sending the connection data structure to the
+new controlling process). If you do that, be careful of race conditions
+and be sure to retrieve the connection in the new controlling process
+before accepting connection messages in the new controlling process.
+In fact, this function is guaranteed to return the connection unchanged,
+so you are free to ignore the connection entry returned in `{:ok, conn}`.
+
+## Examples
+
+    send(new_pid, {:conn, conn})
+    {:ok, conn} = Mint.HTTP.controlling_process(conn, new_pid)
+
+    # In the "new_pid" process
+    receive do
+      {:conn, conn} ->
+        # Will receive connection messages.
+    end
+
+# `delete_private`
+
+```elixir
+@spec delete_private(t(), atom()) :: t()
+```
+
+Deletes a value in the private store.
+
+Deletes the private value stored under `key` in the connection. Returns the
+updated connection.
+
+See also `put_private/3` and `get_private/3`.
+
+## Examples
+
+    conn = Mint.HTTP.put_private(conn, :client_name, "Mint")
+
+    Mint.HTTP.get_private(conn, :client_name)
+    #=> "Mint"
+
+    conn = Mint.HTTP.delete_private(conn, :client_name)
+    Mint.HTTP.get_private(conn, :client_name)
+    #=> nil
+
+# `get_private`
+
+```elixir
+@spec get_private(t(), atom(), term()) :: term()
+```
+
+Gets a private value from the connection.
+
+Retrieves a private value previously set with `put_private/3` from the connection.
+`key` is the key under which the value to retrieve is stored. `default` is a default
+value returned in case there's no value under the given key.
+
+See also `put_private/3` and `delete_private/2`.
+
+## Examples
+
+    conn = Mint.HTTP.put_private(conn, :client_name, "Mint")
+
+    Mint.HTTP.get_private(conn, :client_name)
+    #=> "Mint"
+
+    Mint.HTTP.get_private(conn, :non_existent)
+    #=> nil
+
+# `get_proxy_headers`
+*since 1.4.0* 
+
+```elixir
+@spec get_proxy_headers(t()) :: Mint.Types.headers()
+```
+
+Gets the proxy headers associated with the connection in the `CONNECT` method.
+
+When using tunnel proxy and HTTPs, the only way to exchange data with
+the proxy is through headers in the `CONNECT` method.
+
+# `get_socket`
+
+```elixir
+@spec get_socket(t()) :: Mint.Types.socket()
+```
+
+Gets the socket associated with the connection.
+
+Do not use the returned socket to change its internal state. Only read information from the socket.
+For instance, use `:ssl.connection_information/2` to retrieve TLS-specific information from the
+socket.
+
+# `is_connection_message`
+*since 1.1.0* *macro* 
+
+Macro to check that a given received `message` is intended for the given connection `conn`.
+
+This guard is useful in `receive` loops or in callbacks that handle generic messages (such as a
+`c:GenServer.handle_info/2` callback) so that you don't have to hand the `message` to
+`Mint.HTTP.stream/2` and check for the `:unknown` return value.
+
+This macro can be used in guards.
+
+**Note**: this macro is only available if you compile Mint with Elixir 1.10.0 or greater (and
+OTP 21+, which is required by Elixir 1.10.0 and on).
+
+## Examples
+
+    require Mint.HTTP
+
+    {:ok, conn, request_ref} = Mint.HTTP.request(conn, "POST", "/", headers, "")
+
+    receive do
+      message when Mint.HTTP.is_connection_message(conn, message) ->
+        Mint.HTTP.stream(conn, message)
+
+      other ->
+        # This message is related to something else or to some other connection
+    end
+
+# `open?`
+
+```elixir
+@spec open?(t(), :read | :write) :: boolean()
+```
+
+Checks whether the connection is open.
+
+This function returns `true` if the connection is open for the given `type`,
+`false` otherwise. It should be used to check that a connection is open before
+sending requests or performing operations that involve talking to the server.
+
+The `type` argument can be used to tell whether the connection is open for both reading
+and writing, only open for reading, or closed for both. In HTTP/1, a connection is always
+either open, or closed (for both reading and writing). In HTTP/2, the connection can be closed only
+for writing but not for reading, meaning that you cannot send any more data to the
+server but you can still receive data from the server. In this case, `Mint.HTTP.open?(conn, :read)`
+would return `true` but `Mint.HTTP.open?(conn, :write)` would return `false`.
+See the "Closed connection" section in the module documentation of `Mint.HTTP2`.
+
+If a connection is *completely closed* (that is, `Mint.HTTP.open?(conn, :read)` returns `false`),
+it has become useless and you should get rid of it. If you still need a connection
+to the server, start a new connection with `connect/4`.
+
+> #### The default value of `type` is `:write` {: .warning}
+>
+> With the default value of `type` being `:write`, a call to
+> `Mint.HTTP.open?(conn)` will return `false` if `conn` was closed for writing
+> but is still open for reading. If you need to make sure the connection is
+> completely closed, check that `Mint.HTTP.open?(conn, :read)` returns `false`.
+
+## Examples
+
+    {:ok, conn} = Mint.HTTP.connect(:http, "httpbin.org", 80)
+    Mint.HTTP.open?(conn)
+    #=> true
+
+# `open_request_count`
+
+```elixir
+@spec open_request_count(t()) :: non_neg_integer()
+```
+
+Returns the number of open requests.
+
+Open requests are requests that have not yet received a `:done` response.
+This function returns the number of open requests for both HTTP/1 and HTTP/2,
+but for HTTP/2 only client-initiated requests are considered as open requests.
+See `Mint.HTTP2.open_request_count/1` for more information.
+
+## Examples
+
+    {:ok, conn, _ref} = Mint.HTTP.request(conn, "GET", "/", [])
+    Mint.HTTP.open_request_count(conn)
+    #=> 1
+
+# `protocol`
+*since 1.4.0* 
+
+```elixir
+@spec protocol(t()) :: :http1 | :http2
+```
+
+Returns the protocol used by the current connection.
+
+## Examples
+
+    iex> Mint.HTTP.protocol(%Mint.HTTP1{})
+    :http1
+
+    iex> Mint.HTTP.protocol(%Mint.HTTP2{})
+    :http2
+
+# `put_log`
+*since 1.5.0* 
+
+```elixir
+@spec put_log(t(), boolean()) :: t()
+```
+
+Sets whether the connection should log information or not.
+
+See the ["Logging" section](#module-logging) in the module documentation for more information.
+
+# `put_private`
+
+```elixir
+@spec put_private(t(), atom(), term()) :: t()
+```
+
+Assigns a new private key and value in the connection.
+
+This storage is meant to be used to associate metadata with the connection and
+it can be useful when handling multiple connections.
+
+The given `key` must be an atom, while the given `value` can be an arbitrary
+term. The return value of this function is an updated connection.
+
+See also `get_private/3` and `delete_private/2`.
+
+## Examples
+
+Let's see an example of putting a value and then getting it:
+
+    conn = Mint.HTTP.put_private(conn, :client_name, "Mint")
+    Mint.HTTP.get_private(conn, :client_name)
+    #=> "Mint"
+
+# `recv`
+
+```elixir
+@spec recv(t(), non_neg_integer(), timeout()) ::
+  {:ok, t(), [Mint.Types.response()]}
+  | {:error, t(), Mint.Types.error(), [Mint.Types.response()]}
+```
+
+Receives data from the socket in a blocking way.
+
+By default Mint operates in active mode, meaning that messages are delivered
+to the process that started the connection. However, Mint also supports passive
+mode (see the "Mode" section in the module documentation).
+
+In passive mode, you'll need to manually get bytes out of the socket. You can
+do that with this function.
+
+`byte_count` is the number of bytes you want out of the socket. If `byte_count`
+is `0`, all available bytes will be returned.
+
+`timeout` is the maximum time to wait before returning an error.
+
+This function will raise an error if the socket is in active mode.
+
+> #### Hanging Waiting for Bytes {: .warning}
+>
+> If `byte_count` is greater than `0` and the socket doesn't receive
+> *at least* `byte_count` bytes withing the `timeout`, then the function
+> will block for the duration of `timeout` and then return a timeout error.
+> This behavior is the same as the `recv` function in [`:gen_tcp`](`:gen_tcp`)
+> and [`:ssl`](`:ssl`).
+
+## Examples
+
+    {:ok, conn, responses} = Mint.HTTP.recv(conn, 0, 5000)
+
+# `request`
+
+```elixir
+@spec request(
+  t(),
+  method :: String.t(),
+  path :: String.t(),
+  Mint.Types.headers(),
+  body :: iodata() | nil | :stream
+) :: {:ok, t(), Mint.Types.request_ref()} | {:error, t(), Mint.Types.error()}
+```
+
+Sends a request to the connected server.
+
+This function sends a new request to the server that `conn` is connected to.
+`method` is a string representing the method for the request, such as `"GET"`
+or `"POST"`. `path` is the path on the host to send the request to. `headers`
+is a list of request headers in the form `{header_name, header_value}` with
+`header_name` and `header_value` being strings. `body` can have one of three
+values:
+
+  * `nil` - no body is sent with the request.
+
+  * iodata - the body to send for the request.
+
+  * `:stream` - when the value of the body is `:stream` the request
+    body can be streamed on the connection. See `stream_request_body/3`.
+    In HTTP/1, you can't open a request if the body of another request is
+    streaming.
+
+If the request is sent correctly, this function returns `{:ok, conn, request_ref}`.
+`conn` is an updated connection that should be stored over the old connection.
+`request_ref` is a unique reference that can be used to match on responses for this
+request that are returned by `stream/2`. See `stream/2` for more information.
+
+If there's an error with sending the request, `{:error, conn, reason}` is returned.
+`reason` is the cause of the error. `conn` is an updated connection. It's important
+to store the returned connection over the old connection in case of errors too, because
+the state of the connection might change when there are errors as well. An error when
+sending a request **does not** necessarily mean that the connection is closed. Use
+`open?/1` to verify that the connection is open.
+
+Requests can be pipelined so the full response does not have to received
+before the next request can be sent. It is up to users to verify that the
+server supports pipelining and that the request is safe to pipeline.
+
+In HTTP/1, you can't open a request if the body of another request is streaming.
+See `Mint.HTTP1.request/5` for more information.
+
+For a quick discussion on HTTP/2 streams and requests, see the `Mint.HTTP2` module and
+`Mint.HTTP2.request/5`.
+
+## The `content-length` header
+
+If you don't set the `content-length` header and you send a body with the request (that
+is, not `nil` and not `:stream`), then Mint will add a default `content-length` header
+to your request. If you're using HTTP/2 and streaming the request, you may provide the
+`content-length` header yourself. If you're using HTTP/1, Mint will do chunked
+transfer-encoding when a content-length is not provided (see `Mint.HTTP1.request/5`).
+
+## Examples
+
+    Mint.HTTP.request(conn, "GET", "/", _headers = [], _body = nil)
+    Mint.HTTP.request(conn, "POST", "/path", [{"content-type", "application/json"}], "{}")
+
+# `request_body_window`
+*since 1.8.0* 
+
+Returns the request body flow-control window for the streaming request
+identified by `request_ref`.
+
+The semantics differ by protocol:
+
+  * In HTTP/2, returns `min(connection_window, stream_window)` — the maximum
+    number of body bytes that can be sent right now without violating flow
+    control. Exceeding this value in a single `DATA` frame would close the
+    connection with a `FLOW_CONTROL_ERROR`. See `Mint.HTTP2.get_window_size/2`
+    for the underlying primitives.
+
+  * In HTTP/1, returns `:infinity`. HTTP/1 has no application-level
+    flow-control mechanism: any amount of body data is protocol-valid.
+
+The value returned reflects only the protocol-level flow-control
+constraint. It does not account for the operating-system socket send
+buffer: under either protocol, `stream_request_body/3` can still block
+when that buffer fills up. To bound this behavior, configure
+`send_timeout` on the socket via `:transport_opts` when establishing the
+connection (see `Mint.HTTP.connect/4`).
+
+Raises `ArgumentError` if `request_ref` is not associated with an active
+streaming request.
+
+## Examples
+
+Streaming a binary body in chunks that respect the protocol window:
+
+    defp stream_body(conn, ref, "") do
+      Mint.HTTP.stream_request_body(conn, ref, :eof)
+    end
+
+    defp stream_body(conn, ref, body) do
+      conn
+      |> Mint.HTTP.request_body_window(ref)
+      |> send_body_chunk(conn, ref, body)
+    end
+
+    defp send_body_chunk(0, conn, ref, body) do
+      with {:ok, conn} <- wait(conn, ref) do
+        stream_body(conn, ref, body)
+      end
+    end
+
+    defp send_body_chunk(window, conn, ref, body) do
+      chunk_size = min(window, byte_size(body))
+      <<chunk::binary-size(chunk_size), rest::binary>> = body
+
+      with {:ok, conn} <- Mint.HTTP.stream_request_body(conn, ref, chunk) do
+        stream_body(conn, ref, rest)
+      end
+    end
+
+    defp wait(conn, ref) do
+      # Wait for the server to refill the request body window with a
+      # WINDOW_UPDATE frame. The concrete implementation depends on the
+      # socket mode and other context.
+    end
+
+Note that `min(:infinity, n) == n` thanks to Erlang term ordering, so the
+same loop works on HTTP/1 (each iteration sends the entire remaining body in
+a single chunk) and on HTTP/2 (each iteration sends at most the current
+flow-control window).
+
+# `set_mode`
+
+```elixir
+@spec set_mode(t(), :active | :passive) :: {:ok, t()} | {:error, Mint.Types.error()}
+```
+
+Changes the mode of the underlying socket.
+
+To use the connection in *active mode*, where the process that started the
+connection receives socket messages, set the mode to `:active` (see also `stream/2`).
+To use the connection in *passive mode*, where you need to manually receive data
+from the socket, set the mode to `:passive` (see also `recv/3`).
+
+The mode can also be controlled at connection time by the `:mode` option passed
+to `connect/4`.
+
+Note that if you're switching from active to passive mode, you still might have
+socket messages in the process mailbox that you need to consume before doing
+any other operation on the connection.
+
+See the "Mode" section in the module documentation for more information on modes.
+
+## Examples
+
+    {:ok, conn} = Mint.HTTP.set_mode(conn, :passive)
+
+# `stream`
+
+```elixir
+@spec stream(t(), term()) ::
+  {:ok, t(), [Mint.Types.response()]}
+  | {:error, t(), Mint.Types.error(), [Mint.Types.response()]}
+  | :unknown
+```
+
+Streams the next batch of responses from the given `message`.
+
+This function processes a "message" which can be any term, but should be
+a message received by the process that owns the connection. **Processing**
+a message means that this function will parse it and check if it's a message
+that is directed to this connection, that is, a TCP/SSL message received on the
+connection's socket. If it is, then this function will parse the message,
+turn it into a list of responses, and possibly take action given the responses.
+As an example of an action that this function could perform, if the server sends
+a ping request this function will transparently take care of pinging the server back.
+
+If there's no error, this function returns `{:ok, conn, responses}` where `conn` is
+the updated connection and `responses` is a list of responses. See the "Responses"
+section below. If there's an error, `{:error, conn, reason, responses}` is returned,
+where `conn` is the updated connection, `reason` is the error reason, and `responses`
+is a list of responses that were correctly parsed before the error.
+
+> #### Graceful Close {: .tip}
+>
+> If this function returns `{:ok, conn, responses}`, it doesn't *necessarily* mean
+> that the connection is still open. For example, TCP/SSL **close** messages are treated
+> as errors only if there are in-flight requests. If there are no in-flight requests,
+> the connection is closed gracefully and `{:ok, conn, responses}` is returned.
+> Always check with `open?/1` to see if the connection is still open.
+
+If the given `message` is not from the connection's socket,
+this function returns `:unknown`.
+
+> #### Receiving Multiple Messages {: .warning}
+>
+> Your connection and the HTTP server can exchange multiple **protocol-specific messages**
+> on the socket that don't necessarily *produce responses*. For example, the HTTP server
+> might tell the connection to update some internal settings. For this reason, you
+> should always receive as many messages coming to your process as possible, for example
+> by using `receive` recursively. You can see an example of this approach in the
+> ["Usage Examples" documentation](architecture.html#usage-examples).
+
+## Socket mode
+
+Mint sets the socket in `active: :once` mode. This means that a single socket
+message at a time is delivered to the process that owns the connection. After
+a message is delivered, then no other messages are delivered (we say the socket
+goes in *passive* mode). When `stream/2` is called to process the message that
+was received, Mint sets the socket back to `active: :once`. This is good to know
+in order to understand how the socket is handled by Mint, but in normal usage
+it just means that you will process one message at a time with `stream/2` and not
+pay too much attention to the socket mode.
+
+Mint also supports passive mode to avoid receiving messages. See the "Mode" section
+in the module documentation.
+
+## Responses
+
+Each possible response returned by this function is a tuple with two or more elements.
+The first element is always an atom that identifies the kind of response. The second
+element is a unique reference `t:Mint.Types.request_ref/0` that identifies the request
+that the response belongs to. This is the term returned by `request/5`. After these
+two elements, there can be response-specific terms as well, documented below.
+
+These are the possible responses that can be returned.
+
+  * `{:status, request_ref, status_code}` - returned when the server replied
+    with a response status code. The status code is a non-negative integer.
+    You can have zero or more `1xx` `:status` and `:headers` responses for a
+    single request, but they all precede a single non-`1xx` `:status` response.
+
+  * `{:status_reason, request_ref, reason_phrase}` - returned when the server replied
+    with a response status code and a reason-phrase. The reason-phrase is a string.
+    Returned when the `:optional_responses` option is passed to `connect/4`, with
+    `:status_reason` in the list. See `Mint.HTTP1.connect/4` for more information.
+    This is only available for HTTP/1.1 connections. *Available since v1.8.0*.
+
+  * `{:headers, request_ref, headers}` - returned when the server replied
+    with a list of headers. Headers are in the form `{header_name, header_value}`
+    with `header_name` and `header_value` being strings. A single `:headers` response
+    will come after the `:status` response. A single `:headers` response may come
+    after all the `:data` responses if **trailer headers** are present.
+
+  * `{:data, request_ref, binary}` - returned when the server replied with
+    a chunk of response body (as a binary). The request shouldn't be considered done
+    when a piece of body is received because multiple chunks could be received. The
+    request is done when the `:done` response is returned.
+
+  * `{:done, request_ref}` - returned when the server signaled the request
+    as done. When this is received, the response body and headers can be considered
+    complete and it can be assumed that no more responses will be received for this
+    request. This means that for example, you can stop holding on to the request ref
+    for this request.
+
+  * `{:error, request_ref, reason}` - returned when there is an error that
+    only affects the request and not the whole connection. For example, if the
+    server sends bad data on a given request, that request will be closed and an error
+    for that request will be returned among the responses, but the connection will
+    remain alive and well.
+
+  * `{:pong, request_ref}` - returned when a server replies to a ping
+    request sent by the client. This response type is HTTP/2-specific
+    and will never be returned by an HTTP/1 connection. See `Mint.HTTP2.ping/2`
+    for more information.
+
+  * `{:push_promise, request_ref, promised_request_ref, headers}` - returned when
+    the server sends a server push to the client. This response type is HTTP/2 specific
+    and will never be returned by an HTTP/1 connection. See `Mint.HTTP2` for more
+    information on server pushes.
+
+## Examples
+
+Let's assume we have a function called `receive_next_and_stream/1` that takes
+a connection and then receives the next message, calls `stream/2` with that message
+as an argument, and then returns the result of `stream/2`:
+
+    defp receive_next_and_stream(conn) do
+      receive do
+        message -> Mint.HTTP.stream(conn, message)
+      end
+    end
+
+Now, we can see an example of a workflow involving `stream/2`.
+
+    {:ok, conn, request_ref} = Mint.HTTP.request(conn, "GET", "/", _headers = [])
+
+    {:ok, conn, responses} = receive_next_and_stream(conn)
+    responses
+    #=> [{:status, ^request_ref, 200}]
+
+    {:ok, conn, responses} = receive_next_and_stream(conn)
+    responses
+    #=> [{:headers, ^request_ref, [{"Content-Type", "application/json"}]},
+    #=>  {:data, ^request_ref, "{"}]
+
+    {:ok, conn, responses} = receive_next_and_stream(conn)
+    responses
+    #=> [{:data, ^request_ref, "}"}, {:done, ^request_ref}]
+
+# `stream_request_body`
+
+```elixir
+@spec stream_request_body(
+  t(),
+  Mint.Types.request_ref(),
+  iodata() | :eof | {:eof, trailer_headers :: Mint.Types.headers()}
+) :: {:ok, t()} | {:error, t(), Mint.Types.error()}
+```
+
+Streams a chunk of the request body on the connection or signals the end of the body.
+
+If a request is opened (through `request/5`) with the body as `:stream`, then the
+body can be streamed through this function. The function takes a `conn`, a
+`request_ref` returned by `request/5` to identify the request to stream the body for,
+and a chunk of body to stream. The value of chunk can be:
+
+  * iodata - a chunk of iodata is transmitted to the server as part of the body
+    of the request. If the chunk is empty, in HTTP/1 it's a no-op, while in HTTP/2
+    a `DATA` frame will be sent.
+
+  * `:eof` - signals the end of the streaming of the request body for the given
+    request. Usually the server won't send any reply until this is sent.
+
+  * `{:eof, trailer_headers}` - sends **trailer headers** and signals the end
+    of the streaming of the request body for the given request. This behaves the
+    same way as `:eof` but first sends the trailer headers. See the
+    [*Trailer headers*](#module-trailer-headers) section below.
+
+This function always returns an updated connection to be stored over the old connection.
+
+When streaming a body of arbitrary size, use `request_body_window/2` to learn
+how many bytes you can send right now without violating HTTP/2 flow control,
+then split your body accordingly before passing each chunk to this function.
+
+For information about transfer encoding and content length in HTTP/1, see
+`Mint.HTTP1.stream_request_body/3`.
+
+## Trailer headers
+
+HTTP trailer headers can be sent after the body of a request. trailer headers are described
+[in RFC 9110](https://www.rfc-editor.org/rfc/rfc9110#section-6.5).
+
+The behaviour is slightly different for HTTP/1 and HTTP/2:
+
+  * In HTTP/1, trailer headers are only supported if the transfer encoding is set to
+    `chunked`. See `Mint.HTTP1.stream_request_body/3` for more information on chunked
+    transfer encoding.
+
+  * In HTTP/2, trailer headers behave like normal headers. You don't need to care
+    about the transfer encoding.
+
+### The `trailer` header
+
+As specified in [section 4.4 of RFC 7230](https://tools.ietf.org/html/rfc7230#section-4.4),
+in HTTP/1 you need to specify which headers you're going to send as traoler
+headers using the `trailer` header. The `trailer` header applies to both HTTP/1
+and HTTP/2. See the examples below for more information.
+
+### The `te` header
+
+As specified in  [section 4.3 of RFC 7230](https://tools.ietf.org/html/rfc7230#section-4.3),
+the `te` (or `TE`) header is used to specify which transfer-encodings the client
+is willing to accept (besides `chunked`). Mint supports decoding of trailer headers,
+but if you want to notify the server that you are accepting trailer headers,
+use the `trailers` value in the `te` header. For example:
+
+    Mint.HTTP.request(conn, "GET", "/", [{"te", "trailers"}], "some body")
+
+Note that the `te` header can also be used to communicate which encodings you
+support to the server.
+
+## Examples
+
+Let's see an example of streaming an empty JSON object (`{}`) by streaming one curly
+brace at a time.
+
+    headers = [{"content-type", "application/json"}, {"content-length", "2"}]
+    {:ok, conn, request_ref} = Mint.HTTP.request(conn, "POST", "/", headers, :stream)
+    {:ok, conn} = Mint.HTTP.stream_request_body(conn, request_ref, "{")
+    {:ok, conn} = Mint.HTTP.stream_request_body(conn, request_ref, "}")
+    {:ok, conn} = Mint.HTTP.stream_request_body(conn, request_ref, :eof)
+
+Here's an example of sending trailer headers:
+
+    headers = [{"content-type", "application/json"}, {"trailer", "my-trailer, x-expires"}]
+    {:ok, conn, request_ref} = Mint.HTTP.request(conn, "POST", "/", headers, :stream)
+
+    {:ok, conn} = Mint.HTTP.stream_request_body(conn, request_ref, "{}")
+
+    trailer_headers = [{"my-trailer", "xxx"}, {"x-expires", "10 days"}]
+    {:ok, conn} = Mint.HTTP.stream_request_body(conn, request_ref, {:eof, trailer_headers})
+
+---
+
+*Consult [api-reference.md](api-reference.md) for complete listing*
+
+---
+
+# Mint.HTTP1
+
+Source: https://mint.hexdocs.pm/Mint.HTTP1.md
+
+# `Mint.HTTP1`
+[🔗](https://github.com/elixir-mint/mint/blob/v1.9.0/lib/mint/http1.ex#L1)
+
+Process-less HTTP/1.1 client connection.
+
+This module provides a data structure that represents an HTTP/1 or HTTP/1.1 connection to
+a given server. The connection is represented as an opaque struct `%Mint.HTTP1{}`.
+The connection is a data structure and is not backed by a process, and all the
+connection handling happens in the process that creates the struct.
+
+This module and data structure work exactly like the ones described in the `Mint`
+module, with the exception that `Mint.HTTP1` specifically deals with HTTP/1 and HTTP/1.1 while
+`Mint` deals seamlessly with HTTP/1, HTTP/1.1, and HTTP/2. For more information on
+how to use the data structure and client architecture, see `Mint`.
+
+# `error_reason`
+
+```elixir
+@type error_reason() :: term()
+```
+
+An HTTP/1-specific error reason.
+
+The values can be:
+
+  * `:closed` - when you try to make a request or stream a body chunk but the connection
+    is closed.
+
+  * `:request_body_is_streaming` - when you call `request/5` to send a new
+    request but another request is already streaming.
+
+  * `{:unexpected_data, data}` - when unexpected data is received from the server.
+
+  * `:invalid_status_line` - when the HTTP/1 status line is invalid.
+
+  * `{:invalid_request_target, target}` - when the request target is invalid.
+
+  * `{:invalid_request_method, method}` - when the request method is invalid.
+
+  * `:invalid_header` - when headers can't be parsed correctly.
+
+  * `{:invalid_header_name, name}` - when a header name is invalid.
+
+  * `{:invalid_header_value, name, value}` - when a header value is invalid. `name`
+    is the name of the header and `value` is the invalid value.
+
+  * `:invalid_chunk_size` - when the chunk size is invalid.
+
+  * `:missing_crlf_after_chunk` - when the CRLF after a chunk is missing.
+
+  * `:invalid_trailer_header` - when trailer headers can't be parsed.
+
+  * `:more_than_one_content_length_header` - when more than one `content-length`
+    headers are in the response.
+
+  * `:transfer_encoding_and_content_length` - when both the `content-length` as well
+    as the `transfer-encoding` headers are in the response.
+
+  * `{:invalid_content_length_header, value}` - when the value of the `content-length`
+    header is invalid, that is, is not an non-negative integer.
+
+  * `:empty_token_list` - when a header that is supposed to contain a list of tokens
+    (such as the `connection` header) doesn't contain any.
+
+  * `{:invalid_token_list, string}` - when a header that is supposed to contain a list
+    of tokens (such as the `connection` header) contains a malformed list of tokens.
+
+  * `:trailing_headers_but_not_chunked_encoding` - when you try to send trailer
+    headers through `stream_request_body/3` but the transfer encoding of the request
+    was not `chunked`.
+
+# `t`
+
+```elixir
+@opaque t()
+```
+
+A Mint HTTP/1 connection struct.
+
+The struct's fields are private.
+
+# `close`
+
+```elixir
+@spec close(t()) :: {:ok, t()}
+```
+
+See `Mint.HTTP.close/1`.
+
+# `connect`
+
+```elixir
+@spec connect(
+  Mint.Types.scheme(),
+  Mint.Types.address(),
+  :inet.port_number(),
+  keyword()
+) ::
+  {:ok, t()} | {:error, Mint.Types.error()}
+```
+
+Same as `Mint.HTTP.connect/4`, but forces an HTTP/1 or HTTP/1.1 connection.
+
+This function doesn't support proxying.
+
+## Additional Options
+
+  * `:case_sensitive_headers` - (boolean) if set to `true` the case of the supplied
+     headers in requests will be preserved. The default is to lowercase the headers
+     because HTTP/1.1 header names are case-insensitive. *Available since v1.6.0*.
+  * `:skip_target_validation` - (boolean) if set to `true` the target of a request
+     will not be validated. You might want this if you deal with non standard-
+     conforming URIs but need to preserve them. The default is to validate the request
+     target. *Available since v1.7.0*.
+  * `:optional_responses` - (list of atoms) a list of optional responses to return.
+    Defaults to `[]`. The allowed values in the list are:
+     * `:status_reason`: includes the
+        [reason-phrase](https://datatracker.ietf.org/doc/html/rfc9112#name-status-line)
+        for the status code if it is returned by the server in the status-line.
+        This is only available for HTTP/1.1 connections. *Available since v1.8.0*.
+
+# `controlling_process`
+
+```elixir
+@spec controlling_process(t(), pid()) :: {:ok, t()} | {:error, Mint.Types.error()}
+```
+
+See `Mint.HTTP.controlling_process/2`.
+
+# `delete_private`
+
+```elixir
+@spec delete_private(t(), atom()) :: t()
+```
+
+See `Mint.HTTP.delete_private/2`.
+
+# `get_private`
+
+```elixir
+@spec get_private(t(), atom(), term()) :: term()
+```
+
+See `Mint.HTTP.get_private/3`.
+
+# `get_proxy_headers`
+*since 1.4.0* 
+
+```elixir
+@spec get_proxy_headers(t()) :: Mint.Types.headers()
+```
+
+See `Mint.HTTP.get_proxy_headers/1`.
+
+# `get_socket`
+
+```elixir
+@spec get_socket(t()) :: Mint.Types.socket()
+```
+
+See `Mint.HTTP.get_socket/1`.
+
+# `open?`
+
+```elixir
+@spec open?(t(), :read | :write) :: boolean()
+```
+
+See `Mint.HTTP.open?/1`.
+
+# `open_request_count`
+
+```elixir
+@spec open_request_count(t()) :: non_neg_integer()
+```
+
+See `Mint.HTTP.open_request_count/1`.
+
+In HTTP/1, the number of open requests is the number of pipelined requests.
+
+# `put_log`
+*since 1.5.0* 
+
+```elixir
+@spec put_log(t(), boolean()) :: t()
+```
+
+See `Mint.HTTP.put_log/2`.
+
+# `put_private`
+
+```elixir
+@spec put_private(t(), atom(), term()) :: t()
+```
+
+See `Mint.HTTP.put_private/3`.
+
+# `recv`
+
+```elixir
+@spec recv(t(), non_neg_integer(), timeout()) ::
+  {:ok, t(), [Mint.Types.response()]}
+  | {:error, t(), Mint.Types.error(), [Mint.Types.response()]}
+```
+
+See `Mint.HTTP.recv/3`.
+
+# `request`
+
+```elixir
+@spec request(
+  t(),
+  method :: String.t(),
+  path :: String.t(),
+  Mint.Types.headers(),
+  body :: iodata() | nil | :stream
+) :: {:ok, t(), Mint.Types.request_ref()} | {:error, t(), Mint.Types.error()}
+```
+
+See `Mint.HTTP.request/5`.
+
+In HTTP/1 and HTTP/1.1, you can't open a new request if you're streaming the body of
+another request. If you try, an error will be returned.
+
+# `request_body_window`
+*since 1.8.0* 
+
+See `Mint.HTTP.request_body_window/2`.
+
+# `set_mode`
+
+```elixir
+@spec set_mode(t(), :active | :passive) :: {:ok, t()} | {:error, Mint.Types.error()}
+```
+
+See `Mint.HTTP.set_mode/2`.
+
+# `stream`
+
+```elixir
+@spec stream(t(), term()) ::
+  {:ok, t(), [Mint.Types.response()]}
+  | {:error, t(), Mint.Types.error(), [Mint.Types.response()]}
+  | :unknown
+```
+
+See `Mint.HTTP.stream/2`.
+
+# `stream_request_body`
+
+```elixir
+@spec stream_request_body(
+  t(),
+  Mint.Types.request_ref(),
+  iodata() | :eof | {:eof, trailer_headers :: Mint.Types.headers()}
+) :: {:ok, t()} | {:error, t(), Mint.Types.error()}
+```
+
+See `Mint.HTTP.stream_request_body/3`.
+
+In HTTP/1, sending an empty chunk is a no-op.
+
+## Transfer encoding and content length
+
+When streaming the request body, Mint cannot send a precalculated `content-length`
+request header because it doesn't know the body that you'll stream. However, Mint
+will transparently handle the presence of a `content-length` header using this logic:
+
+  * if you specifically set a `content-length` header, then transfer encoding and
+    making sure the content length is correct for what you'll stream is up to you.
+
+  * if you specifically set the transfer encoding (`transfer-encoding` header)
+    to `chunked`, then it's up to you to
+    [properly encode chunks](https://en.wikipedia.org/wiki/Chunked_transfer_encoding).
+
+  * if you don't set the transfer encoding to `chunked` and don't provide a
+    `content-length` header, Mint will do implicit `chunked` transfer encoding
+    (setting the `transfer-encoding` header appropriately) and will take care
+    of properly encoding the chunks.
+
+---
+
+*Consult [api-reference.md](api-reference.md) for complete listing*
+
+---
+
+# Mint.HTTP2
+
+Source: https://mint.hexdocs.pm/Mint.HTTP2.md
+
+# `Mint.HTTP2`
+[🔗](https://github.com/elixir-mint/mint/blob/v1.9.0/lib/mint/http2.ex#L1)
+
+Process-less HTTP/2 client connection.
+
+This module provides a data structure that represents an HTTP/2 connection to
+a given server. The connection is represented as an opaque struct `%Mint.HTTP2{}`.
+The connection is a data structure and is not backed by a process, and all the
+connection handling happens in the process that creates the struct.
+
+This module and data structure work exactly like the ones described in the `Mint.HTTP`
+module, with the exception that `Mint.HTTP2` specifically deals with HTTP/2 while
+`Mint.HTTP` deals seamlessly with HTTP/1.1 and HTTP/2. For more information on
+how to use the data structure and client architecture, see `Mint.HTTP`.
+
+## HTTP/2 Streams and Requests
+
+HTTP/2 introduces the concept of **streams**. A stream is an isolated conversation
+between the client and the server. Each stream is unique and identified by a unique
+**stream ID**, which means that there's no order when data comes on different streams
+since they can be identified uniquely. A stream closely corresponds to a request, so
+in this documentation and client we will mostly refer to streams as "requests".
+We mentioned data on streams can come in arbitrary order, and streams are requests,
+so the practical effect of this is that performing request A and then request B
+does not mean that the response to request A will come before the response to request B.
+This is why we identify each request with a unique reference returned by `request/5`.
+See `request/5` for more information.
+
+## Closed Connection
+
+In HTTP/2, the connection can either be open, closed, or only closed for writing.
+When a connection is closed for writing, the client cannot send requests or stream
+body chunks, but it can still read data that the server might be sending. When the
+connection gets closed on the writing side, a `:server_closed_connection` error is
+returned. `{:error, request_ref, error}` is returned for requests that haven't been
+processed by the server, with the reason of `error` being `:unprocessed`.
+These requests are safe to retry.
+
+## HTTP/2 Settings
+
+HTTP/2 supports settings negotiation between servers and clients. The server advertises
+its settings to the client and the client advertises its settings to the server. A peer
+(server or client) has to acknowledge the settings advertised by the other peer before
+those settings come into action (that's why it's called a negotiation).
+
+A first settings negotiation happens right when the connection starts.
+Servers and clients can renegotiate settings at any time during the life of the
+connection.
+
+Mint users don't need to care about settings acknowledgements directly since they're
+handled transparently by `stream/2`.
+
+To retrieve the server settings, you can use `get_server_setting/2`. Doing so is often
+useful to be able to tune your requests based on the server settings.
+
+To communicate client settings to the server, use `put_settings/2` or pass them when
+starting up a connection with `connect/4`. Note that the server needs to acknowledge
+the settings sent through `put_setting/2` before those settings come into effect. The
+server ack is processed transparently by `stream/2`, but this means that if you change
+a setting through `put_settings/2` and try to retrieve the value of that setting right
+after with `get_client_setting/2`, you'll likely get the old value of that setting. Once
+the server acknowledges the new settings, the updated value will be returned by
+`get_client_setting/2`.
+
+## Server Push
+
+HTTP/2 supports [server push](https://en.wikipedia.org/wiki/HTTP/2_Server_Push), which
+is a way for a server to send a response to a client without the client needing to make
+the corresponding request. The server sends a `:push_promise` response to a normal request:
+this creates a new request reference. Then, the server sends normal responses for the newly
+created request reference.
+
+Let's see an example. We will ask the server for `"/index.html"` and the server will
+send us a push promise for `"/style.css"`.
+
+    {:ok, conn} = Mint.HTTP2.connect(:https, "example.com", 443)
+    {:ok, conn, request_ref} = Mint.HTTP2.request(conn, "GET", "/index.html", _headers = [], _body = "")
+
+    next_message =
+      receive do
+        msg -> msg
+      end
+
+    {:ok, conn, responses} = Mint.HTTP2.stream(conn, next_message)
+
+    [
+      {:push_promise, ^request_ref, promised_request_ref, promised_headers},
+      {:status, ^request_ref, 200},
+      {:headers, ^request_ref, []},
+      {:data, ^request_ref, "<html>..."},
+      {:done, ^request_ref}
+    ] = responses
+
+    promised_headers
+    #=> [{":method", "GET"}, {":path", "/style.css"}]
+
+As you can see in the example above, when the server sends a push promise then a
+`:push_promise` response is returned as a response to a request. The `:push_promise`
+response contains a `promised_request_ref` and some `promised_headers`. The
+`promised_request_ref` is the new request ref that pushed responses will be tagged with.
+`promised_headers` are headers that tell the client *what request* the promised response
+will respond to. The idea is that the server tells the client a request the client will
+want to make and then preemptively sends a response for that request. Promised headers
+will always include `:method`, `:path`, and `:authority`.
+
+    next_message =
+      receive do
+        msg -> msg
+      end
+
+    {:ok, conn, responses} = Mint.HTTP2.stream(conn, next_message)
+
+    [
+      {:status, ^promised_request_ref, 200},
+      {:headers, ^promised_request_ref, []},
+      {:data, ^promised_request_ref, "body { ... }"},
+      {:done, ^promised_request_ref}
+    ]
+
+The response to a promised request is like a response to any normal request.
+
+> #### Disabling Server Pushes {: .tip}
+>
+> HTTP/2 exposes a boolean setting for enabling or disabling server pushes with `:enable_push`.
+> You can pass this option when connecting or in `put_settings/2`. By default server push
+> is enabled.
+
+# `error_reason`
+
+```elixir
+@type error_reason() :: term()
+```
+
+An HTTP/2-specific error reason.
+
+The values can be:
+
+  * `:closed` - when you try to make a request or stream a body chunk but the connection
+    is closed.
+
+  * `:closed_for_writing` - when you try to make a request or stream a body chunk but
+    the connection is closed for writing. This means you cannot issue any more requests.
+    See the "Closed connection" section in the module documentation for more information.
+
+  * `:too_many_concurrent_requests` - when the maximum number of concurrent requests
+    allowed by the server is reached. To find out what this limit is, use `get_setting/2`
+    with the `:max_concurrent_streams` setting name.
+
+  * `{:max_header_list_size_exceeded, size, max_size}` - when the maximum size of
+    the header list is reached. `size` is the actual value of the header list size,
+    `max_size` is the maximum value allowed. See `get_setting/2` to retrieve the
+    value of the max size.
+
+  * `{:exceeds_window_size, what, window_size}` - when the data you're trying to send
+    exceeds the window size of the connection (if `what` is `:connection`) or of a request
+    (if `what` is `:request`). `window_size` is the allowed window size. See
+    `get_window_size/2`.
+
+  * `{:stream_not_found, stream_id}` - when the given request is not found.
+
+  * `:unknown_request_to_stream` - when you're trying to stream data on an unknown
+    request.
+
+  * `:request_is_not_streaming` - when you try to send data (with `stream_request_body/3`)
+    on a request that is not open for streaming.
+
+  * `:unprocessed` - when a request was closed because it was not processed by the server.
+    When this error is returned, it means that the server hasn't processed the request at all,
+    so it's safe to retry the given request on a different or new connection.
+
+  * `{:server_closed_request, error_code}` - when the server closes the request.
+    `error_code` is the reason why the request was closed.
+
+  * `{:server_closed_connection, reason, debug_data}` - when the server closes the connection
+    gracefully or because of an error. In HTTP/2, this corresponds to a `GOAWAY` frame.
+    `error` is the reason why the connection was closed. `debug_data` is additional debug data.
+
+  * `{:frame_size_error, frame}` - when there's an error with the size of a frame.
+    `frame` is the frame type, such as `:settings` or `:window_update`.
+
+  * `{:protocol_error, debug_data}` - when there's a protocol error.
+    `debug_data` is a string that explains the nature of the error.
+
+  * `{:compression_error, debug_data}` - when there's a header compression error.
+    `debug_data` is a string that explains the nature of the error.
+
+  * `{:flow_control_error, debug_data}` - when there's a flow control error.
+    `debug_data` is a string that explains the nature of the error.
+
+# `setting`
+
+```elixir
+@type setting() ::
+  {:enable_push, boolean()}
+  | {:header_table_size, non_neg_integer()}
+  | {:max_concurrent_streams, pos_integer()}
+  | {:initial_window_size, 1..2_147_483_647}
+  | {:max_frame_size, 16384..16_777_215}
+  | {:max_header_list_size, :infinity | pos_integer()}
+  | {:enable_connect_protocol, boolean()}
+```
+
+HTTP/2 setting with its value.
+
+This type represents both server settings as well as client settings. To retrieve
+server settings use `get_server_setting/2` and to retrieve client settings use
+`get_client_setting/2`. To send client settings to the server, see `put_settings/2`.
+
+The supported settings are the following:
+
+  * `:header_table_size` - corresponds to `SETTINGS_HEADER_TABLE_SIZE`.
+
+  * `:enable_push` - corresponds to `SETTINGS_ENABLE_PUSH`. Sets whether
+    push promises are supported. If you don't want to support push promises,
+    use `put_settings/2` to tell the server that your client doesn't want push promises.
+
+  * `:max_concurrent_streams` - corresponds to `SETTINGS_MAX_CONCURRENT_STREAMS`.
+    Tells what is the maximum number of streams that the peer sending this (client or server)
+    supports. As mentioned in the module documentation, HTTP/2 streams are equivalent to
+    requests, so knowing the maximum number of streams that the server supports can be useful
+    to know how many concurrent requests can be open at any time. Use `get_server_setting/2`
+    to find out how many concurrent streams the server supports.
+
+  * `:initial_window_size` -  corresponds to `SETTINGS_INITIAL_WINDOW_SIZE`.
+    Tells what is the value of the initial HTTP/2 window size for the peer
+    that sends this setting.
+
+  * `:max_frame_size` - corresponds to `SETTINGS_MAX_FRAME_SIZE`. Tells what is the
+    maximum size of an HTTP/2 frame for the peer that sends this setting.
+
+  * `:max_header_list_size` - corresponds to `SETTINGS_MAX_HEADER_LIST_SIZE`. For the
+    client, this also bounds the size of an inbound header block (a HEADERS frame plus
+    its trailing CONTINUATION frames): the connection is closed with a connection error
+    if a server streams a header block larger than this value, which prevents a server
+    from exhausting client memory with an unbounded chain of CONTINUATION frames.
+    Defaults to `256 KB` for the client.
+
+  * `:enable_connect_protocol` - corresponds to `SETTINGS_ENABLE_CONNECT_PROTOCOL`.
+    Sets whether the client may invoke the extended connect protocol which is used to
+    bootstrap WebSocket connections.
+
+# `settings`
+
+```elixir
+@type settings() :: [setting()]
+```
+
+HTTP/2 settings.
+
+See `t:setting/0`.
+
+# `t`
+
+```elixir
+@opaque t()
+```
+
+A Mint HTTP/2 connection struct.
+
+The struct's fields are private.
+
+# `cancel_request`
+
+```elixir
+@spec cancel_request(t(), Mint.Types.request_ref()) ::
+  {:ok, t()} | {:error, t(), Mint.Types.error()}
+```
+
+Cancels an in-flight request.
+
+This function is HTTP/2 specific. It cancels an in-flight request. The server could have
+already sent responses for the request you want to cancel: those responses will be parsed
+by the connection but not returned to the user. No more responses
+to a request will be returned after you call `cancel_request/2` on that request.
+
+If there's no error in canceling the request, `{:ok, conn}` is returned where `conn` is
+the updated connection. If there's an error, `{:error, conn, reason}` is returned where
+`conn` is the updated connection and `reason` is the error reason.
+
+## Examples
+
+    {:ok, conn, ref} = Mint.HTTP2.request(conn, "GET", "/", _headers = [])
+    {:ok, conn} = Mint.HTTP2.cancel_request(conn, ref)
+
+# `close`
+
+```elixir
+@spec close(t()) :: {:ok, t()}
+```
+
+See `Mint.HTTP.close/1`.
+
+# `connect`
+
+```elixir
+@spec connect(
+  Mint.Types.scheme(),
+  Mint.Types.address(),
+  :inet.port_number(),
+  keyword()
+) ::
+  {:ok, t()} | {:error, Mint.Types.error()}
+```
+
+Same as `Mint.HTTP.connect/4`, but forces a HTTP/2 connection.
+
+# `controlling_process`
+
+```elixir
+@spec controlling_process(t(), pid()) :: {:ok, t()} | {:error, Mint.Types.error()}
+```
+
+See `Mint.HTTP.controlling_process/2`.
+
+# `delete_private`
+
+```elixir
+@spec delete_private(t(), atom()) :: t()
+```
+
+See `Mint.HTTP.delete_private/2`.
+
+# `get_client_setting`
+
+```elixir
+@spec get_client_setting(t(), atom()) :: term()
+```
+
+Gets the value of the given HTTP/2 client setting.
+
+This function returns the value of the given HTTP/2 setting that the client
+advertised to the server. Client settings can be advertised through `put_settings/2`
+or when starting up a connection.
+
+Client settings have to be acknowledged by the server before coming into effect.
+
+This function is HTTP/2 specific. For more information on HTTP/2 settings, see
+[the related section in the RFC](https://httpwg.org/specs/rfc7540.html#SettingValues).
+
+See the "HTTP/2 settings" section in the module documentation for more information.
+
+## Supported settings
+
+The possible settings that can be retrieved are described in `t:setting/0`.
+Any other atom passed as `name` will raise an error.
+
+## Examples
+
+    Mint.HTTP2.get_client_setting(conn, :max_concurrent_streams)
+    #=> 500
+
+# `get_private`
+
+```elixir
+@spec get_private(t(), atom(), term()) :: term()
+```
+
+See `Mint.HTTP.get_private/3`.
+
+# `get_proxy_headers`
+*since 1.4.0* 
+
+```elixir
+@spec get_proxy_headers(t()) :: Mint.Types.headers()
+```
+
+See `Mint.HTTP.get_proxy_headers/1`.
+
+# `get_server_setting`
+
+```elixir
+@spec get_server_setting(t(), atom()) :: term()
+```
+
+Gets the value of the given HTTP/2 server settings.
+
+This function returns the value of the given HTTP/2 setting that the server
+advertised to the client. This function is HTTP/2 specific.
+For more information on HTTP/2 settings, see [the related section in
+the RFC](https://httpwg.org/specs/rfc7540.html#SettingValues).
+
+See the "HTTP/2 settings" section in the module documentation for more information.
+
+## Supported settings
+
+The possible settings that can be retrieved are described in `t:setting/0`.
+Any other atom passed as `name` will raise an error.
+
+## Examples
+
+    Mint.HTTP2.get_server_setting(conn, :max_concurrent_streams)
+    #=> 500
+
+# `get_socket`
+
+```elixir
+@spec get_socket(t()) :: Mint.Types.socket()
+```
+
+See `Mint.HTTP.get_socket/1`.
+
+# `get_window_size`
+
+```elixir
+@spec get_window_size(t(), :connection | {:request, Mint.Types.request_ref()}) ::
+  non_neg_integer()
+```
+
+Returns the client **send** window size for the connection or a request.
+
+> #### Send vs receive windows {: .warning}
+>
+> This function returns the *send* window — how much body data this client
+> is still permitted to send to the server before being throttled. It is
+> decremented by `request/5` and `stream_request_body/3` and refilled by
+> the server, which `stream/2` handles transparently.
+>
+> It does **not** return the client *receive* window (how much the server
+> is permitted to send us). To influence that, use `set_window_size/3`.
+
+This function is HTTP/2 specific. It returns the send window of either the
+connection if `connection_or_request` is `:connection` or of a single request
+if `connection_or_request` is `{:request, request_ref}`.
+
+Use this function to check the window size of the connection before sending a
+full request. Also use this function to check the window size of both the
+connection and of a request if you want to stream body chunks on that request.
+
+For more information on flow control and window sizes in HTTP/2, see the section
+below.
+
+## HTTP/2 Flow Control
+
+In HTTP/2, flow control is implemented through a window size. When the client
+sends data to the server, the window size is decreased and the server needs
+to "refill" it on the client side, which `stream/2` handles transparently.
+Symmetrically, the server's outbound flow toward the client is bounded by a
+receive window the client advertises and refills — see `set_window_size/3`.
+
+A window size is kept for the entire connection and all requests affect this
+window size. A window size is also kept per request.
+
+The only thing that affects the send window size is the body of a request,
+regardless of whether it's a full request sent with `request/5` or body chunks
+sent through `stream_request_body/3`. That means that if we make a request with
+a body that is five bytes long, like `"hello"`, the send window size of the
+connection and the send window size of that particular request will decrease
+by five bytes.
+
+If we use all the send window size before the server refills it, functions like
+`request/5` will return an error.
+
+## Examples
+
+On the connection:
+
+    HTTP2.get_window_size(conn, :connection)
+    #=> 65_536
+
+On a single streamed request:
+
+    {:ok, conn, request_ref} = HTTP2.request(conn, "GET", "/", [], :stream)
+    HTTP2.get_window_size(conn, {:request, request_ref})
+    #=> 65_536
+
+    {:ok, conn} = HTTP2.stream_request_body(conn, request_ref, "hello")
+    HTTP2.get_window_size(conn, {:request, request_ref})
+    #=> 65_531
+
+# `open?`
+
+```elixir
+@spec open?(t(), :read | :write) :: boolean()
+```
+
+See `Mint.HTTP.open?/1`.
+
+# `open_request_count`
+
+```elixir
+@spec open_request_count(t()) :: non_neg_integer()
+```
+
+See `Mint.HTTP.open_request_count/1`.
+
+In HTTP/2, the number of open requests is the number of requests **opened by the client**
+that have not yet received a `:done` response. It's important to note that only
+requests opened by the client (with `request/5`) count towards the number of open
+requests, as requests opened from the server with server pushes (see the "Server push"
+section in the module documentation) are not considered open requests. We do this because
+clients might need to know how many open requests there are because the server limits
+the number of concurrent requests the client can open. To know how many requests the client
+can open, see `get_server_setting/2` with the `:max_concurrent_streams` setting.
+
+# `ping`
+
+```elixir
+@spec ping(t(), &lt;&lt;_::8&gt;&gt;) ::
+  {:ok, t(), Mint.Types.request_ref()} | {:error, t(), Mint.Types.error()}
+```
+
+Pings the server.
+
+This function is specific to HTTP/2 connections. It sends a **ping** request to
+the server `conn` is connected to. A `{:ok, conn, request_ref}` tuple is returned,
+where `conn` is the updated connection and `request_ref` is a unique reference that
+identifies this ping request. The response to a ping request is returned by `stream/2`
+as a `{:pong, request_ref}` tuple. If there's an error, this function returns
+`{:error, conn, reason}` where `conn` is the updated connection and `reason` is the
+error reason.
+
+`payload` must be an 8-byte binary with arbitrary content. When the server responds to
+a ping request, it will use that same payload. By default, the payload is an 8-byte
+binary with all bits set to `0`.
+
+Pinging can be used to measure the latency with the server and to ensure the connection
+is alive and well.
+
+## Examples
+
+    {:ok, conn, ref} = Mint.HTTP2.ping(conn)
+
+# `put_log`
+*since 1.5.0* 
+
+```elixir
+@spec put_log(t(), boolean()) :: t()
+```
+
+See `Mint.HTTP.put_log/2`.
+
+# `put_private`
+
+```elixir
+@spec put_private(t(), atom(), term()) :: t()
+```
+
+See `Mint.HTTP.put_private/3`.
+
+# `put_settings`
+
+```elixir
+@spec put_settings(t(), settings()) :: {:ok, t()} | {:error, t(), Mint.Types.error()}
+```
+
+Communicates the given **client settings** to the server.
+
+This function is HTTP/2-specific.
+
+This function takes a connection and a keyword list of HTTP/2 settings and sends
+the values of those settings to the server. The settings won't be effective until
+the server acknowledges them, which will be handled transparently by `stream/2`.
+
+This function returns `{:ok, conn}` when sending the settings to the server is
+successful, with `conn` being the updated connection. If there's an error, this
+function returns `{:error, conn, reason}` with `conn` being the updated connection
+and `reason` being the reason of the error.
+
+## Supported Settings
+
+See `t:setting/0` for the supported settings. You can see the meaning
+of these settings [in the corresponding section in the HTTP/2
+RFC](https://httpwg.org/specs/rfc7540.html#SettingValues).
+
+See the "HTTP/2 settings" section in the module documentation for more information.
+
+## Examples
+
+    {:ok, conn} = Mint.HTTP2.put_settings(conn, max_frame_size: 100)
+
+# `recv`
+
+```elixir
+@spec recv(t(), non_neg_integer(), timeout()) ::
+  {:ok, t(), [Mint.Types.response()]}
+  | {:error, t(), Mint.Types.error(), [Mint.Types.response()]}
+```
+
+See `Mint.HTTP.recv/3`.
+
+# `request`
+
+```elixir
+@spec request(
+  t(),
+  method :: String.t(),
+  path :: String.t(),
+  Mint.Types.headers(),
+  body :: iodata() | nil | :stream
+) :: {:ok, t(), Mint.Types.request_ref()} | {:error, t(), Mint.Types.error()}
+```
+
+See `Mint.HTTP.request/5`.
+
+In HTTP/2, opening a request means opening a new HTTP/2 stream (see the
+module documentation). This means that a request could fail because the
+maximum number of concurrent streams allowed by the server has been reached.
+In that case, the error reason `:too_many_concurrent_requests` is returned.
+If you want to avoid incurring in this error, you can retrieve the value of
+the maximum number of concurrent streams supported by the server through
+`get_server_setting/2` (passing in the `:max_concurrent_streams` setting name).
+
+## Header list size
+
+In HTTP/2, the server can optionally specify a maximum header list size that
+the client needs to respect when sending headers. The header list size is calculated
+by summing the length (in bytes) of each header name plus value, plus 32 bytes for
+each header. Note that pseudo-headers (like `:path` or `:method`) count towards
+this size. If the size is exceeded, an error is returned. To check what the size
+is, use `get_server_setting/2`.
+
+## Request body size
+
+If the request body size will exceed the window size of the HTTP/2 stream created by the
+request or the window size of the connection Mint will return a `:exceeds_window_size`
+error.
+
+To ensure you do not exceed the window size it is recommended to stream the request
+body by initially passing `:stream` as the body and sending the body in chunks using
+`stream_request_body/3` and using `get_window_size/2` to get the window size of the
+request and connection.
+
+# `request_body_window`
+*since 1.8.0* 
+
+See `Mint.HTTP.request_body_window/2`.
+
+# `set_mode`
+
+```elixir
+@spec set_mode(t(), :active | :passive) :: {:ok, t()} | {:error, Mint.Types.error()}
+```
+
+See `Mint.HTTP.set_mode/2`.
+
+# `set_window_size`
+*since 1.8.0* 
+
+```elixir
+@spec set_window_size(
+  t(),
+  :connection | {:request, Mint.Types.request_ref()},
+  pos_integer()
+) ::
+  {:ok, t()} | {:error, t(), Mint.Types.error()}
+```
+
+Advertises a larger client **receive** window to the server.
+
+> #### Receive vs send windows {: .warning}
+>
+> This function sets the *receive* window — the peak amount of body data
+> the server is permitted to send us before being throttled. It does
+> **not** set the *send* window (how much body data we're permitted to
+> send to the server) — the server controls that. See `get_window_size/2`
+> for the send window.
+
+Without calling this, `stream/2` refills the receive window in small
+increments as response body data is consumed. Each refill costs a
+round-trip before the server can send more, so bulk throughput is capped
+at roughly `window / RTT`; on higher-latency links the default 64 KB
+window makes that cap well below the link bandwidth. Raising the window
+removes those pauses and is the main HTTP/2 tuning knob for bulk or
+highly parallel downloads.
+
+Mint exposes the per-stream initial window as the `:initial_window_size`
+client setting passed to `connect/4`, but there is no connection-level
+equivalent — use this function for the connection window, and for any
+per-stream adjustment after a request has started.
+
+`connection_or_request` is `:connection` for the whole connection or
+`{:request, request_ref}` for a single request. `new_size` must be in
+`1..2_147_483_647`. Windows can only grow: `new_size` smaller than the
+current receive window returns
+`{:error, conn, %Mint.HTTPError{reason: :window_size_too_small}}`, and
+`new_size` equal to the current window is a no-op.
+
+For more information on flow control and window sizes in HTTP/2, see the
+section below.
+
+## HTTP/2 Flow Control
+
+See `get_window_size/2` for a description of the client *send* window.
+The client *receive* window is the symmetric bound on the server's
+outbound flow: it starts at 64 KB for the connection and for each new
+request, is decremented by response body bytes, and is refilled by
+`stream/2` as the body is consumed. A window size is kept for the entire
+connection and all responses affect this window size; a window size is
+also kept per request.
+
+This function raises the *advertised* receive window — the peak the
+server is allowed to fill before pausing. It does not pre-allocate any
+buffers; it only permits the server to send further ahead of the
+client's reads.
+
+## Examples
+
+Bump the connection-level receive window right after connect so the server
+can stream multi-MB bodies without flow-control pauses:
+
+    {:ok, conn} = Mint.HTTP2.connect(:https, host, 443)
+    {:ok, conn} = Mint.HTTP2.set_window_size(conn, :connection, 8_000_000)
+
+Give one specific request a bigger window than the per-stream default:
+
+    {:ok, conn, ref} = Mint.HTTP2.request(conn, "GET", "/huge", [], nil)
+    {:ok, conn} = Mint.HTTP2.set_window_size(conn, {:request, ref}, 16_000_000)
+
+# `stream`
+
+```elixir
+@spec stream(t(), term()) ::
+  {:ok, t(), [Mint.Types.response()]}
+  | {:error, t(), Mint.Types.error(), [Mint.Types.response()]}
+  | :unknown
+```
+
+See `Mint.HTTP.stream/2`.
+
+# `stream_request_body`
+
+```elixir
+@spec stream_request_body(
+  t(),
+  Mint.Types.request_ref(),
+  iodata() | :eof | {:eof, trailer_headers :: Mint.Types.headers()}
+) :: {:ok, t()} | {:error, t(), Mint.Types.error()}
+```
+
+See `Mint.HTTP.stream_request_body/3`.
+
+---
+
+*Consult [api-reference.md](api-reference.md) for complete listing*
+
+---
+
+# Mint.Types
+
+Source: https://mint.hexdocs.pm/Mint.Types.md
+
+# `Mint.Types`
+[🔗](https://github.com/elixir-mint/mint/blob/v1.9.0/lib/mint/types.ex#L1)
+
+HTTP-related types.
+
+# `address`
+
+```elixir
+@type address() :: :inet.socket_address() | String.t()
+```
+
+A hostname, IP address, Unix domain socket path, `:loopback`, or any
+other term representing an internet address.
+
+# `error`
+
+```elixir
+@type error() :: Mint.TransportError.t() | Mint.HTTPError.t()
+```
+
+An error reason.
+
+# `headers`
+
+```elixir
+@type headers() :: [{header_name :: String.t(), header_value :: String.t()}]
+```
+
+HTTP headers.
+
+Headers are sent and received as lists of two-element tuples containing two strings,
+the header name and header value.
+
+# `http2_response`
+
+```elixir
+@type http2_response() ::
+  {:pong, request_ref()}
+  | {:push_promise, request_ref(), promised_request_ref :: request_ref(),
+     headers()}
+```
+
+An HTTP/2-specific response to a request.
+
+This type of response is only returned on HTTP/2 connections. See `t:response/0` for
+more response types.
+
+# `request_ref`
+
+```elixir
+@type request_ref() :: reference()
+```
+
+A request reference that uniquely identifies a request.
+
+Responses for a request are always tagged with a request reference so that you
+can connect each response to the right request. Also see `Mint.HTTP.request/5`.
+
+# `response`
+
+```elixir
+@type response() ::
+  {:status, request_ref(), status()}
+  | {:headers, request_ref(), headers()}
+  | {:data, request_ref(), body_chunk :: binary()}
+  | {:done, request_ref()}
+  | {:error, request_ref(), reason :: term()}
+  | http2_response()
+```
+
+A response to a request.
+
+Terms of this type are returned as responses to requests. See `Mint.HTTP.stream/2`
+for more information.
+
+# `scheme`
+
+```elixir
+@type scheme() :: :http | :https
+```
+
+The scheme to use when connecting to an HTTP server.
+
+# `socket`
+
+```elixir
+@type socket() :: term()
+```
+
+The connection socket.
+
+# `status`
+
+```elixir
+@type status() :: non_neg_integer()
+```
+
+An HTTP status code.
+
+The type for an HTTP is a generic non-negative integer since we don't formally check that
+the response code is in the "common" range (`200..599`).
+
+---
+
+*Consult [api-reference.md](api-reference.md) for complete listing*
+
+---
