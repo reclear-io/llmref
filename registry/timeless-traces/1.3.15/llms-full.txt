@@ -1,0 +1,2442 @@
+# README
+
+Source: https://timeless-traces.hexdocs.pm/readme.md
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/logo-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="docs/logo-light.svg">
+    <img src="docs/logo-light.svg" width="300" alt="Timeless">
+  </picture>
+</p>
+
+<h3 align="center">Embedded OpenTelemetry Span Storage for Elixir</h3>
+
+<p align="center">
+  <a href="https://hex.pm/packages/timeless_traces"><img src="https://img.shields.io/hexpm/v/timeless_traces.svg" alt="Hex.pm"></a>
+  <a href="https://hexdocs.pm/timeless_traces"><img src="https://img.shields.io/badge/docs-hexdocs-blue.svg" alt="Docs"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/hexpm/l/timeless_traces.svg" alt="License"></a>
+</p>
+
+---
+
+> "I found it ironic that the first thing you do to time series data is squash the timestamp. That's how the name Timeless was born." --Mark Cotner
+
+Embedded OpenTelemetry span storage and compression for Elixir applications.
+
+TimelessTraces receives spans directly from the OpenTelemetry Erlang SDK (no HTTP, no protobuf), compresses them with two-tier raw/OpenZL block storage (~10x compression), and indexes them in ETS for lock-free trace-level and span-level queries. The trace index stores packed binary trace IDs on disk to keep the index compact while remaining backward-compatible with legacy text rows. Zero external infrastructure required.
+
+Part of the embedded observability stack:
+- [timeless_metrics](https://github.com/awksedgreep/timeless_metrics) - numeric time series compression
+- [timeless_logs](https://github.com/awksedgreep/timeless_logs) - log ingestion/compression/indexing
+- **timeless_traces** - OTel span storage/compression (this library)
+
+## Documentation
+
+- [Getting Started](docs/getting_started.md)
+- [Configuration Reference](docs/configuration.md)
+- [Architecture](docs/architecture.md)
+- [Querying](docs/querying.md)
+- [HTTP API](docs/http_api.md)
+- [Live Tail (Subscriptions)](docs/subscriptions.md)
+- [Storage & Compression](docs/storage.md)
+- [Operations](docs/operations.md)
+- [Telemetry](docs/telemetry.md)
+
+## Installation
+
+```elixir
+def deps do
+  [
+    {:timeless_traces, "~> 1.0"}
+  ]
+end
+```
+
+## Configuration
+
+```elixir
+# config/config.exs
+config :timeless_traces,
+  storage: :disk,              # :disk or :memory
+  data_dir: "priv/span_stream",
+  flush_interval: 1_000,       # ms between auto-flushes
+  max_buffer_size: 1_000,      # spans before forced flush
+  compaction_threshold: 500,   # raw entries before compaction
+  compaction_format: :openzl,  # :openzl (default) or :zstd
+  compression_level: 6,        # compression level 1-22 (default 6)
+  retention_max_age: nil,      # seconds, nil = no age limit
+  retention_max_size: nil      # bytes, nil = no size limit
+
+# Wire up the OTel exporter
+config :opentelemetry,
+  traces_exporter: {TimelessTraces.Exporter, []}
+```
+
+## Usage
+
+### Querying spans
+
+```elixir
+# All error spans
+TimelessTraces.query(status: :error)
+
+# Server spans from a specific service
+TimelessTraces.query(kind: :server, service: "api-gateway")
+
+# Slow spans (> 100ms)
+TimelessTraces.query(min_duration: 100_000_000)
+
+# Combined filters with pagination
+TimelessTraces.query(status: :error, kind: :server, limit: 50, order: :desc)
+```
+
+### Trace lookup
+
+```elixir
+# Get all spans in a trace, sorted by start time
+{:ok, spans} = TimelessTraces.trace("abc123def456...")
+```
+
+### Live tail
+
+```elixir
+# Subscribe to new spans as they arrive
+TimelessTraces.subscribe(status: :error)
+
+receive do
+  {:timeless_traces, :span, %TimelessTraces.Span{} = span} ->
+    IO.inspect(span.name)
+end
+```
+
+### Statistics
+
+```elixir
+{:ok, stats} = TimelessTraces.stats()
+stats.total_blocks   #=> 42
+stats.total_entries   #=> 50_000
+stats.disk_size       #=> 24_000_000
+```
+
+## Query Filters
+
+| Filter | Type | Description |
+|---|---|---|
+| `:name` | string | Substring match on span name |
+| `:service` | string | Match `service.name` in attributes or resource |
+| `:kind` | atom | `:internal`, `:server`, `:client`, `:producer`, `:consumer` |
+| `:status` | atom | `:ok`, `:error`, `:unset` |
+| `:min_duration` | integer | Minimum duration in nanoseconds |
+| `:max_duration` | integer | Maximum duration in nanoseconds |
+| `:since` | integer/DateTime | Start time lower bound (nanos or DateTime) |
+| `:until` | integer/DateTime | Start time upper bound (nanos or DateTime) |
+| `:trace_id` | string | Filter to specific trace |
+| `:attributes` | map | Key/value pairs to match |
+| `:limit` | integer | Max results (default 100) |
+| `:offset` | integer | Skip N results (default 0) |
+| `:order` | atom | `:desc` (default) or `:asc` |
+
+## Architecture
+
+```
+OTel SDK → Exporter → Buffer → Writer (raw) → ETS Index → disk log
+                                    ↓
+                              Compactor (OpenZL/zstd)
+```
+
+- **Buffer** accumulates spans, flushes every 1s or 1000 spans
+- **Writer** serializes blocks as raw Erlang terms initially
+- **Index** stores block metadata + inverted term index + trace index in ETS, persisted via snapshots + disk log
+- **Compactor** merges raw blocks into compressed blocks (zstd or OpenZL columnar)
+- **Retention** enforces age and size limits
+- **Sync** flushes pending index batches and runs `wal_checkpoint(TRUNCATE)` to compact the index DB and WAL together
+
+### Storage Modes
+
+- **`:disk`** - Blocks as files in `data_dir/blocks/`, index persisted as `index.snapshot` + `index.log`
+- **`:memory`** - Blocks in ETS tables only, no filesystem needed
+
+## Compression
+
+Two compression backends are supported. OpenZL columnar compression (default) achieves better ratios and faster queries by encoding span fields in typed columns:
+
+| Backend | Size (500K spans) | Ratio | Compress | Decompress |
+|---|---|---|---|---|
+| zstd | 32.8 MB | 6.8x | 2.1s | 1.5s |
+| OpenZL columnar | 22.1 MB | 10.2x | 1.9s | 564ms |
+
+## Performance
+
+Run on a 28-core laptop. Reproduce with `mix timeless_traces.ingest_benchmark`, `mix timeless_traces.compression_benchmark`, and `mix timeless_traces.search_benchmark`.
+
+Ingestion throughput on 500K spans (1000 spans/block):
+
+| Phase | Throughput |
+|---|---|
+| Writer only (serialization + disk I/O) | ~196K spans/sec |
+| Writer + Index (ETS immediate + disk log persist) | ~468K spans/sec |
+| Full pipeline (Buffer → Writer → async Index) | ~303K spans/sec |
+
+The ETS-first indexing architecture makes index overhead negligible.
+
+Query latency (500K spans, 500 blocks, avg over 3 runs):
+
+| Query | zstd | OpenZL | Speedup |
+|---|---|---|---|
+| All spans (limit 100) | 1.12s | 860ms | 1.3x |
+| status=error | 327ms | 158ms | 2.1x |
+| service filter | 316ms | 225ms | 1.4x |
+| kind=server | 324ms | 226ms | 1.4x |
+| Trace lookup | 7.1ms | 10.0ms | 0.7x |
+
+## License
+
+MIT - see [LICENSE](LICENSE)
+
+---
+
+# LICENSE
+
+Source: https://timeless-traces.hexdocs.pm/license.md
+
+MIT License
+
+Copyright (c) 2026 Mark Cotner
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+---
+
+# Architecture
+
+Source: https://timeless-traces.hexdocs.pm/architecture.md
+
+# Architecture
+
+This document covers TimelessTraces' internal architecture: the supervision tree, data flow, storage format, and indexing strategy.
+
+## Supervision tree
+
+```
+TimelessTraces.Supervisor (:one_for_one)
+├── Registry (TimelessTraces.Registry)     # Pub/sub for live tail
+├── Index (GenServer)                       # ETS indexing + snapshot/disk log persistence
+├── FlushSupervisor (Task.Supervisor)       # Async flush tasks
+├── Buffer (GenServer)                      # Span accumulation
+├── Compactor (GenServer)                   # Raw → compressed blocks
+├── Retention (GenServer)                   # Age/size cleanup
+└── HTTP (Bandit, optional)                 # OTLP ingest + Jaeger query
+```
+
+All components start automatically as an OTP application. The HTTP server is only started when `http` is configured.
+
+## Data flow
+
+```
+OTel SDK
+    ↓
+Exporter (reads spans from OTel ETS table)
+    ↓
+Buffer (accumulate, auto-flush every 1s or 1000 spans)
+    ↓ broadcasts to subscribers
+Writer (serialize as raw Erlang terms)
+    ↓
+Disk (blocks/) or Memory (ETS)
+    ↓
+Index (block metadata + inverted term index + trace index → ETS + disk log)
+    ↓
+Compactor (merge raw → compressed OpenZL/zstd every 30s or at threshold)
+    ↓
+Retention (delete old/oversized blocks every 5 min)
+```
+
+## Exporter
+
+The `TimelessTraces.Exporter` module implements the `:otel_exporter_traces` behaviour. When the OTel SDK calls `export/3`, the exporter:
+
+1. Reads span records from the SDK's ETS table
+2. Normalizes each span: converts trace/span IDs from integers to hex strings, extracts attributes, events, links, resource, and instrumentation scope
+3. Converts timestamps from native units to nanoseconds
+4. Ingests the normalized spans into the Buffer
+
+This is a zero-copy path -- no HTTP, no protobuf serialization, no external collectors.
+
+## Buffer
+
+The Buffer is a GenServer that accumulates spans in memory. It flushes when:
+
+- The buffer reaches `max_buffer_size` (default 1000 spans)
+- The `flush_interval` timer fires (default 1 second)
+- `TimelessTraces.flush()` is called manually
+
+Before each flush, the Buffer broadcasts all spans to registered subscribers (live tail). Flush operations are dispatched as async tasks via the `FlushSupervisor` with backpressure -- at most `System.schedulers_online()` flushes run concurrently.
+
+## Write path
+
+Each flush writes a **raw block** -- a batch of spans serialized with `:erlang.term_to_binary`:
+
+1. **Serialize**: Spans are converted to Erlang binary format
+2. **Write**: The binary is written to a block file (`blocks/000000000001.raw`)
+3. **Index**: Block metadata, inverted terms, and trace index rows are sent to the Index
+
+The Index processes block metadata with sub-millisecond ETS inserts, journaled to a disk log for durability.
+
+## Index
+
+All index state lives in ETS tables — the authoritative source of truth at runtime:
+
+### ETS tables
+
+| Table | Type | Purpose |
+|-------|------|---------|
+| `timeless_traces_blocks` | ordered_set | Block metadata (block_id → file_path, byte_size, entry_count, ts_min, ts_max, format, created_at) |
+| `timeless_traces_term_index` | bag | Term → block_id mapping |
+| `timeless_traces_trace_index` | bag | packed trace_id → block_id mapping (with legacy text-row compatibility) |
+| `timeless_traces_compression_stats` | set | Compression statistics |
+| `timeless_traces_block_data` | set | In-memory block data (memory storage mode only) |
+
+All ETS tables are created with `read_concurrency: true` and `write_concurrency: true`.
+
+### Persistence
+
+Index durability uses a snapshot + write-ahead log strategy:
+
+- **`index.snapshot`**: Periodic full dump of all ETS tables (Erlang `term_to_binary`, compressed). Written every 1000 index operations or on graceful shutdown.
+- **`index.log`**: Erlang `:disk_log` that journals every index mutation (block inserts, deletes, compactions). Replayed on startup after loading the snapshot.
+
+On startup: load snapshot → replay log entries newer than the snapshot → index is fully reconstructed in ETS. No external database required.
+
+### Inverted term index
+
+When a block is indexed, terms are extracted from each span and stored in the `block_terms` table. Terms include:
+
+- `service:<name>` -- the service.name attribute or resource
+- `kind:<kind>` -- span kind (server, client, etc.)
+- `status:<status>` -- span status (ok, error, unset)
+- `name:<span_name>` -- the span operation name
+
+Queries use these terms to identify which blocks contain relevant spans, avoiding full scans.
+
+### Trace index
+
+The trace index maps each trace ID to the blocks that contain its spans. This enables fast trace lookup -- `TimelessTraces.trace(trace_id)` reads only the blocks that contain spans for that trace.
+
+For 32-character hex trace IDs, TimelessTraces stores a packed 16-byte binary form in `trace_index` instead of the original text. Query lookup accepts the normal hex string and transparently probes both the packed form and legacy text rows, so existing datasets continue to work during migration.
+
+## Read path
+
+A query follows this path:
+
+1. **Term lookup**: Use the ETS term index to find block IDs matching the query filters
+2. **Time range**: Further narrow blocks by timestamp range using the block metadata
+3. **Parallel read**: Read and decompress matching blocks in parallel (`System.schedulers_online()` concurrency)
+4. **Filter**: Apply in-memory filters to individual spans within each block
+5. **Sort & paginate**: Sort by start_time (ascending or descending), apply offset and limit
+
+## Compaction
+
+The Compactor GenServer periodically checks for raw blocks and compresses them:
+
+1. **Threshold trigger**: Raw entries >= `compaction_threshold` (default 500)
+2. **Age trigger**: Any raw block older than `compaction_max_raw_age` (default 60 seconds)
+3. **Periodic check**: Every `compaction_interval` ms (default 30,000)
+
+The compaction process:
+
+1. Read all raw block entries from disk
+2. Merge entries into a single batch
+3. Compress with the configured format (OpenZL columnar or zstd)
+4. Write a new compressed block file
+5. Update the index: delete old block metadata, add new
+6. Delete old raw block files
+7. Update compression statistics
+
+## Merge compaction
+
+After initial compaction produces many small compressed blocks (e.g. one per flush cycle), the Compactor runs a second pass that merges them into fewer, larger blocks. Larger blocks compress better (bigger dictionary window) and reduce per-block I/O overhead during reads.
+
+1. Scan for compressed blocks with `entry_count < merge_compaction_target_size`
+2. If enough small blocks exist (`>= merge_compaction_min_blocks`), group into batches by `ts_min`
+3. For each batch: decompress all blocks, merge entries sorted by `start_time`, recompress
+4. Update the index: remove old block metadata, add new merged block
+5. Delete old compressed block files
+
+The merge pass runs automatically after every compaction timer tick and can also be triggered manually via `TimelessTraces.merge_now()`.
+
+| Configuration | Default | Description |
+|---------------|---------|-------------|
+| `merge_compaction_target_size` | 2000 | Target entries per merged block |
+| `merge_compaction_min_blocks` | 4 | Minimum small blocks before merge triggers |
+
+## Retention
+
+The Retention GenServer enforces two independent policies every `retention_check_interval` ms:
+
+1. **Age-based**: Delete blocks with `ts_max` older than `retention_max_age` seconds ago
+2. **Size-based**: Delete oldest blocks until total storage is under `retention_max_size` bytes
+
+## Disk layout
+
+```
+data_dir/
+├── index.snapshot    # Periodic ETS table dump (compressed ETF)
+├── index.log         # Write-ahead log (Erlang disk_log)
+└── blocks/
+    ├── 000000000001.raw   # Raw block (temporary)
+    ├── 000000000002.raw   # Raw block (temporary)
+    ├── 000000000003.ozl   # OpenZL compressed block
+    ├── 000000000004.ozl   # OpenZL compressed block
+    └── ...
+```
+
+Block filenames are 12-digit zero-padded block IDs with format-specific extensions (`.raw`, `.zst`, `.ozl`).
+
+---
+
+# Configuration Reference
+
+Source: https://timeless-traces.hexdocs.pm/configuration.md
+
+# Configuration Reference
+
+All configuration is set under the `:timeless_traces` application key in `config.exs` or at runtime via `Application.put_env/3`.
+
+## Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `data_dir` | string | `"priv/span_stream"` | Root directory for blocks and index |
+| `storage` | atom | `:disk` | Storage backend (`:disk` or `:memory`) |
+| `flush_interval` | integer (ms) | `1_000` | Buffer auto-flush interval |
+| `max_buffer_size` | integer | `1_000` | Max spans before forced flush |
+| `query_timeout` | integer (ms) | `30_000` | Query timeout |
+| `compaction_threshold` | integer | `500` | Min raw entries to trigger compaction |
+| `compaction_interval` | integer (ms) | `30_000` | Compaction check interval |
+| `compaction_max_raw_age` | integer (s) | `60` | Force compact raw blocks older than this |
+| `compaction_format` | atom | `:openzl` | Compression format (`:openzl` or `:zstd`) |
+| `merge_compaction_target_size` | integer | `2_000` | Target entries per merged compressed block |
+| `merge_compaction_min_blocks` | integer | `4` | Min small compressed blocks before merge triggers |
+| `compression_level` | integer | `6` | Compression level (1-22) |
+| `index_publish_interval` | integer (ms) | `2_000` | Index batch write interval |
+| `retention_max_age` | integer (s) or nil | `604_800` (7 days) | Max span age (`nil` = keep forever) |
+| `retention_max_size` | integer (bytes) or nil | `536_870_912` (512 MB) | Max storage size (`nil` = unlimited) |
+| `retention_check_interval` | integer (ms) | `300_000` (5 min) | Retention check interval |
+| `http` | boolean or keyword | `false` | Enable HTTP API |
+
+## HTTP options
+
+When `http` is a keyword list:
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `port` | integer | `10428` | HTTP listen port |
+| `bearer_token` | string or nil | `nil` | Bearer token for authentication |
+
+## Full example
+
+```elixir
+# config/config.exs
+config :timeless_traces,
+  # Storage
+  storage: :disk,
+  data_dir: "priv/span_stream",
+
+  # Buffer
+  flush_interval: 1_000,
+  max_buffer_size: 1_000,
+
+  # Compaction
+  compaction_threshold: 500,
+  compaction_interval: 30_000,
+  compaction_max_raw_age: 60,
+  compaction_format: :openzl,
+  compression_level: 6,
+  merge_compaction_target_size: 2_000,
+  merge_compaction_min_blocks: 4,
+
+  # Indexing
+  index_publish_interval: 2_000,
+
+  # Query
+  query_timeout: 30_000,
+
+  # Retention
+  retention_max_age: 7 * 86_400,
+  retention_max_size: 512 * 1_048_576,
+  retention_check_interval: 300_000,
+
+  # HTTP API
+  http: [port: 10428, bearer_token: "my-secret-token"]
+
+# OTel exporter
+config :opentelemetry,
+  traces_exporter: {TimelessTraces.Exporter, []}
+```
+
+## OpenTelemetry exporter configuration
+
+Wire TimelessTraces as the OTel traces exporter:
+
+```elixir
+config :opentelemetry,
+  traces_exporter: {TimelessTraces.Exporter, []}
+```
+
+The exporter reads spans directly from the OTel SDK's ETS table -- no HTTP or protobuf involved. This is significantly lower overhead than sending spans to an external collector.
+
+## Storage backends
+
+### Disk (default)
+
+Blocks are stored as files in `data_dir/blocks/` and the index is persisted as `data_dir/index.snapshot` + `data_dir/index.log`:
+
+```elixir
+config :timeless_traces, storage: :disk
+```
+
+### Memory
+
+Blocks are stored in ETS tables only. No files are written to disk. Data does not survive restarts. Useful for testing:
+
+```elixir
+config :timeless_traces, storage: :memory
+```
+
+## Tuning guidance
+
+### Buffer size and flush interval
+
+The defaults (1000 spans / 1 second) balance latency and throughput. For high-volume services:
+
+- Increase `max_buffer_size` to 5000-10000 for higher throughput
+- Increase `flush_interval` to 5000ms to reduce disk I/O
+- Decrease both for lower query latency (spans become queryable after flush)
+
+### Compression
+
+The default format is `:openzl` (columnar compression), which achieves ~10x compression on span data with faster query-time decompression than zstd.
+
+| Format | Compression ratio | Best for |
+|--------|-------------------|----------|
+| `:openzl` | ~10.0x | General use (default), fastest queries |
+| `:zstd` | ~6.8x | Simpler, fast compression |
+
+The `compression_level` setting applies to both formats (1-22, higher = smaller but slower).
+
+### Retention
+
+Both age-based and size-based retention are enabled by default. Set either to `nil` to disable:
+
+```elixir
+config :timeless_traces,
+  retention_max_age: nil,    # No age limit
+  retention_max_size: nil    # No size limit
+```
+
+### Merge compaction
+
+After initial compaction, many small compressed blocks accumulate (one per flush cycle). Merge compaction consolidates them into larger blocks for better compression and fewer blocks to scan during queries.
+
+- **High volume**: the defaults (target 2000 entries, min 4 blocks) work well
+- **Low volume**: lower `merge_compaction_min_blocks` to 2 so merges happen with fewer blocks
+- **Large queries**: increase `merge_compaction_target_size` to 5000+ to produce fewer, larger blocks
+
+Merge compaction can also be triggered manually via `TimelessTraces.merge_now()`.
+
+### Index publish interval
+
+The index journals mutations to a disk log every 2 seconds by default. Lower values mean faster persistence but increase disk I/O. For most workloads the default is fine.
+
+---
+
+# Getting Started
+
+Source: https://timeless-traces.hexdocs.pm/getting_started.md
+
+# Getting Started
+
+This guide walks you through installing TimelessTraces, wiring it into the OpenTelemetry SDK, and running your first trace query.
+
+## Installation
+
+Add the dependency to your `mix.exs`:
+
+```elixir
+def deps do
+  [
+    {:timeless_traces, "~> 0.5"},
+    {:opentelemetry_api, "~> 1.4"},
+    {:opentelemetry, "~> 1.5"}
+  ]
+end
+```
+
+Then fetch dependencies:
+
+```bash
+mix deps.get
+```
+
+## Configuration
+
+Set a data directory and wire up the OTel exporter:
+
+```elixir
+# config/config.exs
+config :timeless_traces,
+  data_dir: "priv/span_stream"
+
+config :opentelemetry,
+  traces_exporter: {TimelessTraces.Exporter, []}
+```
+
+That's it. TimelessTraces starts automatically as an OTP application. The exporter receives spans directly from the OpenTelemetry Erlang SDK -- no HTTP, no protobuf, no external collectors.
+
+## Creating spans
+
+Use the standard OpenTelemetry API. Spans are automatically exported to TimelessTraces:
+
+```elixir
+require OpenTelemetry.Tracer, as: Tracer
+
+Tracer.with_span "my_operation" do
+  # Your code here
+  Tracer.set_attribute("user.id", "abc123")
+  :ok
+end
+```
+
+For Phoenix applications, add `opentelemetry_phoenix` and `opentelemetry_ecto` for automatic instrumentation:
+
+```elixir
+def deps do
+  [
+    {:opentelemetry_phoenix, "~> 1.2"},
+    {:opentelemetry_ecto, "~> 1.2"}
+  ]
+end
+```
+
+```elixir
+# In your application.ex start/2
+OpentelemetryPhoenix.setup()
+OpentelemetryEcto.setup([:my_app, :repo])
+```
+
+## Querying spans
+
+Once spans are flowing, query them:
+
+```elixir
+# Find recent error spans
+{:ok, result} = TimelessTraces.query(status: :error)
+result.entries  # => [%TimelessTraces.Span{}, ...]
+result.total    # => 42
+
+# Find slow spans (> 100ms)
+TimelessTraces.query(min_duration: 100_000_000)
+
+# Find spans from a specific service
+TimelessTraces.query(service: "my_app", kind: :server)
+```
+
+## Trace lookup
+
+Retrieve all spans in a single trace:
+
+```elixir
+{:ok, spans} = TimelessTraces.trace("abc123def456...")
+# Returns all spans sorted by start time
+```
+
+## Listing services and operations
+
+```elixir
+{:ok, services} = TimelessTraces.services()
+# => {:ok, ["my_app", "api_gateway", "auth_service"]}
+
+{:ok, ops} = TimelessTraces.operations("my_app")
+# => {:ok, ["GET /users", "DB query", "cache_lookup"]}
+```
+
+## Statistics
+
+Check storage status:
+
+```elixir
+{:ok, stats} = TimelessTraces.stats()
+stats.total_blocks   #=> 42
+stats.total_entries   #=> 50_000
+stats.disk_size       #=> 24_000_000
+```
+
+## Enabling the HTTP API
+
+Optionally enable the HTTP interface for Jaeger-compatible queries and OTLP ingest:
+
+```elixir
+config :timeless_traces, http: true                          # port 10428, no auth
+config :timeless_traces, http: [port: 10500, bearer_token: "secret"]
+```
+
+See the [HTTP API](http_api.md) guide for endpoint details.
+
+## Next steps
+
+- [Configuration Reference](configuration.md) -- all options with defaults
+- [Architecture](architecture.md) -- how the pipeline works
+- [Querying](querying.md) -- full filter reference and optimization tips
+- [HTTP API](http_api.md) -- OTLP ingest and Jaeger-compatible query endpoints
+- [Storage & Compression](storage.md) -- block formats and compaction
+- [Operations](operations.md) -- backup, retention, and troubleshooting
+
+---
+
+# HTTP API
+
+Source: https://timeless-traces.hexdocs.pm/http_api.md
+
+# HTTP API
+
+TimelessTraces includes an optional HTTP interface with OTLP JSON ingest and Jaeger-compatible query endpoints. Enable it in your config:
+
+```elixir
+# Port 10428, no auth
+config :timeless_traces, http: true
+
+# Custom port with auth
+config :timeless_traces, http: [port: 10428, bearer_token: "my-secret-token"]
+```
+
+Or add directly to a supervision tree:
+
+```elixir
+children = [
+  {TimelessTraces.HTTP, port: 10428, bearer_token: "secret"}
+]
+```
+
+## Endpoints summary
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/insert/opentelemetry/v1/traces` | OTLP JSON trace ingest |
+| `GET` | `/select/jaeger/api/services` | List service names |
+| `GET` | `/select/jaeger/api/services/:service/operations` | Operations for a service |
+| `GET` | `/select/jaeger/api/traces` | Search traces |
+| `GET` | `/select/jaeger/api/traces/:trace_id` | Get full trace |
+| `GET` | `/health` | Health check (no auth required) |
+| `GET` | `/api/v1/flush` | Force buffer flush |
+| `POST` | `/api/v1/backup` | Online backup |
+
+## Health check
+
+Always accessible without authentication. Suitable for load balancer health checks.
+
+```bash
+curl http://localhost:10428/health
+```
+
+Response:
+
+```json
+{
+  "status": "ok",
+  "blocks": 42,
+  "spans": 50000,
+  "disk_size": 24000000
+}
+```
+
+## Ingest
+
+### POST /insert/opentelemetry/v1/traces
+
+Accepts OTLP JSON format (the standard OpenTelemetry JSON export format). Maximum body size is 10 MB.
+
+```bash
+curl -X POST http://localhost:10428/insert/opentelemetry/v1/traces \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "resourceSpans": [{
+      "resource": {
+        "attributes": [
+          {"key": "service.name", "value": {"stringValue": "my-service"}}
+        ]
+      },
+      "scopeSpans": [{
+        "scope": {"name": "my-library", "version": "1.0.0"},
+        "spans": [{
+          "traceId": "abc123def456789012345678abcdef01",
+          "spanId": "1234567890abcdef",
+          "name": "GET /users",
+          "kind": 2,
+          "startTimeUnixNano": "1705312200000000000",
+          "endTimeUnixNano": "1705312200050000000",
+          "status": {"code": 1},
+          "attributes": [
+            {"key": "http.method", "value": {"stringValue": "GET"}},
+            {"key": "http.status_code", "value": {"intValue": 200}}
+          ]
+        }]
+      }]
+    }]
+  }'
+```
+
+**Span kind values:**
+
+| Value | Kind |
+|-------|------|
+| 1 or `"SPAN_KIND_INTERNAL"` | internal |
+| 2 or `"SPAN_KIND_SERVER"` | server |
+| 3 or `"SPAN_KIND_CLIENT"` | client |
+| 4 or `"SPAN_KIND_PRODUCER"` | producer |
+| 5 or `"SPAN_KIND_CONSUMER"` | consumer |
+
+**Status code values:**
+
+| Value | Status |
+|-------|--------|
+| 0 or `"STATUS_CODE_UNSET"` | unset |
+| 1 or `"STATUS_CODE_OK"` | ok |
+| 2 or `"STATUS_CODE_ERROR"` | error |
+
+**Attribute value types:**
+
+Attributes use the OTLP key/value format. Supported value types: `stringValue`, `intValue`, `doubleValue`, `boolValue`.
+
+**Timestamps:**
+
+`startTimeUnixNano` and `endTimeUnixNano` are nanosecond unix timestamps, passed as strings or integers.
+
+**Response:**
+
+- `200` with `{"partialSuccess":{}}` on success
+- `400` on invalid JSON or missing `resourceSpans`
+- `413` if body exceeds 10 MB
+
+## Query (Jaeger-compatible)
+
+The query endpoints use Jaeger-compatible URL paths and response formats. This means you can point Jaeger UI directly at TimelessTraces.
+
+### GET /select/jaeger/api/services
+
+List all distinct service names.
+
+```bash
+curl http://localhost:10428/select/jaeger/api/services
+```
+
+Response:
+
+```json
+{
+  "data": ["my-service", "api-gateway", "auth-service"]
+}
+```
+
+### GET /select/jaeger/api/services/:service/operations
+
+List operations for a specific service.
+
+```bash
+curl http://localhost:10428/select/jaeger/api/services/my-service/operations
+```
+
+Response:
+
+```json
+{
+  "data": ["GET /users", "POST /orders", "DB query"]
+}
+```
+
+### GET /select/jaeger/api/traces
+
+Search traces with filters.
+
+```bash
+curl 'http://localhost:10428/select/jaeger/api/traces?service=my-service&operation=GET+/users&limit=20'
+```
+
+**Query parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `service` | string | Filter by service name |
+| `operation` | string | Filter by operation (span name) |
+| `start` | integer | Lower time bound (microseconds) |
+| `end` | integer | Upper time bound (microseconds) |
+| `limit` | integer | Max traces to return |
+| `minDuration` | string | Min duration (e.g. `"100ms"`, `"2s"`, `"500us"`) |
+| `maxDuration` | string | Max duration (e.g. `"1s"`) |
+
+**Duration format:**
+
+| Suffix | Unit |
+|--------|------|
+| `ms` | milliseconds |
+| `us` | microseconds |
+| `s` | seconds |
+| (none) | nanoseconds |
+
+**Response:**
+
+Returns traces in Jaeger JSON format:
+
+```json
+{
+  "data": [
+    {
+      "traceID": "abc123...",
+      "spans": [
+        {
+          "traceID": "abc123...",
+          "spanID": "1234567890abcdef",
+          "operationName": "GET /users",
+          "references": [],
+          "startTime": 1705312200000,
+          "duration": 50000,
+          "tags": [
+            {"key": "span.kind", "type": "string", "value": "server"},
+            {"key": "otel.status_code", "type": "string", "value": "OK"}
+          ],
+          "logs": [],
+          "processID": "p1"
+        }
+      ],
+      "processes": {
+        "p1": {"serviceName": "my-service", "tags": []}
+      }
+    }
+  ]
+}
+```
+
+Note: `startTime` and `duration` are in microseconds (Jaeger convention).
+
+### GET /select/jaeger/api/traces/:trace_id
+
+Get all spans for a specific trace.
+
+```bash
+curl http://localhost:10428/select/jaeger/api/traces/abc123def456789012345678abcdef01
+```
+
+Response format is the same as the search endpoint, with a single trace in the `data` array.
+
+## Flush
+
+### GET /api/v1/flush
+
+Force flush the buffer, writing any pending spans to storage immediately.
+
+```bash
+curl http://localhost:10428/api/v1/flush
+```
+
+Response:
+
+```json
+{"status": "ok"}
+```
+
+## Backup
+
+### POST /api/v1/backup
+
+Create a consistent online backup.
+
+```bash
+# Backup to a specific directory
+curl -X POST http://localhost:10428/api/v1/backup \
+  -H 'Content-Type: application/json' \
+  -d '{"path": "/tmp/span_backup"}'
+
+# Backup to default location (data_dir/backups/timestamp)
+curl -X POST http://localhost:10428/api/v1/backup
+```
+
+Response:
+
+```json
+{
+  "status": "ok",
+  "path": "/tmp/span_backup",
+  "files": ["index.snapshot", "blocks"],
+  "total_bytes": 24000000
+}
+```
+
+## Authentication
+
+When `bearer_token` is configured, all endpoints except `/health` require authentication:
+
+```bash
+# Via Authorization header
+curl -H "Authorization: Bearer my-secret-token" \
+  'http://localhost:10428/select/jaeger/api/services'
+
+# Via query parameter
+curl 'http://localhost:10428/select/jaeger/api/services?token=my-secret-token'
+```
+
+Unauthenticated requests receive:
+- `401 Unauthorized` if no token is provided
+- `403 Forbidden` if the token is incorrect
+
+Token comparison uses `Plug.Crypto.secure_compare` to prevent timing attacks.
+
+## Jaeger UI integration
+
+Point Jaeger UI at TimelessTraces by setting the query service URL:
+
+```bash
+# Run Jaeger UI with TimelessTraces as the backend
+docker run -d \
+  -e QUERY_BASE_PATH=/ \
+  -e GRPC_STORAGE_SERVER=host.docker.internal:10428 \
+  -p 16686:16686 \
+  jaegertracing/jaeger-query:latest
+```
+
+Or configure Jaeger UI's JSON API endpoint to point at `http://localhost:10428/select/jaeger`.
+
+## OTLP collector integration
+
+Any OTLP-compatible collector or agent can forward traces to the HTTP ingest endpoint:
+
+### OpenTelemetry Collector
+
+```yaml
+exporters:
+  otlphttp:
+    endpoint: http://localhost:10428/insert/opentelemetry
+    tls:
+      insecure: true
+
+service:
+  pipelines:
+    traces:
+      exporters: [otlphttp]
+```
+
+---
+
+# Operations
+
+Source: https://timeless-traces.hexdocs.pm/operations.md
+
+# Operations
+
+This guide covers monitoring, backup, retention, and troubleshooting for TimelessTraces.
+
+## Statistics
+
+Get aggregate storage statistics without reading any blocks:
+
+```elixir
+{:ok, stats} = TimelessTraces.stats()
+```
+
+Returns a `%TimelessTraces.Stats{}` struct:
+
+| Field | Description |
+|-------|-------------|
+| `total_blocks` | Number of stored blocks (raw + compressed) |
+| `total_entries` | Total spans across all blocks |
+| `total_bytes` | Total block storage size |
+| `disk_size` | On-disk storage size |
+| `index_size` | Index snapshot + log file size |
+| `oldest_timestamp` | Timestamp of oldest span (nanoseconds) |
+| `newest_timestamp` | Timestamp of newest span (nanoseconds) |
+| `raw_blocks` | Number of uncompressed raw blocks |
+| `raw_bytes` | Size of raw blocks |
+| `raw_entries` | Entries in raw blocks |
+| `zstd_blocks` | Number of zstd-compressed blocks |
+| `zstd_bytes` | Size of zstd blocks |
+| `zstd_entries` | Entries in zstd blocks |
+| `openzl_blocks` | Number of OpenZL-compressed blocks |
+| `openzl_bytes` | Size of OpenZL blocks |
+| `openzl_entries` | Entries in OpenZL blocks |
+| `compression_raw_bytes_in` | Total raw bytes processed by compactor |
+| `compression_compressed_bytes_out` | Total compressed bytes produced |
+| `compaction_count` | Number of compaction runs |
+
+### HTTP API
+
+```bash
+curl http://localhost:10428/health
+```
+
+Returns `status`, `blocks`, `spans`, and `disk_size`.
+
+## Flushing
+
+Force flush the buffer to write pending spans to storage immediately:
+
+```elixir
+TimelessTraces.flush()
+```
+
+```bash
+curl http://localhost:10428/api/v1/flush
+```
+
+Use before backups or graceful shutdowns.
+
+## Backup
+
+Create a consistent online backup without stopping the application.
+
+### Elixir API
+
+```elixir
+{:ok, result} = TimelessTraces.backup("/tmp/span_backup")
+# => {:ok, %{path: "/tmp/span_backup", files: ["index.snapshot", "blocks"], total_bytes: 24000000}}
+```
+
+### HTTP API
+
+```bash
+curl -X POST http://localhost:10428/api/v1/backup \
+  -H 'Content-Type: application/json' \
+  -d '{"path": "/tmp/span_backup"}'
+```
+
+### Backup procedure
+
+1. The buffer is flushed (all pending spans written to storage)
+2. ETS index is written as a snapshot file (atomic rename)
+3. Block files are copied in parallel to the target directory
+4. Returns the backup path, file list, and total bytes
+
+### Restore procedure
+
+1. Stop the TimelessTraces application
+2. Replace the data directory contents with the backup files
+3. Start the application -- it will load from the restored data
+
+## Retention
+
+Retention runs automatically to prevent unbounded disk growth. Two independent policies are enforced:
+
+### Age-based retention
+
+Delete blocks with `ts_max` older than the cutoff:
+
+```elixir
+config :timeless_traces,
+  retention_max_age: 7 * 86_400  # 7 days (default)
+```
+
+### Size-based retention
+
+Delete oldest blocks until total size is under the limit:
+
+```elixir
+config :timeless_traces,
+  retention_max_size: 512 * 1024 * 1024  # 512 MB (default)
+```
+
+### Disable retention
+
+```elixir
+config :timeless_traces,
+  retention_max_age: nil,    # No age limit
+  retention_max_size: nil    # No size limit
+```
+
+### Manual trigger
+
+```elixir
+TimelessTraces.Retention.run_now()
+```
+
+### Check interval
+
+```elixir
+config :timeless_traces,
+  retention_check_interval: 300_000  # 5 minutes (default)
+```
+
+## Telemetry events
+
+TimelessTraces emits telemetry events for monitoring:
+
+| Event | Measurements | Metadata |
+|-------|-------------|----------|
+| `[:timeless_traces, :flush, :stop]` | `duration`, `entry_count`, `byte_size` | `block_id` |
+| `[:timeless_traces, :query, :stop]` | `duration`, `total`, `blocks_read` | `filters` |
+| `[:timeless_traces, :retention, :stop]` | `duration`, `blocks_deleted` | |
+| `[:timeless_traces, :compaction, :stop]` | `duration`, `raw_blocks`, `entry_count`, `byte_size` | |
+| `[:timeless_traces, :merge_compaction, :stop]` | `duration`, `batches_merged`, `blocks_consumed` | |
+| `[:timeless_traces, :block, :error]` | | `file_path`, `reason` |
+
+See the [Telemetry](telemetry.md) guide for handler examples.
+
+### Key metrics to monitor
+
+| Metric | Source | Alert threshold |
+|--------|--------|-----------------|
+| Flush duration | `[:flush, :stop]` duration | Sustained > 100ms |
+| Flush entry count | `[:flush, :stop]` entry_count | Sustained at max_buffer_size |
+| Query latency | `[:query, :stop]` duration | > 5s for typical queries |
+| Blocks read per query | `[:query, :stop]` blocks_read | Growing linearly |
+| Block read errors | `[:block, :error]` | Any occurrence |
+| Retention blocks deleted | `[:retention, :stop]` blocks_deleted | 0 when disk is growing |
+
+## Troubleshooting
+
+### High memory usage
+
+- Check `raw_blocks` in stats -- many uncompacted raw blocks use more memory
+- Trigger compaction: `TimelessTraces.Compactor.compact_now()`
+- Reduce `max_buffer_size` to flush smaller batches
+- Check for slow subscribers blocking the buffer
+
+### Disk space growing
+
+- Verify retention is configured: check `retention_max_age` and `retention_max_size`
+- Trigger retention manually: `TimelessTraces.Retention.run_now()`
+- Check stats for `total_bytes` trends
+- Reduce retention age or size limits
+
+### Slow queries
+
+- Use `:service`, `:kind`, and `:status` filters to leverage the term index
+- Avoid full scans (no filters) on large datasets
+- Reduce the time range with `:since` and `:until`
+- Check `raw_blocks` count -- many small raw blocks are slower to query than fewer compressed blocks
+- Trigger merge compaction to consolidate small compressed blocks: `TimelessTraces.merge_now()`
+
+### Spans not appearing in queries
+
+- Flush the buffer: `TimelessTraces.flush()`
+- Check that the OTel exporter is configured: verify `traces_exporter: {TimelessTraces.Exporter, []}` in config
+- Verify the data_dir exists and is writable
+- Check for block read errors in telemetry events
+- Check the `index_publish_interval` -- spans become queryable after the index batches them (default 2s)
+
+### Compaction not running
+
+- Check `raw_blocks` and `raw_entries` in stats
+- Verify `compaction_threshold` isn't set too high for your span volume
+- Trigger manually: `TimelessTraces.Compactor.compact_now()`
+- Check that `compaction_max_raw_age` is reasonable (default: 60 seconds)
+
+### OTel exporter not working
+
+- Verify the dependency: `{:opentelemetry, "~> 1.5"}` must be in your mix.exs
+- Check the config: `config :opentelemetry, traces_exporter: {TimelessTraces.Exporter, []}`
+- Ensure spans are being created: use `OpenTelemetry.Tracer.with_span/2` in your code
+- Check that TimelessTraces.Application has started (it must start before spans are exported)
+
+---
+
+# Querying
+
+Source: https://timeless-traces.hexdocs.pm/querying.md
+
+# Querying
+
+This guide covers the Elixir query API, all available filters, trace lookup, and query optimization.
+
+## Basic queries
+
+```elixir
+# All spans (default limit 100, newest first)
+{:ok, result} = TimelessTraces.query()
+
+# Error spans
+{:ok, result} = TimelessTraces.query(status: :error)
+
+# Server spans from a specific service
+{:ok, result} = TimelessTraces.query(kind: :server, service: "api-gateway")
+
+# Slow spans (> 100ms)
+{:ok, result} = TimelessTraces.query(min_duration: 100_000_000)
+```
+
+## Result struct
+
+Queries return a `TimelessTraces.Result` struct:
+
+```elixir
+%TimelessTraces.Result{
+  entries: [%TimelessTraces.Span{}, ...],
+  total: 42,      # total matching spans (before pagination)
+  limit: 100,     # max entries returned
+  offset: 0       # entries skipped
+}
+```
+
+## Span struct
+
+Each span in `entries` is a `TimelessTraces.Span`:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `trace_id` | string | 32-character hex trace ID |
+| `span_id` | string | 16-character hex span ID |
+| `parent_span_id` | string or nil | Parent span ID (nil for root spans) |
+| `name` | string | Operation name (e.g. `"GET /users"`) |
+| `kind` | atom | `:internal`, `:server`, `:client`, `:producer`, `:consumer` |
+| `start_time` | integer | Start time in nanoseconds |
+| `end_time` | integer | End time in nanoseconds |
+| `duration_ns` | integer | Duration in nanoseconds |
+| `status` | atom | `:ok`, `:error`, `:unset` |
+| `status_message` | string or nil | Error description |
+| `attributes` | map | Span attributes (string keys) |
+| `events` | list | Span events |
+| `resource` | map | OTel resource attributes (string keys) |
+| `instrumentation_scope` | map or nil | `%{name: "...", version: "..."}` |
+
+## Filters
+
+| Filter | Type | Description |
+|--------|------|-------------|
+| `:name` | string | Case-insensitive substring match on span name |
+| `:service` | string | Exact match on `service.name` in attributes or resource |
+| `:kind` | atom | `:internal`, `:server`, `:client`, `:producer`, `:consumer` |
+| `:status` | atom | `:ok`, `:error`, `:unset` |
+| `:min_duration` | integer | Minimum duration in nanoseconds |
+| `:max_duration` | integer | Maximum duration in nanoseconds |
+| `:since` | DateTime or integer | Start time lower bound (DateTime or unix nanoseconds) |
+| `:until` | DateTime or integer | Start time upper bound (DateTime or unix nanoseconds) |
+| `:trace_id` | string | Exact match on trace ID |
+| `:attributes` | map | All key/value pairs must match (keys and values compared as strings) |
+| `:limit` | integer | Max results (default 100) |
+| `:offset` | integer | Skip N results (default 0) |
+| `:order` | atom | `:desc` (newest first, default) or `:asc` (oldest first) |
+
+## Examples
+
+### Time range queries
+
+```elixir
+# Spans from the last hour
+one_hour_ago = DateTime.add(DateTime.utc_now(), -3600)
+TimelessTraces.query(since: one_hour_ago)
+
+# Spans in a specific window
+TimelessTraces.query(
+  since: ~U[2024-01-15 10:00:00Z],
+  until: ~U[2024-01-15 11:00:00Z]
+)
+
+# Using nanosecond timestamps directly
+TimelessTraces.query(since: 1705312200_000_000_000)
+```
+
+### Duration queries
+
+```elixir
+# Slow spans (> 500ms)
+TimelessTraces.query(min_duration: 500_000_000)
+
+# Spans in a duration range (100ms - 1s)
+TimelessTraces.query(min_duration: 100_000_000, max_duration: 1_000_000_000)
+```
+
+### Attribute queries
+
+```elixir
+# Match specific attributes
+TimelessTraces.query(attributes: %{"http.method" => "POST", "http.status_code" => "500"})
+```
+
+### Pagination
+
+```elixir
+# Page 1
+{:ok, page1} = TimelessTraces.query(status: :error, limit: 50)
+
+# Page 2
+{:ok, page2} = TimelessTraces.query(status: :error, limit: 50, offset: 50)
+```
+
+### Combined filters
+
+```elixir
+TimelessTraces.query(
+  service: "api-gateway",
+  kind: :server,
+  status: :error,
+  min_duration: 100_000_000,
+  since: DateTime.add(DateTime.utc_now(), -86400),
+  limit: 20,
+  order: :asc
+)
+```
+
+## Trace lookup
+
+Retrieve all spans in a trace, sorted by start time:
+
+```elixir
+{:ok, spans} = TimelessTraces.trace("abc123def456789012345678abcdef01")
+```
+
+This uses the trace index for fast lookup -- only blocks known to contain spans for that trace are read.
+
+On disk, `trace_index` stores packed binary trace IDs for 32-character hex values to reduce index size. Lookups remain backward-compatible with older text rows during migration.
+
+## Service and operation discovery
+
+```elixir
+# List all services
+{:ok, services} = TimelessTraces.services()
+# => {:ok, ["my_app", "api_gateway", "auth_service"]}
+
+# List operations for a service
+{:ok, ops} = TimelessTraces.operations("my_app")
+# => {:ok, ["GET /users", "POST /orders", "DB query"]}
+```
+
+## Query optimization
+
+### Use indexed filters
+
+The following filters leverage the inverted term index, narrowing the set of blocks to read:
+
+- `:service` -- matches `service:<name>` terms
+- `:kind` -- matches `kind:<kind>` terms
+- `:status` -- matches `status:<status>` terms
+- `:name` -- matches `name:<name>` terms
+- `:trace_id` -- uses the trace index directly
+
+Time range filters (`:since`, `:until`) narrow blocks by timestamp metadata.
+
+### Avoid full scans
+
+Queries with no filters scan all blocks. On large datasets, always include at least one filter to leverage the index.
+
+### Duration and attribute filters
+
+`:min_duration`, `:max_duration`, and `:attributes` are applied as in-memory filters after block decompression. They don't reduce the number of blocks read. Combine them with indexed filters for best performance.
+
+### Performance benchmarks
+
+Query latency on 500K spans, 500 blocks (avg over 3 runs):
+
+| Query | zstd | OpenZL | Speedup |
+|-------|------|--------|---------|
+| All spans (limit 100) | 945ms | 442ms | 2.1x |
+| status=error | 289ms | 148ms | 2.0x |
+| service filter | 318ms | 243ms | 1.3x |
+| kind=server | 275ms | 225ms | 1.2x |
+| Trace lookup | 5.5ms | 5.7ms | 1.0x |
+
+OpenZL columnar format is faster at query time because columns can be selectively decompressed.
+
+---
+
+# Storage &amp; Compression
+
+Source: https://timeless-traces.hexdocs.pm/storage.md
+
+# Storage & Compression
+
+This document covers TimelessTraces' block-based storage format, compression options, and the compaction pipeline.
+
+## Block-based storage
+
+Spans are stored in **blocks** -- batches of spans written together and indexed as a unit. Each block contains:
+
+- A batch of serialized spans (typically 500-2000)
+- Block metadata: block_id, byte_size, entry_count, timestamp range (ts_min, ts_max), format
+- An inverted index of terms for fast querying
+- Trace index entries mapping packed trace IDs to the block
+
+## Block formats
+
+### Raw (`.raw`)
+
+Uncompressed Erlang binary serialization (`:erlang.term_to_binary`). This is the initial format when spans are flushed from the buffer. Raw blocks are temporary -- the compactor merges them into compressed blocks.
+
+### Zstd (`.zst`)
+
+Erlang `term_to_binary` compressed with [Zstandard](https://facebook.github.io/zstd/). Simple, fast compression with good decompression speed.
+
+| Metric | Value |
+|--------|-------|
+| Compression ratio | ~6.8x |
+| Size (500K spans) | 32.8 MB |
+| Configurable level | 1-22 (default: 6) |
+
+### OpenZL (`.ozl`)
+
+Columnar format with [OpenZL](https://github.com/nicholasgasior/ex_openzl) compression. Span fields are split into separate typed columns and each column is independently compressed. This exploits per-column redundancy for better ratios and enables selective column decompression at query time.
+
+**Columnar layout:**
+
+| Column | Encoding | Contents |
+|--------|----------|----------|
+| start_time | u64 packed | Start timestamps (nanoseconds) |
+| end_time | u64 packed | End timestamps (nanoseconds) |
+| duration | u64 packed | Duration (nanoseconds) |
+| kind | u8 packed | Span kind (0-4) |
+| status | u8 packed | Status (0-2) |
+| trace_id | length-prefixed strings | Trace IDs in the block payload |
+| span_id | length-prefixed strings | Span IDs |
+| parent_span_id | length-prefixed strings | Parent span IDs |
+| name | length-prefixed strings | Span names |
+| status_message | length-prefixed strings | Status messages |
+| rest_blob | Erlang term_to_binary | Attributes, events, resource, scope |
+
+| Metric | Value |
+|--------|-------|
+| Compression ratio | ~10.0x |
+| Size (500K spans) | 22.3 MB |
+| Configurable level | 1-22 (default: 6) |
+
+### Choosing a format
+
+The default is `:openzl` (columnar). Set via configuration:
+
+```elixir
+config :timeless_traces,
+  compaction_format: :openzl,    # or :zstd
+  compression_level: 6           # 1-22
+```
+
+| Use case | Recommended format |
+|----------|-------------------|
+| General use | `:openzl` (default) |
+| Fastest queries | `:openzl` |
+| Simpler compression | `:zstd` |
+
+## Compaction
+
+New spans are first written as raw (uncompressed) blocks for low-latency ingestion. A background Compactor process periodically merges raw blocks into compressed blocks.
+
+### Compaction triggers
+
+Compaction runs when any of these conditions are met:
+
+1. **Entry threshold**: total raw entries >= `compaction_threshold` (default: 500)
+2. **Age threshold**: oldest raw block >= `compaction_max_raw_age` seconds (default: 60)
+3. **Manual trigger**: `TimelessTraces.Compactor.compact_now()`
+4. **Periodic check**: every `compaction_interval` ms (default: 30,000)
+
+### Compaction process
+
+1. Read all raw block entries from disk
+2. Merge entries into a single batch
+3. Compress with the configured format (OpenZL or zstd)
+4. Write a new compressed block file
+5. Update the index (delete old block metadata, add new)
+6. Delete old raw block files
+7. Update compression statistics
+
+### Compaction configuration
+
+```elixir
+config :timeless_traces,
+  compaction_threshold: 500,       # Min raw entries to trigger
+  compaction_interval: 30_000,     # Check interval (ms)
+  compaction_max_raw_age: 60,      # Force compact after this many seconds
+  compaction_format: :openzl,      # Output format
+  compression_level: 6             # Compression level (1-22)
+```
+
+### Manual compaction
+
+```elixir
+TimelessTraces.Compactor.compact_now()
+# => :ok or :noop (if nothing to compact)
+```
+
+## Disk layout
+
+```
+data_dir/
+├── index.snapshot    # Periodic ETS table dump (compressed ETF)
+├── index.log         # Write-ahead log (Erlang disk_log)
+└── blocks/
+    ├── 000000000001.raw   # Raw block (temporary)
+    ├── 000000000002.raw   # Raw block (temporary)
+    ├── 000000000003.ozl   # OpenZL compressed block
+    ├── 000000000004.ozl   # OpenZL compressed block
+    └── ...
+```
+
+Block filenames are 12-digit zero-padded block IDs with format-specific extensions.
+
+The separate `trace_index` persists 32-character hex trace IDs in packed 16-byte binary form to keep the index smaller. Older text rows are still readable during lookup.
+
+## Memory storage mode
+
+For testing or ephemeral environments, use in-memory storage:
+
+```elixir
+config :timeless_traces, storage: :memory
+```
+
+In memory mode:
+- Block data is stored in ETS tables only
+- No block files are written to disk
+- The ETS tables still provide lock-free read access
+- Data does not survive application restarts
+
+## Compression statistics
+
+Track compression efficiency via the stats API:
+
+```elixir
+{:ok, stats} = TimelessTraces.stats()
+
+stats.compression_raw_bytes_in          # Total uncompressed bytes processed
+stats.compression_compressed_bytes_out  # Total compressed bytes produced
+stats.compaction_count                  # Number of compaction runs
+```
+
+The compression ratio is `compression_raw_bytes_in / compression_compressed_bytes_out`.
+
+## Compression comparison
+
+| Backend | Size (500K spans) | Ratio | Compress | Decompress |
+|---------|-------------------|-------|----------|------------|
+| zstd | 32.8 MB | 6.8x | 2.0s | 1.1s |
+| OpenZL columnar | 22.3 MB | 10.0x | 2.0s | 2.3s |
+
+OpenZL achieves better compression through columnar encoding -- timestamps compress well together, span kinds compress to nearly nothing, and string columns (names, IDs) benefit from prefix deduplication.
+
+---
+
+# Live Tail (Subscriptions)
+
+Source: https://timeless-traces.hexdocs.pm/subscriptions.md
+
+# Live Tail (Subscriptions)
+
+TimelessTraces supports real-time span subscriptions. Subscriber processes receive spans as they arrive, before they're written to storage.
+
+## Subscribing
+
+```elixir
+TimelessTraces.subscribe()
+```
+
+The calling process will receive messages of the form:
+
+```elixir
+{:timeless_traces, :span, %TimelessTraces.Span{}}
+```
+
+### Filtered subscriptions
+
+Filter by span name, kind, status, or service:
+
+```elixir
+# Only receive error spans
+TimelessTraces.subscribe(status: :error)
+
+# Only receive server spans
+TimelessTraces.subscribe(kind: :server)
+
+# Only receive spans from a specific service
+TimelessTraces.subscribe(service: "api-gateway")
+
+# Combined filters
+TimelessTraces.subscribe(status: :error, service: "api-gateway")
+```
+
+## Receiving spans
+
+```elixir
+TimelessTraces.subscribe(status: :error)
+
+receive do
+  {:timeless_traces, :span, %TimelessTraces.Span{} = span} ->
+    IO.puts("[#{span.status}] #{span.name} (#{span.duration_ns / 1_000_000}ms)")
+end
+```
+
+### In a GenServer
+
+```elixir
+defmodule MyApp.TraceWatcher do
+  use GenServer
+
+  def start_link(_opts) do
+    GenServer.start_link(__MODULE__, :ok, name: __MODULE__)
+  end
+
+  @impl true
+  def init(:ok) do
+    TimelessTraces.subscribe(status: :error)
+    {:ok, %{}}
+  end
+
+  @impl true
+  def handle_info({:timeless_traces, :span, span}, state) do
+    # React to error spans: send alert, increment counter, etc.
+    IO.puts("ERROR: #{span.name} from #{Map.get(span.attributes, "service.name")}")
+    {:noreply, state}
+  end
+end
+```
+
+### In a LiveView
+
+```elixir
+defmodule MyAppWeb.TraceLive do
+  use Phoenix.LiveView
+
+  def mount(_params, _session, socket) do
+    if connected?(socket) do
+      TimelessTraces.subscribe(status: :error)
+    end
+
+    {:ok, assign(socket, spans: [])}
+  end
+
+  def handle_info({:timeless_traces, :span, span}, socket) do
+    spans = [span | socket.assigns.spans] |> Enum.take(100)
+    {:noreply, assign(socket, spans: spans)}
+  end
+end
+```
+
+## Unsubscribing
+
+```elixir
+TimelessTraces.unsubscribe()
+```
+
+Subscriptions are automatically cleaned up when the subscriber process exits.
+
+## How it works
+
+Subscriptions use an Elixir `Registry` with `:duplicate` keys. When the Buffer receives new spans, it broadcasts to all registered subscribers before flushing. This means subscribers see spans immediately, even before they're written to storage.
+
+Filter matching happens at broadcast time -- subscribers only receive spans that match their filter criteria.
+
+## Performance considerations
+
+- Subscription delivery is synchronous with the Buffer's ingest path. A slow subscriber can affect ingest throughput.
+- For high-volume span streams, filter at the subscription level (`:status`, `:kind`, `:service`, `:name`) rather than in the subscriber's `handle_info`.
+- If you need to do expensive work in response to spans, send yourself a message and process it asynchronously.
+
+---
+
+# Telemetry
+
+Source: https://timeless-traces.hexdocs.pm/telemetry.md
+
+# Telemetry
+
+TimelessTraces emits [telemetry](https://hex.pm/packages/telemetry) events for monitoring and observability.
+
+## Events
+
+### Flush
+
+Emitted when the buffer flushes spans to a block.
+
+**Event:** `[:timeless_traces, :flush, :stop]`
+
+| Measurement | Type | Description |
+|-------------|------|-------------|
+| `duration` | integer (native time) | Time taken to write the block |
+| `entry_count` | integer | Number of spans in the block |
+| `byte_size` | integer | Size of the written block in bytes |
+
+| Metadata | Type | Description |
+|----------|------|-------------|
+| `block_id` | integer | ID of the written block |
+
+### Query
+
+Emitted when a query completes.
+
+**Event:** `[:timeless_traces, :query, :stop]`
+
+| Measurement | Type | Description |
+|-------------|------|-------------|
+| `duration` | integer (native time) | Total query execution time |
+| `total` | integer | Total matching spans (before pagination) |
+| `blocks_read` | integer | Number of blocks decompressed |
+
+| Metadata | Type | Description |
+|----------|------|-------------|
+| `filters` | keyword | The query filters used |
+
+### Retention
+
+Emitted when a retention run completes.
+
+**Event:** `[:timeless_traces, :retention, :stop]`
+
+| Measurement | Type | Description |
+|-------------|------|-------------|
+| `duration` | integer (native time) | Time taken for retention enforcement |
+| `blocks_deleted` | integer | Number of blocks removed |
+
+### Block error
+
+Emitted when a block fails to read or decompress.
+
+**Event:** `[:timeless_traces, :block, :error]`
+
+| Metadata | Type | Description |
+|----------|------|-------------|
+| `file_path` | string | Path to the block file |
+| `reason` | term | Error reason |
+
+## Attaching handlers
+
+### Basic logging
+
+```elixir
+:telemetry.attach_many(
+  "timeless-traces-logger",
+  [
+    [:timeless_traces, :flush, :stop],
+    [:timeless_traces, :query, :stop],
+    [:timeless_traces, :retention, :stop],
+    [:timeless_traces, :block, :error]
+  ],
+  fn event, measurements, metadata, _config ->
+    require Logger
+    Logger.info("#{inspect(event)}: #{inspect(measurements)} #{inspect(metadata)}")
+  end,
+  nil
+)
+```
+
+### With telemetry_metrics
+
+```elixir
+defmodule MyApp.Telemetry do
+  use Supervisor
+  import Telemetry.Metrics
+
+  def start_link(arg) do
+    Supervisor.start_link(__MODULE__, arg, name: __MODULE__)
+  end
+
+  def init(_arg) do
+    children = [
+      {Telemetry.Metrics.ConsoleReporter, metrics: metrics()}
+    ]
+
+    Supervisor.init(children, strategy: :one_for_one)
+  end
+
+  defp metrics do
+    [
+      summary("timeless_traces.flush.stop.duration",
+        unit: {:native, :millisecond}),
+      summary("timeless_traces.query.stop.duration",
+        unit: {:native, :millisecond}),
+      counter("timeless_traces.flush.stop.entry_count"),
+      counter("timeless_traces.block.error")
+    ]
+  end
+end
+```
+
+### With TimelessMetrics
+
+If you're also running [TimelessMetrics](https://github.com/awksedgreep/timeless_metrics), you can write telemetry events as metrics:
+
+```elixir
+:telemetry.attach(
+  "timeless-traces-to-metrics",
+  [:timeless_traces, :flush, :stop],
+  fn _event, %{entry_count: count, byte_size: bytes}, _metadata, _config ->
+    TimelessMetrics.write(:metrics, "timeless_traces_flush_spans", %{}, count / 1)
+    TimelessMetrics.write(:metrics, "timeless_traces_flush_bytes", %{}, bytes / 1)
+  end,
+  nil
+)
+```
+
+### With TimelessLogs
+
+If you're also running [TimelessLogs](https://github.com/awksedgreep/timeless_logs), telemetry events are automatically captured via `Logger` calls.
+
+---
+
+# TimelessTraces
+
+Source: https://timeless-traces.hexdocs.pm/TimelessTraces.md
+
+# `TimelessTraces`
+[🔗](https://github.com/awksedgreep/timeless_traces/blob/main/lib/timeless_traces.ex#L1)
+
+Embedded OpenTelemetry span storage and compression for Elixir applications.
+
+TimelessTraces receives spans from the OpenTelemetry Erlang SDK, compresses them
+into compressed blocks, and indexes them in ETS for fast querying.
+
+## Setup
+
+    # config/config.exs
+    config :timeless_traces,
+      data_dir: "priv/span_stream"
+
+    # Enable the OTel exporter
+    config :opentelemetry,
+      traces_exporter: {TimelessTraces.Exporter, []}
+
+## Querying
+
+    # Find error spans
+    TimelessTraces.query(status: :error)
+
+    # Find spans by service and kind
+    TimelessTraces.query(service: "my_app", kind: :server)
+
+    # Find slow spans (> 100ms)
+    TimelessTraces.query(min_duration: 100_000_000)
+
+## Trace Lookup
+
+    # Get all spans in a trace
+    TimelessTraces.trace("abc123def456...")
+
+# `backup`
+
+```elixir
+@spec backup(String.t()) :: {:ok, map()} | {:error, term()}
+```
+
+Create a consistent online backup of the span store.
+
+Flushes all in-flight data, writes an ETS index snapshot,
+and copies block files to the target directory.
+
+## Parameters
+
+  * `target_dir` - Directory to write backup files into (will be created)
+
+## Returns
+
+    {:ok, %{path: target_dir, files: [filenames], total_bytes: integer()}}
+
+## Examples
+
+    TimelessTraces.backup("/tmp/span_backup_2024")
+
+# `flush`
+
+```elixir
+@spec flush() :: :ok
+```
+
+Flush the buffer, writing any pending spans to storage immediately.
+
+# `merge_now`
+
+```elixir
+@spec merge_now() :: :ok | :noop
+```
+
+Merge multiple small compressed blocks into fewer, larger blocks.
+
+Returns `:ok` if blocks were merged, `:noop` if no merge was needed.
+
+# `operations`
+
+```elixir
+@spec operations(String.t()) :: {:ok, [String.t()]}
+```
+
+List all distinct operation (span) names for a given service.
+
+## Examples
+
+    {:ok, ops} = TimelessTraces.operations("my_app")
+    #=> {:ok, ["GET /users", "DB query", "cache_lookup"]}
+
+# `query`
+
+```elixir
+@spec query(keyword()) :: {:ok, TimelessTraces.Result.t()} | {:error, term()}
+```
+
+Query stored spans. Returns a `TimelessTraces.Result` struct.
+
+## Filters
+
+  * `:name` - Substring match on span name
+  * `:service` - Match `service.name` attribute or resource
+  * `:kind` - Span kind atom (`:internal`, `:server`, `:client`, `:producer`, `:consumer`)
+  * `:status` - Status atom (`:ok`, `:error`, `:unset`)
+  * `:min_duration` - Minimum duration in nanoseconds
+  * `:max_duration` - Maximum duration in nanoseconds
+  * `:since` - Start time lower bound (DateTime or unix nanos)
+  * `:until` - Start time upper bound (DateTime or unix nanos)
+  * `:trace_id` - Filter to specific trace ID
+  * `:attributes` - Map of attribute key/value pairs to match
+
+## Pagination & Ordering
+
+  * `:limit` - Max entries to return (default 100)
+  * `:offset` - Number of entries to skip (default 0)
+  * `:order` - `:desc` (newest first, default) or `:asc` (oldest first)
+
+# `services`
+
+```elixir
+@spec services() :: {:ok, [String.t()]}
+```
+
+List all distinct service names found in stored spans.
+
+## Examples
+
+    {:ok, services} = TimelessTraces.services()
+    #=> {:ok, ["my_app", "api_gateway", "auth_service"]}
+
+# `stats`
+
+```elixir
+@spec stats() :: {:ok, TimelessTraces.Stats.t()}
+```
+
+Return aggregate statistics about stored span data.
+
+## Examples
+
+    {:ok, stats} = TimelessTraces.stats()
+    stats.total_blocks   #=> 42
+    stats.total_entries   #=> 50000
+
+# `subscribe`
+
+```elixir
+@spec subscribe(keyword()) :: {:ok, pid()}
+```
+
+Subscribe the calling process to receive new spans as they arrive.
+
+The subscriber receives messages of the form:
+`{:timeless_traces, :span, %TimelessTraces.Span{}}`.
+
+## Options
+
+  * `:name` - Only receive spans with this name
+  * `:kind` - Only receive spans of this kind
+  * `:status` - Only receive spans with this status
+  * `:service` - Only receive spans from this service
+
+# `trace`
+
+```elixir
+@spec trace(String.t()) :: {:ok, [TimelessTraces.Span.t()]}
+```
+
+Retrieve all spans for a given trace ID, sorted by start time.
+
+## Examples
+
+    {:ok, spans} = TimelessTraces.trace("abc123...")
+
+# `unsubscribe`
+
+```elixir
+@spec unsubscribe() :: :ok
+```
+
+Unsubscribe the calling process from span notifications.
+
+---
+
+*Consult [api-reference.md](api-reference.md) for complete listing*
+
+---
+
+# TimelessTraces.DB
+
+Source: https://timeless-traces.hexdocs.pm/TimelessTraces.DB.md
+
+# `TimelessTraces.DB`
+[🔗](https://github.com/awksedgreep/timeless_traces/blob/main/lib/timeless_traces/db.ex#L1)
+
+SQLite connection manager with a single writer and pooled readers.
+
+Uses WAL mode for concurrent reads during writes. The writer is serialized
+through a GenServer to respect SQLite's single-writer constraint.
+
+# `backup`
+
+Create a consistent backup of this database using VACUUM INTO.
+
+# `child_spec`
+
+Returns a specification to start this module under a supervisor.
+
+See `Supervisor`.
+
+# `db_path`
+
+Get the database path.
+
+# `execute_batch`
+
+Prepare once, execute many times with different params. Use inside write_transaction.
+
+# `read`
+
+Execute a read query using a reader connection from the pool.
+
+# `start_link`
+
+# `write`
+
+Execute a write query (INSERT, UPDATE, DELETE) through the serialized writer.
+
+# `write_transaction`
+
+Execute multiple write queries in a single transaction.
+
+---
+
+*Consult [api-reference.md](api-reference.md) for complete listing*
+
+---
+
+# TimelessTraces.Exporter
+
+Source: https://timeless-traces.hexdocs.pm/TimelessTraces.Exporter.md
+
+# `TimelessTraces.Exporter`
+[🔗](https://github.com/awksedgreep/timeless_traces/blob/main/lib/timeless_traces/exporter.ex#L1)
+
+OpenTelemetry traces exporter that stores spans in TimelessTraces.
+
+## Configuration
+
+    config :opentelemetry,
+      traces_exporter: {TimelessTraces.Exporter, []}
+
+---
+
+*Consult [api-reference.md](api-reference.md) for complete listing*
+
+---
+
+# TimelessTraces.HTTP
+
+Source: https://timeless-traces.hexdocs.pm/TimelessTraces.HTTP.md
+
+# `TimelessTraces.HTTP`
+[🔗](https://github.com/awksedgreep/timeless_traces/blob/main/lib/timeless_traces/http.ex#L1)
+
+Optional HTTP interface compatible with VictoriaTraces (OTLP ingest) and Jaeger (query).
+
+## Usage
+
+Add to your config:
+
+    config :timeless_traces, http: true                          # port 10428, no auth
+    config :timeless_traces, http: [port: 10500, bearer_token: "secret"]
+
+Or add to your supervision tree directly:
+
+    children = [
+      {TimelessTraces.HTTP, port: 10428}
+    ]
+
+## Endpoints
+
+### Ingest
+  * `POST /insert/opentelemetry/v1/traces` - OTLP JSON trace ingest
+
+### Query (Jaeger-compatible)
+  * `GET /select/jaeger/api/services` - List service names
+  * `GET /select/jaeger/api/services/:service/operations` - Operations for a service
+  * `GET /select/jaeger/api/traces/:trace_id` - Get full trace
+  * `GET /select/jaeger/api/traces` - Search traces
+
+### Operational
+  * `GET /health` - Health check
+  * `POST /api/v1/backup` - Online backup
+  * `GET /api/v1/flush` - Force buffer flush
+
+# `child_spec`
+
+# `dispatch`
+
+# `handle`
+
+---
+
+*Consult [api-reference.md](api-reference.md) for complete listing*
+
+---
+
+# TimelessTraces.Result
+
+Source: https://timeless-traces.hexdocs.pm/TimelessTraces.Result.md
+
+# `TimelessTraces.Result`
+[🔗](https://github.com/awksedgreep/timeless_traces/blob/main/lib/timeless_traces/result.ex#L1)
+
+Query result with pagination metadata.
+
+# `t`
+
+```elixir
+@type t() :: %TimelessTraces.Result{
+  entries: [TimelessTraces.Span.t()],
+  has_more: boolean(),
+  limit: pos_integer(),
+  offset: non_neg_integer(),
+  total: non_neg_integer()
+}
+```
+
+---
+
+*Consult [api-reference.md](api-reference.md) for complete listing*
+
+---
+
+# TimelessTraces.Span
+
+Source: https://timeless-traces.hexdocs.pm/TimelessTraces.Span.md
+
+# `TimelessTraces.Span`
+[🔗](https://github.com/awksedgreep/timeless_traces/blob/main/lib/timeless_traces/span.ex#L1)
+
+A single OpenTelemetry span.
+
+# `t`
+
+```elixir
+@type t() :: %TimelessTraces.Span{
+  attributes: map(),
+  duration_ns: integer(),
+  end_time: integer(),
+  events: list(),
+  instrumentation_scope: map() | nil,
+  kind: :internal | :server | :client | :producer | :consumer,
+  name: String.t(),
+  parent_span_id: String.t() | nil,
+  resource: map(),
+  span_id: String.t(),
+  start_time: integer(),
+  status: :ok | :error | :unset,
+  status_message: String.t() | nil,
+  trace_id: String.t()
+}
+```
+
+# `encode_span_id`
+
+```elixir
+@spec encode_span_id(non_neg_integer()) :: String.t()
+```
+
+# `encode_trace_id`
+
+```elixir
+@spec encode_trace_id(non_neg_integer()) :: String.t()
+```
+
+# `from_map`
+
+```elixir
+@spec from_map(map()) :: t()
+```
+
+# `normalize_attributes`
+
+```elixir
+@spec normalize_attributes(term()) :: map()
+```
+
+# `normalize_kind`
+
+```elixir
+@spec normalize_kind(atom() | String.t()) :: atom()
+```
+
+# `normalize_status`
+
+```elixir
+@spec normalize_status(atom() | String.t()) :: atom()
+```
+
+---
+
+*Consult [api-reference.md](api-reference.md) for complete listing*
+
+---
+
+# TimelessTraces.Stats
+
+Source: https://timeless-traces.hexdocs.pm/TimelessTraces.Stats.md
+
+# `TimelessTraces.Stats`
+[🔗](https://github.com/awksedgreep/timeless_traces/blob/main/lib/timeless_traces/stats.ex#L1)
+
+Aggregate statistics about stored span data.
+
+# `t`
+
+```elixir
+@type t() :: %TimelessTraces.Stats{
+  compaction_count: non_neg_integer(),
+  compression_compressed_bytes_out: non_neg_integer(),
+  compression_raw_bytes_in: non_neg_integer(),
+  disk_size: non_neg_integer(),
+  index_size: non_neg_integer(),
+  newest_timestamp: integer() | nil,
+  oldest_timestamp: integer() | nil,
+  openzl_blocks: non_neg_integer(),
+  openzl_bytes: non_neg_integer(),
+  openzl_entries: non_neg_integer(),
+  raw_blocks: non_neg_integer(),
+  raw_bytes: non_neg_integer(),
+  raw_entries: non_neg_integer(),
+  total_blocks: non_neg_integer(),
+  total_bytes: non_neg_integer(),
+  total_entries: non_neg_integer(),
+  zstd_blocks: non_neg_integer(),
+  zstd_bytes: non_neg_integer(),
+  zstd_entries: non_neg_integer()
+}
+```
+
+---
+
+*Consult [api-reference.md](api-reference.md) for complete listing*
+
+---
+
+# TimelessTraces.Telemetry
+
+Source: https://timeless-traces.hexdocs.pm/TimelessTraces.Telemetry.md
+
+# `TimelessTraces.Telemetry`
+[🔗](https://github.com/awksedgreep/timeless_traces/blob/main/lib/timeless_traces/telemetry.ex#L1)
+
+Telemetry events emitted by TimelessTraces.
+
+## Events
+
+  * `[:timeless_traces, :flush, :stop]` - A buffer flush completed.
+    * Measurements: `%{duration: native_time, entry_count: integer, byte_size: integer}`
+    * Metadata: `%{block_id: integer}`
+
+  * `[:timeless_traces, :query, :stop]` - A query completed.
+    * Measurements: `%{duration: native_time, total: integer, blocks_read: integer}`
+    * Metadata: `%{filters: keyword}`
+
+  * `[:timeless_traces, :retention, :stop]` - A retention cleanup completed.
+    * Measurements: `%{duration: native_time, blocks_deleted: integer}`
+    * Metadata: `%{}`
+
+  * `[:timeless_traces, :flush, :error]` - A buffer flush failed or crashed.
+    * Measurements: `%{entry_count: integer}`
+    * Metadata: `%{reason: term}`
+
+  * `[:timeless_traces, :block, :error]` - A block read failed (corrupt or missing).
+    * Measurements: `%{}`
+    * Metadata: `%{file_path: string, reason: atom}`
+
+---
+
+*Consult [api-reference.md](api-reference.md) for complete listing*
+
+---
+
+# mix timeless_traces.compression_benchmark
+
+Source: https://timeless-traces.hexdocs.pm/Mix.Tasks.TimelessTraces.CompressionBenchmark.md
+
+# `mix timeless_traces.compression_benchmark`
+[🔗](https://github.com/awksedgreep/timeless_traces/blob/main/lib/mix/tasks/compression_benchmark.ex#L1)
+
+Benchmark zstd vs openzl columnar compression for span blocks
+
+---
+
+*Consult [api-reference.md](api-reference.md) for complete listing*
+
+---
+
+# mix timeless_traces.http_benchmark
+
+Source: https://timeless-traces.hexdocs.pm/Mix.Tasks.TimelessTraces.HttpBenchmark.md
+
+# `mix timeless_traces.http_benchmark`
+[🔗](https://github.com/awksedgreep/timeless_traces/blob/main/lib/mix/tasks/http_benchmark.ex#L1)
+
+Benchmark HTTP ingest and query throughput via Rocket
+
+---
+
+*Consult [api-reference.md](api-reference.md) for complete listing*
+
+---
+
+# mix timeless_traces.index_benchmark
+
+Source: https://timeless-traces.hexdocs.pm/Mix.Tasks.TimelessTraces.IndexBenchmark.md
+
+# `mix timeless_traces.index_benchmark`
+[🔗](https://github.com/awksedgreep/timeless_traces/blob/main/lib/mix/tasks/index_benchmark.ex#L1)
+
+Benchmark pure ETS index operations in isolation (no disk I/O)
+
+---
+
+*Consult [api-reference.md](api-reference.md) for complete listing*
+
+---
+
+# mix timeless_traces.ingest_benchmark
+
+Source: https://timeless-traces.hexdocs.pm/Mix.Tasks.TimelessTraces.IngestBenchmark.md
+
+# `mix timeless_traces.ingest_benchmark`
+[🔗](https://github.com/awksedgreep/timeless_traces/blob/main/lib/mix/tasks/ingest_benchmark.ex#L1)
+
+Benchmark ingestion throughput through the full pipeline
+
+---
+
+*Consult [api-reference.md](api-reference.md) for complete listing*
+
+---
+
+# mix timeless_traces.search_benchmark
+
+Source: https://timeless-traces.hexdocs.pm/Mix.Tasks.TimelessTraces.SearchBenchmark.md
+
+# `mix timeless_traces.search_benchmark`
+[🔗](https://github.com/awksedgreep/timeless_traces/blob/main/lib/mix/tasks/search_benchmark.ex#L1)
+
+Benchmark query throughput across different filter patterns
+
+---
+
+*Consult [api-reference.md](api-reference.md) for complete listing*
+
+---
