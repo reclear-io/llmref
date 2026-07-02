@@ -1,0 +1,2307 @@
+# acumen · v1.1.1
+
+Source: https://acumen.hexdocs.pm/
+
+# acumen
+
+Acumen is a Gleam library for interacting with [Automatic Certificate Management Environment (ACME)](https://tools.ietf.org/html/rfc8555) servers like [Let’s Encrypt](https://letsencrypt.org). It handles account registration, domain challenges, and TLS certificate issuance.
+
+## Features
+
+- Uses a sans-IO pattern - produces HTTP request descriptions and consumes responses rather than performing I/O directly
+- HTTP client agnostic - use any HTTP library (`gleam_httpc`,`gleam_fetch`, etc.)
+- Works on both Erlang and JavaScript targets
+- Supports ACME Renewal Information (ARI) per [RFC 9773](https://tools.ietf.org/html/rfc9773)for server-suggested renewal windows
+- Tested against [Pebble](https://github.com/letsencrypt/pebble)
+
+## Installation
+
+```
+gleam add acumen
+```
+You will also need an HTTP client library to send the requests that acumen builds. For Erlang targets, [ gleam_httpc](https://hex.pm/packages/gleam_httpc) is a good choice. For JavaScript targets,
+
+[works well.](https://hex.pm/packages/gleam_fetch)
+
+`gleam_fetch`## Examples
+
+Acumen follows a build -> send -> parse pattern for every operation. The `acumen.execute` function orchestrates this loop and handles automatic `badNonce` retry.
+
+### Fetching the directory and initial nonce
+
+Before any ACME operation, you need to fetch the server directory and an initial replay nonce.
+
+```
+import acumen
+import acumen/nonce
+import gleam/http/request
+import gleam/httpc
+// Fetch the ACME directory
+let assert Ok(req) = request.to("https://acme-staging-v02.api.letsencrypt.org/directory")
+let assert Ok(resp) = httpc.send(req)
+let assert Ok(directory) = acumen.directory(resp)
+// Get an initial nonce
+let assert Ok(nonce_req) = nonce.build(directory)
+let assert Ok(nonce_resp) = httpc.send(nonce_req)
+let assert Ok(initial_nonce) = nonce.response(nonce_resp)
+// Create context for subsequent requests
+let ctx = acumen.Context(directory:, nonce: initial_nonce)
+```
+### Registering an account
+
+Generate a key and register an account with the ACME server.
+
+```
+import acumen/register_account
+import gose/jwk
+import kryptos/ec
+// Generate an account key
+let key = jwk.generate_ec(ec.P256)
+let unregistered = acumen.UnregisteredKey(key)
+// Build and submit the registration
+let reg = register_account.request()
+  |> register_account.contacts(["mailto:admin@example.com"])
+  |> register_account.agree_to_terms
+let assert Ok(#(resp, ctx)) = acumen.execute(
+  ctx,
+  build: register_account.build(reg, _, unregistered),
+  send: httpc.send,
+)
+let assert Ok(#(account, registered_key)) =
+  register_account.response(resp, unregistered)
+```
+From here on, use `registered_key` for all subsequent operations.
+
+### Creating an order
+
+Create an order for the domains you want a certificate for.
+
+```
+import acumen/create_order
+// Identifiers can be DNS names or IP addresses
+let assert Ok(order_req) = create_order.request(
+  identifiers: [acumen.DnsIdentifier("example.com"), acumen.DnsIdentifier("www.example.com")],
+)
+// For IP certificates: acumen.IpIdentifier("192.0.2.1")
+let assert Ok(#(resp, ctx)) = acumen.execute(
+  ctx,
+  build: create_order.build(order_req, _, registered_key),
+  send: httpc.send,
+)
+let assert Ok(ord) = create_order.response(resp)
+```
+### Completing challenges
+
+For each authorization in the order, fetch it and complete the appropriate challenge.
+
+```
+import acumen/challenge
+import acumen/fetch_authorization
+import acumen/validate_challenge
+import gleam/list
+let assert [auth_url, ..] = ord.authorizations
+// Fetch the authorization
+let assert Ok(#(resp, ctx)) = acumen.execute(
+  ctx,
+  build: fetch_authorization.build(auth_url, _, registered_key),
+  send: httpc.send,
+)
+let assert Ok(auth) = fetch_authorization.response(resp, auth_url)
+// Find the HTTP-01 challenge
+let assert Ok(http_challenge) =
+  challenge.find_by_type(auth.challenges, of: challenge.Http01)
+// Compute the key authorization value
+let assert Ok(key_auth) = challenge.key_authorization(http_challenge, registered_key)
+let assert Ok(token) = challenge.token(http_challenge)
+// Deploy: GET /.well-known/acme-challenge/{token} -> key_auth
+// Tell the server to validate
+let assert Ok(#(resp, ctx)) = acumen.execute(
+  ctx,
+  build: validate_challenge.build(challenge.url(http_challenge), _, registered_key),
+  send: httpc.send,
+)
+let assert Ok(validated_challenge) = validate_challenge.response(resp)
+```
+### Finalizing the order
+
+Once all challenges are validated, generate a CSR and finalize the order.
+
+```
+import acumen/finalize_order
+import acumen/order
+import kryptos/ec
+// Generate a certificate key pair and CSR from the order
+// Use order.to_rsa_csr(ord, rsa_key) for RSA keys
+let #(cert_key, _pub) = ec.generate_key_pair(ec.P256)
+let assert Ok(csr) = order.to_ec_csr(ord, cert_key)
+// Finalize the order
+let assert Ok(#(resp, ctx)) = acumen.execute(
+  ctx,
+  build: finalize_order.build(ord.finalize_url, _, registered_key, csr:),
+  send: httpc.send,
+)
+let assert Ok(finalized_order) = finalize_order.response(resp, ord.url)
+```
+### Fetching the certificate
+
+After the order is finalized, poll until the order reaches the `Valid` status, then download the certificate.
+
+```
+import acumen/fetch_certificate
+import acumen/fetch_order
+import acumen/order
+import gleam/erlang/process
+// Poll until the order is valid
+let assert Ok(#(resp, ctx)) = acumen.execute(
+  ctx,
+  build: fetch_order.build(ord.url, _, registered_key),
+  send: httpc.send,
+)
+let assert Ok(completed_order) = fetch_order.response(resp, ord.url)
+// The certificate URL is inside the Valid status variant
+let assert order.Valid(cert_url) = completed_order.status
+// Download the certificate chain (PEM format)
+let assert Ok(#(resp, ctx)) = acumen.execute(
+  ctx,
+  build: fetch_certificate.build(cert_url, _, registered_key),
+  send: httpc.send,
+)
+let assert Ok(pem_chain) = fetch_certificate.response(resp)
+// pem_chain contains the full certificate chain in PEM format
+```
+If the order is still processing, use `acumen.retry_after(resp)` to determine how long to wait before polling again.
+
+### Error handling
+
+All operations return `Result` types. When using `acumen.execute`, errors are wrapped in `ExecuteError`:
+
+- `ProtocolError(error: acme_error, context: context)`— the ACME server returned an error with updated context (see- `AcmeError`for all variants)
+- `TransportError(e)`— your HTTP client returned an error
+- `NonceRetryExhausted`— automatic- `badNonce`retry failed after 4 attempts
+
+### Other challenge types
+
+Acumen supports multiple challenge types beyond HTTP-01:
+
+- DNS-01: Use `challenge.dns01_txt_record(key_auth)`to compute the TXT record value for`_acme-challenge.<domain>`
+- DNS-Account-01: Use `challenge.dns_account01_txt_record(for: domain, account_url: kid, key_authorization: key_auth)`for account-bound DNS challenges — returns`Result(#(record_name, record_value), AcmeError)`
+- TLS-ALPN-01: Parsed and decoded; the caller must handle serving the `acme-tls/1`ALPN certificate with the acmeIdentifier extension
+- DNS-Persist-01: Use `challenge.dns_persist01_txt_record(issuer: issuer_name, account_url: kid)`for persistent DNS challenges
+
+---
+
+# acumen · v1.1.1
+
+Source: https://acumen.hexdocs.pm/index.html
+
+# acumen
+
+Acumen is a Gleam library for interacting with [Automatic Certificate Management Environment (ACME)](https://tools.ietf.org/html/rfc8555) servers like [Let’s Encrypt](https://letsencrypt.org). It handles account registration, domain challenges, and TLS certificate issuance.
+
+## Features
+
+- Uses a sans-IO pattern - produces HTTP request descriptions and consumes responses rather than performing I/O directly
+- HTTP client agnostic - use any HTTP library (`gleam_httpc`,`gleam_fetch`, etc.)
+- Works on both Erlang and JavaScript targets
+- Supports ACME Renewal Information (ARI) per [RFC 9773](https://tools.ietf.org/html/rfc9773)for server-suggested renewal windows
+- Tested against [Pebble](https://github.com/letsencrypt/pebble)
+
+## Installation
+
+```
+gleam add acumen
+```
+You will also need an HTTP client library to send the requests that acumen builds. For Erlang targets, [ gleam_httpc](https://hex.pm/packages/gleam_httpc) is a good choice. For JavaScript targets,
+
+[works well.](https://hex.pm/packages/gleam_fetch)
+
+`gleam_fetch`## Examples
+
+Acumen follows a build -> send -> parse pattern for every operation. The `acumen.execute` function orchestrates this loop and handles automatic `badNonce` retry.
+
+### Fetching the directory and initial nonce
+
+Before any ACME operation, you need to fetch the server directory and an initial replay nonce.
+
+```
+import acumen
+import acumen/nonce
+import gleam/http/request
+import gleam/httpc
+// Fetch the ACME directory
+let assert Ok(req) = request.to("https://acme-staging-v02.api.letsencrypt.org/directory")
+let assert Ok(resp) = httpc.send(req)
+let assert Ok(directory) = acumen.directory(resp)
+// Get an initial nonce
+let assert Ok(nonce_req) = nonce.build(directory)
+let assert Ok(nonce_resp) = httpc.send(nonce_req)
+let assert Ok(initial_nonce) = nonce.response(nonce_resp)
+// Create context for subsequent requests
+let ctx = acumen.Context(directory:, nonce: initial_nonce)
+```
+### Registering an account
+
+Generate a key and register an account with the ACME server.
+
+```
+import acumen/register_account
+import gose/jwk
+import kryptos/ec
+// Generate an account key
+let key = jwk.generate_ec(ec.P256)
+let unregistered = acumen.UnregisteredKey(key)
+// Build and submit the registration
+let reg = register_account.request()
+  |> register_account.contacts(["mailto:admin@example.com"])
+  |> register_account.agree_to_terms
+let assert Ok(#(resp, ctx)) = acumen.execute(
+  ctx,
+  build: register_account.build(reg, _, unregistered),
+  send: httpc.send,
+)
+let assert Ok(#(account, registered_key)) =
+  register_account.response(resp, unregistered)
+```
+From here on, use `registered_key` for all subsequent operations.
+
+### Creating an order
+
+Create an order for the domains you want a certificate for.
+
+```
+import acumen/create_order
+// Identifiers can be DNS names or IP addresses
+let assert Ok(order_req) = create_order.request(
+  identifiers: [acumen.DnsIdentifier("example.com"), acumen.DnsIdentifier("www.example.com")],
+)
+// For IP certificates: acumen.IpIdentifier("192.0.2.1")
+let assert Ok(#(resp, ctx)) = acumen.execute(
+  ctx,
+  build: create_order.build(order_req, _, registered_key),
+  send: httpc.send,
+)
+let assert Ok(ord) = create_order.response(resp)
+```
+### Completing challenges
+
+For each authorization in the order, fetch it and complete the appropriate challenge.
+
+```
+import acumen/challenge
+import acumen/fetch_authorization
+import acumen/validate_challenge
+import gleam/list
+let assert [auth_url, ..] = ord.authorizations
+// Fetch the authorization
+let assert Ok(#(resp, ctx)) = acumen.execute(
+  ctx,
+  build: fetch_authorization.build(auth_url, _, registered_key),
+  send: httpc.send,
+)
+let assert Ok(auth) = fetch_authorization.response(resp, auth_url)
+// Find the HTTP-01 challenge
+let assert Ok(http_challenge) =
+  challenge.find_by_type(auth.challenges, of: challenge.Http01)
+// Compute the key authorization value
+let assert Ok(key_auth) = challenge.key_authorization(http_challenge, registered_key)
+let assert Ok(token) = challenge.token(http_challenge)
+// Deploy: GET /.well-known/acme-challenge/{token} -> key_auth
+// Tell the server to validate
+let assert Ok(#(resp, ctx)) = acumen.execute(
+  ctx,
+  build: validate_challenge.build(challenge.url(http_challenge), _, registered_key),
+  send: httpc.send,
+)
+let assert Ok(validated_challenge) = validate_challenge.response(resp)
+```
+### Finalizing the order
+
+Once all challenges are validated, generate a CSR and finalize the order.
+
+```
+import acumen/finalize_order
+import acumen/order
+import kryptos/ec
+// Generate a certificate key pair and CSR from the order
+// Use order.to_rsa_csr(ord, rsa_key) for RSA keys
+let #(cert_key, _pub) = ec.generate_key_pair(ec.P256)
+let assert Ok(csr) = order.to_ec_csr(ord, cert_key)
+// Finalize the order
+let assert Ok(#(resp, ctx)) = acumen.execute(
+  ctx,
+  build: finalize_order.build(ord.finalize_url, _, registered_key, csr:),
+  send: httpc.send,
+)
+let assert Ok(finalized_order) = finalize_order.response(resp, ord.url)
+```
+### Fetching the certificate
+
+After the order is finalized, poll until the order reaches the `Valid` status, then download the certificate.
+
+```
+import acumen/fetch_certificate
+import acumen/fetch_order
+import acumen/order
+import gleam/erlang/process
+// Poll until the order is valid
+let assert Ok(#(resp, ctx)) = acumen.execute(
+  ctx,
+  build: fetch_order.build(ord.url, _, registered_key),
+  send: httpc.send,
+)
+let assert Ok(completed_order) = fetch_order.response(resp, ord.url)
+// The certificate URL is inside the Valid status variant
+let assert order.Valid(cert_url) = completed_order.status
+// Download the certificate chain (PEM format)
+let assert Ok(#(resp, ctx)) = acumen.execute(
+  ctx,
+  build: fetch_certificate.build(cert_url, _, registered_key),
+  send: httpc.send,
+)
+let assert Ok(pem_chain) = fetch_certificate.response(resp)
+// pem_chain contains the full certificate chain in PEM format
+```
+If the order is still processing, use `acumen.retry_after(resp)` to determine how long to wait before polling again.
+
+### Error handling
+
+All operations return `Result` types. When using `acumen.execute`, errors are wrapped in `ExecuteError`:
+
+- `ProtocolError(error: acme_error, context: context)`— the ACME server returned an error with updated context (see- `AcmeError`for all variants)
+- `TransportError(e)`— your HTTP client returned an error
+- `NonceRetryExhausted`— automatic- `badNonce`retry failed after 4 attempts
+
+### Other challenge types
+
+Acumen supports multiple challenge types beyond HTTP-01:
+
+- DNS-01: Use `challenge.dns01_txt_record(key_auth)`to compute the TXT record value for`_acme-challenge.<domain>`
+- DNS-Account-01: Use `challenge.dns_account01_txt_record(for: domain, account_url: kid, key_authorization: key_auth)`for account-bound DNS challenges — returns`Result(#(record_name, record_value), AcmeError)`
+- TLS-ALPN-01: Parsed and decoded; the caller must handle serving the `acme-tls/1`ALPN certificate with the acmeIdentifier extension
+- DNS-Persist-01: Use `challenge.dns_persist01_txt_record(issuer: issuer_name, account_url: kid)`for persistent DNS challenges
+
+---
+
+# acumen · acumen · v1.1.1
+
+Source: https://acumen.hexdocs.pm/acumen.html
+
+Acumen is a Gleam library for interacting with ACME servers (such as Let’s Encrypt) to automate certificate issuance and management.
+
+## Architecture
+
+Acumen uses a **sans-IO** pattern, meaning it produces HTTP request descriptions
+and consumes response data rather than performing I/O directly. This makes it:
+
+- **HTTP client agnostic**: Use any HTTP library (gleam_httpc, gleam_fetch, etc.)
+- **Target agnostic**: Works on both Erlang VM and JavaScript runtimes
+
+## Quick Start
+
+```
+import acumen
+import acumen/nonce
+import acumen/register_account
+import gleam/http/request
+import gleam/httpc
+import gose/key
+import kryptos/ec
+pub fn main() {
+  // 1. Fetch the ACME directory
+  let assert Ok(req) = request.to("https://acme-v02.api.letsencrypt.org/directory")
+  let assert Ok(resp) = httpc.send(req)
+  let assert Ok(directory) = acumen.directory(resp)
+  // 2. Get an initial nonce
+  let assert Ok(nonce_req) = nonce.build(directory)
+  let assert Ok(nonce_resp) = httpc.send(nonce_req)
+  let assert Ok(initial_nonce) = nonce.response(nonce_resp)
+  // 3. Create context and account key
+  let ctx = acumen.Context(directory:, nonce: initial_nonce)
+  let key = key.generate_ec(ec.P256)
+  let unregistered = acumen.UnregisteredKey(key)
+  // 4. Register an account
+  let reg = register_account.request()
+    |> register_account.contacts(["mailto:admin@example.com"])
+    |> register_account.agree_to_terms
+  let assert Ok(#(resp, ctx)) = acumen.execute(
+    ctx,
+    build: register_account.build(reg, _, unregistered),
+    send: httpc.send,
+  )
+  let assert Ok(#(account, registered_key)) =
+    register_account.response(resp, unregistered)
+}
+```
+All errors that can occur during ACME operations.
+
+```
+pub type AcmeError {
+  InvalidRequest(message: String)
+  InvalidResponse(message: String)
+  JsonParseError(message: String)
+  JwsError(message: String)
+  CryptoError(message: String)
+  InvalidChallenge(message: String)
+  AccountDoesNotExist(detail: String)
+  AlreadyReplaced(detail: String)
+  AlreadyRevoked(detail: String)
+  BadCsr(detail: String)
+  BadNonce(detail: String)
+  BadPublicKey(detail: String)
+  BadRevocationReason(detail: String)
+  BadSignatureAlgorithm(detail: String)
+  CaaError(detail: String)
+  CompoundError(detail: String, subproblems: List(
+```
+[Subproblem](https://acumen.hexdocs.pm#Subproblem)))
+  ConnectionError(detail: String)
+  DnsError(detail: String)
+  ExternalAccountRequired(detail: String)
+  IncorrectResponse(detail: String)
+  InvalidContact(detail: String)
+  MalformedError(detail: String)
+  OrderNotReady(detail: String)
+  RateLimited(detail: String)
+  RejectedIdentifier(detail: String)
+  ServerInternalError(detail: String)
+  TlsError(detail: String)
+  Unauthorized(detail: String)
+  UnsupportedContact(detail: String)
+  UnsupportedIdentifier(detail: String)
+  UserActionRequired(
+    detail: String,
+    instance: [option.Option](https://hexdocs.pm/gleam_stdlib/0.71.0/gleam/option.html#Option)(String),
+  )
+  UnknownError(
+    type_: String,
+    detail: String,
+    status: [option.Option](https://hexdocs.pm/gleam_stdlib/0.71.0/gleam/option.html#Option)(Int),
+  )
+}### Constructors
+
+-
+          `InvalidRequest(message: String)`An input value was invalid when building a request (e.g., malformed URI).
+-
+          `InvalidResponse(message: String)`The server response was malformed or unexpected.
+-
+          `JsonParseError(message: String)`JSON decoding failed.
+-
+          `JwsError(message: String)`JWS signing or encoding failed.
+-
+          `CryptoError(message: String)`A cryptographic operation failed (e.g., key thumbprint).
+-
+          `InvalidChallenge(message: String)`The challenge type does not support the requested operation.
+-
+          `AccountDoesNotExist(detail: String)`The account does not exist on the server.
+-
+          `AlreadyReplaced(detail: String)`The certificate has already been replaced by another order.
+-
+          `AlreadyRevoked(detail: String)`The certificate was already revoked.
+-
+          `BadCsr(detail: String)`The CSR is unacceptable.
+-
+          `BadNonce(detail: String)`The nonce was invalid. Automatically retried by `execute`.
+-
+          `BadPublicKey(detail: String)`The public key is unacceptable.
+-
+          `BadRevocationReason(detail: String)`The revocation reason is unacceptable.
+-
+          `BadSignatureAlgorithm(detail: String)`The JWS algorithm is not supported by the server.
+-
+          `CaaError(detail: String)`CAA records forbid certificate issuance.
+-
+
+          Multiple errors occurred; check `subproblems`for details.
+-
+          `ConnectionError(detail: String)`The server could not connect to the client for validation.
+-
+          `DnsError(detail: String)`A DNS lookup failed during validation.
+-
+          `ExternalAccountRequired(detail: String)`External account binding is required by the server.
+-
+          `IncorrectResponse(detail: String)`The challenge validation response was incorrect.
+-
+          `InvalidContact(detail: String)`A contact URL in the account is invalid.
+-
+          `MalformedError(detail: String)`The request was malformed.
+-
+          `OrderNotReady(detail: String)`The order is not ready for finalization.
+-
+          `RateLimited(detail: String)`Too many requests; consider backing off.
+-
+          `RejectedIdentifier(detail: String)`The server will not issue for the requested identifier.
+-
+          `ServerInternalError(detail: String)`An internal server error occurred.
+-
+          `TlsError(detail: String)`A TLS error occurred during validation.
+-
+          `Unauthorized(detail: String)`The client is not authorized for the requested operation.
+-
+          `UnsupportedContact(detail: String)`The contact URL scheme is not supported by the server.
+-
+          `UnsupportedIdentifier(detail: String)`The identifier type is not supported by the server.
+-
+
+          The user must visit a URL to complete an action; check the `instance`field for the URL.
+-
+
+          An unrecognized error type from the server.
+
+Lightweight state container for building ACME requests.
+
+ACME requires a fresh nonce for each request. The `execute` function
+automatically updates the context with nonces from response headers.
+
+```
+pub type Context {
+  Context(directory:
+```
+[Directory](https://acumen.hexdocs.pm#Directory), nonce: String)
+}### Constructors
+
+-
+
+          #### Arguments- directory
+-
+                The ACME directory with endpoint URLs.
+- nonce
+-
+                The current nonce for replay protection.
+
+ACME directory containing endpoint URLs for all ACME operations.
+
+The directory is fetched once from the ACME server and provides the URLs needed to interact with the ACME API.
+
+## Example
+
+```
+let assert Ok(req) = request.to("https://acme-v02.api.letsencrypt.org/directory")
+let assert Ok(resp) = httpc.send(req)
+let assert Ok(directory) = acumen.directory(resp)
+```
+```
+pub type Directory {
+  Directory(
+    new_nonce:
+```
+[url.Url](https://acumen.hexdocs.pm/acumen/url.html#Url),
+    new_account: [url.Url](https://acumen.hexdocs.pm/acumen/url.html#Url),
+    new_order: [url.Url](https://acumen.hexdocs.pm/acumen/url.html#Url),
+    revoke_cert: [url.Url](https://acumen.hexdocs.pm/acumen/url.html#Url),
+    key_change: [url.Url](https://acumen.hexdocs.pm/acumen/url.html#Url),
+    new_authz: [option.Option](https://hexdocs.pm/gleam_stdlib/0.71.0/gleam/option.html#Option)([url.Url](https://acumen.hexdocs.pm/acumen/url.html#Url)),
+    renewal_info: [option.Option](https://hexdocs.pm/gleam_stdlib/0.71.0/gleam/option.html#Option)([uri.Uri](https://hexdocs.pm/gleam_stdlib/0.71.0/gleam/uri.html#Uri)),
+    meta: [option.Option](https://hexdocs.pm/gleam_stdlib/0.71.0/gleam/option.html#Option)([DirectoryMeta](https://acumen.hexdocs.pm#DirectoryMeta)),
+  )
+}### Constructors
+
+-
+          `Directory( new_nonce:`[url.Url](https://acumen.hexdocs.pm/acumen/url.html#Url), new_account:[url.Url](https://acumen.hexdocs.pm/acumen/url.html#Url), new_order:[url.Url](https://acumen.hexdocs.pm/acumen/url.html#Url), revoke_cert:[url.Url](https://acumen.hexdocs.pm/acumen/url.html#Url), key_change:[url.Url](https://acumen.hexdocs.pm/acumen/url.html#Url), new_authz:[option.Option](https://hexdocs.pm/gleam_stdlib/0.71.0/gleam/option.html#Option)([url.Url](https://acumen.hexdocs.pm/acumen/url.html#Url)), renewal_info:[option.Option](https://hexdocs.pm/gleam_stdlib/0.71.0/gleam/option.html#Option)([uri.Uri](https://hexdocs.pm/gleam_stdlib/0.71.0/gleam/uri.html#Uri)), meta:[option.Option](https://hexdocs.pm/gleam_stdlib/0.71.0/gleam/option.html#Option)([DirectoryMeta](https://acumen.hexdocs.pm#DirectoryMeta)), )#### Arguments- new_nonce
+-
+                URL for fetching replay-protection nonces.
+- new_account
+-
+                URL for account registration.
+- new_order
+-
+                URL for creating certificate orders.
+- revoke_cert
+-
+                URL for revoking certificates.
+- key_change
+-
+                URL for changing account keys.
+- new_authz
+-
+                URL for pre-authorization.
+- renewal_info
+-
+                URL for fetching renewal information.
+- meta
+-
+                Optional server metadata (terms of service, CAA identities, etc.).
+
+Optional metadata from the ACME directory.
+
+Provides additional information about the ACME server’s policies and capabilities.
+
+```
+pub type DirectoryMeta {
+  DirectoryMeta(
+    terms_of_service:
+```
+[option.Option](https://hexdocs.pm/gleam_stdlib/0.71.0/gleam/option.html#Option)([uri.Uri](https://hexdocs.pm/gleam_stdlib/0.71.0/gleam/uri.html#Uri)),
+    website: [option.Option](https://hexdocs.pm/gleam_stdlib/0.71.0/gleam/option.html#Option)([uri.Uri](https://hexdocs.pm/gleam_stdlib/0.71.0/gleam/uri.html#Uri)),
+    caa_identities: List(String),
+    external_account_required: Bool,
+    profiles: [dict.Dict](https://hexdocs.pm/gleam_stdlib/0.71.0/gleam/dict.html#Dict)(String, String),
+  )
+}### Constructors
+
+-
+          `DirectoryMeta( terms_of_service:`[option.Option](https://hexdocs.pm/gleam_stdlib/0.71.0/gleam/option.html#Option)([uri.Uri](https://hexdocs.pm/gleam_stdlib/0.71.0/gleam/uri.html#Uri)), website:[option.Option](https://hexdocs.pm/gleam_stdlib/0.71.0/gleam/option.html#Option)([uri.Uri](https://hexdocs.pm/gleam_stdlib/0.71.0/gleam/uri.html#Uri)), caa_identities: List(String), external_account_required: Bool, profiles:[dict.Dict](https://hexdocs.pm/gleam_stdlib/0.71.0/gleam/dict.html#Dict)(String, String), )#### Arguments- terms_of_service
+-
+                URL for the terms of service that users must agree to.
+- website
+-
+                Website for the certificate authority.
+- caa_identities
+-
+                Domain names for DNS CAA record validation.
+- external_account_required
+-
+                Whether external account binding is required for registration.
+- profiles
+-
+                Available certificate issuance profiles.
+
+Errors returned by the `execute` function.
+
+This type is parameterized by `e`, the error type of your HTTP transport.
+
+```
+pub type ExecuteError(e) {
+  ProtocolError(error:
+```
+[AcmeError](https://acumen.hexdocs.pm#AcmeError), context: [Context](https://acumen.hexdocs.pm#Context))
+  TransportError(e)
+  NonceRetryExhausted
+}### Constructors
+
+-
+
+          An ACME protocol error returned by the server.
+-
+          `TransportError(e)`An HTTP transport error (e.g., network failure, timeout).
+-
+          `NonceRetryExhausted`All nonce retry attempts were exhausted.
+
+An identifier representing a domain name or IP address for certificate issuance.
+
+```
+pub type Identifier {
+  DnsIdentifier(value: String)
+  IpIdentifier(value: String)
+}
+```
+### Constructors
+
+-
+          `DnsIdentifier(value: String)`A DNS identifier representing a fully qualified domain name (e.g., `"example.com"`or`"*.example.com"`for wildcard certificates).
+-
+          `IpIdentifier(value: String)`An IP identifier representing an IPv4 or IPv6 address (e.g., `"192.0.2.1"`or`"2001:db8::1"`).
+
+An account key that has been registered with the ACME server.
+
+After successful registration, the key is paired with a `kid` (key ID),
+which is the account URL.
+
+The `RegisteredKey` is returned by `register_account.response` after a
+successful account registration.
+
+```
+pub type RegisteredKey {
+  RegisteredKey(jwk:
+```
+[gose.Key](https://hexdocs.pm/gose/2.1.0/gose.html#Key)(String), kid: [url.Url](https://acumen.hexdocs.pm/acumen/url.html#Url))
+}### Constructors
+
+Parsed Retry-After header value.
+
+Per RFC 9110, the Retry-After header can be either delta-seconds (an integer) or an HTTP date.
+
+```
+pub type RetryAfter {
+  RetryAfterSeconds(Int)
+  RetryAfterTimestamp(
+```
+[timestamp.Timestamp](https://hexdocs.pm/gleam_time/1.8.0/gleam/time/timestamp.html#Timestamp))
+}### Constructors
+
+-
+          `RetryAfterSeconds(Int)`Wait this many seconds before retrying.
+-
+
+          Retry after this specific point in time.
+
+A subproblem within a compound ACME error.
+
+Compound errors contain multiple subproblems, each potentially associated with a specific identifier that caused the issue.
+
+```
+pub type Subproblem {
+  Subproblem(
+    type_: String,
+    detail: String,
+    identifier:
+```
+[option.Option](https://hexdocs.pm/gleam_stdlib/0.71.0/gleam/option.html#Option)([Identifier](https://acumen.hexdocs.pm#Identifier)),
+  )
+}### Constructors
+
+An account key that has not yet been registered with the ACME server.
+
+## Example
+
+```
+import gose/key
+import kryptos/ec
+let key = key.generate_ec(ec.P256)
+let unregistered = acumen.UnregisteredKey(key)
+```
+```
+pub type UnregisteredKey {
+  UnregisteredKey(jwk:
+```
+[gose.Key](https://hexdocs.pm/gose/2.1.0/gose.html#Key)(String))
+}### Constructors
+
+```
+pub fn directory(
+  resp:
+```
+[response.Response](https://hexdocs.pm/gleam_http/4.3.0/gleam/http/response.html#Response)(String),
+) -> Result([Directory](https://acumen.hexdocs.pm#Directory), [AcmeError](https://acumen.hexdocs.pm#AcmeError))Parses an ACME directory response.
+
+The directory is the entry point for all ACME operations. Fetch it with a GET to the server’s directory URL.
+
+## Example
+
+```
+// Let's Encrypt production
+let assert Ok(req) = request.to("https://acme-v02.api.letsencrypt.org/directory")
+let assert Ok(resp) = httpc.send(req)
+let assert Ok(directory) = acumen.directory(resp)
+// Let's Encrypt staging
+let assert Ok(req) = request.to("https://acme-staging-v02.api.letsencrypt.org/directory")
+let assert Ok(resp) = httpc.send(req)
+let assert Ok(directory) = acumen.directory(resp)
+```
+```
+pub fn execute(
+  context:
+```
+[Context](https://acumen.hexdocs.pm#Context),
+  build build_request: fn([Context](https://acumen.hexdocs.pm#Context)) -> Result(
+    [request.Request](https://hexdocs.pm/gleam_http/4.3.0/gleam/http/request.html#Request)(String),
+    [AcmeError](https://acumen.hexdocs.pm#AcmeError),
+  ),
+  send send: fn([request.Request](https://hexdocs.pm/gleam_http/4.3.0/gleam/http/request.html#Request)(String)) -> Result(
+    [response.Response](https://hexdocs.pm/gleam_http/4.3.0/gleam/http/response.html#Response)(String),
+    e,
+  ),
+) -> Result(
+  #([response.Response](https://hexdocs.pm/gleam_http/4.3.0/gleam/http/response.html#Response)(String), [Context](https://acumen.hexdocs.pm#Context)),
+  [ExecuteError](https://acumen.hexdocs.pm#ExecuteError)(e),
+)Executes an ACME request with automatic nonce retry handling.
+
+Builds the signed request, sends it, and retries on `badNonce` errors
+(up to 3 retries). Updates the context with fresh nonces from each
+response.
+
+## Example
+
+```
+let registration = register_account.request()
+  |> register_account.contacts(["mailto:admin@example.com"])
+  |> register_account.agree_to_terms
+let result = acumen.execute(
+  ctx,
+  build: register_account.build(registration, _, unregistered_key),
+  send: httpc.send,
+)
+case result {
+  Ok(#(resp, new_ctx)) -> {
+    // Process successful response
+  }
+  Error(acumen.ProtocolError(error: acumen.RateLimited(_), context: _)) -> {
+    // Back off and retry later
+  }
+  Error(acumen.TransportError(e)) -> {
+    // Handle network error
+  }
+  Error(acumen.NonceRetryExhausted) -> {
+    // All retries failed
+  }
+}
+```
+`pub fn external_account_required(directory: `[Directory](https://acumen.hexdocs.pm#Directory)) -> BoolReturns `True` if the server requires external account binding.
+
+Returns `False` if the directory has no metadata or the field is not set.
+
+```
+pub fn profiles(
+  directory:
+```
+[Directory](https://acumen.hexdocs.pm#Directory),
+) -> [dict.Dict](https://hexdocs.pm/gleam_stdlib/0.71.0/gleam/dict.html#Dict)(String, String)Returns available certificate issuance profiles as a dictionary of profile names to descriptions. Empty if the server advertises none.
+
+## Example
+
+```
+let available_profiles = acumen.profiles(directory)
+case dict.get(available_profiles, "tlsserver") {
+  Ok(description) -> io.println("TLS Server profile: " <> description)
+  Error(Nil) -> io.println("TLS Server profile not available")
+}
+```
+```
+pub fn retry_after(
+  resp:
+```
+[response.Response](https://hexdocs.pm/gleam_http/4.3.0/gleam/http/response.html#Response)(body),
+) -> Result([RetryAfter](https://acumen.hexdocs.pm#RetryAfter), Nil)Extracts the `Retry-After` header value from a response.
+
+Handles both delta-seconds and HTTP-date formats per RFC 9110.
+
+## Example
+
+```
+case acumen.retry_after(resp) {
+  Ok(acumen.RetryAfterSeconds(seconds)) -> {
+    // Wait for `seconds` before retrying
+  }
+  Ok(acumen.RetryAfterTimestamp(timestamp)) -> {
+    // Retry after `timestamp`
+  }
+  Error(Nil) -> {
+    // No retry-after header, use default backoff
+  }
+}
+```
+
+---
+
+# acumen/account · acumen · v1.1.1
+
+Source: https://acumen.hexdocs.pm/acumen/account.html
+
+Account types for ACME.
+
+An account represents your identity with the ACME server and is required for all certificate operations.
+
+An ACME account registered with the server.
+
+```
+pub type Account {
+  Account(
+    status:
+```
+[Status](https://acumen.hexdocs.pm#Status),
+    contacts: List(String),
+    orders_url: [option.Option](https://hexdocs.pm/gleam_stdlib/0.71.0/gleam/option.html#Option)([url.Url](https://acumen.hexdocs.pm/url.html#Url)),
+    terms_of_service_agreed: [option.Option](https://hexdocs.pm/gleam_stdlib/0.71.0/gleam/option.html#Option)(Bool),
+  )
+}### Constructors
+
+-
+          `Account( status:`[Status](https://acumen.hexdocs.pm#Status), contacts: List(String), orders_url:[option.Option](https://hexdocs.pm/gleam_stdlib/0.71.0/gleam/option.html#Option)([url.Url](https://acumen.hexdocs.pm/url.html#Url)), terms_of_service_agreed:[option.Option](https://hexdocs.pm/gleam_stdlib/0.71.0/gleam/option.html#Option)(Bool), )#### Arguments- status
+-
+                Current account status.
+- contacts
+-
+                Contact URLs, typically `mailto:`addresses.
+- orders_url
+-
+                URL to list the account’s orders.
+- terms_of_service_agreed
+-
+                Whether the terms of service were agreed to.
+
+External account binding credentials from the CA.
+
+Some CAs (like Google, ZeroSSL) require you to link your ACME account to an existing account with them. They provide a key ID and MAC key that you use during registration.
+
+```
+pub type ExternalAccountBinding {
+  ExternalAccountBinding(key_id: String, mac_key: BitArray)
+}
+```
+### Constructors
+
+-
+          `ExternalAccountBinding(key_id: String, mac_key: BitArray)`#### Arguments- key_id
+-
+                The key ID provided by the CA
+- mac_key
+-
+                The MAC key (decoded from base64url) for HMAC signing
+
+---
+
+# acumen/authorization · acumen · v1.1.1
+
+Source: https://acumen.hexdocs.pm/acumen/authorization.html
+
+Authorization types for ACME domain validation.
+
+An authorization represents the server’s authorization for an account to represent a specific identifier (domain). Each authorization contains one or more challenges that can be completed to prove control.
+
+An ACME authorization for an identifier.
+
+```
+pub type Authorization {
+  Authorization(
+    url:
+```
+[url.Url](https://acumen.hexdocs.pm/url.html#Url),
+    status: [Status](https://acumen.hexdocs.pm#Status),
+    identifier: [acumen.Identifier](https://acumen.hexdocs.pm/acumen.html#Identifier),
+    challenges: List([challenge.Challenge](https://acumen.hexdocs.pm/challenge.html#Challenge)),
+    expires: [option.Option](https://hexdocs.pm/gleam_stdlib/0.71.0/gleam/option.html#Option)([timestamp.Timestamp](https://hexdocs.pm/gleam_time/1.8.0/gleam/time/timestamp.html#Timestamp)),
+    wildcard: Bool,
+  )
+}### Constructors
+
+-
+          `Authorization( url:`[url.Url](https://acumen.hexdocs.pm/url.html#Url), status:[Status](https://acumen.hexdocs.pm#Status), identifier:[acumen.Identifier](https://acumen.hexdocs.pm/acumen.html#Identifier), challenges: List([challenge.Challenge](https://acumen.hexdocs.pm/challenge.html#Challenge)), expires:[option.Option](https://hexdocs.pm/gleam_stdlib/0.71.0/gleam/option.html#Option)([timestamp.Timestamp](https://hexdocs.pm/gleam_time/1.8.0/gleam/time/timestamp.html#Timestamp)), wildcard: Bool, )#### Arguments- url
+-
+                The authorization URL.
+- status
+-
+                Current authorization status.
+- identifier
+-
+                The identifier (domain or IP) being authorized.
+- challenges
+-
+                Available challenges to complete.
+- expires
+-
+                When the authorization expires.
+- wildcard
+-
+                Whether this is for a wildcard domain.
+
+Authorization status.
+
+```
+pub type Status {
+  Pending
+  Valid
+  Invalid
+  Deactivated
+  Expired
+  Revoked
+}
+```
+### Constructors
+
+-
+          `Pending`Authorization created, challenges not yet completed.
+-
+          `Valid`A challenge was successfully completed.
+-
+          `Invalid`A challenge failed or authorization was abandoned.
+-
+          `Deactivated`Authorization was deactivated by the client.
+-
+          `Expired`Authorization expired before completion.
+-
+          `Revoked`Authorization was revoked by the server.
+
+---
+
+# acumen/challenge · acumen · v1.1.1
+
+Source: https://acumen.hexdocs.pm/acumen/challenge.html
+
+Challenge types for ACME domain validation.
+
+After creating an order, complete challenges to prove control over the requested identifiers.
+
+An ACME challenge for domain validation.
+
+Each variant represents a specific challenge type with its required fields. Unknown challenge types are ignored during decoding.
+
+```
+pub type Challenge {
+  Http01Challenge(
+    url:
+```
+[url.Url](https://acumen.hexdocs.pm/url.html#Url),
+    status: [Status](https://acumen.hexdocs.pm#Status),
+    token: String,
+    validated: [option.Option](https://hexdocs.pm/gleam_stdlib/0.71.0/gleam/option.html#Option)([timestamp.Timestamp](https://hexdocs.pm/gleam_time/1.8.0/gleam/time/timestamp.html#Timestamp)),
+    error: [option.Option](https://hexdocs.pm/gleam_stdlib/0.71.0/gleam/option.html#Option)([acumen.AcmeError](https://acumen.hexdocs.pm/acumen.html#AcmeError)),
+  )
+  Dns01Challenge(
+    url: [url.Url](https://acumen.hexdocs.pm/url.html#Url),
+    status: [Status](https://acumen.hexdocs.pm#Status),
+    token: String,
+    validated: [option.Option](https://hexdocs.pm/gleam_stdlib/0.71.0/gleam/option.html#Option)([timestamp.Timestamp](https://hexdocs.pm/gleam_time/1.8.0/gleam/time/timestamp.html#Timestamp)),
+    error: [option.Option](https://hexdocs.pm/gleam_stdlib/0.71.0/gleam/option.html#Option)([acumen.AcmeError](https://acumen.hexdocs.pm/acumen.html#AcmeError)),
+  )
+  TlsAlpn01Challenge(
+    url: [url.Url](https://acumen.hexdocs.pm/url.html#Url),
+    status: [Status](https://acumen.hexdocs.pm#Status),
+    token: String,
+    validated: [option.Option](https://hexdocs.pm/gleam_stdlib/0.71.0/gleam/option.html#Option)([timestamp.Timestamp](https://hexdocs.pm/gleam_time/1.8.0/gleam/time/timestamp.html#Timestamp)),
+    error: [option.Option](https://hexdocs.pm/gleam_stdlib/0.71.0/gleam/option.html#Option)([acumen.AcmeError](https://acumen.hexdocs.pm/acumen.html#AcmeError)),
+  )
+  DnsAccount01Challenge(
+    url: [url.Url](https://acumen.hexdocs.pm/url.html#Url),
+    status: [Status](https://acumen.hexdocs.pm#Status),
+    token: String,
+    validated: [option.Option](https://hexdocs.pm/gleam_stdlib/0.71.0/gleam/option.html#Option)([timestamp.Timestamp](https://hexdocs.pm/gleam_time/1.8.0/gleam/time/timestamp.html#Timestamp)),
+    error: [option.Option](https://hexdocs.pm/gleam_stdlib/0.71.0/gleam/option.html#Option)([acumen.AcmeError](https://acumen.hexdocs.pm/acumen.html#AcmeError)),
+  )
+  DnsPersist01Challenge(
+    url: [url.Url](https://acumen.hexdocs.pm/url.html#Url),
+    status: [Status](https://acumen.hexdocs.pm#Status),
+    validated: [option.Option](https://hexdocs.pm/gleam_stdlib/0.71.0/gleam/option.html#Option)([timestamp.Timestamp](https://hexdocs.pm/gleam_time/1.8.0/gleam/time/timestamp.html#Timestamp)),
+    error: [option.Option](https://hexdocs.pm/gleam_stdlib/0.71.0/gleam/option.html#Option)([acumen.AcmeError](https://acumen.hexdocs.pm/acumen.html#AcmeError)),
+    issuer_domain_names: List(String),
+  )
+}### Constructors
+
+-
+          `Http01Challenge( url:`[url.Url](https://acumen.hexdocs.pm/url.html#Url), status:[Status](https://acumen.hexdocs.pm#Status), token: String, validated:[option.Option](https://hexdocs.pm/gleam_stdlib/0.71.0/gleam/option.html#Option)([timestamp.Timestamp](https://hexdocs.pm/gleam_time/1.8.0/gleam/time/timestamp.html#Timestamp)), error:[option.Option](https://hexdocs.pm/gleam_stdlib/0.71.0/gleam/option.html#Option)([acumen.AcmeError](https://acumen.hexdocs.pm/acumen.html#AcmeError)), )HTTP-01: serve a file at `/.well-known/acme-challenge/{token}`.
+-
+          `Dns01Challenge( url:`[url.Url](https://acumen.hexdocs.pm/url.html#Url), status:[Status](https://acumen.hexdocs.pm#Status), token: String, validated:[option.Option](https://hexdocs.pm/gleam_stdlib/0.71.0/gleam/option.html#Option)([timestamp.Timestamp](https://hexdocs.pm/gleam_time/1.8.0/gleam/time/timestamp.html#Timestamp)), error:[option.Option](https://hexdocs.pm/gleam_stdlib/0.71.0/gleam/option.html#Option)([acumen.AcmeError](https://acumen.hexdocs.pm/acumen.html#AcmeError)), )DNS-01: create a TXT record at `_acme-challenge.{domain}`.
+-
+          `TlsAlpn01Challenge( url:`[url.Url](https://acumen.hexdocs.pm/url.html#Url), status:[Status](https://acumen.hexdocs.pm#Status), token: String, validated:[option.Option](https://hexdocs.pm/gleam_stdlib/0.71.0/gleam/option.html#Option)([timestamp.Timestamp](https://hexdocs.pm/gleam_time/1.8.0/gleam/time/timestamp.html#Timestamp)), error:[option.Option](https://hexdocs.pm/gleam_stdlib/0.71.0/gleam/option.html#Option)([acumen.AcmeError](https://acumen.hexdocs.pm/acumen.html#AcmeError)), )TLS-ALPN-01: respond to the `acme-tls/1`ALPN protocol.
+-
+          `DnsAccount01Challenge( url:`[url.Url](https://acumen.hexdocs.pm/url.html#Url), status:[Status](https://acumen.hexdocs.pm#Status), token: String, validated:[option.Option](https://hexdocs.pm/gleam_stdlib/0.71.0/gleam/option.html#Option)([timestamp.Timestamp](https://hexdocs.pm/gleam_time/1.8.0/gleam/time/timestamp.html#Timestamp)), error:[option.Option](https://hexdocs.pm/gleam_stdlib/0.71.0/gleam/option.html#Option)([acumen.AcmeError](https://acumen.hexdocs.pm/acumen.html#AcmeError)), )DNS-Account-01: create an account-scoped DNS TXT record.
+-
+          `DnsPersist01Challenge( url:`[url.Url](https://acumen.hexdocs.pm/url.html#Url), status:[Status](https://acumen.hexdocs.pm#Status), validated:[option.Option](https://hexdocs.pm/gleam_stdlib/0.71.0/gleam/option.html#Option)([timestamp.Timestamp](https://hexdocs.pm/gleam_time/1.8.0/gleam/time/timestamp.html#Timestamp)), error:[option.Option](https://hexdocs.pm/gleam_stdlib/0.71.0/gleam/option.html#Option)([acumen.AcmeError](https://acumen.hexdocs.pm/acumen.html#AcmeError)), issuer_domain_names: List(String), )DNS-Persist-01: create a persistent TXT record at `_validation-persist.{domain}`.
+
+Known ACME challenge types for use with `find_by_type`.
+
+```
+pub type ChallengeType {
+  Http01
+  Dns01
+  TlsAlpn01
+  DnsPersist01
+  DnsAccount01
+}
+```
+### Constructors
+
+-
+          `Http01`HTTP-01 challenge type.
+-
+          `Dns01`DNS-01 challenge type.
+-
+          `TlsAlpn01`TLS-ALPN-01 challenge type.
+-
+          `DnsPersist01`DNS-Persist-01 challenge type.
+-
+          `DnsAccount01`DNS-Account-01 challenge type.
+
+```
+pub fn dns01_txt_record(
+  key_authorization: String,
+) -> Result(String,
+```
+[acumen.AcmeError](https://acumen.hexdocs.pm/acumen.html#AcmeError))Computes the DNS-01 TXT record value.
+
+## Example
+
+```
+let assert Ok(key_auth) = challenge.key_authorization(dns_challenge, registered_key)
+let assert Ok(txt_value) = challenge.dns01_txt_record(key_auth)
+// Create TXT record: _acme-challenge.example.com -> txt_value
+```
+```
+pub fn dns_account01_txt_record(
+  for domain: String,
+  account_url account_url:
+```
+[url.Url](https://acumen.hexdocs.pm/url.html#Url),
+  key_authorization key_authorization: String,
+) -> Result(#(String, String), [acumen.AcmeError](https://acumen.hexdocs.pm/acumen.html#AcmeError))Computes the DNS-Account-01 TXT record name and value.
+
+Returns `#(name, value)` where `name` is the full record name and
+`value` is the record content.
+
+## Example
+
+```
+let assert Ok(key_auth) = challenge.key_authorization(dns_acct_challenge, registered_key)
+let assert Ok(#(record_name, record_value)) =
+  challenge.dns_account01_txt_record("example.com", registered_key.kid, key_auth)
+// Create TXT record: record_name -> record_value
+```
+```
+pub fn dns_persist01_txt_record(
+  issuer issuer_domain_name: String,
+  account_url account_url:
+```
+[url.Url](https://acumen.hexdocs.pm/url.html#Url),
+) -> StringBuilds a DNS-Persist-01 TXT record value for a single issuer.
+
+A DNS-Persist-01 challenge may include multiple issuer domain names.
+Callers should create a separate TXT record for each issuer, all on the
+same `_validation-persist.{domain}` DNS name.
+
+## Example
+
+```
+let assert Ok(issuers) = challenge.issuer_domain_names(dns_persist_challenge)
+let txt_records = list.map(issuers, fn(issuer) {
+  challenge.dns_persist01_txt_record(issuer:, account_url: registered_key.kid)
+})
+// Create a TXT record at _validation-persist.example.com for each value
+```
+```
+pub fn find_by_type(
+  challenges: List(
+```
+[Challenge](https://acumen.hexdocs.pm#Challenge)),
+  of type_: [ChallengeType](https://acumen.hexdocs.pm#ChallengeType),
+) -> Result([Challenge](https://acumen.hexdocs.pm#Challenge), Nil)Finds the first challenge matching the given type, or `Error(Nil)` if none.
+
+## Example
+
+```
+let assert Ok(http_challenge) =
+  challenge.find_by_type(authorization.challenges, of: challenge.Http01)
+```
+```
+pub fn issuer_domain_names(
+  challenge:
+```
+[Challenge](https://acumen.hexdocs.pm#Challenge),
+) -> Result(List(String), Nil)Returns the issuer domain names for a DNS-Persist-01 challenge.
+
+Returns `Error(Nil)` for other challenge types.
+
+```
+pub fn key_authorization(
+  challenge:
+```
+[Challenge](https://acumen.hexdocs.pm#Challenge),
+  key: [acumen.RegisteredKey](https://acumen.hexdocs.pm/acumen.html#RegisteredKey),
+) -> Result(String, [acumen.AcmeError](https://acumen.hexdocs.pm/acumen.html#AcmeError))Computes the key authorization string for a challenge.
+
+Returns `Error(acumen.InvalidChallenge(_))` for challenge types that
+don’t have a token (e.g., `DnsPersist01Challenge`).
+
+## Example
+
+```
+let assert Ok(key_auth) = challenge.key_authorization(http_challenge, registered_key)
+// Deploy: GET /.well-known/acme-challenge/{token} -> key_auth
+```
+
+---
+
+# acumen/create_order · acumen · v1.1.1
+
+Source: https://acumen.hexdocs.pm/acumen/create_order.html
+
+Create a new ACME order for certificate issuance.
+
+Before obtaining a certificate, you must create an order specifying which identifiers (domain names or IP addresses) you want on the certificate.
+
+## Example
+
+```
+import acumen
+import acumen/create_order
+import acumen/order.{type Order}
+let assert Ok(ord) = create_order.request(identifiers: [
+  acumen.DnsIdentifier("example.com"),
+  acumen.DnsIdentifier("www.example.com"),
+])
+let assert Ok(#(resp, ctx)) = acumen.execute(
+  ctx,
+  build: create_order.build(ord, _, registered_key),
+  send: httpc.send,
+)
+let assert Ok(created_order) = create_order.response(resp)
+```
+Request builder for order creation.
+
+Use `request` to create a builder with required identifiers, optionally
+configure it with `not_before`, `not_after`, `replaces`, and `profile`,
+then call `build`.
+
+`pub opaque type RequestBuilder````
+pub fn build(
+  builder:
+```
+[RequestBuilder](https://acumen.hexdocs.pm#RequestBuilder),
+  context: [acumen.Context](https://acumen.hexdocs.pm/acumen.html#Context),
+  key: [acumen.RegisteredKey](https://acumen.hexdocs.pm/acumen.html#RegisteredKey),
+) -> Result([request.Request](https://hexdocs.pm/gleam_http/4.3.0/gleam/http/request.html#Request)(String), [acumen.AcmeError](https://acumen.hexdocs.pm/acumen.html#AcmeError))Builds the signed HTTP request for order creation.
+
+Sends the identifiers and any optional constraints (profile,
+notBefore/notAfter, replaces) to the ACME server’s `newOrder` endpoint.
+
+```
+pub fn not_after(
+  builder:
+```
+[RequestBuilder](https://acumen.hexdocs.pm#RequestBuilder),
+  timestamp: [timestamp.Timestamp](https://hexdocs.pm/gleam_time/1.8.0/gleam/time/timestamp.html#Timestamp),
+) -> [RequestBuilder](https://acumen.hexdocs.pm#RequestBuilder)Sets the requested notAfter constraint on the certificate.
+
+The CA may ignore this or apply its own constraints.
+
+```
+pub fn not_before(
+  builder:
+```
+[RequestBuilder](https://acumen.hexdocs.pm#RequestBuilder),
+  timestamp: [timestamp.Timestamp](https://hexdocs.pm/gleam_time/1.8.0/gleam/time/timestamp.html#Timestamp),
+) -> [RequestBuilder](https://acumen.hexdocs.pm#RequestBuilder)Sets the requested notBefore constraint on the certificate.
+
+The CA may ignore this or apply its own constraints.
+
+```
+pub fn profile(
+  builder:
+```
+[RequestBuilder](https://acumen.hexdocs.pm#RequestBuilder),
+  name: String,
+) -> [RequestBuilder](https://acumen.hexdocs.pm#RequestBuilder)Sets the certificate issuance profile for the order.
+
+Available profiles can be discovered with `acumen.profiles(directory)`.
+
+```
+pub fn replaces(
+  builder:
+```
+[RequestBuilder](https://acumen.hexdocs.pm#RequestBuilder),
+  cert_id: String,
+) -> [RequestBuilder](https://acumen.hexdocs.pm#RequestBuilder)Sets the certificate being replaced.
+
+Build `cert_id` with `renewal_info.cert_id` or
+`renewal_info.cert_id_from_certificate`.
+
+```
+pub fn request(
+  identifiers identifiers: List(
+```
+[acumen.Identifier](https://acumen.hexdocs.pm/acumen.html#Identifier)),
+) -> Result([RequestBuilder](https://acumen.hexdocs.pm#RequestBuilder), [acumen.AcmeError](https://acumen.hexdocs.pm/acumen.html#AcmeError))Creates a new order request builder. At least one identifier is required.
+
+## Example
+
+```
+let assert Ok(ord) = create_order.request(identifiers: [
+  acumen.DnsIdentifier("example.com"),
+  acumen.DnsIdentifier("www.example.com"),
+])
+```
+```
+pub fn response(
+  resp:
+```
+[response.Response](https://hexdocs.pm/gleam_http/4.3.0/gleam/http/response.html#Response)(String),
+) -> Result([order.Order](https://acumen.hexdocs.pm/order.html#Order), [acumen.AcmeError](https://acumen.hexdocs.pm/acumen.html#AcmeError))Parses the order creation response.
+
+Accepts both 200 and 201 status codes — the server may return an existing order for duplicate identifiers.
+
+---
+
+# acumen/deactivate_authorization · acumen · v1.1.1
+
+Source: https://acumen.hexdocs.pm/acumen/deactivate_authorization.html
+
+Deactivate an ACME authorization.
+
+Relinquish authorization to issue certificates for an identifier. Use this when you no longer want the server to consider you authorized.
+
+## Example
+
+```
+import acumen
+import acumen/deactivate_authorization
+let assert Ok(#(resp, ctx)) = acumen.execute(
+  ctx,
+  build: deactivate_authorization.build(authz_url, _, registered_key),
+  send: httpc.send,
+)
+let assert Ok(authz) = deactivate_authorization.response(resp, authz_url)
+// authz.status == Deactivated
+```
+
+---
+
+# acumen/fetch_authorization · acumen · v1.1.1
+
+Source: https://acumen.hexdocs.pm/acumen/fetch_authorization.html
+
+Fetch an ACME authorization.
+
+After creating an order, fetch each authorization to see the available challenges for proving domain control.
+
+## Example
+
+```
+import acumen
+import acumen/authorization.{type Authorization}
+import acumen/fetch_authorization
+let assert Ok(#(resp, ctx)) = acumen.execute(
+  ctx,
+  build: fetch_authorization.build(auth_url, _, registered_key),
+  send: httpc.send,
+)
+let assert Ok(auth) = fetch_authorization.response(resp, auth_url)
+```
+
+---
+
+# acumen/fetch_certificate · acumen · v1.1.1
+
+Source: https://acumen.hexdocs.pm/acumen/fetch_certificate.html
+
+Fetch an issued certificate from the ACME server.
+
+After an order reaches the `Valid` status, use the certificate URL
+from `order.Valid(certificate_url)` to download the certificate chain
+in PEM format.
+
+## Example
+
+```
+import acumen
+import acumen/fetch_certificate
+import acumen/order
+// After the order is valid...
+let assert order.Valid(certificate_url) = completed_order.status
+let assert Ok(#(resp, ctx)) = acumen.execute(
+  ctx,
+  build: fetch_certificate.build(certificate_url, _, registered_key),
+  send: httpc.send,
+)
+let assert Ok(pem_chain) = fetch_certificate.response(resp)
+```
+
+---
+
+# acumen/fetch_order · acumen · v1.1.1
+
+Source: https://acumen.hexdocs.pm/acumen/fetch_order.html
+
+Fetch an existing ACME order.
+
+Use this to check the status of an order after creating it or to poll for status changes during certificate issuance.
+
+## Example
+
+```
+import acumen
+import acumen/fetch_order
+import acumen/order.{type Order}
+let assert Ok(#(resp, ctx)) = acumen.execute(
+  ctx,
+  build: fetch_order.build(existing_order.url, _, registered_key),
+  send: httpc.send,
+)
+let assert Ok(updated_order) = fetch_order.response(resp, existing_order.url)
+```
+```
+pub fn build(
+  url:
+```
+[url.Url](https://acumen.hexdocs.pm/url.html#Url),
+  context: [acumen.Context](https://acumen.hexdocs.pm/acumen.html#Context),
+  key: [acumen.RegisteredKey](https://acumen.hexdocs.pm/acumen.html#RegisteredKey),
+) -> Result([request.Request](https://hexdocs.pm/gleam_http/4.3.0/gleam/http/request.html#Request)(String), [acumen.AcmeError](https://acumen.hexdocs.pm/acumen.html#AcmeError))Builds a signed POST-as-GET request to fetch an existing order.
+
+Used to poll order status during the authorization and finalization flow.
+
+```
+pub fn response(
+  resp:
+```
+[response.Response](https://hexdocs.pm/gleam_http/4.3.0/gleam/http/response.html#Response)(String),
+  url url: [url.Url](https://acumen.hexdocs.pm/url.html#Url),
+) -> Result([order.Order](https://acumen.hexdocs.pm/order.html#Order), [acumen.AcmeError](https://acumen.hexdocs.pm/acumen.html#AcmeError))Parses the order fetch response.
+
+Pass the order URL since the response doesn’t include a Location header.
+
+---
+
+# acumen/fetch_renewal_info · acumen · v1.1.1
+
+Source: https://acumen.hexdocs.pm/acumen/fetch_renewal_info.html
+
+Fetch renewal information for a certificate (RFC 9773).
+
+Queries the ACME server for a suggested renewal window for a specific
+certificate. This uses an unauthenticated GET request (no JWS signing
+needed), so it does not require `acumen.execute` — just build, send,
+and parse the response directly.
+
+## Example
+
+```
+import acumen
+import acumen/fetch_renewal_info
+import acumen/renewal_info
+import gleam/httpc
+import kryptos/x509/certificate
+// Parse the certificate and build the identifier
+let assert Ok(certs) = certificate.from_pem(pem)
+let assert [cert, ..] = certs
+let assert Ok(cert_id) = renewal_info.cert_id_from_certificate(cert)
+// Fetch renewal information
+let assert Ok(req) = fetch_renewal_info.build(directory, cert_id)
+let assert Ok(resp) = httpc.send(req)
+let assert Ok(info) = fetch_renewal_info.response(resp)
+// Check the suggested renewal window
+let start = info.suggested_window.start
+let end = info.suggested_window.end
+// Check polling interval
+let retry = acumen.retry_after(resp)
+```
+```
+pub fn build(
+  directory:
+```
+[acumen.Directory](https://acumen.hexdocs.pm/acumen.html#Directory),
+  cert_id cert_id: String,
+) -> Result([request.Request](https://hexdocs.pm/gleam_http/4.3.0/gleam/http/request.html#Request)(String), [acumen.AcmeError](https://acumen.hexdocs.pm/acumen.html#AcmeError))Builds an HTTP GET request to fetch renewal information for a certificate.
+
+Targets `{renewalInfo_url}/{cert_id}`. Build the `cert_id` with
+`renewal_info.cert_id` or `renewal_info.cert_id_from_certificate`.
+
+---
+
+# acumen/finalize_order · acumen · v1.1.1
+
+Source: https://acumen.hexdocs.pm/acumen/finalize_order.html
+
+Finalize an ACME order with a Certificate Signing Request.
+
+After all authorizations are valid (order status is `Ready`), submit a CSR
+to finalize the order and trigger certificate issuance.
+
+## Example
+
+```
+import acumen
+import acumen/finalize_order
+import acumen/order
+// Generate a CSR from the order
+let assert Ok(csr) = order.to_ec_csr(ready_order, cert_key)
+let assert Ok(#(resp, ctx)) = acumen.execute(
+  ctx,
+  build: finalize_order.build(ready_order.finalize_url, _, registered_key, csr:),
+  send: httpc.send,
+)
+let assert Ok(finalized) = finalize_order.response(resp, ready_order.url)
+```
+```
+pub fn build(
+  url:
+```
+[url.Url](https://acumen.hexdocs.pm/url.html#Url),
+  context: [acumen.Context](https://acumen.hexdocs.pm/acumen.html#Context),
+  key: [acumen.RegisteredKey](https://acumen.hexdocs.pm/acumen.html#RegisteredKey),
+  csr csr: BitArray,
+) -> Result([request.Request](https://hexdocs.pm/gleam_http/4.3.0/gleam/http/request.html#Request)(String), [acumen.AcmeError](https://acumen.hexdocs.pm/acumen.html#AcmeError))Builds the HTTP request to finalize an order with a CSR.
+
+The `csr` must be in DER format; the library handles base64url encoding.
+
+```
+pub fn response(
+  resp:
+```
+[response.Response](https://hexdocs.pm/gleam_http/4.3.0/gleam/http/response.html#Response)(String),
+  order_url order_url: [url.Url](https://acumen.hexdocs.pm/url.html#Url),
+) -> Result([order.Order](https://acumen.hexdocs.pm/order.html#Order), [acumen.AcmeError](https://acumen.hexdocs.pm/acumen.html#AcmeError))Parses the finalize response.
+
+Returns the order, typically in `Processing` or `Valid` status.
+Pass the `order_url` directly since the finalize response does not
+include a Location header.
+
+---
+
+# acumen/list_orders · acumen · v1.1.1
+
+Source: https://acumen.hexdocs.pm/acumen/list_orders.html
+
+List orders associated with an ACME account.
+
+The ACME server provides a paginated list of order URLs for each account.
+Use the `next` field in the response to fetch subsequent pages.
+
+## Example
+
+```
+import acumen
+import acumen/list_orders.{type OrdersList}
+import gleam/option
+let assert option.Some(orders_url) = account.orders_url
+let assert Ok(#(resp, ctx)) = acumen.execute(
+  ctx,
+  build: list_orders.build(orders_url, _, registered_key),
+  send: httpc.send,
+)
+let assert Ok(orders_list) = list_orders.response(resp)
+```
+A paginated list of order URLs from the ACME server.
+
+```
+pub type OrdersList {
+  OrdersList(orders: List(
+```
+[url.Url](https://acumen.hexdocs.pm/url.html#Url)), next: [option.Option](https://hexdocs.pm/gleam_stdlib/0.71.0/gleam/option.html#Option)([url.Url](https://acumen.hexdocs.pm/url.html#Url)))
+}### Constructors
+
+-
+
+          #### Arguments- orders
+-
+                The order URLs on this page.
+- next
+-
+                URL to fetch the next page, if one exists.
+
+```
+pub fn build(
+  url:
+```
+[url.Url](https://acumen.hexdocs.pm/url.html#Url),
+  context: [acumen.Context](https://acumen.hexdocs.pm/acumen.html#Context),
+  key: [acumen.RegisteredKey](https://acumen.hexdocs.pm/acumen.html#RegisteredKey),
+) -> Result([request.Request](https://hexdocs.pm/gleam_http/4.3.0/gleam/http/request.html#Request)(String), [acumen.AcmeError](https://acumen.hexdocs.pm/acumen.html#AcmeError))Builds a signed POST-as-GET request to list orders for an account.
+
+Targets the account’s `orders` URL from the registration response.
+
+```
+pub fn response(
+  resp:
+```
+[response.Response](https://hexdocs.pm/gleam_http/4.3.0/gleam/http/response.html#Response)(String),
+) -> Result([OrdersList](https://acumen.hexdocs.pm#OrdersList), [acumen.AcmeError](https://acumen.hexdocs.pm/acumen.html#AcmeError))Parses the orders list response.
+
+Pagination is indicated by a `Link` header with `rel="next"`.
+
+## Example
+
+```
+let assert Ok(orders_list) = list_orders.response(resp)
+// Follow pagination if there are more pages
+case orders_list.next {
+  option.Some(next_url) -> {
+    let assert Ok(#(resp, ctx)) = acumen.execute(
+      ctx,
+      build: list_orders.build(next_url, _, registered_key),
+      send: httpc.send,
+    )
+    let assert Ok(next_page) = list_orders.response(resp)
+  }
+  option.None -> {
+    // No more pages
+  }
+}
+```
+
+---
+
+# acumen/nonce · acumen · v1.1.1
+
+Source: https://acumen.hexdocs.pm/acumen/nonce.html
+
+Nonce fetching for ACME replay protection.
+
+ACME uses nonces to prevent replay attacks. Every request to the ACME server must include a fresh nonce, and every response includes a new nonce for the next request.
+
+## Usage
+
+You need to fetch an initial nonce before making your first ACME request:
+
+```
+import acumen
+import acumen/nonce
+import gleam/httpc
+// After fetching the directory...
+let assert Ok(nonce_req) = nonce.build(directory)
+let assert Ok(resp) = httpc.send(nonce_req)
+let assert Ok(initial_nonce) = nonce.response(resp)
+let ctx = acumen.Context(directory:, nonce: initial_nonce)
+```
+After the initial nonce, subsequent nonces are handled automatically by
+`acumen.execute`, which extracts nonces from response headers and updates
+the context.
+
+## Extracting Nonces from Any Response
+
+The `response` function can extract a nonce from any ACME response, not
+just dedicated nonce responses. This is useful if you need to manually
+manage nonces outside of the `execute` flow.
+
+```
+pub fn build(
+  directory:
+```
+[acumen.Directory](https://acumen.hexdocs.pm/acumen.html#Directory),
+) -> [request.Request](https://hexdocs.pm/gleam_http/4.3.0/gleam/http/request.html#Request)(String)Builds an HTTP HEAD request to the directory’s `newNonce` endpoint.
+
+```
+pub fn response(
+  resp:
+```
+[response.Response](https://hexdocs.pm/gleam_http/4.3.0/gleam/http/response.html#Response)(a),
+) -> Result(String, [acumen.AcmeError](https://acumen.hexdocs.pm/acumen.html#AcmeError))Extracts a nonce from any ACME response’s `Replay-Nonce` header.
+
+When using `acumen.execute`, nonce extraction is handled automatically.
+
+---
+
+# acumen/order · acumen · v1.1.1
+
+Source: https://acumen.hexdocs.pm/acumen/order.html
+
+Order types and CSR generation for ACME certificate requests.
+
+An order represents a request for a certificate covering one or more identifiers (domain names or IP addresses). This module also provides helpers to generate Certificate Signing Requests (CSRs) from an order.
+
+Errors that can occur when generating a CSR from an order.
+
+```
+pub type CsrError {
+  NoIdentifiers
+  InvalidIdentifier
+  SigningFailed
+}
+```
+### Constructors
+
+-
+          `NoIdentifiers`The order has no identifiers.
+-
+          `InvalidIdentifier`An identifier could not be encoded (e.g., non-ASCII DNS name, invalid IP).
+-
+          `SigningFailed`The CSR could not be signed.
+
+An ACME order for certificate issuance.
+
+```
+pub type Order {
+  Order(
+    url:
+```
+[url.Url](https://acumen.hexdocs.pm/url.html#Url),
+    status: [Status](https://acumen.hexdocs.pm#Status),
+    identifiers: List([acumen.Identifier](https://acumen.hexdocs.pm/acumen.html#Identifier)),
+    authorizations: List([url.Url](https://acumen.hexdocs.pm/url.html#Url)),
+    finalize_url: [url.Url](https://acumen.hexdocs.pm/url.html#Url),
+    expires: [option.Option](https://hexdocs.pm/gleam_stdlib/0.71.0/gleam/option.html#Option)([timestamp.Timestamp](https://hexdocs.pm/gleam_time/1.8.0/gleam/time/timestamp.html#Timestamp)),
+    not_before: [option.Option](https://hexdocs.pm/gleam_stdlib/0.71.0/gleam/option.html#Option)([timestamp.Timestamp](https://hexdocs.pm/gleam_time/1.8.0/gleam/time/timestamp.html#Timestamp)),
+    not_after: [option.Option](https://hexdocs.pm/gleam_stdlib/0.71.0/gleam/option.html#Option)([timestamp.Timestamp](https://hexdocs.pm/gleam_time/1.8.0/gleam/time/timestamp.html#Timestamp)),
+    profile: [option.Option](https://hexdocs.pm/gleam_stdlib/0.71.0/gleam/option.html#Option)(String),
+    error: [option.Option](https://hexdocs.pm/gleam_stdlib/0.71.0/gleam/option.html#Option)([acumen.AcmeError](https://acumen.hexdocs.pm/acumen.html#AcmeError)),
+  )
+}### Constructors
+
+-
+          `Order( url:`[url.Url](https://acumen.hexdocs.pm/url.html#Url), status:[Status](https://acumen.hexdocs.pm#Status), identifiers: List([acumen.Identifier](https://acumen.hexdocs.pm/acumen.html#Identifier)), authorizations: List([url.Url](https://acumen.hexdocs.pm/url.html#Url)), finalize_url:[url.Url](https://acumen.hexdocs.pm/url.html#Url), expires:[option.Option](https://hexdocs.pm/gleam_stdlib/0.71.0/gleam/option.html#Option)([timestamp.Timestamp](https://hexdocs.pm/gleam_time/1.8.0/gleam/time/timestamp.html#Timestamp)), not_before:[option.Option](https://hexdocs.pm/gleam_stdlib/0.71.0/gleam/option.html#Option)([timestamp.Timestamp](https://hexdocs.pm/gleam_time/1.8.0/gleam/time/timestamp.html#Timestamp)), not_after:[option.Option](https://hexdocs.pm/gleam_stdlib/0.71.0/gleam/option.html#Option)([timestamp.Timestamp](https://hexdocs.pm/gleam_time/1.8.0/gleam/time/timestamp.html#Timestamp)), profile:[option.Option](https://hexdocs.pm/gleam_stdlib/0.71.0/gleam/option.html#Option)(String), error:[option.Option](https://hexdocs.pm/gleam_stdlib/0.71.0/gleam/option.html#Option)([acumen.AcmeError](https://acumen.hexdocs.pm/acumen.html#AcmeError)), )#### Arguments- url
+-
+                The order URL (from Location header).
+- status
+-
+                Current order status (certificate URL is inside `Valid`variant).
+- identifiers
+-
+                The identifiers requested on the certificate.
+- authorizations
+-
+                URLs to authorization objects (for challenge completion).
+- finalize_url
+-
+                URL to finalize the order with a CSR.
+- expires
+-
+                When the order expires.
+- not_before
+-
+                Requested certificate notBefore (optional).
+- not_after
+-
+                Requested certificate notAfter (optional).
+- profile
+-
+                Certificate issuance profile (optional).
+- error
+-
+                Problem document when order is invalid.
+
+Order status.
+
+```
+pub type Status {
+  Pending
+  Ready
+  Processing
+  Valid(certificate_url:
+```
+[url.Url](https://acumen.hexdocs.pm/url.html#Url))
+  Invalid
+}### Constructors
+
+-
+          `Pending`Authorizations not yet satisfied.
+-
+          `Ready`Ready for finalization (all authorizations valid).
+-
+          `Processing`CA is issuing the certificate.
+-
+
+          Certificate is available for download at the given URL.
+-
+          `Invalid`Order failed (e.g., authorization failed).
+
+```
+pub fn to_ec_csr(
+  order:
+```
+[Order](https://acumen.hexdocs.pm#Order),
+  key: [ec.PrivateKey](https://hexdocs.pm/kryptos/1.4.0/kryptos/ec.html#PrivateKey),
+) -> Result(BitArray, [CsrError](https://acumen.hexdocs.pm#CsrError))Generates a CSR from an order using an EC key.
+
+Uses the order’s identifiers as Subject Alternative Names, with the first DNS identifier as the Common Name. Returns the CSR in DER format.
+
+## Example
+
+```
+let #(private_key, _public_key) = ec.generate_key_pair(ec.P256)
+let assert Ok(csr_der) = order.to_ec_csr(ready_order, private_key)
+```
+```
+pub fn to_rsa_csr(
+  order:
+```
+[Order](https://acumen.hexdocs.pm#Order),
+  key: [rsa.PrivateKey](https://hexdocs.pm/kryptos/1.4.0/kryptos/rsa.html#PrivateKey),
+) -> Result(BitArray, [CsrError](https://acumen.hexdocs.pm#CsrError))Generates a CSR from an order using an RSA key.
+
+Uses the order’s identifiers as Subject Alternative Names, with the first DNS identifier as the Common Name. Returns the CSR in DER format.
+
+Hash algorithm is selected by key size: SHA-512 for 4096+ bits, SHA-384 for 3072+, SHA-256 otherwise.
+
+## Example
+
+```
+let assert Ok(#(private_key, _public_key)) = rsa.generate_key_pair(2048)
+let assert Ok(csr_der) = order.to_rsa_csr(ready_order, private_key)
+```
+
+---
+
+# acumen/register_account · acumen · v1.1.1
+
+Source: https://acumen.hexdocs.pm/acumen/register_account.html
+
+Register a new ACME account.
+
+Before requesting certificates, you must register an account with the ACME server.
+
+## Example
+
+```
+import acumen
+import acumen/account.{type Account}
+import acumen/register_account
+import gose/key
+import kryptos/ec
+// Generate an account key (store this securely!)
+let key = key.generate_ec(ec.P256)
+let unregistered = acumen.UnregisteredKey(key)
+// Build the registration request
+let reg = register_account.request()
+  |> register_account.contacts(["mailto:admin@example.com"])
+  |> register_account.agree_to_terms
+// Execute the request
+let assert Ok(#(resp, ctx)) = acumen.execute(
+  ctx,
+  build: register_account.build(reg, _, unregistered),
+  send: httpc.send,
+)
+// Parse the response to get the account and registered key
+let assert Ok(#(account, registered_key)) =
+  register_account.response(resp, unregistered)
+```
+Request builder for account registration.
+
+Use `request` to create a builder, configure it with `contacts`,
+`agree_to_terms`, and/or `only_existing`, then call `build`.
+
+`pub opaque type RequestBuilder``pub fn agree_to_terms(builder: `[RequestBuilder](https://acumen.hexdocs.pm#RequestBuilder)) -> [RequestBuilder](https://acumen.hexdocs.pm#RequestBuilder)Indicates agreement to the ACME server’s terms of service.
+
+Most ACME servers (including Let’s Encrypt) require you to agree to their
+terms of service. The ToS URL is available in `directory.meta.terms_of_service`.
+
+```
+pub fn build(
+  builder:
+```
+[RequestBuilder](https://acumen.hexdocs.pm#RequestBuilder),
+  context: [acumen.Context](https://acumen.hexdocs.pm/acumen.html#Context),
+  key: [acumen.UnregisteredKey](https://acumen.hexdocs.pm/acumen.html#UnregisteredKey),
+) -> Result([request.Request](https://hexdocs.pm/gleam_http/4.3.0/gleam/http/request.html#Request)(String), [acumen.AcmeError](https://acumen.hexdocs.pm/acumen.html#AcmeError))Builds the HTTP request for account registration.
+
+The full JWK is embedded in the protected header since the key isn’t registered yet.
+
+```
+pub fn contacts(
+  builder:
+```
+[RequestBuilder](https://acumen.hexdocs.pm#RequestBuilder),
+  contacts: List(String),
+) -> [RequestBuilder](https://acumen.hexdocs.pm#RequestBuilder)Adds contact URLs to the registration request.
+
+Contact URLs are typically `mailto:` addresses where the CA can reach you
+about certificate expiration, policy changes, or security issues.
+
+```
+pub fn external_account_binding(
+  builder:
+```
+[RequestBuilder](https://acumen.hexdocs.pm#RequestBuilder),
+  key_id key_id: String,
+  mac_key mac_key: BitArray,
+) -> [RequestBuilder](https://acumen.hexdocs.pm#RequestBuilder)Adds external account binding credentials to the registration request.
+
+Some CAs (like Google, ZeroSSL) require you to bind your ACME account to an existing account with them. They provide a key ID and a MAC key (usually base64url-encoded).
+
+## Example
+
+```
+let assert Ok(mac_key) = bit_array.base64_url_decode(mac_key_b64)
+let reg = register_account.request()
+  |> register_account.external_account_binding(key_id: "key-id-from-ca", mac_key: mac_key)
+  |> register_account.agree_to_terms
+```
+`pub fn only_existing(builder: `[RequestBuilder](https://acumen.hexdocs.pm#RequestBuilder)) -> [RequestBuilder](https://acumen.hexdocs.pm#RequestBuilder)Configures the request to only return an existing account.
+
+When set, the server will return the existing account for this key if one
+exists, or return an `AccountDoesNotExist` error if not. No new account
+will be created.
+
+This is useful for recovering an account URL when you have the private key but lost the account metadata.
+
+`pub fn request() -> `[RequestBuilder](https://acumen.hexdocs.pm#RequestBuilder)Creates a new account registration request builder.
+
+## Example
+
+```
+let reg = register_account.request()
+  |> register_account.contacts(["mailto:admin@example.com"])
+  |> register_account.agree_to_terms
+```
+```
+pub fn response(
+  resp:
+```
+[response.Response](https://hexdocs.pm/gleam_http/4.3.0/gleam/http/response.html#Response)(String),
+  key key: [acumen.UnregisteredKey](https://acumen.hexdocs.pm/acumen.html#UnregisteredKey),
+) -> Result(
+  #([account.Account](https://acumen.hexdocs.pm/account.html#Account), [acumen.RegisteredKey](https://acumen.hexdocs.pm/acumen.html#RegisteredKey)),
+  [acumen.AcmeError](https://acumen.hexdocs.pm/acumen.html#AcmeError),
+)Parses the account registration response.
+
+Returns the account and a `RegisteredKey` (the key upgraded with the
+account URL). Use the `RegisteredKey` for all subsequent operations.
+
+---
+
+# acumen/renewal_info · acumen · v1.1.1
+
+Source: https://acumen.hexdocs.pm/acumen/renewal_info.html
+
+Renewal information types and certificate identifier helpers (RFC 9773).
+
+The ACME Renewal Information (ARI) extension allows servers to suggest optimal renewal windows for certificates.
+
+## Example
+
+```
+import acumen/renewal_info
+import kryptos/x509/certificate
+// From raw components:
+let id = renewal_info.cert_id(aki_bytes, serial_bytes)
+// From a parsed certificate:
+let assert Ok(certs) = certificate.from_pem(pem_string)
+let assert [cert, ..] = certs
+let assert Ok(id) = renewal_info.cert_id_from_certificate(cert)
+```
+Renewal information from an ACME server (RFC 9773).
+
+```
+pub type RenewalInfo {
+  RenewalInfo(
+    suggested_window:
+```
+[SuggestedWindow](https://acumen.hexdocs.pm#SuggestedWindow),
+    explanation_url: [option.Option](https://hexdocs.pm/gleam_stdlib/0.71.0/gleam/option.html#Option)([uri.Uri](https://hexdocs.pm/gleam_stdlib/0.71.0/gleam/uri.html#Uri)),
+  )
+}### Constructors
+
+-
+
+          #### Arguments- suggested_window
+-
+                The server’s suggested renewal window.
+- explanation_url
+-
+                URL with additional context about the renewal recommendation.
+
+```
+pub fn cert_id(
+  authority_key_identifier authority_key_identifier: BitArray,
+  serial serial: BitArray,
+) -> String
+```
+Builds a certificate identifier from raw AKI keyIdentifier and serial number bytes.
+
+The identifier format is `base64url(AKI) "." base64url(serial)` as specified
+by RFC 9773. This identifier is used both for querying renewal information
+and for the `replaces` field in order creation.
+
+## Example
+
+```
+let id = renewal_info.cert_id(aki_bytes, serial_bytes)
+```
+```
+pub fn cert_id_from_certificate(
+  cert:
+```
+[certificate.Certificate](https://hexdocs.pm/kryptos/1.4.0/kryptos/x509/certificate.html#Certificate)([certificate.Parsed](https://hexdocs.pm/kryptos/1.4.0/kryptos/x509/certificate.html#Parsed)),
+) -> Result(String, [acumen.AcmeError](https://acumen.hexdocs.pm/acumen.html#AcmeError))Extracts a certificate identifier from a parsed certificate.
+
+Extracts the Authority Key Identifier (AKI) keyIdentifier and serial number, and constructs the RFC 9773 certificate identifier.
+
+Parse certificates with `kryptos/x509/certificate.from_pem` or
+`kryptos/x509/certificate.from_der` before calling this function.
+
+## Example
+
+```
+let assert Ok(certs) = certificate.from_pem(pem_string)
+let assert [cert, ..] = certs
+let assert Ok(id) = renewal_info.cert_id_from_certificate(cert)
+```
+
+---
+
+# acumen/revoke_certificate · acumen · v1.1.1
+
+Source: https://acumen.hexdocs.pm/acumen/revoke_certificate.html
+
+Revoke certificates issued through ACME.
+
+Once revoked, a certificate appears on Certificate Revocation Lists (CRLs).
+
+## Example
+
+```
+import acumen
+import acumen/revoke_certificate
+// Build the revocation request with the DER-encoded certificate
+let rev = revoke_certificate.request(cert_der_bytes)
+  |> revoke_certificate.reason(revoke_certificate.KeyCompromise)
+// Execute the request
+let assert Ok(#(resp, ctx)) = acumen.execute(
+  ctx,
+  build: revoke_certificate.build(rev, _, registered_key),
+  send: httpc.send,
+)
+// Parse the response
+let assert Ok(Nil) = revoke_certificate.response(resp)
+```
+Request builder for certificate revocation.
+
+Use `request` to create a builder with the DER-encoded certificate,
+optionally configure it with `reason`, then call `build`.
+
+`pub opaque type RequestBuilder`Reason codes for certificate revocation as defined in RFC 5280.
+
+Not all reason codes are commonly used. The most common are:
+
+- `Unspecified`: No specific reason given
+- `KeyCompromise`: The certificate’s private key was compromised
+- `Superseded`: The certificate has been replaced by a newer one
+- `CessationOfOperation`: The certificate is no longer needed
+
+```
+pub type RevocationReason {
+  Unspecified
+  KeyCompromise
+  CaCompromise
+  AffiliationChanged
+  Superseded
+  CessationOfOperation
+  CertificateHold
+  RemoveFromCrl
+  PrivilegeWithdrawn
+  AaCompromise
+}
+```
+### Constructors
+
+-
+          `Unspecified`No specific reason given (code 0)
+-
+          `KeyCompromise`The certificate’s private key was compromised (code 1)
+-
+          `CaCompromise`The CA’s private key was compromised (code 2)
+-
+          `AffiliationChanged`The certificate holder’s affiliation changed (code 3)
+-
+          `Superseded`The certificate has been replaced (code 4)
+-
+          `CessationOfOperation`The certificate is no longer needed (code 5)
+-
+          `CertificateHold`The certificate is temporarily on hold (code 6)
+-
+          `RemoveFromCrl`Remove the certificate from a CRL (code 8)
+-
+          `PrivilegeWithdrawn`Privileges were withdrawn (code 9)
+-
+          `AaCompromise`The attribute authority was compromised (code 10)
+
+```
+pub fn build(
+  builder:
+```
+[RequestBuilder](https://acumen.hexdocs.pm#RequestBuilder),
+  context: [acumen.Context](https://acumen.hexdocs.pm/acumen.html#Context),
+  key: [acumen.RegisteredKey](https://acumen.hexdocs.pm/acumen.html#RegisteredKey),
+) -> Result([request.Request](https://hexdocs.pm/gleam_http/4.3.0/gleam/http/request.html#Request)(String), [acumen.AcmeError](https://acumen.hexdocs.pm/acumen.html#AcmeError))Builds a signed revocation request to the `revokeCert` endpoint.
+
+```
+pub fn build_with_certificate_key(
+  builder:
+```
+[RequestBuilder](https://acumen.hexdocs.pm#RequestBuilder),
+  context: [acumen.Context](https://acumen.hexdocs.pm/acumen.html#Context),
+  key key: [gose.Key](https://hexdocs.pm/gose/2.1.0/gose.html#Key)(String),
+) -> Result([request.Request](https://hexdocs.pm/gleam_http/4.3.0/gleam/http/request.html#Request)(String), [acumen.AcmeError](https://acumen.hexdocs.pm/acumen.html#AcmeError))Signs the revocation request with the certificate’s private key instead of the account key. Useful when account access is unavailable, such as during incident response.
+
+## Example
+
+```
+import acumen
+import acumen/revoke_certificate
+import gose/key
+let assert Ok(cert_private_key) = key.from_pem(cert_key_pem)
+let req = revoke_certificate.request(cert_der_bytes)
+  |> revoke_certificate.reason(revoke_certificate.KeyCompromise)
+let assert Ok(#(resp, ctx)) = acumen.execute(
+  ctx,
+  build: revoke_certificate.build_with_certificate_key(
+    req,
+    _,
+    key: cert_private_key,
+  ),
+  send: httpc.send,
+)
+let assert Ok(Nil) = revoke_certificate.response(resp)
+```
+```
+pub fn reason(
+  builder:
+```
+[RequestBuilder](https://acumen.hexdocs.pm#RequestBuilder),
+  revocation_reason: [RevocationReason](https://acumen.hexdocs.pm#RevocationReason),
+) -> [RequestBuilder](https://acumen.hexdocs.pm#RequestBuilder)Sets the revocation reason. Optional but recommended.
+
+---
+
+# acumen/rotate_key · acumen · v1.1.1
+
+Source: https://acumen.hexdocs.pm/acumen/rotate_key.html
+
+Account key rotation for ACME.
+
+Key rotation allows you to replace your account’s key pair while maintaining account continuity.
+
+## Example
+
+```
+import acumen
+import acumen/rotate_key
+import gose/key
+import kryptos/ec
+// Generate a new key to rotate to
+let new_key = key.generate_ec(ec.P256)
+// Build and execute the key change request
+let change = rotate_key.request(new_key)
+let assert Ok(#(resp, ctx)) = acumen.execute(
+  ctx,
+  build: rotate_key.build(change, _, old_registered_key),
+  send: httpc.send,
+)
+// Parse the response to get the new registered key
+let assert Ok(new_registered_key) =
+  rotate_key.response(resp, new_key, old_registered_key)
+```
+```
+pub fn build(
+  builder:
+```
+[RequestBuilder](https://acumen.hexdocs.pm#RequestBuilder),
+  context: [acumen.Context](https://acumen.hexdocs.pm/acumen.html#Context),
+  key: [acumen.RegisteredKey](https://acumen.hexdocs.pm/acumen.html#RegisteredKey),
+) -> Result([request.Request](https://hexdocs.pm/gleam_http/4.3.0/gleam/http/request.html#Request)(String), [acumen.AcmeError](https://acumen.hexdocs.pm/acumen.html#AcmeError))Builds the HTTP request for key rotation.
+
+Creates a nested JWS: inner payload `{account, oldKey}` signed with the
+new key, wrapped in an outer JWS signed with the old key.
+
+`pub fn request(new_key: `[gose.Key](https://hexdocs.pm/gose/2.1.0/gose.html#Key)(String)) -> [RequestBuilder](https://acumen.hexdocs.pm#RequestBuilder)Creates a new key rotation request builder wrapping the replacement key.
+
+```
+pub fn response(
+  resp:
+```
+[response.Response](https://hexdocs.pm/gleam_http/4.3.0/gleam/http/response.html#Response)(String),
+  new_key new_key: [gose.Key](https://hexdocs.pm/gose/2.1.0/gose.html#Key)(String),
+  old_key old_key: [acumen.RegisteredKey](https://acumen.hexdocs.pm/acumen.html#RegisteredKey),
+) -> Result([acumen.RegisteredKey](https://acumen.hexdocs.pm/acumen.html#RegisteredKey), [acumen.AcmeError](https://acumen.hexdocs.pm/acumen.html#AcmeError))Parses the key rotation response.
+
+Returns a new `RegisteredKey` with the new key and the old key’s
+account URL.
+
+---
+
+# acumen/update_account · acumen · v1.1.1
+
+Source: https://acumen.hexdocs.pm/acumen/update_account.html
+
+Update an existing ACME account.
+
+After registration, you can update your account by posting to the account URL. Per RFC 8555, you can update:
+
+- `contact`: Contact URLs for the account
+- `termsOfServiceAgreed`: Agreement to terms of service
+- `status`: Set to “deactivated” to deactivate the account (Section 7.3.6)
+
+The server ignores updates to `orders` and unrecognized fields.
+
+## Example
+
+```
+import acumen
+import acumen/update_account
+// Update contact information
+let update = update_account.request()
+  |> update_account.contacts(["mailto:new-admin@example.com"])
+// Or deactivate the account
+let deactivate = update_account.request()
+  |> update_account.deactivate
+let assert Ok(#(resp, ctx)) = acumen.execute(
+  ctx,
+  build: update_account.build(update, _, registered_key),
+  send: httpc.send,
+)
+let assert Ok(account) = update_account.response(resp)
+```
+Request builder for account updates.
+
+Create with `request()`, configure with `contacts()`, `agree_to_terms()`,
+or `deactivate()`, then pass to `build()`.
+
+`pub opaque type RequestBuilder``pub fn agree_to_terms(builder: `[RequestBuilder](https://acumen.hexdocs.pm#RequestBuilder)) -> [RequestBuilder](https://acumen.hexdocs.pm#RequestBuilder)Indicates agreement to the ACME server’s terms of service.
+
+The ToS URL is available in `directory.meta.terms_of_service`.
+
+```
+pub fn build(
+  builder:
+```
+[RequestBuilder](https://acumen.hexdocs.pm#RequestBuilder),
+  context: [acumen.Context](https://acumen.hexdocs.pm/acumen.html#Context),
+  key: [acumen.RegisteredKey](https://acumen.hexdocs.pm/acumen.html#RegisteredKey),
+) -> Result([request.Request](https://hexdocs.pm/gleam_http/4.3.0/gleam/http/request.html#Request)(String), [acumen.AcmeError](https://acumen.hexdocs.pm/acumen.html#AcmeError))Builds the signed HTTP request for account update.
+
+Only includes fields that were explicitly set on the builder; omitted fields are left unchanged on the server.
+
+```
+pub fn contacts(
+  builder:
+```
+[RequestBuilder](https://acumen.hexdocs.pm#RequestBuilder),
+  contacts: List(String),
+) -> [RequestBuilder](https://acumen.hexdocs.pm#RequestBuilder)Sets the new contact URLs for the account.
+
+Contact URLs are typically `mailto:` addresses where the CA can reach you
+about certificate expiration, policy changes, or security issues.
+
+`pub fn deactivate(builder: `[RequestBuilder](https://acumen.hexdocs.pm#RequestBuilder)) -> [RequestBuilder](https://acumen.hexdocs.pm#RequestBuilder)Marks the account for deactivation.
+
+Once deactivated, the account cannot be used for any further operations. This action is permanent.
+
+`pub fn request() -> `[RequestBuilder](https://acumen.hexdocs.pm#RequestBuilder)Creates a new account update request builder with no changes set.
+
+## Example
+
+```
+let update = update_account.request()
+  |> update_account.contacts(["mailto:new@example.com"])
+```
+```
+pub fn response(
+  resp:
+```
+[response.Response](https://hexdocs.pm/gleam_http/4.3.0/gleam/http/response.html#Response)(String),
+) -> Result([account.Account](https://acumen.hexdocs.pm/account.html#Account), [acumen.AcmeError](https://acumen.hexdocs.pm/acumen.html#AcmeError))Parses the account update response.
+
+Returns the full account state after the update, including any fields that were not modified.
+
+---
+
+# acumen/url · acumen · v1.1.1
+
+Source: https://acumen.hexdocs.pm/acumen/url.html
+
+A URL type that preserves the original server-provided string.
+
+ACME servers provide URLs in JSON responses and HTTP headers. RFC 8555 Section 6.4 requires the exact server-provided string in signed JWS headers. This type stores the raw string alongside the parsed URI so that serialization never alters the URL.
+
+`pub fn from_string(string: String) -> Result(`[Url](https://acumen.hexdocs.pm#Url), Nil)Parses a string into a `Url`.
+
+Succeeds only for absolute HTTPS URLs with a host.
+
+---
+
+# acumen/validate_challenge · acumen · v1.1.1
+
+Source: https://acumen.hexdocs.pm/acumen/validate_challenge.html
+
+Trigger validation of an ACME challenge.
+
+After setting up the challenge response (HTTP file, DNS record, etc.), use this to tell the ACME server to validate it.
+
+## Example
+
+```
+import acumen
+import acumen/challenge
+import acumen/validate_challenge
+// After deploying the challenge response...
+let assert Ok(#(resp, ctx)) = acumen.execute(
+  ctx,
+  build: validate_challenge.build(challenge.url(http_challenge), _, registered_key),
+  send: httpc.send,
+)
+let assert Ok(updated_challenge) = validate_challenge.response(resp)
+```
+```
+pub fn build(
+  url:
+```
+[url.Url](https://acumen.hexdocs.pm/url.html#Url),
+  context: [acumen.Context](https://acumen.hexdocs.pm/acumen.html#Context),
+  key: [acumen.RegisteredKey](https://acumen.hexdocs.pm/acumen.html#RegisteredKey),
+) -> Result([request.Request](https://hexdocs.pm/gleam_http/4.3.0/gleam/http/request.html#Request)(String), [acumen.AcmeError](https://acumen.hexdocs.pm/acumen.html#AcmeError))Builds the POST request to trigger challenge validation.
+
+```
+pub fn response(
+  resp:
+```
+[response.Response](https://hexdocs.pm/gleam_http/4.3.0/gleam/http/response.html#Response)(String),
+) -> Result([challenge.Challenge](https://acumen.hexdocs.pm/challenge.html#Challenge), [acumen.AcmeError](https://acumen.hexdocs.pm/acumen.html#AcmeError))Parses the challenge response after triggering validation.
+
+The returned challenge status may still be `Processing`.
+
+---
