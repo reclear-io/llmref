@@ -1,0 +1,1403 @@
+# Overview
+
+Source: https://grpc-connection-pool.hexdocs.pm/readme.md
+
+# GrpcConnectionPool
+
+[![Hex.pm](https://img.shields.io/hexpm/v/grpc_connection_pool.svg)](https://hex.pm/packages/grpc_connection_pool)
+[![Documentation](https://img.shields.io/badge/docs-hexdocs-purple.svg)](https://hexdocs.pm/grpc_connection_pool/)
+[![License](https://img.shields.io/hexpm/l/grpc_connection_pool.svg)](LICENSE)
+
+A high-performance gRPC connection pooling library for Elixir with zero-GenServer-call hot path, pluggable selection strategies, and automatic health monitoring.
+
+## Overview
+
+GrpcConnectionPool was extracted from a production Pub/Sub gRPC client and optimized for maximum throughput. The hot path (`get_channel`) does **zero GenServer calls** — channels are stored in ETS for O(1) indexed access with lock-free atomics-based round-robin.
+
+### Key Features
+
+- **Zero GenServer.call hot path** — 2M+ ops/sec single-process throughput
+- **Pluggable strategies** — round-robin (atomics), random, power-of-two-choices, or custom
+- **O(1) channel selection** — constant time regardless of pool size
+- **`:persistent_term` config** — zero-copy reads for configuration
+- **Health monitoring** — automatic connection health checks and recovery
+- **Connection warming** — periodic pings to prevent idle connection timeouts
+- **Exponential backoff** — configurable retry with jitter
+- **Multiple pools** — support for multiple named pools serving different services
+- **Dynamic scaling** — `scale_up/2`, `scale_down/2`, `resize/2` at runtime
+- **`await_ready/2`** — block until pool has connections, useful for startup
+- **Rich telemetry** — comprehensive events for observability
+
+## Architecture
+
+```
+Pool.Supervisor (one_for_one)
++-- PoolState (GenServer -- owns ETS, persistent_term setup)
++-- Registry (health tracking)
++-- DynamicSupervisor --> Workers
++-- WorkerStarter (Task, temporary)
++-- TelemetryReporter (GenServer, periodic status)
+```
+
+### Hot Path
+
+```
+Pool.get_channel()
+  -> ETS.lookup(:channel_count)            # O(1)
+  -> persistent_term.get(strategy)         # O(1), zero-copy
+  -> Strategy.select (atomics.add_get)     # O(1), lock-free
+  -> ETS.lookup({:channel, index})         # O(1)
+  -> return channel                        # no GenServer!
+```
+
+### Design Decisions
+
+1. **Custom pool over NimblePool** — "no checkout" model where channels are returned directly. No checkout/checkin overhead.
+
+2. **ETS + atomics over GenServer.call** — Workers store channels in ETS on connect/disconnect. The hot path reads ETS directly with zero message passing.
+
+3. **Pluggable strategies** — Different workloads need different selection. Round-robin is default, but random avoids correlated hot-spotting and power-of-two handles uneven loads.
+
+4. **Separation of Concerns**:
+   - `Config`: Configuration management with strategy support
+   - `Worker`: Connection lifecycle, stores channels in ETS
+   - `Pool`: Zero-GenServer hot path, strategy dispatch
+   - `PoolState`: ETS ownership, persistent_term setup
+   - `Strategy`: Behaviour for pluggable selection
+
+## Installation
+
+Add `grpc_connection_pool` to your dependencies in `mix.exs`:
+
+```elixir
+def deps do
+  [
+    {:grpc_connection_pool, "~> 0.5.0"},
+    {:grpc, "~> 1.0"},  # Required peer dependency
+    {:gun, "~> 2.2"}    # grpc >= 1.0 makes gun optional; the default Gun adapter needs it
+  ]
+end
+```
+
+> **grpc 1.0:** this library targets grpc `~> 1.0`, which is client-only and makes
+> `:gun` an optional dependency. Since the pool uses the default Gun adapter, add
+> `:gun` explicitly. See the [Changelog](CHANGELOG.md) for the 0.5.0 migration notes
+> (telemetry event change, disconnect-detection rework).
+
+## Quick Start
+
+### 1. Basic Usage
+
+```elixir
+# Create configuration
+{:ok, config} = GrpcConnectionPool.Config.production(
+  host: "api.example.com",
+  port: 443,
+  pool_size: 5
+)
+
+# Start pool
+{:ok, _pid} = GrpcConnectionPool.start_link(config)
+
+# Get a channel and make a gRPC call. get_channel/1 returns a channel
+# directly (no checkout/checkin) using the configured selection strategy.
+case GrpcConnectionPool.get_channel() do
+  {:ok, channel} ->
+    request = %MyService.ListRequest{}
+    MyService.Stub.list(channel, request)
+
+  {:error, :not_connected} ->
+    {:error, :unavailable}
+end
+```
+
+### 2. Local Development
+
+```elixir
+{:ok, config} = GrpcConnectionPool.Config.local(
+  host: "localhost",
+  port: 9090,
+  pool_size: 3
+)
+
+{:ok, _pid} = GrpcConnectionPool.start_link(config)
+```
+
+## Configuration
+
+### Configuration Options
+
+The library supports flexible configuration through `GrpcConnectionPool.Config`:
+
+```elixir
+{:ok, config} = GrpcConnectionPool.Config.new([
+  endpoint: [
+    type: :production,           # :production, :local, or custom atom
+    host: "api.example.com",     # Required: gRPC server hostname
+    port: 443,                   # Required: gRPC server port  
+    ssl: [],                     # SSL options ([] for default SSL)
+    credentials: nil,            # Custom GRPC.Credential (overrides ssl)
+    interceptors: nil,           # List of gRPC client interceptors (modules)
+    retry_config: [              # Optional: retry configuration
+      max_attempts: 3,
+      base_delay: 1000,
+      max_delay: 5000
+    ]
+  ],
+  pool: [
+    size: 5,                     # Number of connections in pool
+    name: MyApp.GrpcPool,        # Pool name (must be unique)
+    strategy: :round_robin,      # :round_robin | :random | :power_of_two | CustomModule
+    telemetry_interval: 5_000,   # Interval (ms) for periodic :status events
+    telemetry_sample_rate: 1     # Per-call :get_channel event: 1 = every call,
+                                 # 0 = off, N = ~1-in-N (see Telemetry below)
+  ],
+  connection: [
+    keepalive: 30_000,           # HTTP/2 keepalive interval
+    ping_interval: 25_000,       # Ping interval to keep connections warm
+    health_check: true,          # Enable connection health monitoring
+    suppress_connection_errors: false  # Suppress connection-down logs (useful for GCP endpoints)
+  ]
+])
+```
+
+> **High-throughput tip:** the `[:grpc_connection_pool, :pool, :get_channel]`
+> event fires on every `get_channel/1` by default. On very hot pools set
+> `telemetry_sample_rate: 0` (or a sampling factor `N`) and rely on the periodic
+> `[:grpc_connection_pool, :pool, :status]` event instead — this avoids a
+> per-call metadata-map allocation in the hot path.
+
+### Configuration from Environment
+
+#### In `config/config.exs`:
+
+```elixir
+# Single service configuration
+config :my_app, GrpcConnectionPool,
+  endpoint: [
+    type: :production,
+    host: "api.example.com",
+    port: 443,
+    ssl: []
+  ],
+  pool: [
+    size: 10,
+    name: MyApp.GrpcPool
+  ],
+  connection: [
+    ping_interval: 30_000
+  ]
+
+# Multiple service configuration
+config :my_app, :service_a,
+  endpoint: [type: :production, host: "service-a.example.com"],
+  pool: [size: 5, name: MyApp.ServiceA.Pool]
+
+config :my_app, :service_b, 
+  endpoint: [type: :production, host: "service-b.example.com"],
+  pool: [size: 8, name: MyApp.ServiceB.Pool]
+```
+
+## Complete Configuration Examples
+
+### Basic Production Configuration
+
+```elixir
+# For a production gRPC service with SSL
+config :my_app, GrpcConnectionPool,
+  endpoint: [
+    type: :production,
+    host: "api.example.com",
+    port: 443,
+    ssl: []  # Use default SSL settings
+  ],
+  pool: [
+    size: 10,
+    name: MyApp.GrpcPool
+  ],
+  connection: [
+    keepalive: 30_000,     # Send keepalive every 30 seconds
+    ping_interval: 25_000,  # Ping every 25 seconds to keep warm
+    health_check: true
+  ]
+```
+
+### Local Development Configuration
+
+```elixir
+# For local development with a gRPC server (no SSL)
+config :my_app, GrpcConnectionPool,
+  endpoint: [
+    type: :local,
+    host: "localhost", 
+    port: 9090
+  ],
+  pool: [
+    size: 3,  # Smaller pool for development
+    name: MyApp.DevPool
+  ]
+```
+
+### Test Environment with Emulator
+
+```elixir
+# For testing with Google Pub/Sub emulator or similar
+config :my_app, GrpcConnectionPool,
+  endpoint: [
+    type: :test,
+    host: "localhost",
+    port: 8085,
+    retry_config: [
+      max_attempts: 3,
+      base_delay: 1000,
+      max_delay: 5000
+    ]
+  ],
+  pool: [
+    size: 2,  # Small pool for tests
+    name: MyApp.TestPool
+  ],
+  connection: [
+    ping_interval: nil  # Disable pinging in tests
+  ]
+```
+
+### Multiple Service Configuration
+
+```elixir
+# Configuration for multiple gRPC services
+config :my_app, :service_a,
+  endpoint: [
+    type: :production,
+    host: "service-a.example.com",
+    port: 443
+  ],
+  pool: [
+    size: 5,
+    name: MyApp.ServiceAPool
+  ]
+
+config :my_app, :service_b,  
+  endpoint: [
+    type: :production,
+    host: "service-b.example.com", 
+    port: 443
+  ],
+  pool: [
+    size: 8,
+    name: MyApp.ServiceBPool
+  ]
+```
+
+### Advanced SSL Configuration
+
+```elixir
+# Custom SSL configuration with client certificates
+config :my_app, GrpcConnectionPool,
+  endpoint: [
+    type: :production,
+    host: "secure-api.example.com",
+    port: 443,
+    credentials: GRPC.Credential.new(ssl: [
+      verify: :verify_peer,
+      cacertfile: "/path/to/ca.pem",
+      certfile: "/path/to/client.pem", 
+      keyfile: "/path/to/client-key.pem"
+    ])
+  ]
+```
+
+### Environment-Specific Configuration
+
+```elixir
+# Different configurations per environment using Mix.env()
+case Mix.env() do
+  :prod ->
+    config :my_app, GrpcConnectionPool,
+      endpoint: [
+        type: :production,
+        host: "api.example.com",
+        port: 443
+      ],
+      pool: [size: 20]  # Large pool for production
+      
+  :dev ->
+    config :my_app, GrpcConnectionPool,
+      endpoint: [
+        type: :local,
+        host: "localhost", 
+        port: 9090
+      ],
+      pool: [size: 3]   # Small pool for development
+      
+  :test ->
+    config :my_app, GrpcConnectionPool,
+      endpoint: [
+        type: :test,
+        host: "localhost",
+        port: 8085
+      ],
+      pool: [size: 1],  # Minimal pool for tests
+      connection: [
+        ping_interval: nil  # No pinging needed in tests
+      ]
+end
+```
+
+#### Load from environment:
+
+```elixir
+# Single pool
+{:ok, config} = GrpcConnectionPool.Config.from_env(:my_app)
+
+# Multiple pools  
+{:ok, service_a_config} = GrpcConnectionPool.Config.from_env(:my_app, :service_a)
+{:ok, service_b_config} = GrpcConnectionPool.Config.from_env(:my_app, :service_b)
+```
+
+### Runtime Configuration
+
+For configuration determined at runtime (e.g., from environment variables):
+
+#### In `config/runtime.exs`:
+
+```elixir
+import Config
+
+if config_env() == :prod do
+  # Get configuration from environment variables
+  grpc_host = System.get_env("GRPC_HOST") || "api.example.com"
+  grpc_port = System.get_env("GRPC_PORT", "443") |> String.to_integer()
+  pool_size = System.get_env("GRPC_POOL_SIZE", "10") |> String.to_integer()
+  
+  config :my_app, GrpcConnectionPool,
+    endpoint: [
+      type: :production,
+      host: grpc_host,
+      port: grpc_port
+    ],
+    pool: [size: pool_size]
+end
+```
+
+## Adding to Supervisor Tree
+
+### Single Pool
+
+```elixir
+defmodule MyApp.Application do
+  use Application
+  
+  def start(_type, _args) do
+    # Load configuration
+    {:ok, config} = GrpcConnectionPool.Config.from_env(:my_app)
+    
+    children = [
+      # Your other services...
+      {GrpcConnectionPool, config}
+    ]
+    
+    opts = [strategy: :one_for_one, name: MyApp.Supervisor]
+    Supervisor.start_link(children, opts)
+  end
+end
+```
+
+### Multiple Pools for Different Services
+
+```elixir
+defmodule MyApp.Application do
+  use Application
+  
+  def start(_type, _args) do
+    # Load configurations for different services
+    {:ok, service_a_config} = GrpcConnectionPool.Config.from_env(:my_app, :service_a)
+    {:ok, service_b_config} = GrpcConnectionPool.Config.from_env(:my_app, :service_b)
+    
+    children = [
+      # Your other services...
+      {GrpcConnectionPool, service_a_config},
+      {GrpcConnectionPool, service_b_config}
+    ]
+    
+    opts = [strategy: :one_for_one, name: MyApp.Supervisor]
+    Supervisor.start_link(children, opts)
+  end
+end
+```
+
+### Manual Pool Configuration
+
+```elixir
+def start(_type, _args) do
+  # Create configurations programmatically
+  {:ok, user_service_config} = GrpcConnectionPool.Config.production(
+    host: "users.example.com",
+    pool_name: MyApp.UserService.Pool,
+    pool_size: 5
+  )
+  
+  {:ok, payment_service_config} = GrpcConnectionPool.Config.production(
+    host: "payments.example.com", 
+    pool_name: MyApp.PaymentService.Pool,
+    pool_size: 3
+  )
+  
+  children = [
+    {GrpcConnectionPool, user_service_config},
+    {GrpcConnectionPool, payment_service_config}
+  ]
+  
+  Supervisor.start_link(children, strategy: :one_for_one)
+end
+```
+
+### Complete Application Module Examples
+
+#### Single Pool Application
+
+```elixir
+# lib/my_app/application.ex
+defmodule MyApp.Application do
+  use Application
+  
+  def start(_type, _args) do
+    # Single pool from config
+    {:ok, config} = GrpcConnectionPool.Config.from_env(:my_app)
+    
+    children = [
+      # Your other processes...
+      {GrpcConnectionPool, config}
+    ]
+    
+    opts = [strategy: :one_for_one, name: MyApp.Supervisor]
+    Supervisor.start_link(children, opts)
+  end
+end
+```
+
+#### Multiple Pool Application
+
+```elixir
+# lib/my_app/application.ex  
+defmodule MyApp.Application do
+  use Application
+  
+  def start(_type, _args) do
+    # Load configurations for different services
+    {:ok, service_a_config} = GrpcConnectionPool.Config.from_env(:my_app, :service_a)  
+    {:ok, service_b_config} = GrpcConnectionPool.Config.from_env(:my_app, :service_b)
+    
+    children = [
+      # Your other services...
+      {GrpcConnectionPool, service_a_config},
+      {GrpcConnectionPool, service_b_config}
+    ]
+    
+    opts = [strategy: :one_for_one, name: MyApp.Supervisor]
+    Supervisor.start_link(children, opts)
+  end
+end
+```
+
+## Usage Examples
+
+### Basic Operations
+
+```elixir
+# Simple call against the default pool
+case GrpcConnectionPool.get_channel() do
+  {:ok, channel} ->
+    request = %MyService.GetUserRequest{user_id: "123"}
+
+    case MyService.Stub.get_user(channel, request) do
+      {:ok, user} -> IO.puts("Found user: #{user.name}")
+      {:error, error} -> IO.puts("gRPC error: #{inspect(error)}")
+    end
+
+  {:error, :not_connected} ->
+    IO.puts("Pool has no healthy connections")
+end
+```
+
+### Using Named Pools
+
+```elixir
+# Pass a pool name to get_channel/1 to target a specific pool
+with {:ok, channel} <- GrpcConnectionPool.get_channel(MyApp.UserService.Pool) do
+  UserService.Stub.get(channel, %UserService.GetRequest{id: "123"})
+end
+
+with {:ok, channel} <- GrpcConnectionPool.get_channel(MyApp.PaymentService.Pool) do
+  PaymentService.Stub.charge(channel, %PaymentService.ChargeRequest{amount: 1000})
+end
+```
+
+### Error Handling
+
+```elixir
+case GrpcConnectionPool.get_channel() do
+  {:ok, channel} ->
+    request = %MyService.CreateRequest{data: "important data"}
+
+    case MyService.Stub.create(channel, request) do
+      {:ok, result} ->
+        # Success case
+        handle_success(result)
+
+      {:error, %GRPC.RPCError{status: status, message: message}} ->
+        # gRPC-level error (service returned an error)
+        handle_grpc_error(status, message)
+    end
+
+  {:error, :not_connected} ->
+    # Pool has no healthy connections — also returned if the pool isn't
+    # started yet (get_channel/1 never raises).
+    handle_connection_error()
+end
+```
+
+### Custom SSL Configuration
+
+```elixir
+# For services requiring client certificates
+ssl_config = [
+  verify: :verify_peer,
+  cacertfile: "/path/to/ca.pem",
+  certfile: "/path/to/client.pem", 
+  keyfile: "/path/to/client-key.pem"
+]
+
+{:ok, config} = GrpcConnectionPool.Config.new([
+  endpoint: [
+    type: :production,
+    host: "secure-api.example.com",
+    port: 443,
+    ssl: ssl_config
+  ],
+  pool: [size: 5]
+])
+```
+
+### Using Custom gRPC Credentials
+
+```elixir
+# For advanced authentication scenarios
+credentials = GRPC.Credential.new(ssl: [
+  verify: :verify_peer,
+  cacerts: :public_key.cacerts_get()
+])
+
+{:ok, config} = GrpcConnectionPool.Config.new([
+  endpoint: [
+    type: :production,
+    host: "api.example.com", 
+    port: 443,
+    credentials: credentials  # Overrides ssl config
+  ]
+])
+```
+
+### Using gRPC Interceptors
+
+```elixir
+# Define interceptors for logging, authentication, metrics, etc.
+{:ok, config} = GrpcConnectionPool.Config.new([
+  endpoint: [
+    type: :production,
+    host: "api.example.com",
+    port: 443,
+    interceptors: [
+      MyApp.LoggingInterceptor,    # Log all requests/responses
+      MyApp.AuthInterceptor,        # Add authentication headers
+      MyApp.MetricsInterceptor      # Track metrics
+    ]
+  ],
+  pool: [size: 10]
+])
+
+# Interceptors are applied to all connections in the pool
+{:ok, _pid} = GrpcConnectionPool.start_link(config)
+```
+
+Interceptors are modules that implement the gRPC interceptor behavior and are applied to all gRPC calls made through channels from the pool. They can be used for:
+- Request/response logging
+- Authentication header injection
+- Metrics collection
+- Request/response transformation
+- Error handling and retry logic
+
+## Environment-Specific Usage
+
+### Development Environment
+
+```elixir
+# config/dev.exs
+config :my_app, GrpcConnectionPool,
+  endpoint: [
+    type: :local,
+    host: "localhost",
+    port: 9090  # Local gRPC server
+  ],
+  pool: [size: 2],  # Smaller pool for development
+  connection: [
+    ping_interval: nil  # Disable pinging for local development
+  ]
+```
+
+### Test Environment with Emulators
+
+```elixir
+# config/test.exs
+config :my_app, GrpcConnectionPool,
+  endpoint: [
+    type: :test,
+    host: "localhost",
+    port: 8085,  # Emulator port
+    retry_config: [
+      max_attempts: 3,
+      base_delay: 500,   # Faster retries for tests
+      max_delay: 2000
+    ]
+  ],
+  pool: [size: 1],  # Minimal pool for tests
+  connection: [
+    ping_interval: nil,  # No pinging needed in tests
+    health_check: false  # Disable health checks in tests
+  ]
+```
+
+### Production Environment
+
+```elixir
+# config/prod.exs  
+config :my_app, GrpcConnectionPool,
+  endpoint: [
+    type: :production,
+    host: "api.example.com",
+    port: 443,
+    ssl: []  # Use default SSL
+  ],
+  pool: [
+    size: 20,  # Large pool for production load
+    checkout_timeout: 10_000
+  ],
+  connection: [
+    keepalive: 30_000,
+    ping_interval: 25_000,
+    health_check: true
+  ]
+```
+
+## Advanced Features
+
+### Pool Monitoring
+
+```elixir
+# Check pool status
+status = GrpcConnectionPool.status()
+IO.inspect(status)  # %{pool_name: GrpcConnectionPool.Pool, status: :running}
+
+# Check specific pool
+status = GrpcConnectionPool.status(MyApp.UserService.Pool)
+```
+
+### Graceful Shutdown
+
+```elixir
+# Stop specific pool
+:ok = GrpcConnectionPool.stop(MyApp.UserService.Pool)
+
+# The pool will be automatically restarted by the supervisor if needed
+```
+
+### Telemetry Events
+
+The library emits telemetry events for observability. Attach handlers to monitor pool and connection behavior.
+
+#### Pool Events
+
+| Event | Measurements | Metadata |
+|-------|--------------|----------|
+| `[:grpc_connection_pool, :pool, :init]` | `pool_size` | `pool_name`, `endpoint` |
+| `[:grpc_connection_pool, :pool, :get_channel]` | _(none)_ | `pool_name`, `available_channels` (emitted per `telemetry_sample_rate`) |
+| `[:grpc_connection_pool, :pool, :scale_up]` | `duration`, `requested`, `succeeded`, `failed`, `new_size` | `pool_name` |
+| `[:grpc_connection_pool, :pool, :scale_down]` | `duration`, `requested`, `terminated`, `new_size` | `pool_name` |
+| `[:grpc_connection_pool, :pool, :status]` | `expected_size`, `current_size` | `pool_name` |
+
+#### Channel Events
+
+| Event | Measurements | Metadata |
+|-------|--------------|----------|
+| `[:grpc_connection_pool, :channel, :connected]` | `duration` | `pool_name` |
+| `[:grpc_connection_pool, :channel, :connection_failed]` | `duration` | `pool_name`, `error` |
+| `[:grpc_connection_pool, :channel, :disconnected]` | `duration` | `pool_name`, `reason` |
+| `[:grpc_connection_pool, :channel, :ping]` | `duration` | `pool_name`, `result` (`:ok` or `:error`) |
+| `[:grpc_connection_pool, :channel, :connection_down]` | - | `pool_name`, `reason` |
+| `[:grpc_connection_pool, :channel, :reconnect_scheduled]` | `delay_ms`, `attempt` | `pool_name`, `reason` |
+
+> **Changed in 0.5.0 (grpc 1.0):** the `:gun_down` and `:gun_error` events were
+> removed. Under grpc 1.0 the Gun adapter owns the socket in its own process and
+> those gun messages never reach the pool. A single adapter-agnostic
+> `:channel, :connection_down` event (metadata `pool_name`, `reason`) is now emitted
+> when the monitored connection process dies. The `:disconnected` and
+> `:reconnect_scheduled` events are unchanged. If you handled `:gun_down`/`:gun_error`,
+> switch to `:connection_down` (or `:disconnected`).
+
+#### Example: Attaching Telemetry Handlers
+
+```elixir
+# In your application startup
+:telemetry.attach_many(
+  "grpc-pool-handler",
+  [
+    [:grpc_connection_pool, :pool, :init],
+    [:grpc_connection_pool, :pool, :get_channel],
+    [:grpc_connection_pool, :channel, :connected],
+    [:grpc_connection_pool, :channel, :disconnected],
+    [:grpc_connection_pool, :channel, :reconnect_scheduled]
+  ],
+  &MyApp.Telemetry.handle_event/4,
+  nil
+)
+
+# Handler module
+defmodule MyApp.Telemetry do
+  require Logger
+
+  def handle_event([:grpc_connection_pool, :pool, :init], measurements, metadata, _config) do
+    Logger.info("Pool #{metadata.pool_name} initialized with #{measurements.pool_size} connections to #{metadata.endpoint}")
+  end
+
+  def handle_event([:grpc_connection_pool, :channel, :connected], measurements, metadata, _config) do
+    duration_ms = System.convert_time_unit(measurements.duration, :native, :millisecond)
+    Logger.debug("Channel connected for #{metadata.pool_name} in #{duration_ms}ms")
+  end
+
+  def handle_event([:grpc_connection_pool, :channel, :reconnect_scheduled], measurements, metadata, _config) do
+    Logger.warning("Reconnect scheduled for #{metadata.pool_name}: attempt #{measurements.attempt}, delay #{measurements.delay_ms}ms, reason: #{inspect(metadata.reason)}")
+  end
+
+  def handle_event(_event, _measurements, _metadata, _config), do: :ok
+end
+```
+
+### Connection Health
+
+The library automatically monitors connection health and replaces dead connections. You can also check worker status:
+
+```elixir
+# This is mainly for debugging - not needed in normal usage
+worker_pid = :poolex.checkout(MyApp.UserService.Pool)
+status = GrpcConnectionPool.Worker.status(worker_pid)  # :connected | :disconnected
+:poolex.checkin(MyApp.UserService.Pool, worker_pid)
+```
+
+## Testing
+
+### Unit Tests
+
+```bash
+mix test --exclude emulator
+```
+
+### Integration Tests with Emulator
+
+Start the Google Pub/Sub emulator (or any gRPC service emulator):
+
+```bash
+# Using Docker Compose (if available)
+docker-compose up -d
+
+# Or manually
+docker run --rm -p 8085:8085 google/cloud-sdk:emulators-pubsub \
+  /google-cloud-sdk/bin/gcloud beta emulators pubsub start \
+  --host-port=0.0.0.0:8085 --project=test-project
+```
+
+Run integration tests:
+
+```bash
+mix test --only emulator
+```
+
+Run all tests:
+
+```bash
+mix test
+```
+
+### Testing in Your Application
+
+```elixir
+# In your test helper
+defmodule MyApp.TestHelper do
+  def start_test_pool do
+    {:ok, config} = GrpcConnectionPool.Config.local(
+      host: "localhost",
+      port: 8085,  # Your test service port
+      pool_size: 1
+    )
+    
+    {:ok, _pid} = GrpcConnectionPool.start_link(config, name: TestPool)
+  end
+  
+  def stop_test_pool do
+    GrpcConnectionPool.stop(TestPool)
+  end
+end
+
+# In your tests
+defmodule MyApp.GrpcTest do
+  use ExUnit.Case
+  
+  setup do
+    MyApp.TestHelper.start_test_pool()
+    on_exit(&MyApp.TestHelper.stop_test_pool/0)
+  end
+  
+  test "grpc operation works" do
+    assert {:ok, channel} = GrpcConnectionPool.get_channel(TestPool)
+    request = %MyService.EchoRequest{message: "ping"}
+    assert {:ok, _reply} = MyService.Stub.echo(channel, request)
+  end
+end
+```
+
+## Connection Strategies
+
+The pool supports pluggable channel selection strategies via the `GrpcConnectionPool.Strategy` behaviour.
+
+### Built-in Strategies
+
+| Strategy | Config | Description | Best For |
+|----------|--------|-------------|----------|
+| **Round Robin** | `:round_robin` | Lock-free atomics counter, cycles through channels sequentially | General use (default) |
+| **Random** | `:random` | Random channel selection via `:rand.uniform` | Avoiding correlated hot-spotting |
+| **Power of Two** | `:power_of_two` | Pick 2 random channels, choose least-frequently-used (lock-free atomics counters) | Uneven workloads |
+
+### Configuring a Strategy
+
+```elixir
+{:ok, config} = GrpcConnectionPool.Config.new(
+  endpoint: [host: "api.example.com", port: 443],
+  pool: [size: 10, strategy: :random]
+)
+```
+
+### Custom Strategies
+
+Implement the `GrpcConnectionPool.Strategy` behaviour:
+
+```elixir
+defmodule MyApp.WeightedStrategy do
+  @behaviour GrpcConnectionPool.Strategy
+
+  @impl true
+  def init(_pool_name, _pool_size) do
+    # Return any state — stored in :persistent_term
+    %{weights: [0.5, 0.3, 0.2]}
+  end
+
+  @impl true
+  def select(state, channel_count, _ets_table) do
+    # Must return {:ok, index} where 0 <= index < channel_count
+    {:ok, weighted_random(state.weights, channel_count)}
+  end
+
+  defp weighted_random(_weights, count), do: :rand.uniform(count) - 1
+end
+```
+
+Then use it:
+
+```elixir
+config = GrpcConnectionPool.Config.new(
+  pool: [strategy: MyApp.WeightedStrategy]
+)
+```
+
+### Strategy Performance
+
+Benchmarked with pool_size=10:
+
+| Strategy | Throughput | Avg Latency | Memory/call |
+|----------|-----------|-------------|-------------|
+| round_robin | 1.91M ips | 522 ns | 0.72 KB |
+| random | 1.87M ips | 534 ns | 1.05 KB |
+| power_of_two | 1.08M ips | 925 ns | 2.05 KB |
+
+## Performance Considerations
+
+### Pool Sizing
+
+- **Small services**: 3-5 connections per pool
+- **Medium load**: 5-10 connections per pool  
+- **High load**: 10-20+ connections per pool
+- **Multiple services**: Separate pools with appropriate sizing
+
+### Connection Settings
+
+```elixir
+config :my_app, GrpcConnectionPool,
+  connection: [
+    keepalive: 30_000,     # Keep connections alive (important for cloud services)
+    ping_interval: 25_000, # Ping before cloud timeouts (usually 60s)
+    health_check: true     # Enable automatic health monitoring
+  ]
+```
+
+### Monitoring
+
+Monitor pool performance using:
+- Connection establishment logs
+- Pool checkout timeouts
+- gRPC operation latencies
+- Connection health check failures
+
+## Troubleshooting
+
+### Common Issues
+
+1. **`:noproc` errors**: Pool not started or wrong pool name
+2. **Connection timeouts**: Network issues or service unavailable
+3. **SSL errors**: Incorrect SSL configuration or certificates
+4. **Pool checkout timeouts**: Pool too small or slow operations
+
+### Debug Logging
+
+Enable debug logging to troubleshoot issues:
+
+```elixir
+# config/config.exs
+config :logger, level: :info
+
+# In your code
+require Logger
+Logger.info("Pool status: #{inspect(GrpcConnectionPool.status())}")
+```
+
+### Health Check Failures
+
+If you see frequent reconnections:
+
+1. Check network connectivity
+2. Verify service availability
+3. Adjust `ping_interval` and `keepalive` settings
+4. Check for firewall or load balancer timeouts
+
+### Connection Error Messages with GCP Services
+
+GCP gRPC endpoints have hardcoded timeouts that periodically close connections, causing connection-down error messages. This is normal behavior and the connection pool will automatically replace the workers. To suppress these expected error messages:
+
+```elixir
+config :my_app, GrpcConnectionPool,
+  endpoint: [
+    type: :production,
+    host: "pubsub.googleapis.com",  # Or other GCP gRPC endpoints
+    port: 443
+  ],
+  connection: [
+    suppress_connection_errors: true  # Suppress expected connection-down errors from GCP
+  ]
+```
+
+The worker processes will still reconnect with backoff and the pool will automatically recover.
+
+## Contributing
+
+1. Fork the repository
+2. Create a feature branch (`git checkout -b feature/amazing-feature`)
+3. Make your changes
+4. Add tests for your changes
+5. Run the test suite (`mix test`)
+6. Commit your changes (`git commit -m 'Add amazing feature'`)
+7. Push to the branch (`git push origin feature/amazing-feature`)
+8. Open a Pull Request
+
+### Development Setup
+
+```bash
+git clone https://github.com/nyo16/grpc_connection_pool.git
+cd grpc_connection_pool
+mix deps.get
+mix test
+```
+
+## License
+
+This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENSE) file for details.
+
+## Acknowledgments
+
+- Inspired by production requirements from Google Cloud Pub/Sub integration
+- Thanks to the Elixir gRPC community for the solid foundation
+
+---
+
+**Documentation**: [https://hexdocs.pm/grpc_connection_pool](https://hexdocs.pm/grpc_connection_pool)  
+**Source Code**: [https://github.com/nyo16/grpc_connection_pool](https://github.com/nyo16/grpc_connection_pool)  
+**Issues**: [https://github.com/nyo16/grpc_connection_pool/issues](https://github.com/nyo16/grpc_connection_pool/issues)
+
+---
+
+# Changelog
+
+Source: https://grpc-connection-pool.hexdocs.pm/changelog.md
+
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [0.5.0] - 2026-06-26
+
+### Changed
+- **grpc 1.0 support.** Bumped `grpc` to `~> 1.0` (was `0.11.5`). grpc 1.0 is
+  client-only (`GRPC.Server` was removed) and makes `:gun` optional, so `gun ~> 2.2`
+  is now a direct dependency (the pool uses the default Gun adapter). `:public_key`
+  and `:ssl` are declared in `extra_applications` (used by `Config`).
+- **BREAKING (telemetry): the `[:grpc_connection_pool, :channel, :gun_down]` and
+  `[:grpc_connection_pool, :channel, :gun_error]` events were removed.** Under
+  grpc 1.0 the Gun adapter owns the socket in its own process, so those gun
+  messages never reach the pool. A single adapter-agnostic
+  `[:grpc_connection_pool, :channel, :connection_down]` event (metadata
+  `pool_name`, `reason`) is emitted instead. `:disconnected` and
+  `:reconnect_scheduled` are unchanged. Consumers handling `:gun_down`/`:gun_error`
+  should switch to `:connection_down` (or `:disconnected`).
+- **Disconnect detection reworked.** grpc 1.0's Gun adapter keeps the live
+  connection inside its own `ConnectionProcess`, which lingers as a zombie after a
+  drop, so the old `gun_down`/`gun_error` message handlers were dead code. The
+  worker now monitors the inner gun process and pairs it with
+  `adapter_opts: [retry: 0]` so gun fails fast on a drop and the pool's own
+  `Backoff` governs reconnection. This also restores fast-fail connects (a dead
+  endpoint now errors in ~0ms instead of stalling ~5s per attempt).
+
+### Fixed
+- **License declaration** now correctly reports **Apache-2.0** (matching the committed
+  `LICENSE` file) instead of MIT in `mix.exs` and README — resolves the Hex.pm
+  mismatch (#6).
+
+## [0.4.0] - 2026-06-01
+
+### Changed
+- **Security:** production configs now default to verifying TLS. `Config.production/1`
+  sets `verify: :verify_peer`, and a `:production` endpoint built without `ssl`/`credentials`
+  no longer silently downgrades to plaintext h2c — it raises a clear configuration error.
+- Narrowed several broad `rescue`/`catch` clauses (`Pool.scale_up/scale_down`,
+  `Worker.send_ping`, `TelemetryReporter`) so unexpected errors surface instead of being
+  swallowed; demoted expected reconnect/retry logs to `:debug`.
+
+### Fixed
+- Documentation: replaced README examples referencing a non-existent
+  `GrpcConnectionPool.execute/1` with the real `get_channel/1` + stub-call pattern;
+  corrected the stale install snippet and the `:get_channel` telemetry/strategy docs.
+
+## [0.3.5] - 2026-06-01
+
+### Fixed
+- **Slot-claim race in the hot path** — slot claim/release are now serialized through
+  `PoolState` (`register_channel/3`, `unregister_channel/2`). Concurrent worker
+  connects/disconnects could previously collide on a slot, leaving `:channel_count`
+  higher than the populated channels so `get_channel/1` returned `:not_connected` on a
+  healthy pool.
+- `get_channel/1` now returns `{:error, :not_connected}` (instead of raising) when the
+  pool is not started or `PoolState` is restarting.
+
+### Changed
+- **Hot-path performance:** collapsed the per-call ETS table-name rebuild + two
+  `persistent_term` lookups into one combined term; `RoundRobin` uses unsigned atomics
+  (no `abs/1`); `PowerOfTwo` now tracks load in lock-free `:atomics` counters
+  (least-frequently-used) instead of writing a timestamp to ETS on every selection.
+- Per-call `:get_channel` telemetry is configurable via `telemetry_sample_rate`
+  (default `1` = emit every call; `0` disables; `N` samples ~1-in-N).
+- The `pid => slot` map moved from ETS into `PoolState` state (slot claim is now O(1)).
+
+## [0.3.0] - 2026-03-24
+
+### Added
+- **Zero GenServer.call hot path** — channels stored directly in ETS for O(1) indexed access, eliminating the GenServer.call bottleneck on every `get_channel` request
+- **Pluggable connection strategies** via `GrpcConnectionPool.Strategy` behaviour:
+  - `:round_robin` (default) — lock-free atomics-based round-robin
+  - `:random` — random selection, good for avoiding hot-spotting
+  - `:power_of_two` — power-of-two-choices with least-recently-used tiebreak
+  - Custom strategies supported via behaviour implementation
+- **`:persistent_term` for pool config** — zero-copy reads for configuration data
+- **ETS with read/write concurrency** — optimized concurrent access flags
+- **`PoolState` GenServer** — dedicated ETS table owner for crash resilience
+- **`TelemetryReporter` GenServer** — replaced recursive `:timer.sleep` telemetry loop with a proper GenServer using `Process.send_after`
+- **`await_ready/2`** — blocks until at least one channel is connected or timeout, useful for application startup
+- **Stale scaling lock detection** — scaling locks older than 30 seconds are automatically released
+- **`max_reconnect_attempts` config** — workers crash after N consecutive connection failures instead of the fragile `crash_after_reconnect_attempt` timer
+- **Benchee benchmarks** — `bench/get_channel_bench.exs` for measuring hot path performance
+- **Strategy tests** — comprehensive tests for all three built-in strategies
+- **CI/CD pipeline** — GitHub Actions with compile, format, credo, test, dialyzer, and auto-publish to Hex on tag push
+
+### Changed
+- **4.3x–5.8x faster `get_channel`** — single-process throughput improved from ~470K ips to ~2M ips
+- **O(n) scaling eliminated** — pool_size=25 was 38% slower than pool_size=5, now only 2% slower
+- **44–58% lower latency under concurrency** — 100 concurrent callers: median 553μs → 312μs, p99 1035μs → 439μs
+- **28–56% less memory per call** — memory now constant regardless of pool size (was O(n))
+- **Pool.status 2.5x faster** — reads from ETS channel_count instead of Registry.lookup
+- Pool supervision tree restructured: PoolState starts first, then Registry, DynamicSupervisor, workers, and TelemetryReporter
+
+### Removed
+- `crash_after_reconnect_attempt` message — replaced by `max_reconnect_attempts` config with clean `{:stop, reason, state}` on exhaustion
+
+## [0.2.3] - 2026-01-29
+
+### Added
+- Enhanced telemetry events for better observability:
+  - `[:grpc_connection_pool, :pool, :init]` - Pool initialization with size and endpoint
+  - `[:grpc_connection_pool, :channel, :ping]` - Ping health check with duration and result
+  - `[:grpc_connection_pool, :channel, :gun_down]` - Gun connection down events with reason and protocol
+  - `[:grpc_connection_pool, :channel, :gun_error]` - Gun error events with reason
+  - `[:grpc_connection_pool, :channel, :reconnect_scheduled]` - Reconnection scheduling with delay and attempt count
+- Reconnect attempt tracking in worker state
+- Comprehensive telemetry documentation in README
+- Telemetry test suite
+
+## [0.2.2] - 2026-01-29
+
+### Added
+- Support for gRPC client interceptors in endpoint configuration (thanks [@arctarus](https://github.com/arctarus))
+- Comprehensive tests for interceptors feature
+- CHANGELOG.md file
+
+## [0.2.1] - 2025-11-22
+
+### Fixed
+- Handle GRPC v0.11.5 FunctionClauseError during disconnect
+
+## [0.2.0] - 2025-11-22
+
+### Added
+- Dynamic pool scaling feature
+
+## [0.1.6] - 2025-11-22
+
+### Fixed
+- Handle GenServer exit gracefully in connection cleanup
+
+## [0.1.5] - 2025-11-21
+
+### Changed
+- Refactored to replace Poolex with DynamicSupervisor
+- Added conn_grpc features
+- Fixed documentation LICENSE reference warnings
+
+## [0.1.4] - 2025-11-19
+
+### Changed
+- Updated dependencies: poolex to 1.4.2, grpc to 0.11.5
+- Changed gRPC connection logs from info to debug level
+
+### Added
+- `suppress_connection_errors` config option for GCP endpoints
+
+## [0.1.3] - 2025-11-18
+
+### Added
+- License file
+
+## [0.1.2] - 2025-11-18
+
+### Added
+- Comprehensive README with complete configuration examples and architecture details
+
+## [0.1.0] - 2025-11-18
+
+### Added
+- Initial release: Complete GrpcConnectionPool library
+- Configuration module with support for production, local, and custom environments
+- Connection pooling with DynamicSupervisor
+- Automatic connection warming and health monitoring
+- Retry logic with exponential backoff and jitter
+- Telemetry integration for metrics
+
+---
+
+# License
+
+Source: https://grpc-connection-pool.hexdocs.pm/license.md
+
+Apache License
+                           Version 2.0, January 2004
+                        http://www.apache.org/licenses/
+
+   TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
+
+   1. Definitions.
+
+      "License" shall mean the terms and conditions for use, reproduction,
+      and distribution as defined by Sections 1 through 9 of this document.
+
+      "Licensor" shall mean the copyright owner or entity authorized by
+      the copyright owner that is granting the License.
+
+      "Legal Entity" shall mean the union of the acting entity and all
+      other entities that control, are controlled by, or are under common
+      control with that entity. For the purposes of this definition,
+      "control" means (i) the power, direct or indirect, to cause the
+      direction or management of such entity, whether by contract or
+      otherwise, or (ii) ownership of fifty percent (50%) or more of the
+      outstanding shares, or (iii) beneficial ownership of such entity.
+
+      "You" (or "Your") shall mean an individual or Legal Entity
+      exercising permissions granted by this License.
+
+      "Source" form shall mean the preferred form for making modifications,
+      including but not limited to software source code, documentation
+      source, and configuration files.
+
+      "Object" form shall mean any form resulting from mechanical
+      transformation or translation of a Source form, including but
+      not limited to compiled object code, generated documentation,
+      and conversions to other media types.
+
+      "Work" shall mean the work of authorship, whether in Source or
+      Object form, made available under the License, as indicated by a
+      copyright notice that is included in or attached to the work
+      (an example is provided in the Appendix below).
+
+      "Derivative Works" shall mean any work, whether in Source or Object
+      form, that is based on (or derived from) the Work and for which the
+      editorial revisions, annotations, elaborations, or other modifications
+      represent, as a whole, an original work of authorship. For the purposes
+      of this License, Derivative Works shall not include works that remain
+      separable from, or merely link (or bind by name) to the interfaces of,
+      the Work and Derivative Works thereof.
+
+      "Contribution" shall mean any work of authorship, including
+      the original version of the Work and any modifications or additions
+      to that Work or Derivative Works thereof, that is intentionally
+      submitted to Licensor for inclusion in the Work by the copyright owner
+      or by an individual or Legal Entity authorized to submit on behalf of
+      the copyright owner. For the purposes of this definition, "submitted"
+      means any form of electronic, verbal, or written communication sent
+      to the Licensor or its representatives, including but not limited to
+      communication on electronic mailing lists, source code control systems,
+      and issue tracking systems that are managed by, or on behalf of, the
+      Licensor for the purpose of discussing and improving the Work, but
+      excluding communication that is conspicuously marked or otherwise
+      designated in writing by the copyright owner as "Not a Contribution."
+
+      "Contributor" shall mean Licensor and any individual or Legal Entity
+      on behalf of whom a Contribution has been received by Licensor and
+      subsequently incorporated within the Work.
+
+   2. Grant of Copyright License. Subject to the terms and conditions of
+      this License, each Contributor hereby grants to You a perpetual,
+      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
+      copyright license to reproduce, prepare Derivative Works of,
+      publicly display, publicly perform, sublicense, and distribute the
+      Work and such Derivative Works in Source or Object form.
+
+   3. Grant of Patent License. Subject to the terms and conditions of
+      this License, each Contributor hereby grants to You a perpetual,
+      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
+      (except as stated in this section) patent license to make, have made,
+      use, offer to sell, sell, import, and otherwise transfer the Work,
+      where such license applies only to those patent claims licensable
+      by such Contributor that are necessarily infringed by their
+      Contribution(s) alone or by combination of their Contribution(s)
+      with the Work to which such Contribution(s) was submitted. If You
+      institute patent litigation against any entity (including a
+      cross-claim or counterclaim in a lawsuit) alleging that the Work
+      or a Contribution incorporated within the Work constitutes direct
+      or contributory patent infringement, then any patent licenses
+      granted to You under this License for that Work shall terminate
+      as of the date such litigation is filed.
+
+   4. Redistribution. You may reproduce and distribute copies of the
+      Work or Derivative Works thereof in any medium, with or without
+      modifications, and in Source or Object form, provided that You
+      meet the following conditions:
+
+      (a) You must give any other recipients of the Work or
+          Derivative Works a copy of this License; and
+
+      (b) You must cause any modified files to carry prominent notices
+          stating that You changed the files; and
+
+      (c) You must retain, in the Source form of any Derivative Works
+          that You distribute, all copyright, patent, trademark, and
+          attribution notices from the Source form of the Work,
+          excluding those notices that do not pertain to any part of
+          the Derivative Works; and
+
+      (d) If the Work includes a "NOTICE" text file as part of its
+          distribution, then any Derivative Works that You distribute must
+          include a readable copy of the attribution notices contained
+          within such NOTICE file, excluding those notices that do not
+          pertain to any part of the Derivative Works, in at least one
+          of the following places: within a NOTICE text file distributed
+          as part of the Derivative Works; within the Source form or
+          documentation, if provided along with the Derivative Works; or,
+          within a display generated by the Derivative Works, if and
+          wherever such third-party notices normally appear. The contents
+          of the NOTICE file are for informational purposes only and
+          do not modify the License. You may add Your own attribution
+          notices within Derivative Works that You distribute, alongside
+          or as an addendum to the NOTICE text from the Work, provided
+          that such additional attribution notices cannot be construed
+          as modifying the License.
+
+      You may add Your own copyright statement to Your modifications and
+      may provide additional or different license terms and conditions
+      for use, reproduction, or distribution of Your modifications, or
+      for any such Derivative Works as a whole, provided Your use,
+      reproduction, and distribution of the Work otherwise complies with
+      the conditions stated in this License.
+
+   5. Submission of Contributions. Unless You explicitly state otherwise,
+      any Contribution intentionally submitted for inclusion in the Work
+      by You to the Licensor shall be under the terms and conditions of
+      this License, without any additional terms or conditions.
+      Notwithstanding the above, nothing herein shall supersede or modify
+      the terms of any separate license agreement you may have executed
+      with Licensor regarding such Contributions.
+
+   6. Trademarks. This License does not grant permission to use the trade
+      names, trademarks, service marks, or product names of the Licensor,
+      except as required for reasonable and customary use in describing the
+      origin of the Work and reproducing the content of the NOTICE file.
+
+   7. Disclaimer of Warranty. Unless required by applicable law or
+      agreed to in writing, Licensor provides the Work (and each
+      Contributor provides its Contributions) on an "AS IS" BASIS,
+      WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+      implied, including, without limitation, any warranties or conditions
+      of TITLE, NON-INFRINGEMENT, MERCHANTABILITY, or FITNESS FOR A
+      PARTICULAR PURPOSE. You are solely responsible for determining the
+      appropriateness of using or redistributing the Work and assume any
+      risks associated with Your exercise of permissions under this License.
+
+   8. Limitation of Liability. In no event and under no legal theory,
+      whether in tort (including negligence), contract, or otherwise,
+      unless required by applicable law (such as deliberate and grossly
+      negligent acts) or agreed to in writing, shall any Contributor be
+      liable to You for damages, including any direct, indirect, special,
+      incidental, or consequential damages of any character arising as a
+      result of this License or out of the use or inability to use the
+      Work (including but not limited to damages for loss of goodwill,
+      work stoppage, computer failure or malfunction, or any and all
+      other commercial damages or losses), even if such Contributor
+      has been advised of the possibility of such damages.
+
+   9. Accepting Warranty or Additional Liability. While redistributing
+      the Work or Derivative Works thereof, You may choose to offer,
+      and charge a fee for, acceptance of support, warranty, indemnity,
+      or other liability obligations and/or rights consistent with this
+      License. However, in accepting such obligations, You may act only
+      on Your own behalf and on Your sole responsibility, not on behalf
+      of any other Contributor, and only if You agree to indemnify,
+      defend, and hold each Contributor harmless for any liability
+      incurred by, or claims asserted against, such Contributor by reason
+      of your accepting any such warranty or additional liability.
+
+   END OF TERMS AND CONDITIONS
+
+---
