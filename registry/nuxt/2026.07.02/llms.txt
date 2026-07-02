@@ -1,0 +1,335 @@
+# Nuxt Docs
+
+> Nuxt is an open source framework that makes web development intuitive and powerful. Create performant and production-grade full-stack web apps and websites with confidence.
+
+## Documentation Sets
+
+- [Nuxt Docs](https://nuxt.com/llms-full.txt): The complete Nuxt documentation and blog posts written in Markdown (MDC syntax).
+
+## Nuxt v4 Documentation
+
+- [Introduction](https://nuxt.com/raw/docs/4.x/getting-started/introduction.md): Nuxt's goal is to make web development intuitive and performant with a great Developer Experience in mind.
+- [Installation](https://nuxt.com/raw/docs/4.x/getting-started/installation.md): Get started with Nuxt quickly with our online starters or start locally with your terminal.
+- [Configuration](https://nuxt.com/raw/docs/4.x/getting-started/configuration.md): Nuxt is configured with sensible defaults to make you productive.
+- [Views](https://nuxt.com/raw/docs/4.x/getting-started/views.md): Nuxt provides several component layers to implement the user interface of your application.
+- [Assets](https://nuxt.com/raw/docs/4.x/getting-started/assets.md): Nuxt offers two options for your assets.
+- [Styling](https://nuxt.com/raw/docs/4.x/getting-started/styling.md): Learn how to style your Nuxt application.
+- [Routing](https://nuxt.com/raw/docs/4.x/getting-started/routing.md): Nuxt file-system routing creates a route for every file in the pages/ directory.
+- [SEO and Meta](https://nuxt.com/raw/docs/4.x/getting-started/seo-meta.md): Improve your Nuxt app's SEO with powerful head config, composables and components.
+- [Transitions](https://nuxt.com/raw/docs/4.x/getting-started/transitions.md): Apply transitions between pages and layouts with Vue or native browser View Transitions.
+- [Data Fetching](https://nuxt.com/raw/docs/4.x/getting-started/data-fetching.md): Nuxt provides composables to handle data fetching within your application.
+- [State Management](https://nuxt.com/raw/docs/4.x/getting-started/state-management.md): Nuxt provides powerful state management libraries and the useState composable to create a reactive and SSR-friendly shared state.
+- [Error Handling](https://nuxt.com/raw/docs/4.x/getting-started/error-handling.md): Learn how to catch and handle errors in Nuxt.
+- [Server](https://nuxt.com/raw/docs/4.x/getting-started/server.md): Build full-stack applications with Nuxt's server framework. You can fetch data from your database or another server, create APIs, or even generate static server-side content like a sitemap or a RSS feed - all from a single codebase.
+- [Layers](https://nuxt.com/raw/docs/4.x/getting-started/layers.md): Nuxt provides a powerful system that allows you to extend the default files, configs, and much more.
+- [Prerendering](https://nuxt.com/raw/docs/4.x/getting-started/prerendering.md): Nuxt allows pages to be statically rendered at build time to improve certain performance or SEO metrics
+- [Deployment](https://nuxt.com/raw/docs/4.x/getting-started/deployment.md): Learn how to deploy your Nuxt application to any hosting provider.
+- [Testing](https://nuxt.com/raw/docs/4.x/getting-started/testing.md): How to test your Nuxt application.
+- [Upgrade Guide](https://nuxt.com/raw/docs/4.x/getting-started/upgrade.md): Learn how to upgrade to the latest Nuxt version.
+- [.nuxt](https://nuxt.com/raw/docs/4.x/directory-structure/nuxt.md): Nuxt uses the .nuxt/ directory in development to generate your Vue application.
+- [.output](https://nuxt.com/raw/docs/4.x/directory-structure/output.md): Nuxt creates the .output/ directory when building your application for production.
+- [assets](https://nuxt.com/raw/docs/4.x/directory-structure/app/assets.md): The assets/ directory is used to add all the website's assets that the build tool will process.
+- [components](https://nuxt.com/raw/docs/4.x/directory-structure/app/components.md): The components/ directory is where you put all your Vue components.
+- [composables](https://nuxt.com/raw/docs/4.x/directory-structure/app/composables.md): Use the composables/ directory to auto-import your Vue composables into your application.
+- [layouts](https://nuxt.com/raw/docs/4.x/directory-structure/app/layouts.md): Nuxt provides a layouts framework to extract common UI patterns into reusable layouts.
+- [middleware](https://nuxt.com/raw/docs/4.x/directory-structure/app/middleware.md): Nuxt provides middleware to run code before navigating to a particular route.
+- [pages](https://nuxt.com/raw/docs/4.x/directory-structure/app/pages.md): Nuxt provides file-based routing to create routes within your web application.
+- [plugins](https://nuxt.com/raw/docs/4.x/directory-structure/app/plugins.md): Nuxt has a plugins system to use Vue plugins and more at the creation of your Vue application.
+- [utils](https://nuxt.com/raw/docs/4.x/directory-structure/app/utils.md): Use the utils/ directory to auto-import your utility functions throughout your application.
+- [app.vue](https://nuxt.com/raw/docs/4.x/directory-structure/app/app.md): The app.vue file is the main component of your Nuxt application.
+- [app.config.ts](https://nuxt.com/raw/docs/4.x/directory-structure/app/app-config.md): Expose reactive configuration within your application with the App Config file.
+- [error.vue](https://nuxt.com/raw/docs/4.x/directory-structure/app/error.md): The error.vue file is the error page in your Nuxt application.
+- [content](https://nuxt.com/raw/docs/4.x/directory-structure/content.md): Use the content/ directory to create a file-based CMS for your application.
+- [layers](https://nuxt.com/raw/docs/4.x/directory-structure/layers.md): Use the layers/ directory to organize and auto-register local layers within your application.
+- [modules](https://nuxt.com/raw/docs/4.x/directory-structure/modules.md): Use the modules/ directory to automatically register local modules within your application.
+- [node_modules](https://nuxt.com/raw/docs/4.x/directory-structure/node_modules.md): The package manager stores the dependencies of your project in the node_modules/ directory.
+- [public](https://nuxt.com/raw/docs/4.x/directory-structure/public.md): The public/ directory is used to serve your website's static assets.
+- [server](https://nuxt.com/raw/docs/4.x/directory-structure/server.md): The server/ directory is used to register API and server handlers to your application.
+- [shared](https://nuxt.com/raw/docs/4.x/directory-structure/shared.md): Use the shared/ directory to share functionality between the Vue app and the Nitro server.
+- [.env](https://nuxt.com/raw/docs/4.x/directory-structure/env.md): A .env file specifies your build/dev-time environment variables.
+- [.gitignore](https://nuxt.com/raw/docs/4.x/directory-structure/gitignore.md): A .gitignore file specifies intentionally untracked files that git should ignore.
+- [.nuxtignore](https://nuxt.com/raw/docs/4.x/directory-structure/nuxtignore.md): The .nuxtignore file lets Nuxt ignore files in your project’s root directory during the build phase.
+- [.nuxtrc](https://nuxt.com/raw/docs/4.x/directory-structure/nuxtrc.md): The .nuxtrc file allows you to define nuxt configurations in a flat syntax.
+- [nuxt.config.ts](https://nuxt.com/raw/docs/4.x/directory-structure/nuxt-config.md): Nuxt can be easily configured with a single nuxt.config file.
+- [package.json](https://nuxt.com/raw/docs/4.x/directory-structure/package.md): The package.json file contains all the dependencies and scripts for your application.
+- [tsconfig.json](https://nuxt.com/raw/docs/4.x/directory-structure/tsconfig.md): Learn how Nuxt manages TypeScript configuration across different parts of your project.
+- [Nuxt Directory Structure](https://nuxt.com/raw/docs/4.x/directory-structure.md): Learn about the directory structure of a Nuxt application and how to use it.
+- [Nuxt Guide](https://nuxt.com/raw/docs/4.x/guide.md): Learn how Nuxt works with in-depth guides.
+- [Rendering Modes](https://nuxt.com/raw/docs/4.x/guide/concepts/rendering.md): Learn about the different rendering modes available in Nuxt.
+- [Vue.js Development](https://nuxt.com/raw/docs/4.x/guide/concepts/vuejs-development.md): Nuxt uses Vue.js and adds features such as component auto-imports, file-based routing and composables for an SSR-friendly usage.
+- [Nuxt Lifecycle](https://nuxt.com/raw/docs/4.x/guide/concepts/nuxt-lifecycle.md): Understanding the lifecycle of Nuxt applications can help you gain deeper insights into how the framework operates, especially for both server-side and client-side rendering.
+- [Auto-imports](https://nuxt.com/raw/docs/4.x/guide/concepts/auto-imports.md): Nuxt auto-imports components, composables, helper functions and Vue APIs.
+- [Server Engine](https://nuxt.com/raw/docs/4.x/guide/concepts/server-engine.md): Nuxt is powered by a new server engine: Nitro.
+- [Modules](https://nuxt.com/raw/docs/4.x/guide/concepts/modules.md): Nuxt provides a module system to extend the framework core and simplify integrations.
+- [ES Modules](https://nuxt.com/raw/docs/4.x/guide/concepts/esm.md): Nuxt uses native ES modules.
+- [TypeScript](https://nuxt.com/raw/docs/4.x/guide/concepts/typescript.md): Nuxt is fully typed and provides helpful shortcuts to ensure you have access to accurate type information when you are coding.
+- [Code Style](https://nuxt.com/raw/docs/4.x/guide/concepts/code-style.md): Nuxt supports ESLint out of the box
+- [Nuxt and Hydration](https://nuxt.com/raw/docs/4.x/guide/best-practices/hydration.md): Why fixing hydration issues is important
+- [Nuxt performance](https://nuxt.com/raw/docs/4.x/guide/best-practices/performance.md): Best practices for improving performance of Nuxt apps.
+- [Nuxt Plugins](https://nuxt.com/raw/docs/4.x/guide/best-practices/plugins.md): Best practices when using Nuxt plugins.
+- [Nuxt MCP Server](https://nuxt.com/raw/docs/4.x/guide/ai/mcp.md): Use Nuxt documentation in your AI assistants with Model Context Protocol support.
+- [Nuxt LLMs.txt](https://nuxt.com/raw/docs/4.x/guide/ai/llms-txt.md): How to get AI tools like Cursor, Windsurf, GitHub Copilot, ChatGPT, and Claude to understand Nuxt concepts, APIs, and best practices.
+- [Create Your First Module](https://nuxt.com/raw/docs/4.x/guide/modules/getting-started.md): Learn how to create your first Nuxt module using the official starter template.
+- [Understand Module Structure](https://nuxt.com/raw/docs/4.x/guide/modules/module-anatomy.md): Learn how Nuxt modules are structured and how to define them.
+- [Add Plugins, Components & More](https://nuxt.com/raw/docs/4.x/guide/modules/recipes-basics.md): Learn how to inject plugins, components, composables and server routes from your module.
+- [Module Dependencies](https://nuxt.com/raw/docs/4.x/guide/modules/module-dependencies.md): Declare dependencies on other modules with version constraints and configuration merging.
+- [Use Hooks & Extend Types](https://nuxt.com/raw/docs/4.x/guide/modules/recipes-advanced.md): Master lifecycle hooks, virtual files and TypeScript declarations in your modules.
+- [Test Your Module](https://nuxt.com/raw/docs/4.x/guide/modules/testing.md): Learn how to test your Nuxt module with unit, integration and E2E tests.
+- [Follow Best Practices](https://nuxt.com/raw/docs/4.x/guide/modules/best-practices.md): Build performant and maintainable Nuxt modules with these guidelines.
+- [Publish & Share Your Module](https://nuxt.com/raw/docs/4.x/guide/modules/ecosystem.md): Join the Nuxt module ecosystem and publish your module to npm.
+- [Module Author Guide](https://nuxt.com/raw/docs/4.x/guide/modules.md): Learn how to create a Nuxt module to integrate, enhance or extend any Nuxt applications.
+- [Custom Routing](https://nuxt.com/raw/docs/4.x/guide/recipes/custom-routing.md): In Nuxt, your routing is defined by the structure of your files inside the pages directory. However, since it uses vue-router under the hood, Nuxt offers you several ways to add custom routes in your project.
+- [Using Vite Plugins in Nuxt](https://nuxt.com/raw/docs/4.x/guide/recipes/vite-plugin.md): Learn how to integrate Vite plugins into your Nuxt project.
+- [Custom useFetch in Nuxt](https://nuxt.com/raw/docs/4.x/guide/recipes/custom-usefetch.md): How to create a custom fetcher for calling your external API in Nuxt.
+- [Sessions and Authentication](https://nuxt.com/raw/docs/4.x/guide/recipes/sessions-and-authentication.md): Authentication is an extremely common requirement in web apps. This recipe will show you how to implement basic user registration and authentication in your Nuxt app.
+- [Creating Custom Events](https://nuxt.com/raw/docs/4.x/guide/going-further/events.md): Nuxt provides a powerful event system powered by hookable.
+- [Experimental Features](https://nuxt.com/raw/docs/4.x/guide/going-further/experimental-features.md): Enable Nuxt experimental features to unlock new possibilities.
+- [Features](https://nuxt.com/raw/docs/4.x/guide/going-further/features.md): Enable or disable optional Nuxt features to unlock new possibilities.
+- [How Nuxt Works?](https://nuxt.com/raw/docs/4.x/guide/going-further/internals.md): Nuxt is a minimal but highly customizable framework to build web applications.
+- [Runtime Config](https://nuxt.com/raw/docs/4.x/guide/going-further/runtime-config.md): Nuxt provides a runtime config API to expose configuration and secrets within your application.
+- [Nightly Release Channel](https://nuxt.com/raw/docs/4.x/guide/going-further/nightly-release-channel.md): The nightly release channel allows using Nuxt built directly from the latest commits to the repository.
+- [Lifecycle Hooks](https://nuxt.com/raw/docs/4.x/guide/going-further/hooks.md): Nuxt provides a powerful hooking system to expand almost every aspect using hooks.
+- [Nuxt Kit](https://nuxt.com/raw/docs/4.x/guide/going-further/kit.md): @nuxt/kit provides features for module authors.
+- [NuxtApp](https://nuxt.com/raw/docs/4.x/guide/going-further/nuxt-app.md): In Nuxt, you can access runtime app context within composables, components and plugins.
+- [Authoring Nuxt Layers](https://nuxt.com/raw/docs/4.x/guide/going-further/layers.md): Nuxt provides a powerful system that allows you to extend the default files, configs, and much more.
+- [Debugging](https://nuxt.com/raw/docs/4.x/guide/going-further/debugging.md): In Nuxt, you can get started with debugging your application directly in the browser as well as in your IDE.
+- [](https://nuxt.com/raw/docs/4.x/guide/going-further.md)
+- [<ClientOnly>](https://nuxt.com/raw/docs/4.x/api/components/client-only.md): Render components only in client-side with the <ClientOnly> component.
+- [<DevOnly>](https://nuxt.com/raw/docs/4.x/api/components/dev-only.md): Render components only during development with the <DevOnly> component.
+- [<NuxtClientFallback>](https://nuxt.com/raw/docs/4.x/api/components/nuxt-client-fallback.md): Nuxt provides the <NuxtClientFallback> component to render its content on the client if any of its children trigger an error in SSR
+- [<NuxtPicture>](https://nuxt.com/raw/docs/4.x/api/components/nuxt-picture.md): Nuxt provides a <NuxtPicture> component to handle automatic image optimization.
+- [<Teleport>](https://nuxt.com/raw/docs/4.x/api/components/teleports.md): The <Teleport> component teleports a component to a different location in the DOM.
+- [<NuxtRouteAnnouncer>](https://nuxt.com/raw/docs/4.x/api/components/nuxt-route-announcer.md): The <NuxtRouteAnnouncer> component adds a hidden element with the page title to announce route changes to assistive technologies.
+- [<NuxtTime>](https://nuxt.com/raw/docs/4.x/api/components/nuxt-time.md): The <NuxtTime> component displays time in a locale-friendly format with server-client consistency.
+- [<NuxtAnnouncer>](https://nuxt.com/raw/docs/4.x/api/components/nuxt-announcer.md): The <NuxtAnnouncer> component adds a hidden element to announce dynamic content changes to assistive technologies.
+- [<NuxtPage>](https://nuxt.com/raw/docs/4.x/api/components/nuxt-page.md): The <NuxtPage> component is required to display pages located in the pages/ directory.
+- [<NuxtLayout>](https://nuxt.com/raw/docs/4.x/api/components/nuxt-layout.md): Nuxt provides the <NuxtLayout> component to show layouts on pages and error pages.
+- [<NuxtLink>](https://nuxt.com/raw/docs/4.x/api/components/nuxt-link.md): Nuxt provides <NuxtLink> component to handle any kind of links within your application.
+- [<NuxtLoadingIndicator>](https://nuxt.com/raw/docs/4.x/api/components/nuxt-loading-indicator.md): Display a progress bar between page navigations.
+- [<NuxtErrorBoundary>](https://nuxt.com/raw/docs/4.x/api/components/nuxt-error-boundary.md): The <NuxtErrorBoundary> component handles client-side errors happening in its default slot.
+- [<NuxtWelcome>](https://nuxt.com/raw/docs/4.x/api/components/nuxt-welcome.md): The <NuxtWelcome> component greets users in new projects made from the starter template.
+- [<NuxtIsland>](https://nuxt.com/raw/docs/4.x/api/components/nuxt-island.md): Nuxt provides the <NuxtIsland> component to render a non-interactive component without any client JS.
+- [<NuxtImg>](https://nuxt.com/raw/docs/4.x/api/components/nuxt-img.md): Nuxt provides a <NuxtImg> component to handle automatic image optimization.
+- [createUseAsyncData](https://nuxt.com/raw/docs/4.x/api/composables/create-use-async-data.md): A factory function to create a custom useAsyncData composable with pre-defined default options.
+- [createUseFetch](https://nuxt.com/raw/docs/4.x/api/composables/create-use-fetch.md): A factory function to create a custom useFetch composable with pre-defined default options.
+- [onPrehydrate](https://nuxt.com/raw/docs/4.x/api/composables/on-prehydrate.md): Use onPrehydrate to run a callback on the client immediately before Nuxt hydrates the page.
+- [useAnnouncer](https://nuxt.com/raw/docs/4.x/api/composables/use-announcer.md): A composable for announcing messages to screen readers.
+- [useAppConfig](https://nuxt.com/raw/docs/4.x/api/composables/use-app-config.md): Access the reactive app config defined in the project.
+- [useAsyncData](https://nuxt.com/raw/docs/4.x/api/composables/use-async-data.md): useAsyncData provides access to data that resolves asynchronously in an SSR-friendly composable.
+- [useCookie](https://nuxt.com/raw/docs/4.x/api/composables/use-cookie.md): useCookie is an SSR-friendly composable to read and write cookies.
+- [useError](https://nuxt.com/raw/docs/4.x/api/composables/use-error.md): useError composable returns the global Nuxt error that is being handled.
+- [useFetch](https://nuxt.com/raw/docs/4.x/api/composables/use-fetch.md): Fetch data from an API endpoint with an SSR-friendly composable.
+- [useHead](https://nuxt.com/raw/docs/4.x/api/composables/use-head.md): useHead customizes the head properties of individual pages of your Nuxt app.
+- [useHeadSafe](https://nuxt.com/raw/docs/4.x/api/composables/use-head-safe.md): The recommended way to provide head data with user input.
+- [useHydration](https://nuxt.com/raw/docs/4.x/api/composables/use-hydration.md): Allows full control of the hydration cycle to set and receive data from the server.
+- [useLazyAsyncData](https://nuxt.com/raw/docs/4.x/api/composables/use-lazy-async-data.md): This wrapper around useAsyncData triggers navigation immediately.
+- [useLazyFetch](https://nuxt.com/raw/docs/4.x/api/composables/use-lazy-fetch.md): This wrapper around useFetch triggers navigation immediately.
+- [useLoadingIndicator](https://nuxt.com/raw/docs/4.x/api/composables/use-loading-indicator.md): This composable gives you access to the loading state of the app page.
+- [useNuxtApp](https://nuxt.com/raw/docs/4.x/api/composables/use-nuxt-app.md): Access the shared runtime context of the Nuxt Application.
+- [useNuxtData](https://nuxt.com/raw/docs/4.x/api/composables/use-nuxt-data.md): Access the current cached value of data fetching composables.
+- [usePreviewMode](https://nuxt.com/raw/docs/4.x/api/composables/use-preview-mode.md): Use usePreviewMode to check and control preview mode in Nuxt
+- [useRequestEvent](https://nuxt.com/raw/docs/4.x/api/composables/use-request-event.md): Access the incoming request event with the useRequestEvent composable.
+- [useRequestFetch](https://nuxt.com/raw/docs/4.x/api/composables/use-request-fetch.md): Forward the request context and headers for server-side fetch requests with the useRequestFetch composable.
+- [useRequestHeader](https://nuxt.com/raw/docs/4.x/api/composables/use-request-header.md): Use useRequestHeader to access a certain incoming request header.
+- [useRequestHeaders](https://nuxt.com/raw/docs/4.x/api/composables/use-request-headers.md): Use useRequestHeaders to access the incoming request headers.
+- [useRequestURL](https://nuxt.com/raw/docs/4.x/api/composables/use-request-url.md): Access the incoming request URL with the useRequestURL composable.
+- [useResponseHeader](https://nuxt.com/raw/docs/4.x/api/composables/use-response-header.md): Use useResponseHeader to set a server response header.
+- [useRoute](https://nuxt.com/raw/docs/4.x/api/composables/use-route.md): The useRoute composable returns the current route.
+- [useRouteAnnouncer](https://nuxt.com/raw/docs/4.x/api/composables/use-route-announcer.md): This composable observes the page title changes and updates the announcer message accordingly.
+- [useRouter](https://nuxt.com/raw/docs/4.x/api/composables/use-router.md): The useRouter composable returns the router instance.
+- [useRuntimeConfig](https://nuxt.com/raw/docs/4.x/api/composables/use-runtime-config.md): Access runtime config variables with the useRuntimeConfig composable.
+- [useRuntimeHook](https://nuxt.com/raw/docs/4.x/api/composables/use-runtime-hook.md): Registers a runtime hook in a Nuxt application and ensures it is properly disposed of when the scope is destroyed.
+- [useSeoMeta](https://nuxt.com/raw/docs/4.x/api/composables/use-seo-meta.md): The useSeoMeta composable lets you define your site's SEO meta tags as a flat object with full TypeScript support.
+- [useServerSeoMeta](https://nuxt.com/raw/docs/4.x/api/composables/use-server-seo-meta.md): The useServerSeoMeta composable lets you define your site's SEO meta tags as a flat object with full TypeScript support.
+- [useState](https://nuxt.com/raw/docs/4.x/api/composables/use-state.md): The useState composable creates a reactive and SSR-friendly shared state.
+- [$fetch](https://nuxt.com/raw/docs/4.x/api/utils/dollarfetch.md): Nuxt uses ofetch to expose globally the $fetch helper for making HTTP requests.
+- [abortNavigation](https://nuxt.com/raw/docs/4.x/api/utils/abort-navigation.md): abortNavigation is a helper function that prevents navigation from taking place and throws an error if one is set as a parameter.
+- [addRouteMiddleware](https://nuxt.com/raw/docs/4.x/api/utils/add-route-middleware.md): addRouteMiddleware() is a helper function to dynamically add middleware in your application.
+- [callOnce](https://nuxt.com/raw/docs/4.x/api/utils/call-once.md): Run a given function or block of code once during SSR or CSR.
+- [clearError](https://nuxt.com/raw/docs/4.x/api/utils/clear-error.md): The clearError composable clears all handled errors.
+- [clearNuxtData](https://nuxt.com/raw/docs/4.x/api/utils/clear-nuxt-data.md): Delete cached data, error status and pending promises of useAsyncData and useFetch.
+- [clearNuxtState](https://nuxt.com/raw/docs/4.x/api/utils/clear-nuxt-state.md): Delete the cached state of useState.
+- [createError](https://nuxt.com/raw/docs/4.x/api/utils/create-error.md): Create an error object with additional metadata.
+- [defineLazyHydrationComponent](https://nuxt.com/raw/docs/4.x/api/utils/define-lazy-hydration-component.md): Define a lazy hydration component with a specific strategy.
+- [defineNuxtComponent](https://nuxt.com/raw/docs/4.x/api/utils/define-nuxt-component.md): defineNuxtComponent() is a helper function for defining type safe components with Options API.
+- [defineNuxtPlugin](https://nuxt.com/raw/docs/4.x/api/utils/define-nuxt-plugin.md): defineNuxtPlugin() is a helper function for creating Nuxt plugins.
+- [defineNuxtRouteMiddleware](https://nuxt.com/raw/docs/4.x/api/utils/define-nuxt-route-middleware.md): Create named route middleware using defineNuxtRouteMiddleware helper function.
+- [definePageMeta](https://nuxt.com/raw/docs/4.x/api/utils/define-page-meta.md): Define metadata for your page components.
+- [defineRouteRules](https://nuxt.com/raw/docs/4.x/api/utils/define-route-rules.md): Define route rules for hybrid rendering at the page level.
+- [navigateTo](https://nuxt.com/raw/docs/4.x/api/utils/navigate-to.md): navigateTo is a helper function that programmatically navigates users.
+- [onBeforeRouteLeave](https://nuxt.com/raw/docs/4.x/api/utils/on-before-route-leave.md): The onBeforeRouteLeave composable allows registering a route guard within a component.
+- [onBeforeRouteUpdate](https://nuxt.com/raw/docs/4.x/api/utils/on-before-route-update.md): The onBeforeRouteUpdate composable allows registering a route guard within a component.
+- [onNuxtReady](https://nuxt.com/raw/docs/4.x/api/utils/on-nuxt-ready.md): The onNuxtReady composable allows running a callback after your app has finished initializing.
+- [prefetchComponents](https://nuxt.com/raw/docs/4.x/api/utils/prefetch-components.md): Nuxt provides utilities to give you control over prefetching components.
+- [preloadComponents](https://nuxt.com/raw/docs/4.x/api/utils/preload-components.md): Nuxt provides utilities to give you control over preloading components.
+- [preloadRouteComponents](https://nuxt.com/raw/docs/4.x/api/utils/preload-route-components.md): preloadRouteComponents allows you to manually preload individual pages in your Nuxt app.
+- [prerenderRoutes](https://nuxt.com/raw/docs/4.x/api/utils/prerender-routes.md): prerenderRoutes hints to Nitro to prerender an additional route.
+- [refreshCookie](https://nuxt.com/raw/docs/4.x/api/utils/refresh-cookie.md): Refresh useCookie values manually when a cookie has changed
+- [refreshNuxtData](https://nuxt.com/raw/docs/4.x/api/utils/refresh-nuxt-data.md): Refresh all or specific asyncData instances in Nuxt
+- [reloadNuxtApp](https://nuxt.com/raw/docs/4.x/api/utils/reload-nuxt-app.md): reloadNuxtApp will perform a hard reload of the page.
+- [setPageLayout](https://nuxt.com/raw/docs/4.x/api/utils/set-page-layout.md): setPageLayout allows you to dynamically change the layout of a page.
+- [setResponseStatus](https://nuxt.com/raw/docs/4.x/api/utils/set-response-status.md): setResponseStatus sets the status (and optionally the statusText) of the response.
+- [showError](https://nuxt.com/raw/docs/4.x/api/utils/show-error.md): Nuxt provides a quick and simple way to show a full screen error page if needed.
+- [updateAppConfig](https://nuxt.com/raw/docs/4.x/api/utils/update-app-config.md): Update the App Config at runtime.
+- [nuxt add](https://nuxt.com/raw/docs/4.x/api/commands/add.md): Scaffold an entity into your Nuxt application.
+- [nuxt analyze](https://nuxt.com/raw/docs/4.x/api/commands/analyze.md): Analyze the production bundle or your Nuxt application.
+- [nuxt build](https://nuxt.com/raw/docs/4.x/api/commands/build.md): Build your Nuxt application.
+- [nuxt build-module](https://nuxt.com/raw/docs/4.x/api/commands/build-module.md): Nuxt command to build your Nuxt module before publishing.
+- [nuxt cleanup](https://nuxt.com/raw/docs/4.x/api/commands/cleanup.md): Remove common generated Nuxt files and caches.
+- [nuxt dev](https://nuxt.com/raw/docs/4.x/api/commands/dev.md): The dev command starts a development server with hot module replacement at http://localhost:3000
+- [nuxt devtools](https://nuxt.com/raw/docs/4.x/api/commands/devtools.md): The devtools command allows you to enable or disable Nuxt DevTools on a per-project basis.
+- [nuxt generate](https://nuxt.com/raw/docs/4.x/api/commands/generate.md): Pre-renders every route of the application and stores the result in plain HTML files.
+- [nuxt info](https://nuxt.com/raw/docs/4.x/api/commands/info.md): The info command logs information about the current or specified Nuxt project.
+- [create nuxt](https://nuxt.com/raw/docs/4.x/api/commands/init.md): The init command initializes a fresh Nuxt project.
+- [nuxt module](https://nuxt.com/raw/docs/4.x/api/commands/module.md): Search and add modules to your Nuxt application with the command line.
+- [nuxt prepare](https://nuxt.com/raw/docs/4.x/api/commands/prepare.md): The prepare command creates a .nuxt directory in your application and generates types.
+- [nuxt preview](https://nuxt.com/raw/docs/4.x/api/commands/preview.md): The preview command starts a server to preview your application after the build command.
+- [nuxt test](https://nuxt.com/raw/docs/4.x/api/commands/test.md): The test command runs tests using @nuxt/test-utils.
+- [nuxt typecheck](https://nuxt.com/raw/docs/4.x/api/commands/typecheck.md): The typecheck command runs vue-tsc to check types throughout your app.
+- [nuxt upgrade](https://nuxt.com/raw/docs/4.x/api/commands/upgrade.md): The upgrade command upgrades Nuxt to the latest version.
+- [Modules](https://nuxt.com/raw/docs/4.x/api/kit/modules.md): Nuxt Kit provides a set of utilities to help you create and use modules. You can use these utilities to create your own modules or to reuse existing modules.
+- [Runtime Config](https://nuxt.com/raw/docs/4.x/api/kit/runtime-config.md): Nuxt Kit provides a set of utilities to help you access and modify Nuxt runtime configuration.
+- [Templates](https://nuxt.com/raw/docs/4.x/api/kit/templates.md): Nuxt Kit provides a set of utilities to help you work with templates. These functions allow you to generate extra files during development and build time.
+- [Nitro](https://nuxt.com/raw/docs/4.x/api/kit/nitro.md): Nuxt Kit provides a set of utilities to help you work with Nitro. These functions allow you to add server handlers, plugins, and prerender routes.
+- [Resolving](https://nuxt.com/raw/docs/4.x/api/kit/resolving.md): Nuxt Kit provides a set of utilities to help you resolve paths. These functions allow you to resolve paths relative to the current module, with unknown name or extension.
+- [Logging](https://nuxt.com/raw/docs/4.x/api/kit/logging.md): Nuxt Kit provides a set of utilities to help you work with logging. These functions allow you to log messages with extra features.
+- [Builder](https://nuxt.com/raw/docs/4.x/api/kit/builder.md): Nuxt Kit provides a set of utilities to help you work with the builder. These functions allow you to extend the Vite and webpack configurations.
+- [Examples](https://nuxt.com/raw/docs/4.x/api/kit/examples.md): Examples of Nuxt Kit utilities in use.
+- [Layers](https://nuxt.com/raw/docs/4.x/api/kit/layers.md): Nuxt Kit provides utilities to help you work with layers and their directory structures.
+- [Programmatic Usage](https://nuxt.com/raw/docs/4.x/api/kit/programmatic.md): Nuxt Kit provides a set of utilities to help you work with Nuxt programmatically. These functions allow you to load Nuxt, build Nuxt, and load Nuxt configuration.
+- [Compatibility](https://nuxt.com/raw/docs/4.x/api/kit/compatibility.md): Nuxt Kit provides a set of utilities to help you check the compatibility of your modules with different Nuxt versions.
+- [Auto-imports](https://nuxt.com/raw/docs/4.x/api/kit/autoimports.md): Nuxt Kit provides a set of utilities to help you work with auto-imports. These functions allow you to register your own utils, composables and Vue APIs.
+- [Components](https://nuxt.com/raw/docs/4.x/api/kit/components.md): Nuxt Kit provides a set of utilities to help you work with components. You can register components globally or locally, and also add directories to be scanned for components.
+- [Context](https://nuxt.com/raw/docs/4.x/api/kit/context.md): Nuxt Kit provides a set of utilities to help you work with context.
+- [Pages](https://nuxt.com/raw/docs/4.x/api/kit/pages.md): Nuxt Kit provides a set of utilities to help you create and use pages. You can use these utilities to manipulate the pages configuration or to define route rules.
+- [Layout](https://nuxt.com/raw/docs/4.x/api/kit/layout.md): Nuxt Kit provides a set of utilities to help you work with layouts.
+- [Head](https://nuxt.com/raw/docs/4.x/api/kit/head.md): Nuxt Kit provides utilities to help you manage head configuration in modules.
+- [Plugins](https://nuxt.com/raw/docs/4.x/api/kit/plugins.md): Nuxt Kit provides a set of utilities to help you create and use plugins. You can add plugins or plugin templates to your module using these functions.
+- [Lifecycle Hooks](https://nuxt.com/raw/docs/4.x/api/advanced/hooks.md): Nuxt provides a powerful hooking system to expand almost every aspect using hooks.
+- [Import meta](https://nuxt.com/raw/docs/4.x/api/advanced/import-meta.md): Understand where your code is running using `import.meta`.
+- [Nuxt Configuration](https://nuxt.com/raw/docs/4.x/api/nuxt-config.md): Discover all the options you can use in your nuxt.config.ts file.
+- [Nuxt API Reference](https://nuxt.com/raw/docs/4.x/api.md): Explore all Nuxt Internals: Components, Composables, Utils, Commands and more.
+- [Hello World](https://nuxt.com/raw/docs/4.x/examples/hello-world.md): A minimal Nuxt application only requires the `app.vue` and `nuxt.config.js` files.
+- [Auto Imports](https://nuxt.com/raw/docs/4.x/examples/features/auto-imports.md): This example demonstrates the auto-imports feature in Nuxt.
+- [Data Fetching](https://nuxt.com/raw/docs/4.x/examples/features/data-fetching.md): This example demonstrates data fetching with Nuxt using built-in composables and API routes.
+- [State Management](https://nuxt.com/raw/docs/4.x/examples/features/state-management.md): This example shows how to use the `useState` composable to create a reactive and SSR-friendly shared state across components.
+- [Meta Tags](https://nuxt.com/raw/docs/4.x/examples/features/meta-tags.md): This example shows how to use the Nuxt helpers and composables for SEO and meta management.
+- [Layouts](https://nuxt.com/raw/docs/4.x/examples/features/layouts.md): This example shows how to define default and custom layouts.
+- [Middleware](https://nuxt.com/raw/docs/4.x/examples/routing/middleware.md): This example shows how to add route middleware with the middleware/ directory or with a plugin, and how to use them globally or per page.
+- [Pages](https://nuxt.com/raw/docs/4.x/examples/routing/pages.md): This example shows how to use the pages/ directory to create application routes.
+- [Universal Router](https://nuxt.com/raw/docs/4.x/examples/routing/universal-router.md): This example demonstrates Nuxt universal routing utilities without depending on `pages/` and `vue-router`.
+- [Layers](https://nuxt.com/raw/docs/4.x/examples/advanced/config-extends.md): This example shows how to use the extends key in `nuxt.config.ts`.
+- [Error Handling](https://nuxt.com/raw/docs/4.x/examples/advanced/error-handling.md): This example shows how to handle errors in different contexts: pages, plugins, components and middleware.
+- [JSX / TSX](https://nuxt.com/raw/docs/4.x/examples/advanced/jsx.md): This example shows how to use JSX syntax with typescript in Nuxt pages and components.
+- [Locale](https://nuxt.com/raw/docs/4.x/examples/advanced/locale.md): This example shows how to define a locale composable to handle the application's locale, both server and client side.
+- [Module Extend Pages](https://nuxt.com/raw/docs/4.x/examples/advanced/module-extend-pages.md): This example defines a new `test` page using `extendPages` within a module.
+- [Teleport](https://nuxt.com/raw/docs/4.x/examples/advanced/teleport.md): This example shows how to use the <Teleport> with client-side and server-side rendering.
+- [Testing](https://nuxt.com/raw/docs/4.x/examples/advanced/testing.md): This example shows how to test your Nuxt application.
+- [useCookie](https://nuxt.com/raw/docs/4.x/examples/advanced/use-cookie.md): This example shows how to use the useCookie API to persist small amounts of data that both client and server can use.
+- [Use Custom Fetch Composable](https://nuxt.com/raw/docs/4.x/examples/advanced/use-custom-fetch-composable.md): This example shows a convenient wrapper for the useFetch composable from nuxt. It allows you to customize the fetch request with default values and user authentication token.
+- [WASM](https://nuxt.com/raw/docs/4.x/examples/experimental/wasm.md): This example demonstrates the server-side support of WebAssembly in Nuxt.
+- [Getting Help](https://nuxt.com/raw/docs/4.x/community/getting-help.md): We're a friendly community of developers and we'd love to help.
+- [Reporting Bugs](https://nuxt.com/raw/docs/4.x/community/reporting-bugs.md): One of the most valuable roles in open source is taking the time to report bugs helpfully.
+- [Contribution](https://nuxt.com/raw/docs/4.x/community/contribution.md): Nuxt is a community project - and so we love contributions of all kinds! ❤️
+- [Framework](https://nuxt.com/raw/docs/4.x/community/framework-contribution.md): Some specific points about contributions to the framework repository.
+- [Roadmap](https://nuxt.com/raw/docs/4.x/community/roadmap.md): Nuxt is constantly evolving, with new features and modules being added all the time.
+- [Releases](https://nuxt.com/raw/docs/4.x/community/changelog.md): Discover the latest releases of Nuxt & Nuxt official modules.
+- [Overview](https://nuxt.com/raw/docs/4.x/bridge/overview.md): Reduce the differences with Nuxt 3 and reduce the burden of migration to Nuxt 3.
+- [Configuration](https://nuxt.com/raw/docs/4.x/bridge/configuration.md): Learn how to configure Nuxt Bridge to your own needs.
+- [TypeScript](https://nuxt.com/raw/docs/4.x/bridge/typescript.md): Learn how to use TypeScript with Nuxt Bridge.
+- [Legacy Composition API](https://nuxt.com/raw/docs/4.x/bridge/bridge-composition-api.md): Learn how to migrate to Composition API with Nuxt Bridge.
+- [Plugins and Middleware](https://nuxt.com/raw/docs/4.x/bridge/plugins-and-middleware.md): Learn how to migrate from Nuxt 2 to Nuxt Bridge new plugins and middleware.
+- [New Composition API](https://nuxt.com/raw/docs/4.x/bridge/nuxt3-compatible-api.md): Nuxt Bridge implements composables compatible with Nuxt 3.
+- [Meta Tags](https://nuxt.com/raw/docs/4.x/bridge/meta.md): Learn how to migrate from Nuxt 2 to Nuxt Bridge new meta tags.
+- [Runtime Config](https://nuxt.com/raw/docs/4.x/bridge/runtime-config.md): Nuxt provides a runtime config API to expose configuration and secrets within your application.
+- [Nitro](https://nuxt.com/raw/docs/4.x/bridge/nitro.md): Activate Nitro to your Nuxt 2 application with Nuxt Bridge.
+- [Vite](https://nuxt.com/raw/docs/4.x/bridge/vite.md): Activate Vite to your Nuxt 2 application with Nuxt Bridge.
+- [Overview](https://nuxt.com/raw/docs/4.x/migration/overview.md): Nuxt 3 is a complete rewrite of Nuxt 2, and also based on a new set of underlying technologies.
+- [Build Tooling](https://nuxt.com/raw/docs/4.x/migration/bundling.md): Learn how to migrate from Nuxt 2 to Nuxt 3 build tooling.
+- [Server](https://nuxt.com/raw/docs/4.x/migration/server.md): Learn how to migrate from Nuxt 2 to Nuxt 3 server.
+- [Configuration](https://nuxt.com/raw/docs/4.x/migration/configuration.md): Learn how to migrate from Nuxt 2 to Nuxt 3 new configuration.
+- [Modules](https://nuxt.com/raw/docs/4.x/migration/module-authors.md): Learn how to migrate from Nuxt 2 to Nuxt 3 modules.
+- [Auto Imports](https://nuxt.com/raw/docs/4.x/migration/auto-imports.md): Nuxt 3 adopts a minimal friction approach, meaning wherever possible components and composables are auto-imported.
+- [Meta Tags](https://nuxt.com/raw/docs/4.x/migration/meta.md): Manage your meta tags, from Nuxt 2 to Nuxt 3.
+- [Plugins and Middleware](https://nuxt.com/raw/docs/4.x/migration/plugins-and-middleware.md): Learn how to migrate from Nuxt 2 to Nuxt 3 plugins and middleware.
+- [Pages and Layouts](https://nuxt.com/raw/docs/4.x/migration/pages-and-layouts.md): Learn how to migrate from Nuxt 2 to Nuxt 3 pages and layouts.
+- [Component Options](https://nuxt.com/raw/docs/4.x/migration/component-options.md): Learn how to migrate from Nuxt 2 components options to Nuxt 3 composables.
+- [Runtime Config](https://nuxt.com/raw/docs/4.x/migration/runtime-config.md): Learn how to migrate from Nuxt 2 to Nuxt 3 runtime config.
+- [Nuxt Docs](https://nuxt.com/raw/docs/4.x/readme.md): This repository contains the documentation of Nuxt, hosted on https://nuxt.com/docs/4.x/getting-started/introduction
+
+## Deployment Guides
+
+- [AWS Amplify](https://nuxt.com/raw/deploy/aws-amplify.md): Deploy your Nuxt Application to AWS Amplify infrastructure.
+- [Azure](https://nuxt.com/raw/deploy/azure.md): Deploy your Nuxt Application to Azure infrastructure.
+- [Cleavr](https://nuxt.com/raw/deploy/cleavr.md): Deploy your Nuxt Application to Cleavr infrastructure.
+- [Clever Cloud](https://nuxt.com/raw/deploy/clever-cloud.md): Deploy your Nuxt Application to Clever Cloud infrastructure.
+- [Cloudflare](https://nuxt.com/raw/deploy/cloudflare.md): Deploy your Nuxt Application to Cloudflare infrastructure.
+- [Deno Deploy](https://nuxt.com/raw/deploy/deno-deploy.md): Deploy your Nuxt Application to Deno Deploy infrastructure.
+- [DigitalOcean](https://nuxt.com/raw/deploy/digitalocean.md): Deploy your Nuxt Application to DigitalOcean infrastructure.
+- [Firebase](https://nuxt.com/raw/deploy/firebase.md): Deploy your Nuxt Application to Firebase infrastructure.
+- [Flightcontrol](https://nuxt.com/raw/deploy/flightcontrol.md): Deploy your Nuxt Application to Flightcontrol infrastructure.
+- [GitHub Pages](https://nuxt.com/raw/deploy/github-pages.md): Deploy your Nuxt Application to GitHub Pages infrastructure.
+- [GitLab Pages](https://nuxt.com/raw/deploy/gitlab.md): Deploy your Nuxt Application to GitLab Pages.
+- [Heroku](https://nuxt.com/raw/deploy/heroku.md): Deploy your Nuxt Application to Heroku infrastructure.
+- [Hostinger](https://nuxt.com/raw/deploy/hostinger.md): Deploy your Nuxt Application to Hostinger Node.js Hosting.
+- [IIS](https://nuxt.com/raw/deploy/iis.md): Deploy your Nuxt Application to IIS infrastructure.
+- [Koyeb](https://nuxt.com/raw/deploy/koyeb.md): Deploy your Nuxt Application to Koyeb infrastructure.
+- [Netlify](https://nuxt.com/raw/deploy/netlify.md): Deploy your Nuxt Application to Netlify infrastructure.
+- [Northflank](https://nuxt.com/raw/deploy/northflank.md): Deploy your Nuxt Application to Northflank infrastructure.
+- [Render](https://nuxt.com/raw/deploy/render.md): Deploy your Nuxt Application to Render infrastructure.
+- [SST](https://nuxt.com/raw/deploy/sst.md): Deploy your Nuxt Application to AWS with SST.
+- [Stormkit](https://nuxt.com/raw/deploy/stormkit.md): Deploy your Nuxt Application to Stormkit infrastructure.
+- [Vercel](https://nuxt.com/raw/deploy/vercel.md): Deploy your Nuxt Application to Vercel infrastructure.
+- [Zeabur](https://nuxt.com/raw/deploy/zeabur.md): Deploy your Nuxt Application to Zeabur.
+- [Zerops](https://nuxt.com/raw/deploy/zerops.md): Deploy your Nuxt Application to Zerops infrastructure.
+
+## Blog
+
+- [Announcing 3.0](https://nuxt.com/raw/blog/v3.md): We are thrilled to announce the first stable version of Nuxt 3.0.0
+- [Nuxt 3.3](https://nuxt.com/raw/blog/v3-3.md): The 3.3.0 is a minor (feature) release with lots of performance and DX improvements, bug fixes and new features to play with.
+- [Nuxt 3.4](https://nuxt.com/raw/blog/v3-4.md): Nuxt 3.4.0 is the latest release of Nuxt 3, bringing exciting new features, including support for the View Transitions API, transferring rich JavaScript payloads from server to client - and much more.
+- [Nuxt 3.5](https://nuxt.com/raw/blog/v3-5.md): Nuxt 3.5.0 is out, bringing Vue 3.3, new defaults, interactive server components, typed pages, environment config - and much more.
+- [Nuxt 3.6](https://nuxt.com/raw/blog/v3-6.md): Nuxt 3.6 is out, bringing performance improvements, fully static server components, better style inlining, static presets, increased type safety - and much more.
+- [Nuxt on the Edge](https://nuxt.com/raw/blog/nuxt-on-the-edge.md): Learn how we made Nuxt 3 capable of running on edge runtimes to run with server-side rendering close to your users.
+- [Nuxt 3.7](https://nuxt.com/raw/blog/v3-7.md): Nuxt 3.7 is out, bringing a new CLI, native web streams and response, rendering optimisations, async context support - and much more.
+- [A New Website](https://nuxt.com/raw/blog/new-website.md): We are thrilled to release the new nuxt.com, powered by Nuxt UI and now open source.
+- [Nuxt 3.8](https://nuxt.com/raw/blog/v3-8.md): Nuxt 3.8 is out, bringing built-in DevTools, automatic Nuxt Image install, a new app manifest and much more.
+- [Nuxt DevTools v1.0](https://nuxt.com/raw/blog/nuxt-devtools-v1-0.md): Nuxt DevTools v1.0 is out, generally available to all Nuxt projects!
+- [Nuxt 3.9](https://nuxt.com/raw/blog/v3-9.md): Nuxt 3.9 is out - a Christmas gift from the Nuxt team bringing Vite 5, interactive server components, new composables, a new loading API and more.
+- [Nuxt: A vision for 2023](https://nuxt.com/raw/blog/vision-2023.md): This past year has been an exciting one. Looking into the new year, there is a lot we have planned as a team and we'd love to share it with you.
+- [Nuxt 3.10](https://nuxt.com/raw/blog/v3-10.md): Nuxt 3.10 is out - packed with features and fixes. Here are a few highlights.
+- [The Evolution of Shiki v1.0](https://nuxt.com/raw/blog/shiki-v1.md): Shiki v1.0 came with many improvements and features - see how Nuxt drives the evolution of Shiki!
+- [Nuxt 3.11](https://nuxt.com/raw/blog/v3-11.md): Nuxt 3.11 is out - with better logging, preview mode, server pages and much more!
+- [Nuxt: Looking forward](https://nuxt.com/raw/blog/looking-forward-2024.md): A lot of things have happened for Nuxt over the last year. Sébastien and Daniel share their thoughts on what we've achieved, and where we're going next.
+- [Refreshed Nuxt ESLint Integrations](https://nuxt.com/raw/blog/eslint-module.md): We revamped our ESLint integrations to support ESLint v9 with the flat config, as well as a new module with many more capabilities.
+- [Nuxt 3.12](https://nuxt.com/raw/blog/v3-12.md): Nuxt 3.12 is out - full of improvements and preparing the way for Nuxt 4!
+- [Introducing Nuxt Scripts](https://nuxt.com/raw/blog/nuxt-scripts.md): Nuxt Scripts provides better performance, privacy, security, and developer experience for third-party scripts.
+- [Nuxt 3.13](https://nuxt.com/raw/blog/v3-13.md): Nuxt 3.13 is out - porting back some of the new features we're building for Nuxt 4!
+- [Nuxt 3.14](https://nuxt.com/raw/blog/v3-14.md): Nuxt 3.14 is out - with a new rspack builder, shared folder, and performance enhancements!
+- [Introducing Nuxt Icon v1](https://nuxt.com/raw/blog/nuxt-icon-v1-0.md): Discover Nuxt Icon v1 - a modern, versatile, and customizable icon solution for your Nuxt projects.
+- [Introducing Nuxt DevTools](https://nuxt.com/raw/blog/introducing-nuxt-devtools.md): Unleash the Developer Experience with Nuxt and understand your app better than ever.
+- [Announcing Nuxt 3 Release Candidate](https://nuxt.com/raw/blog/nuxt3-rc.md): Nuxt 3 beta was announced on October 12, 2021 after 16 months of work, introducing a new foundation based on Vue 3, Vite and Nitro. Six months later, we are happy to announce the first release candidate of Nuxt 3, code named “Mount Hope“ 🚀
+- [Nuxt 3.15](https://nuxt.com/raw/blog/v3-15.md): Nuxt 3.15 is out - with Vite 6, better HMR and faster performance
+- [Nuxt 3.16](https://nuxt.com/raw/blog/v3-16.md): Nuxt 3.16 is out - packed with features and performance improvements
+- [Nuxt UI v3](https://nuxt.com/raw/blog/nuxt-ui-v3.md): Nuxt UI v3 is out! After 1500+ commits, this major redesign brings improved accessibility, Tailwind CSS v4 support, and full Vue compatibility
+- [Nuxt 3.17](https://nuxt.com/raw/blog/v3-17.md): Nuxt 3.17 is out - bringing a major reworking of the async data layer, a new built-in component, better warnings, and performance improvements!
+- [Roadmap to v4](https://nuxt.com/raw/blog/roadmap-v4.md): We have some exciting news about the roadmap to Nuxt 4, including a new timeline and what to expect in the next few weeks.
+- [Building a Privacy-First Feedback Widget](https://nuxt.com/raw/blog/building-a-feedback-widget.md): A lightweight, privacy-focused widget to gather your feedback on Nuxt documentation, built with Drizzle, NuxtHub database and Motion Vue.
+- [Announcing Nuxt 4.0](https://nuxt.com/raw/blog/v4.md): Nuxt 4.0 is here! A thoughtful evolution focused on developer experience, with better project organization, smarter data fetching, and improved type safety.
+- [Nuxt 3.18](https://nuxt.com/raw/blog/v3-18.md): Nuxt 3.18 is out - bringing v4 features to v3, improved accessibility, better browser dev tooling integration, and performance enhancements!
+- [Nuxt 4.1](https://nuxt.com/raw/blog/v4-1.md): Nuxt 4.1 is out - bringing enhanced build stability, better development experience, and powerful new features for module authors!
+- [Nuxt UI v4](https://nuxt.com/raw/blog/nuxt-ui-v4.md): Nuxt UI v4 unifies Nuxt UI and Nuxt UI Pro into one powerful, completely free library. With over 110 components, 12 templates, and a comprehensive Figma kit, all of this is available for free.
+- [Nuxt 2 End-of-Life (EOL)](https://nuxt.com/raw/blog/nuxt2-eol.md): Nuxt 2 will reach End of Life (EOL) on June 30th, 2024. We've partnered with HeroDevs on offering Never-Ending Support (NES).
+- [Introducing Nuxt 3 Beta](https://nuxt.com/raw/blog/nuxt3-beta.md): 468 days after the first commit, the Nuxt 3 beta has finally arrived. Discover what's inside and what to expect from it. Yes, it includes Vue 3 and Vite ⚡️
+- [Building an MCP Server for Nuxt](https://nuxt.com/raw/blog/building-nuxt-mcp.md): How we built the Nuxt MCP server to enable AI assistants to access our documentation through structured data and composable tools.
+- [Nuxt 4.2](https://nuxt.com/raw/blog/v4-2.md): Nuxt 4.2 is out - with experimental TypeScript plugin support, better error handling in development, abort control for data fetching, and more!
+- [Nuxt Image v2](https://nuxt.com/raw/blog/nuxt-image-v2.md): Nuxt Image v2 is out - with full TypeScript support, IPX v3, and new providers!
+- [Nuxt 4.3](https://nuxt.com/raw/blog/v4-3.md): Nuxt 4.3 is out – route rule layouts, ISR payload extraction, draggable error overlay, and more!
+- [Nuxt 4.4](https://nuxt.com/raw/blog/v4-4.md): Nuxt 4.4 brings custom useFetch/useAsyncData factories, vue-router v5, a new accessibility announcer, typed layout props, build profiling, smarter payload handling, and much more.
+- [Introducing the Nuxt Agent](https://nuxt.com/raw/blog/introducing-nuxt-agent.md): Our own AI agent on nuxt.com, grounded in the official docs and the Nuxt ecosystem. We built it internally using the AI SDK, our MCP server, and Nuxt UI components.
+- [Meet Nuxi](https://nuxt.com/raw/blog/meet-nuxi.md): Today, we're announcing the new Nuxt Agent: Nuxi. We want to make your Nuxt experience less generic and more personalized, with the care that characterizes the Nuxt community.
+- [Going Full Static](https://nuxt.com/raw/blog/going-full-static.md): Long awaited features for JAMstack fans has been shipped in v2.13: full static export, improved smart prefetching, integrated crawler, faster re-deploy, built-in web server and new target option for config ⚡️
+- [Introducing Smart Prefetching](https://nuxt.com/raw/blog/introducing-smart-prefetching.md): Starting from Nuxt v2.4.0, Nuxt will automagically prefetch the code-splitted pages linked with a nuxt-link when visible in the viewport by default.
+- [Understanding how fetch works in Nuxt 2.12](https://nuxt.com/raw/blog/understanding-how-fetch-works-in-nuxt-2-12.md): Explore different features of the fetch hook and learn a brand new way to bring data into Nuxt applications.
+- [Nuxt 2 Static Improvements](https://nuxt.com/raw/blog/nuxt-static-improvements.md): With Nuxt version 2.13, the full-static mode has been introduced. In addition, a new command nuxt export was added to pre-render your pages without triggering a webpack build with the goal to separate the rendering and build process. The only issue was that most Nuxt users weren't able to unleash the full potential of the separation... until now.
+- [Nuxt 2: From Terminal to Browser](https://nuxt.com/raw/blog/nuxtjs-from-terminal-to-browser.md): How we changed the developer experience to stop switching between the terminal and browser.
