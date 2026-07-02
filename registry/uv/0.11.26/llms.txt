@@ -1,0 +1,92 @@
+# uv
+
+> uv is an extremely fast Python package and project manager, written in Rust.
+
+You can use uv to install Python dependencies, run scripts, manage virtual environments,
+build and publish packages, and even install Python itself. uv is capable of replacing
+`pip`, `pip-tools`, `pipx`, `poetry`, `pyenv`, `twine`, `virtualenv`, and more.
+
+uv includes both a pip-compatible CLI (prepend `uv` to a pip command, e.g., `uv pip install ruff`)
+and a first-class project interface (e.g., `uv add ruff`) complete with lockfiles and
+workspace support.
+
+When fetching documentation, use explicit `index.md` paths for directories, e.g.,
+`https://docs.astral.sh/uv/concepts/projects/dependencies/index.md`. This returns
+clean markdown instead of rendered HTML with JS/CSS.
+
+
+## Getting started
+
+- [Features](https://docs.astral.sh/uv/getting-started/features/index.md)
+- [First steps](https://docs.astral.sh/uv/getting-started/first-steps/index.md)
+- [Installation](https://docs.astral.sh/uv/getting-started/installation/index.md)
+
+## Guides
+
+- [Installing Python](https://docs.astral.sh/uv/guides/install-python/index.md)
+- [Publishing packages](https://docs.astral.sh/uv/guides/package/index.md)
+- [Working on projects](https://docs.astral.sh/uv/guides/projects/index.md)
+- [Running scripts](https://docs.astral.sh/uv/guides/scripts/index.md)
+- [Using tools](https://docs.astral.sh/uv/guides/tools/index.md)
+
+## Integrations
+
+- [AWS Lambda](https://docs.astral.sh/uv/guides/integration/aws-lambda/index.md)
+- [AWS CodeArtifact](https://docs.astral.sh/uv/guides/integration/aws/index.md)
+- [Azure Artifacts](https://docs.astral.sh/uv/guides/integration/azure/index.md)
+- [Bazel](https://docs.astral.sh/uv/guides/integration/bazel/index.md)
+- [Coiled](https://docs.astral.sh/uv/guides/integration/coiled/index.md)
+- [Dependabot](https://docs.astral.sh/uv/guides/integration/dependabot/index.md)
+- [Docker](https://docs.astral.sh/uv/guides/integration/docker/index.md)
+- [FastAPI](https://docs.astral.sh/uv/guides/integration/fastapi/index.md)
+- [GitHub Actions](https://docs.astral.sh/uv/guides/integration/github/index.md)
+- [GitLab CI/CD](https://docs.astral.sh/uv/guides/integration/gitlab/index.md)
+- [Google Artifact Registry](https://docs.astral.sh/uv/guides/integration/google/index.md)
+- [JFrog Artifactory](https://docs.astral.sh/uv/guides/integration/jfrog/index.md)
+- [Jupyter](https://docs.astral.sh/uv/guides/integration/jupyter/index.md)
+- [marimo](https://docs.astral.sh/uv/guides/integration/marimo/index.md)
+- [Pre-commit](https://docs.astral.sh/uv/guides/integration/pre-commit/index.md)
+- [PyTorch](https://docs.astral.sh/uv/guides/integration/pytorch/index.md)
+- [Renovate](https://docs.astral.sh/uv/guides/integration/renovate/index.md)
+
+## Projects
+
+- [Building distributions](https://docs.astral.sh/uv/concepts/projects/build/index.md)
+- [Configuring projects](https://docs.astral.sh/uv/concepts/projects/config/index.md)
+- [Managing dependencies](https://docs.astral.sh/uv/concepts/projects/dependencies/index.md)
+- [Exporting lockfiles](https://docs.astral.sh/uv/concepts/projects/export/index.md)
+- [Creating projects](https://docs.astral.sh/uv/concepts/projects/init/index.md)
+- [Structure and files](https://docs.astral.sh/uv/concepts/projects/layout/index.md)
+- [Running commands](https://docs.astral.sh/uv/concepts/projects/run/index.md)
+- [Locking and syncing](https://docs.astral.sh/uv/concepts/projects/sync/index.md)
+- [Using workspaces](https://docs.astral.sh/uv/concepts/projects/workspaces/index.md)
+
+## Features
+
+- [Build backend](https://docs.astral.sh/uv/concepts/build-backend/index.md)
+- [Caching](https://docs.astral.sh/uv/concepts/cache/index.md)
+- [Configuration files](https://docs.astral.sh/uv/concepts/configuration-files/index.md)
+- [Package indexes](https://docs.astral.sh/uv/concepts/indexes/index.md)
+- [Preview features](https://docs.astral.sh/uv/concepts/preview/index.md)
+- [Python versions](https://docs.astral.sh/uv/concepts/python-versions/index.md)
+- [Resolution](https://docs.astral.sh/uv/concepts/resolution/index.md)
+- [Tools](https://docs.astral.sh/uv/concepts/tools/index.md)
+- [Authentication](https://docs.astral.sh/uv/concepts/authentication/index.md)
+
+## The pip interface
+
+- [Compatibility with pip](https://docs.astral.sh/uv/pip/compatibility/index.md)
+- [Locking environments](https://docs.astral.sh/uv/pip/compile/index.md)
+- [Declaring dependencies](https://docs.astral.sh/uv/pip/dependencies/index.md)
+- [Using environments](https://docs.astral.sh/uv/pip/environments/index.md)
+- [Inspecting environments](https://docs.astral.sh/uv/pip/inspection/index.md)
+- [Managing packages](https://docs.astral.sh/uv/pip/packages/index.md)
+
+## Reference
+
+- [Commands](https://docs.astral.sh/uv/reference/cli/index.md)
+- [Environment variables](https://docs.astral.sh/uv/reference/environment/index.md)
+- [Installer options](https://docs.astral.sh/uv/reference/installer/index.md)
+- [Settings](https://docs.astral.sh/uv/reference/settings/index.md)
+- [Storage](https://docs.astral.sh/uv/reference/storage/index.md)
+
