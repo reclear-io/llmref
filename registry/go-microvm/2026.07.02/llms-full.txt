@@ -1,0 +1,3159 @@
+# Install libkrun development headers
+
+Source: https://github.com/stacklok/go-microvm/blob/main/README.md
+
+<div align="center">
+  <img src="assets/go-microvm.png" alt="go-microvm mascot" width="250" />
+
+  <h1>go-microvm</h1>
+
+  <p><strong>Run OCI container images as microVMs with libkrun.</strong></p>
+
+  <p>
+    <a href="https://github.com/stacklok/go-microvm/actions/workflows/ci.yaml"><img src="https://github.com/stacklok/go-microvm/actions/workflows/ci.yaml/badge.svg" alt="CI status" /></a>
+    <a href="https://pkg.go.dev/github.com/stacklok/go-microvm"><img src="https://pkg.go.dev/badge/github.com/stacklok/go-microvm.svg" alt="Go Reference" /></a>
+    <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="License: Apache-2.0" /></a>
+    <a href="https://goreportcard.com/report/github.com/stacklok/go-microvm"><img src="https://goreportcard.com/badge/github.com/stacklok/go-microvm" alt="Go Report Card" /></a>
+  </p>
+
+  <p>
+    <a href="#quick-start">Quick Start</a> &middot;
+    <a href="#architecture">Architecture</a> &middot;
+    <a href="docs/ARCHITECTURE.md">Docs</a> &middot;
+    <a href="#contributing">Contributing</a> &middot;
+    <a href="#license">License</a>
+  </p>
+</div>
+
+> [!WARNING]
+> **Experimental** -- go-microvm is under active development. APIs, configuration
+> formats, and behavior may change without notice between releases. It is not
+> yet recommended for production use.
+
+---
+
+go-microvm is a Go library and runner binary that turns any OCI container image
+into a lightweight virtual machine. It pulls the image, flattens its layers
+into a rootfs, configures in-process networking, and boots the result using
+[libkrun](https://github.com/containers/libkrun) -- all in a single function
+call.
+
+You would use go-microvm when you need stronger isolation than containers provide
+but want to keep the OCI image workflow you already have. The library handles
+image caching, preflight validation, port forwarding, virtio-fs mounts, and
+process lifecycle so you can focus on what runs inside the VM.
+
+## Table of Contents
+
+- [Prerequisites](#prerequisites)
+- [Quick Start](#quick-start)
+- [Advanced Usage](#advanced-usage)
+- [Package Overview](#package-overview)
+- [Build](#build)
+- [Architecture](#architecture)
+- [Security Model](#security-model)
+- [Troubleshooting](#troubleshooting)
+- [Contributing](#contributing)
+- [License](#license)
+
+## Prerequisites
+
+go-microvm requires hardware virtualization support and a few system packages.
+
+### Linux -- Fedora
+
+```bash
+# Install libkrun development headers
+sudo dnf install libkrun-devel
+
+# Ensure your user has KVM access
+sudo usermod -aG kvm $USER
+# Log out and back in for the group change to take effect
+```
+
+### Linux -- Ubuntu / Debian
+
+libkrun is not yet packaged for Debian-based distributions. You must build it
+from source:
+
+```bash
+# Install build dependencies
+sudo apt install build-essential libssl-dev pkg-config python3 patchelf
+
+# Clone and build libkrun
+git clone https://github.com/containers/libkrun.git
+cd libkrun
+make
+sudo make install
+sudo ldconfig
+
+# Ensure your user has KVM access
+sudo usermod -aG kvm $USER
+```
+
+### macOS (Apple Silicon)
+
+```bash
+# Install libkrun via Homebrew
+brew tap slp/krun
+brew trust slp/krun
+brew install libkrun libkrunfw
+
+# Or build from source:
+git clone https://github.com/containers/libkrun.git
+cd libkrun
+make
+sudo make install
+```
+
+On macOS, Hypervisor.framework provides hardware virtualization and is available
+on all supported Apple Silicon Macs. No `/dev/kvm` equivalent is needed.
+
+### All Platforms -- Verify KVM Access (Linux)
+
+```bash
+# Check that /dev/kvm exists and is accessible
+ls -la /dev/kvm
+
+# If you get "permission denied", add your user to the kvm group:
+sudo usermod -aG kvm $USER
+# Then log out and log back in.
+
+# Verify KVM modules are loaded
+lsmod | grep kvm
+# If empty, load them:
+sudo modprobe kvm kvm_intel   # Intel CPUs
+sudo modprobe kvm kvm_amd     # AMD CPUs
+```
+
+### Go Toolchain
+
+go-microvm requires **Go 1.26** or later. The library packages (everything
+except `krun` and `go-microvm-runner`) do not require CGO and compile with
+`CGO_ENABLED=0`. The runner binary requires `CGO_ENABLED=1` and `libkrun-devel`.
+
+## Quick Start
+
+```go
+package main
+
+import (
+    "context"
+    "log"
+
+    "github.com/stacklok/go-microvm"
+)
+
+func main() {
+    ctx := context.Background()
+
+    vm, err := microvm.Run(ctx, "alpine:latest",
+        microvm.WithPorts(microvm.PortForward{Host: 8080, Guest: 80}),
+    )
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer vm.Stop(ctx)
+
+    info, _ := vm.Status(ctx)
+    log.Printf("VM %s running (id %s)", info.Name, info.ID)
+
+    // The VM is now serving on localhost:8080.
+    // Block until interrupted, or integrate with your own lifecycle.
+    select {}
+}
+```
+
+`microvm.Run` executes the full pipeline: preflight checks, OCI image pull,
+layer extraction, rootfs caching, networking setup, subprocess spawn, and
+post-boot hooks. It returns a `*VM` handle that you use to query status, stop,
+or remove the VM.
+
+## Advanced Usage
+
+For appliance-style deployments, go-microvm exposes hooks and overrides at every
+stage of the pipeline:
+
+```go
+package main
+
+import (
+    "context"
+    "os"
+    "path/filepath"
+
+    "github.com/stacklok/go-microvm"
+    "github.com/stacklok/go-microvm/hypervisor/libkrun"
+    "github.com/stacklok/go-microvm/image"
+    "github.com/stacklok/go-microvm/preflight"
+    "github.com/stacklok/go-microvm/ssh"
+)
+
+func main() {
+    ctx := context.Background()
+
+    vm, err := microvm.Run(ctx, "my-appliance:latest",
+        // Name the VM (defaults to "go-microvm").
+        microvm.WithName("my-appliance"),
+
+        // Configure VM resources.
+        // vCPUs default to 1, memory defaults to 512 MiB.
+        // Stock libkrunfw caps vCPUs at 8.
+        microvm.WithCPUs(4),
+        microvm.WithMemory(2048),
+
+        // Port forwards from host to guest.
+        microvm.WithPorts(
+            microvm.PortForward{Host: 443, Guest: 443},
+            microvm.PortForward{Host: 2222, Guest: 22},
+        ),
+
+        // Replace the OCI ENTRYPOINT/CMD with a custom init script.
+        // The command is written into /.krun_config.json and executed
+        // by libkrun's built-in init process (PID 1).
+        microvm.WithInitOverride("/sbin/my-init"),
+
+        // Inject files into the rootfs before boot.
+        // Hooks run after image extraction but before .krun_config.json
+        // is written, so they can modify anything in the filesystem.
+        microvm.WithRootFSHook(func(rootfs string, cfg *image.OCIConfig) error {
+            return os.WriteFile(
+                filepath.Join(rootfs, "etc", "my-app.conf"),
+                []byte("key=value\n"), 0o644,
+            )
+        }),
+
+        // Run setup after the VM process is alive.
+        // Common use: wait for SSH, push configuration, run health checks.
+        microvm.WithPostBoot(func(ctx context.Context, vm *microvm.VM) error {
+            keyPath := filepath.Join(vm.DataDir(), "id_ecdsa")
+            sshClient := ssh.NewClient("127.0.0.1", 2222, "root", keyPath)
+            return sshClient.WaitForReady(ctx)
+        }),
+
+        // Mount a host directory into the guest via virtio-fs.
+        microvm.WithVirtioFS(microvm.VirtioFSMount{
+            Tag: "shared", HostPath: "/srv/data",
+        }),
+
+        // Use a custom data directory for state, caches, and logs.
+        // Defaults to ~/.config/go-microvm or $GO_MICROVM_DATA_DIR.
+        microvm.WithDataDir("/var/lib/my-appliance"),
+
+        // Configure the libkrun backend with a specific runner binary
+        // and library search path. These options are backend-specific.
+        microvm.WithBackend(libkrun.NewBackend(
+            libkrun.WithRunnerPath("/usr/local/bin/go-microvm-runner"),
+            libkrun.WithLibDir("/opt/libs"),
+        )),
+
+        // Add custom preflight checks beyond the built-in defaults
+        // (KVM access, disk space, system resources, port availability).
+        microvm.WithPreflightChecks(
+            preflight.PortCheck(443, 2222),
+            preflight.Check{
+                Name:        "connectivity",
+                Description: "Verify registry is reachable",
+                Run: func(ctx context.Context) error {
+                    // Custom validation logic here.
+                    return nil
+                },
+                Required: true,
+            },
+        ),
+
+        // Provide a custom image cache location.
+        microvm.WithImageCache(image.NewCache("/var/cache/go-microvm")),
+    )
+    if err != nil {
+        panic(err)
+    }
+    defer vm.Stop(ctx)
+
+    // VM lifecycle methods:
+    //   vm.Stop(ctx)      -- SIGTERM, then SIGKILL after 30s
+    //   vm.Status(ctx)    -- returns VMInfo{Name, Active, ID, Ports}
+    //   vm.Remove(ctx)    -- stop + clean up
+    //   vm.Name()         -- VM name
+    //   vm.ID()           -- backend-specific identifier (e.g. PID string for libkrun)
+    //   vm.DataDir()      -- data directory path
+    //   vm.RootFSPath()   -- extracted rootfs path
+    //   vm.Ports()        -- configured port forwards
+}
+```
+
+### Complete Option Reference
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `WithName(s)` | VM name for identification | `"go-microvm"` |
+| `WithCPUs(n)` | Virtual CPUs (max 8 with stock libkrunfw, max 255 hard limit) | `1` |
+| `WithMemory(mib)` | RAM in MiB | `512` |
+| `WithPorts(...)` | TCP port forwards from host to guest | none |
+| `WithInitOverride(cmd...)` | Replace OCI ENTRYPOINT/CMD | OCI config |
+| `WithRootFSPath(path)` | Use pre-built rootfs directory, skip OCI image pull | none |
+| `WithRootFSHook(...)` | Modify rootfs before boot | none |
+| `WithPostBoot(...)` | Run logic after VM process starts | none |
+| `WithNetProvider(p)` | Replace default runner-side networking with a custom provider | runner-side vnet |
+| `WithFirewallRules(...)` | Firewall rules for frame-level packet filtering | none |
+| `WithFirewallDefaultAction(action)` | Default firewall action when no rule matches | `Allow` |
+| `WithPreflightChecker(c)` | Replace entire preflight checker | platform defaults |
+| `WithPreflightChecks(...)` | Add custom pre-boot checks | KVM + resources |
+| `WithVirtioFS(...)` | Host directory mounts via virtio-fs | none |
+| `WithDataDir(p)` | State, cache, and log directory | `~/.config/go-microvm` |
+| `WithCleanDataDir()` | Remove existing data dir contents before boot | disabled |
+| `WithEgressPolicy(p)` | Restrict outbound traffic to allowed DNS hostnames | none |
+| `WithImageCache(c)` | Custom image cache instance | `$dataDir/cache/` |
+| `WithImageFetcher(f)` | Custom image fetcher for OCI retrieval | local-then-remote |
+| `WithLogLevel(n)` | libkrun log verbosity (0=off, 1=error, ..., 5=trace) | `0` |
+| `WithBackend(b)` | Hypervisor backend (e.g. `libkrun.NewBackend(...)`) | libkrun |
+
+## Package Overview
+
+| Package | CGO? | Description |
+|---------|------|-------------|
+| `microvm` (root) | No | Top-level API: `Run()`, `VM` type, functional options, hook types |
+| `hypervisor` | No | `Backend` and `VMHandle` interfaces, `VMConfig`, `InitConfig` types |
+| `hypervisor/libkrun` | No | libkrun backend: spawns go-microvm-runner subprocess, `WithRunnerPath`/`WithLibDir`/`WithSpawner` |
+| `image` | No | OCI image pull via `ImageFetcher`, layer flattening, rootfs extraction |
+| `image/disk` | No | Disk image download with decompression (gzip/bzip2/xz) |
+| `krun` | **Yes** | CGO bindings to libkrun C API (context, VM config, `StartEnter`) |
+| `hooks` | No | RootFS hook factories: `InjectAuthorizedKeys`, `InjectFile`, `InjectBinary`, `InjectEnvFile` |
+| `extract` | No | Binary bundle caching with SHA-256 versioning and cross-process locking |
+| `guest/*` | No | Guest-side boot orchestration, hardening, SSH server (Linux-only, `//go:build linux`) |
+| `net` | No | `Provider` interface and `Config`/`PortForward` types |
+| `net/firewall` | No | Frame-level packet filtering with stateful connection tracking |
+| `net/egress` | No | DNS-based egress policy: intercepts DNS, creates dynamic firewall rules |
+| `net/hosted` | No | Hosted `net.Provider` running VirtualNetwork in caller's process with HTTP services |
+| `net/topology` | No | Shared network topology constants (subnet, gateway, IPs, MTU) |
+| `preflight` | No | `Checker` interface, `Check` struct, built-in KVM/HVF and port checks |
+| `runner` | No | `Spawner` / `ProcessHandle` interfaces for managing the go-microvm-runner subprocess |
+| `runner/cmd/go-microvm-runner` | **Yes** | The runner binary (calls `krun.StartEnter`, never returns) |
+| `ssh` | No | ECDSA key generation and SSH client for guest communication |
+| `state` | No | flock-based state persistence with atomic JSON writes |
+| `rootfs` | No | Rootfs cloning with reflink (copy-on-write) support |
+| `internal/pathutil` | No | Path traversal validation for safe file operations |
+| `internal/xattr` | No | Extended attribute helpers for `override_stat` ownership mapping |
+
+Only `krun` and `runner/cmd/go-microvm-runner` require CGO and `libkrun-devel`.
+All other packages are pure Go and can be imported and tested with
+`CGO_ENABLED=0`.
+
+## Build
+
+go-microvm uses [Task](https://taskfile.dev/) as its build tool. Run
+`task --list` for all available commands.
+
+| Command | Description |
+|---------|-------------|
+| `task build-dev` | Build runner for development on Linux (requires system `libkrun-devel`, `CGO_ENABLED=1`) |
+| `task build-dev-darwin` | Build runner on macOS (requires Homebrew libkrun, signs with entitlements) |
+| `task build-runner` | Build runner + libs using builder container (no system libkrun needed) |
+| `task fetch-runtime` | Download pre-built runtime from GitHub Release |
+| `task fetch-firmware` | Download pre-built firmware from GitHub Release |
+| `task test` | Run all tests with race detector (`go test -v -race ./...`) |
+| `task test-coverage` | Run tests with coverage, generates `coverage.html` |
+| `task lint` | Run `golangci-lint` |
+| `task lint-fix` | Run linter and auto-fix issues |
+| `task fmt` | Format code (`go fmt` + `goimports`) |
+| `task tidy` | Run `go mod tidy` |
+| `task verify` | Run fmt, lint, and test in sequence (CI pipeline) |
+| `task version` | Print version, commit, and build date from git |
+| `task clean` | Remove `bin/`, `dist/`, and coverage files |
+
+### Testing Without CGO
+
+The library packages do not require CGO and can be validated separately:
+
+```bash
+# Test pure-Go packages only (no libkrun needed)
+CGO_ENABLED=0 go test $(go list ./... | grep -v krun | grep -v go-microvm-runner)
+
+# Vet pure-Go packages
+CGO_ENABLED=0 go vet $(go list ./... | grep -v krun | grep -v go-microvm-runner)
+```
+
+## Architecture
+
+go-microvm uses a **two-process model**:
+
+```
++---------------------------+         +---------------------------+
+|     Your application      |         |     go-microvm-runner       |
+|  (links go-microvm lib)   |  spawn  |  (CGO binary, links      |
+|                           |-------->|   libkrun)                |
+|  microvm.Run()           |  JSON   |                           |
+|                           |  config |  1. Parse Config (argv[1])|
+|  Pure Go, no CGO          |         |  2. krun.CreateContext()  |
+|                           |         |  3. SetVMConfig, SetRoot  |
+|  Monitors runner PID      |         |  4. AddNetUnixStream      |
+|  In-process networking    |         |  5. krun_start_enter()    |
+|  Runs hooks               |         |     (never returns)       |
++---------------------------+         +---------------------------+
+         |                                      |
+         |  SIGTERM / SIGKILL                    |  VM runs inside
+         +------------------------------------->|  this process
+```
+
+1. **Your application** links the go-microvm library (pure Go, no CGO). It pulls
+   the OCI image, configures networking, runs preflight checks, and spawns a
+   subprocess.
+
+2. **go-microvm-runner** is a small CGO binary that receives the VM configuration
+   as JSON in `argv[1]`. It calls libkrun's C API to configure the VM context,
+   then calls `krun_start_enter()` -- which **never returns** on success. The
+   calling process becomes the VM supervisor until the guest shuts down.
+
+This separation exists because `krun_start_enter()` takes over the process. If
+it were called from your application directly, you would lose control of the
+Go runtime.
+
+### OCI-to-VM Pipeline
+
+```
+  Pull image (crane)
+       |
+  Flatten layers (mutate.Extract)
+       |
+  Extract to rootfs directory (with security checks)
+       |
+  Run rootfs hooks (optional, caller-provided)
+       |
+  Write /.krun_config.json
+       |
+  Start networking (in-process vnet)
+       |
+  Spawn go-microvm-runner subprocess
+       |
+  Runner calls krun_start_enter()
+       |
+  Run post-boot hooks (optional, caller-provided)
+```
+
+### Networking
+
+```
++-------------------+     Unix socket      +-------------------+
+|   Host machine    | (SOCK_STREAM, 4-byte |   Guest VM        |
+|                   |  BE length-prefix)   |                   |
+|  VirtualNetwork ------>  virtio-net  -------> eth0            |
+|  (in-process)     |                      |  192.168.127.2    |
+|  192.168.127.1    |                      |                   |
+|                   |                      |  DHCP from        |
+|  Port forwards:   |                      |  VirtualNetwork   |
+|  localhost:8080 --|--------------------->|  gateway           |
+|       -> guest:80 |                      |                   |
++-------------------+                      +-------------------+
+```
+
+By default, the runner creates an in-process VirtualNetwork (gvisor-tap-vsock)
+providing a virtual network (192.168.127.0/24), DHCP, DNS, and TCP port
+forwarding. For advanced use cases, `WithNetProvider()` moves the network stack
+to the caller's process -- the `net/hosted` package provides a ready-made
+provider that also supports HTTP services on the gateway IP. An optional
+frame-level firewall with stateful connection tracking can be enabled via
+`WithFirewallRules()`. See [docs/NETWORKING.md](docs/NETWORKING.md) for a
+deep dive.
+
+### Extension Points
+
+- **`hypervisor.Backend`** -- pluggable hypervisor backend (default: libkrun)
+- **`net.Provider`** -- replace default in-process networking
+- **`preflight.Checker`** -- add custom pre-boot validations
+- **`RootFSHook`** -- modify the rootfs before VM boot
+- **`PostBootHook`** -- run logic after the VM process is confirmed alive
+- **`WithInitOverride`** -- replace the OCI ENTRYPOINT/CMD entirely
+- **`WithEgressPolicy`** -- restrict outbound traffic to allowed DNS hostnames
+
+For a detailed architecture walkthrough, see
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+## Security Model
+
+### Guest-VMM Trust Boundary
+
+libkrun runs the guest and VMM in the same process and security context. The
+microVM provides hardware-level isolation via KVM (Linux) or
+Hypervisor.framework (macOS), but the VMM itself is not sandboxed from the
+host process. This is the same model used by krunvm and crun+libkrun. Treat
+the VM as a stronger isolation boundary than containers but weaker than a fully
+sandboxed hypervisor like Firecracker.
+
+### Tar Extraction Security
+
+When extracting OCI image layers, go-microvm applies multiple defenses against
+malicious tar archives:
+
+- **Path traversal prevention**: `sanitizeTarPath` rejects absolute paths and
+  paths containing `..` components that would resolve outside the rootfs.
+- **Symlink traversal prevention**: `mkdirAllNoSymlink` creates directories one
+  component at a time and refuses to follow symlinks when creating parent
+  directories. `validateNoSymlinkLeaf` prevents writing through symlinks.
+- **Hardlink boundary enforcement**: hard links are validated to ensure both
+  source and target remain within the rootfs directory.
+- **Decompression bomb limit**: extraction is capped at 30 GiB via an
+  `io.LimitedReader` to prevent resource exhaustion.
+
+### Process Identity Verification
+
+When stopping a VM, the `runner.Process.IsAlive()` method sends signal 0 to the
+PID to verify the process exists before sending SIGTERM. This prevents sending
+signals to unrelated processes if the PID has been reused. The stop sequence
+uses SIGTERM first, then falls back to SIGKILL after a 30-second timeout.
+
+## Troubleshooting
+
+### VM Fails to Start
+
+```bash
+# 1. Check KVM availability (Linux)
+ls -la /dev/kvm
+# If missing: sudo modprobe kvm kvm_intel  (or kvm_amd)
+# If permission denied: sudo usermod -aG kvm $USER
+
+# 2. Check console output for guest-side errors
+cat ~/.config/go-microvm/console.log
+
+# 3. Check runner stderr for host-side errors
+cat ~/.config/go-microvm/vm.log
+
+# 4. Verify the runner binary is available
+which go-microvm-runner
+# Or check next to your binary
+```
+
+### Image Pull Fails
+
+```bash
+# Check registry connectivity
+crane manifest alpine:latest
+
+# Check Docker/Podman auth for private registries
+cat ~/.docker/config.json
+
+# Try pulling manually to see detailed errors
+crane pull alpine:latest /tmp/test.tar
+```
+
+### Port Conflicts
+
+```bash
+# Check which process is using a port
+ss -tlnp | grep ':8080'
+
+# Or use the go-microvm preflight check directly:
+# microvm.WithPreflightChecks(preflight.PortCheck(8080))
+```
+
+### macOS-Specific Issues
+
+- The runner binary must be code-signed with three entitlements (hypervisor,
+  disable-library-validation, allow-dyld-environment-variables). The
+  `task build-dev-darwin` command handles signing automatically.
+- If using bundled libraries, set `DYLD_LIBRARY_PATH` (not `LD_LIBRARY_PATH`).
+  The `libkrun.WithLibDir` backend option handles this for the runner subprocess.
+- libkrun internally calls `dlopen` with versioned filenames (e.g.,
+  `libkrunfw.5.dylib`). If you see "library not loaded" errors, ensure the
+  versioned dylib names are present, not just unversioned symlinks.
+- See [docs/MACOS.md](docs/MACOS.md) for details on filesystem permissions
+  (virtiofs xattr), guest networking differences, and troubleshooting.
+
+## Contributing
+
+Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for
+development setup, build commands, code conventions, and the workflow for
+submitting changes.
+
+## License
+
+Apache 2.0 -- see [LICENSE](LICENSE).
+
+---
+
+# go-microvm
+
+Source: https://github.com/stacklok/go-microvm/blob/main/CLAUDE.md
+
+# go-microvm
+
+Go library + runner binary for running OCI container images as microVMs via libkrun.
+Two-process model: pure-Go library spawns a CGO runner subprocess. Module: `github.com/stacklok/go-microvm`.
+
+## Commands
+
+```bash
+task build-dev            # Build runner (requires libkrun-devel, Linux)
+task build-dev-darwin     # Build runner (macOS, requires Homebrew libkrun, signs entitlements)
+task build-runner         # Build runner + libs using builder container (no system libkrun needed)
+task fetch-runtime        # Download pre-built runtime from GitHub Release
+task fetch-firmware       # Download pre-built firmware from GitHub Release
+task builder-image-build  # Build the builder container image locally
+task test                 # go test -v -race ./...
+task test-nocgo           # go test excluding CGO packages (used by CI)
+task build-nocgo          # Verify compilation of pure Go packages
+task lint                 # golangci-lint run ./...
+task lint-fix             # Auto-fix lint issues
+task fmt                  # go fmt + goimports
+task verify               # fmt + lint + test (CI pipeline)
+task tidy                 # go mod tidy
+task package-runtime      # Package runtime tarball for release
+task package-firmware     # Package firmware tarball for release
+task clean                # Remove bin/, dist/, and coverage files
+```
+
+Run a single test: `go test -v -race -run TestName ./path/to/package`
+
+macOS dev setup: `brew tap slp/krun && brew trust slp/krun && brew install libkrun libkrunfw` (see `docs/MACOS.md` for details)
+
+## Architecture
+
+Entry point: `microvm.go:Run()` orchestrates the full pipeline (preflight, pull, hooks, config, net, spawn, post-boot). Config via functional options in `options.go`. Returns a `*VM` handle (`vm.go`).
+
+**CGO boundary**: Only `krun/` and `runner/cmd/go-microvm-runner/` use CGO. Everything else is pure Go. The runner binary is sacrificial -- `krun_start_enter()` never returns, so it runs in a detached subprocess.
+
+**Key subsystems**: `hypervisor/` (Backend abstraction + libkrun impl), `image/` (OCI pull + cache), `runner/` (subprocess spawning), `net/` (Provider interface + firewall + hosted mode + egress policy + topology constants), `guest/` (guest-side boot orchestration, hardening, SSH server), `hooks/` (RootFS hook factories for key injection, file injection), `extract/` (binary bundle caching), `preflight/` (platform checks via build tags), `ssh/` (keygen + client), `state/` (flock-based JSON persistence), `internal/` (pathutil, procutil).
+
+## Things That Will Bite You
+
+- **CGO boundary is strict**: Only `krun/` and `runner/cmd/go-microvm-runner/` use CGO. Every other package MUST stay `CGO_ENABLED=0`. Never import `krun` from a non-CGO package.
+- **Runner config is duplicated**: `runner.Config` in `runner/config.go` and a duplicate `Config` struct in `runner/cmd/go-microvm-runner/main.go`. When adding a field, update BOTH structs with the same JSON tag, then handle it in `runVM()`.
+- **`krun_start_enter()` never returns**: It calls `exit()` when the guest shuts down. That's why we need the two-process model -- the runner process is sacrificial.
+- **Platform build tags**: Preflight checks, resource checks, and some net code use `//go:build linux` or `//go:build darwin`. Each platform goes in a separate file. macOS preflight checks verify `kern.hv_support` sysctl and use `hw.memsize`/`syscall.Statfs` for resources.
+- **Entitlements required on macOS**: `assets/entitlements.plist` has three entitlements: `com.apple.security.hypervisor`, `com.apple.security.cs.disable-library-validation`, and `com.apple.security.cs.allow-dyld-environment-variables` (needed because the hypervisor entitlement activates hardened runtime, which strips DYLD_* vars). The `task build-dev-darwin` command signs automatically.
+- **CGO Homebrew paths**: `krun/context.go` CGO directives include `-L/opt/homebrew/lib` and `-L/usr/local/lib` for macOS. The linker ignores nonexistent paths.
+- **Tests excluding CGO packages**: When CGO isn't available, exclude krun: `CGO_ENABLED=0 go test $(go list ./... | grep -v krun | grep -v go-microvm-runner)`
+- **Functional options pattern**: All public config uses `With*` constructors applying to unexported `config` struct via `optionFunc`. Follow the existing pattern in `options.go` exactly.
+- **Backend abstraction**: `WithRunnerPath`, `WithLibDir`, and `WithSpawner` are NOT on the top-level `microvm` package. They live in `hypervisor/libkrun` as backend-specific options. Use `microvm.WithBackend(libkrun.NewBackend(libkrun.WithRunnerPath(...)))`. Similarly, `VM.PID()` is gone; use `VM.ID()` (returns string).
+
+## Conventions
+
+- **SPDX headers required**: Every `.go` and `.yaml` file needs `// SPDX-FileCopyrightText: Copyright 2025 Stacklok, Inc.` and `// SPDX-License-Identifier: Apache-2.0` (use `#` for YAML).
+- Use `log/slog` exclusively -- no `fmt.Println` or `log.Printf` in library code.
+- Wrap errors with `fmt.Errorf("context: %w", err)` forming readable chains.
+- Prefer table-driven tests. Test files go alongside the code they test.
+- When adding a new package, include a `doc.go` with SPDX header and ensure it doesn't import `krun`.
+
+## Commit Guidelines
+
+- Imperative mood, capitalize, no trailing period, limit subject to 50 chars
+- IMPORTANT: Never use `git add -A`. Stage specific files only.
+
+## Verification
+
+After any code change:
+```bash
+task fmt && task lint    # Format and lint
+task test                # Full test suite with race detector
+```
+
+After modifying CGO-free packages only:
+```bash
+CGO_ENABLED=0 go vet $(go list ./... | grep -v krun | grep -v go-microvm-runner)
+```
+
+When tests fail, fix the implementation, not the tests.
+
+## Reference Docs
+
+Read these on demand when working on related subsystems:
+- `docs/ARCHITECTURE.md` -- Deep technical architecture, two-process model, extension points
+- `docs/SECURITY.md` -- Trust boundaries, guest escape analysis, hardening
+- `docs/NETWORKING.md` -- Networking modes (runner-side, hosted), firewall, wire protocol
+- `docs/MACOS.md` -- macOS support, code signing, Hypervisor.framework
+- `docs/TROUBLESHOOTING.md` -- Common issues, log files, resource limits
+
+---
+
+# Contributing to go-microvm
+
+Source: https://github.com/stacklok/go-microvm/blob/main/CONTRIBUTING.md
+
+# Contributing to go-microvm
+
+## Prerequisites
+
+- **Go 1.26+**
+- **[Task](https://taskfile.dev/)** -- `go install github.com/go-task/task/v3/cmd/task@latest`
+- **golangci-lint** -- `go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest`
+- **goimports** -- `go install golang.org/x/tools/cmd/goimports@latest`
+
+For CGO builds (runner binary), you also need libkrun headers:
+
+| Platform | Install |
+|----------|---------|
+| Fedora | `sudo dnf install libkrun-devel` |
+| macOS | `brew tap slp/krun && brew trust slp/krun && brew install libkrun libkrunfw` |
+| Any Linux | `task build-runner` (uses builder container, no system libkrun needed) |
+
+## Development Workflow
+
+```bash
+# 1. Make your changes
+
+# 2. Format and lint
+task fmt
+task lint
+
+# 3. Run tests
+task test-nocgo          # Pure Go packages (no libkrun needed)
+task test                # All packages (requires libkrun-devel)
+
+# 4. Build the runner (pick one)
+task build-dev           # Linux with system libkrun-devel
+task build-dev-darwin    # macOS with Homebrew libkrun (auto-signs)
+task build-runner        # Linux via builder container (no system deps)
+```
+
+`task verify` runs fmt, lint, and test in sequence as a pre-push check.
+
+## Task Reference
+
+Run `task --list` for the full list. Key tasks for development:
+
+| Task | What it does |
+|------|-------------|
+| `task test` | Run all tests with race detector |
+| `task test-nocgo` | Run tests excluding CGO packages |
+| `task lint` | Run golangci-lint |
+| `task fmt` | go fmt + goimports |
+| `task verify` | fmt + lint + test (pre-push check) |
+| `task build-dev` | Build runner binary (Linux, requires libkrun-devel) |
+| `task build-dev-darwin` | Build runner binary (macOS, requires Homebrew libkrun) |
+| `task build-runner` | Build runner via builder container (no system deps) |
+| `task build-nocgo` | Verify pure Go packages compile |
+| `task clean` | Remove bin/, dist/, and coverage files |
+
+## Code Conventions
+
+- **SPDX headers** on every `.go` and `.yaml` file
+- **`log/slog`** for logging (no `fmt.Println` or `log.Printf`)
+- **Error wrapping**: `fmt.Errorf("context: %w", err)`
+- **Table-driven tests** with testify
+- **Functional options**: follow the `With*` pattern in `options.go`
+- **CGO boundary**: only `krun/` and `runner/cmd/go-microvm-runner/` use CGO.
+  Never import `krun` from other packages.
+
+## Commit Guidelines
+
+- Imperative mood, capitalized, no trailing period
+- Limit subject line to 50 characters
+- Stage specific files only (never `git add -A`)
+
+## CI
+
+CI runs automatically on push and PR. See [docs/CI.md](docs/CI.md) for
+details on the pipeline structure and the builder image dependency chain.
+
+The key thing to know: most CI jobs run pure Go tests and lint. The Linux
+CGO build depends on a pre-built builder container image. If you're only
+changing pure Go code, all jobs should pass without any special setup.
+
+---
+
+# go-microvm Architecture
+
+Source: https://github.com/stacklok/go-microvm/blob/main/docs/ARCHITECTURE.md
+
+# go-microvm Architecture
+
+This document describes the internal architecture of go-microvm: how it turns an
+OCI container image into a running microVM, the two-process model, networking,
+state management, security measures, and extension points.
+
+## Table of Contents
+
+- [The Two-Process Model](#the-two-process-model)
+- [Hypervisor Backend Abstraction](#hypervisor-backend-abstraction)
+- [OCI Image Pipeline](#oci-image-pipeline)
+- [Image Caching](#image-caching)
+- [.krun_config.json](#krun_configjson)
+- [Networking](#networking)
+- [Extension Points](#extension-points)
+- [Preflight Check System](#preflight-check-system)
+- [Guest-Side Packages](#guest-side-packages)
+- [State Management](#state-management)
+- [Security Model](#security-model)
+- [SSH Utilities](#ssh-utilities)
+
+## The Two-Process Model
+
+libkrun's `krun_start_enter()` function takes over the calling process. On
+success it never returns -- the process becomes the VM supervisor and
+eventually calls `exit()` when the guest shuts down. This means we cannot call
+it from a normal Go application without losing the Go runtime entirely.
+
+go-microvm solves this with two processes:
+
+```
++----------------------------------+       +----------------------------------+
+|        Your application          |       |        go-microvm-runner           |
+|   (links go-microvm library)     |       |   (CGO binary, links libkrun)   |
+|                                  |       |                                  |
+|   1. Preflight checks            | spawn |   1. Parse Config from argv[1]   |
+|   2. Pull & cache OCI image      |------>|   2. Validate (rootfs, vCPUs>0)  |
+|   3. Extract layers to rootfs    | JSON  |   3. krun.CreateContext()         |
+|   4. Run rootfs hooks            | config|   4. SetVMConfig(vCPUs, RAM)      |
+|   5. Write .krun_config.json     |       |   5. SetRoot(rootfsPath)          |
+|   6. Start networking (if custom)|       |   6. Setup networking             |
+|   7. Spawn go-microvm-runner       |       |   7. AddVirtioFS (for each mount) |
+|   8. Run post-boot hooks         |       |   8. SetConsoleOutput(logPath)    |
+|   9. Return *VM handle           |       |   9. krun_start_enter()           |
+|                                  |       |      (NEVER RETURNS ON SUCCESS)   |
+|   Pure Go, no CGO                |       |                                  |
+|   Monitors runner PID            |       |   Process becomes VM supervisor   |
++----------------------------------+       +----------------------------------+
+         |                                              |
+         |  SIGTERM (graceful) / SIGKILL (30s timeout)  |
+         +--------------------------------------------->|
+```
+
+### Library Side (your application)
+
+The library is pure Go with no CGO dependency. It performs the following steps
+in `microvm.Run()`:
+
+1. **Preflight checks** -- Runs all registered `preflight.Checker` validations.
+   Built-in checks verify KVM/HVF access, disk space, and system resources.
+   Custom checks can be added via `WithPreflightChecks()`. Required check
+   failures abort the pipeline; non-required failures log warnings.
+
+2. **Image pull and cache** -- Uses an `ImageFetcher` interface to retrieve the
+   OCI image. The default fetcher tries the local Docker/Podman daemon first,
+   then falls back to pulling from a remote registry. Callers can provide a
+   custom fetcher via `WithImageFetcher()`. After fetching, computes the
+   manifest digest for cache lookup. On cache miss, flattens layers via
+   `mutate.Extract()` and extracts the tar stream to a temporary directory with
+   full security checks.
+
+3. **Rootfs hooks** -- Runs caller-provided `RootFSHook` functions in
+   registration order. Each receives the rootfs path and parsed `OCIConfig`.
+
+4. **Write .krun_config.json** -- Constructs `KrunConfig` from the OCI image
+   config (Entrypoint, Cmd, Env, WorkingDir), applying `WithInitOverride` if
+   set. Writes the JSON file to `/.krun_config.json` in the rootfs.
+
+5. **Start networking** -- Networking follows one of two paths:
+   - **Default (no `WithNetProvider`)**: Port forwards are passed to the
+     runner via `runner.Config`. The runner creates an in-process
+     VirtualNetwork (gvisor-tap-vsock) connected via a socketpair.
+     Networking lives in the runner process alongside the VM.
+   - **Custom provider (`WithNetProvider`)**: Calls `net.Provider.Start()`
+     which creates the network stack in the caller's process, starts a
+     Unix socket listener, and returns once ready. The socket path is
+     passed to the runner for `krun_add_net_unixstream`.
+
+   The `net/hosted` package provides a ready-made hosted provider that
+   runs the VirtualNetwork in the caller's process and supports HTTP
+   services on the gateway IP.
+
+6. **Start VM via backend** -- The `hypervisor.Backend` handles rootfs
+   preparation and VM launch. The default libkrun backend serializes
+   `runner.Config` as JSON and spawns `go-microvm-runner` as a detached
+   subprocess (`setsid` for new session). The runner is located by
+   searching: explicit path, system PATH, then next to the calling
+   executable. Custom backends can be provided via `WithBackend()`.
+
+7. **Post-boot hooks** -- Runs caller-provided `PostBootHook` functions. If
+   any hook fails, the VM is stopped and the error is returned.
+
+### Runner Side (go-microvm-runner)
+
+The runner binary (`runner/cmd/go-microvm-runner/main.go`) is intentionally
+minimal. It is a thin translation layer between JSON config and the libkrun
+C API:
+
+1. Parse the JSON config from `os.Args[1]`
+2. Validate: rootfs path exists and is a directory, vCPUs > 0, RAM > 0
+3. Create a libkrun context via `krun.CreateContext()`
+4. Configure vCPUs and RAM via `SetVMConfig()`
+5. Set the root filesystem via `SetRoot()`
+6. Set up networking:
+   - If `NetSockPath` is set (custom provider), connect via `AddNetUnixStream()`
+   - If `PortForwards` is set (default path), create an in-process
+     VirtualNetwork with a socketpair and pass the VM-side fd to libkrun
+7. Add virtio-fs mounts via `AddVirtioFS()` (for each mount)
+8. Set console output via `SetConsoleOutput()` (if log path provided)
+9. Call `krun_start_enter()` which takes over the process
+
+The runner does NOT call `SetExec()`. Instead, libkrun's built-in init process
+(PID 1 in the guest) reads `/.krun_config.json` from the rootfs to determine
+what program to execute. This is the same mechanism used by krunvm.
+
+### Runner Interfaces
+
+The runner package provides two interfaces for testability and extensibility:
+
+```go
+// ProcessHandle abstracts a running process.
+type ProcessHandle interface {
+    Stop(ctx context.Context) error
+    IsAlive() bool
+    PID() int
+}
+
+// Spawner abstracts subprocess creation.
+type Spawner interface {
+    Spawn(ctx context.Context, cfg Config) (ProcessHandle, error)
+}
+```
+
+`DefaultSpawner` is the production implementation that calls `SpawnProcess()`.
+The libkrun backend accepts a custom spawner via `libkrun.WithSpawner()` for
+testing or to customize how the runner subprocess is launched.
+
+## Hypervisor Backend Abstraction
+
+The `hypervisor` package defines the `Backend` interface that decouples go-microvm
+from any specific hypervisor implementation:
+
+```go
+type Backend interface {
+    Name() string
+    PrepareRootFS(ctx context.Context, rootfsPath string, initCfg InitConfig) (string, error)
+    Start(ctx context.Context, cfg VMConfig) (VMHandle, error)
+}
+
+type VMHandle interface {
+    Stop(ctx context.Context) error
+    IsAlive() bool
+    ID() string
+}
+```
+
+### libkrun Backend
+
+The default backend (`hypervisor/libkrun`) implements `Backend` by:
+
+1. **PrepareRootFS**: Writes `/.krun_config.json` to the rootfs from `InitConfig`
+2. **Start**: Converts `VMConfig` to `runner.Config`, spawns `go-microvm-runner`
+   via the `runner.Spawner` interface, and returns a `processHandle` wrapping
+   the subprocess
+
+The libkrun backend accepts its own options via `libkrun.NewBackend(opts...)`:
+
+| Option | Description |
+|--------|-------------|
+| `libkrun.WithRunnerPath(p)` | Path to go-microvm-runner binary |
+| `libkrun.WithLibDir(d)` | Directory for libkrun/libkrunfw shared libraries |
+| `libkrun.WithSpawner(s)` | Custom runner subprocess spawner (for testing) |
+
+### Custom Backends
+
+To support a different hypervisor, implement `hypervisor.Backend` and pass it
+via `microvm.WithBackend()`. The backend handles all hypervisor-specific logic
+while go-microvm handles OCI image management, networking, hooks, and lifecycle.
+
+For migration details from the older top-level `WithRunnerPath`/`WithLibDir`/
+`WithSpawner` options, see [MIGRATION-BACKEND-ABSTRACTION.md](MIGRATION-BACKEND-ABSTRACTION.md).
+
+## OCI Image Pipeline
+
+The pipeline converts an OCI container image into a booted microVM. Each step
+includes security measures where applicable.
+
+### Image Fetcher Interface
+
+Image retrieval is abstracted behind the `ImageFetcher` interface:
+
+```go
+type ImageFetcher interface {
+    Pull(ctx context.Context, ref string) (v1.Image, error)
+}
+```
+
+Three implementations are provided:
+
+| Fetcher | Description |
+|---------|-------------|
+| `RemoteFetcher` | Pulls from OCI registries via `go-containerregistry/remote`. Uses `authn.DefaultKeychain` for Docker/Podman credential stores. |
+| `DaemonFetcher` | Pulls from the local Docker/Podman daemon via its Unix socket. Useful for locally-built images. |
+| `FallbackFetcher` | Tries multiple fetchers in order; returns the first success. Errors are aggregated with `errors.Join`. |
+
+The default (when no `WithImageFetcher()` is set) is
+`NewLocalThenRemoteFetcher()`, which tries the daemon first, then falls
+back to remote registry pull.
+
+```
+Step 1: PULL
+  ImageFetcher.Pull(imageRef) with context support
+  Default: tries local Docker/Podman daemon, then remote registry
+  Supports Docker Hub, GHCR, quay.io, private registries
+  Uses ~/.docker/config.json for authentication
+       |
+Step 2: DIGEST
+  img.Digest() --> manifest digest (sha256:...)
+  Used as content-addressable cache key
+       |
+Step 3: CACHE CHECK
+  cache.Get(digest) --> check if directory exists
+  Hit?  --> return cached rootfs path + OCI config
+  Miss? --> continue to extraction
+       |
+Step 4: FLATTEN
+  mutate.Extract(img) --> single tar stream
+  Merges all image layers into one unified filesystem
+       |
+Step 5: EXTRACT
+  extractTar(reader, tmpDir) --> rootfs directory
+  Security checks at this step:
+    a. io.LimitedReader caps total extraction at 30 GiB
+    b. sanitizeTarPath() rejects absolute paths and ".." traversal
+    c. mkdirAllNoSymlink() refuses to follow symlinks when creating dirs
+    d. validateNoSymlinkLeaf() prevents writing through symlinks
+    e. Hardlink sources validated to stay within rootfs boundary
+    f. Unsupported entry types (char/block devices, fifos) are skipped
+       |
+Step 6: CACHE STORE
+  cache.Put(digest, tmpDir) --> atomic os.Rename to cache dir
+  If another process already cached this digest, discard our extraction
+       |
+Step 7: ROOTFS HOOKS
+  hook(rootfsPath, ociConfig) for each registered hook
+  Runs in registration order; any error aborts the pipeline
+       |
+Step 8: KRUN CONFIG
+  Write /.krun_config.json to rootfs:
+  {
+    "Cmd":        [...],     // from OCI or WithInitOverride
+    "Env":        [...],     // PATH default + OCI env vars
+    "WorkingDir": "/"        // from OCI or default "/"
+  }
+       |
+Step 9: NETWORKING
+  Default: port forwards passed to runner config (runner creates VirtualNetwork)
+  Custom provider: net.Provider.Start() in caller's process, socket path to runner
+       |
+Step 10: SPAWN
+  runner.Spawner.Spawn() --> go-microvm-runner subprocess
+  Detached (setsid), stdout/stderr redirected to vm.log
+       |
+Step 11: POST-BOOT
+  hook(ctx, vm) for each registered hook
+  Common: SSH wait, config push, health check
+```
+
+## Image Caching
+
+Images are cached by manifest digest under the data directory:
+
+```
+~/.config/go-microvm/cache/
+    sha256-abc123def456.../    <-- extracted rootfs for this digest
+    sha256-789012345678.../    <-- another cached image
+```
+
+### Cache Key
+
+The cache key is the manifest digest (e.g., `sha256:abc123...`). The colon is
+replaced with a hyphen for filesystem safety: `sha256-abc123...`.
+
+### Cache Lookup
+
+`cache.Get(digest)` checks if the directory exists via `os.Stat()`. If it
+exists and is a directory, the cache hit returns the path.
+
+### Cache Store
+
+`cache.Put(digest, tmpDir)` uses `os.Rename()` for atomicity. If two
+concurrent pulls for the same image race:
+1. Both extract to separate temporary directories
+2. The first to call `Rename` succeeds
+3. The second detects the destination already exists and discards its extraction
+   via `os.RemoveAll()`
+
+This ensures no partial writes and no corruption from concurrent access.
+
+### Cache Directory
+
+The cache directory defaults to `~/.config/go-microvm/cache/`. It can be
+customized via `WithDataDir()` (which sets the cache under `$dataDir/cache/`)
+or directly via `WithImageCache(image.NewCache("/custom/path"))`.
+
+## .krun_config.json
+
+libkrun's built-in init process reads `/.krun_config.json` from the root of
+the guest filesystem to determine what program to execute. go-microvm constructs
+this file from the OCI image config with optional overrides.
+
+### Format
+
+```json
+{
+  "Cmd": ["/bin/sh", "-c", "echo hello"],
+  "Env": [
+    "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    "HOME=/root"
+  ],
+  "WorkingDir": "/"
+}
+```
+
+### Field Resolution
+
+| Field | Source | Override |
+|-------|--------|---------|
+| `Cmd` | OCI Entrypoint + Cmd concatenated | `WithInitOverride(cmd...)` replaces entirely |
+| `Env` | Default `PATH` + OCI image `Env` | None (extend via rootfs hook) |
+| `WorkingDir` | OCI `WorkingDir`, or `/` if unset | None |
+
+### How libkrun Uses It
+
+1. libkrun's init process starts as PID 1 in the guest
+2. It reads `/.krun_config.json`
+3. It sets the environment variables from `Env`
+4. It changes to `WorkingDir`
+5. It executes `Cmd[0]` with `Cmd[1:]` as arguments
+
+This is the same mechanism used by krunvm and podman machine.
+
+## Networking
+
+go-microvm uses a userspace network stack powered by
+[gvisor-tap-vsock](https://github.com/containers/gvisor-tap-vsock). All VM
+traffic flows as Ethernet frames with no kernel networking between host and
+guest.
+
+There are two networking modes:
+
+- **Default (runner-side)**: When no `WithNetProvider()` is set, the runner
+  process creates an in-process VirtualNetwork connected to libkrun via a
+  socketpair. Port forwards are configured directly in the runner. This is
+  the simplest path -- no external process or socket needed.
+
+- **Hosted (caller-side)**: When `WithNetProvider()` is set, the network
+  stack runs in the caller's process and exposes a Unix socket that the
+  runner connects to. The `net/hosted` package provides a ready-made
+  implementation that also supports HTTP services on the gateway IP.
+
+The networking layer is abstracted behind the `net.Provider` interface,
+allowing alternative implementations. An optional frame-level firewall can
+be enabled via `WithFirewallRules()`.
+
+Network topology constants (subnet, gateway IP, guest IP, MAC, MTU) are
+centralized in the `net/topology` package and shared by both the runner
+and the hosted provider.
+
+For a thorough deep dive on the networking and firewall subsystem, see
+[docs/NETWORKING.md](NETWORKING.md).
+
+### Network Topology
+
+```
++---------------------------------------------------+
+|                   Host Machine                     |
+|                                                    |
+|  +---------------+    Unix socket   +-----------+  |
+|  | VirtualNetwork|---(SOCK_STREAM)->|  libkrun  |  |
+|  | (in-process)  |  4-byte BE len  |  virtio-  |  |
+|  |               |  prefix frames  |  net      |  |
+|  | Gateway:      |                 |           |  |
+|  | 192.168.127.1 |                 +-----------+  |
+|  |               |                      |         |
+|  | DHCP server   |                 +----v-----+   |
+|  | DNS server    |                 | Guest VM |   |
+|  | Port forwards |                 |          |   |
+|  +---------------+                 | eth0:    |   |
+|        |                           | 192.168. |   |
+|        |  Port forwards:           | 127.2    |   |
+|        |  localhost:8080           |          |   |
+|        +-----> guest:80            +----------+   |
+|        |  localhost:2222                          |
+|        +-----> guest:22                           |
++---------------------------------------------------+
+```
+
+### Network Details
+
+| Property | Value |
+|----------|-------|
+| Gateway | 192.168.127.1 (VirtualNetwork, in-process) |
+| Guest IP | 192.168.127.2 (DHCP assigned) |
+| Subnet | 192.168.127.0/24 |
+| Socket type | Unix domain, SOCK_STREAM |
+| Wire format | 4-byte big-endian length prefix + Ethernet frame |
+| DHCP | Built into VirtualNetwork |
+| DNS | Built into VirtualNetwork |
+| Port forwarding | TCP, host-to-guest only |
+
+### The net.Provider Interface
+
+```go
+type Provider interface {
+    // Start launches the network provider. Must block until ready.
+    Start(ctx context.Context, cfg Config) error
+
+    // SocketPath returns the Unix socket for virtio-net.
+    SocketPath() string
+
+    // Stop terminates the provider and cleans up.
+    Stop()
+}
+```
+
+`Config` contains:
+- `LogDir` -- directory for log files
+- `Forwards` -- slice of `PortForward{Host, Guest}` for TCP forwarding
+- `FirewallRules` -- optional packet filtering rules for frame-level filtering
+- `FirewallDefaultAction` -- default action when no rule matches (Allow or Deny)
+
+To replace the default runner-side networking with a different backend
+(e.g., passt, slirp4netns, a custom bridge, or the built-in hosted
+provider), implement this interface and pass it via
+`microvm.WithNetProvider()`. The `SocketPath()` return value is passed to
+the runner as the Unix socket path for `krun_add_net_unixstream`.
+
+### Network Topology Constants
+
+The `net/topology` package centralizes all network layout constants:
+
+| Constant | Value | Description |
+|----------|-------|-------------|
+| `Subnet` | `192.168.127.0/24` | Virtual network CIDR |
+| `GatewayIP` | `192.168.127.1` | Host-side gateway (VirtualNetwork) |
+| `GuestIP` | `192.168.127.2` | DHCP-assigned guest IP |
+| `GatewayMAC` | `5a:94:ef:e4:0c:ee` | Gateway MAC address |
+| `MTU` | `1500` | Maximum transmission unit |
+
+Both the runner's in-process networking and the hosted provider import
+these values to ensure a consistent topology.
+
+### Hosted Network Provider
+
+The `net/hosted` package implements a `net.Provider` that runs the
+VirtualNetwork in the caller's process rather than inside go-microvm-runner.
+This enables callers to access the VirtualNetwork directly -- for example,
+to create in-process TCP listeners via gonet that are reachable from the
+guest VM without opening real host sockets.
+
+```go
+p := hosted.NewProvider()
+vm, err := microvm.Run(ctx, image,
+    microvm.WithNetProvider(p),
+    microvm.WithPorts(microvm.PortForward{Host: sshPort, Guest: 22}),
+)
+// p.VirtualNetwork() is now available for gonet listeners.
+```
+
+#### HTTP Services
+
+`Provider.AddService()` registers HTTP handlers that listen inside the
+virtual network on the gateway IP (192.168.127.1). Services are started
+before the guest boots and are reachable from inside the VM:
+
+```go
+p := hosted.NewProvider()
+p.AddService(hosted.Service{Port: 4483, Handler: myHandler})
+vm, err := microvm.Run(ctx, image, microvm.WithNetProvider(p))
+// Guest can reach http://192.168.127.1:4483/
+```
+
+The hosted provider exposes a Unix socket (`hosted-net.sock` in the data
+directory) that go-microvm-runner connects to. When firewall rules are
+configured, a `firewall.Relay` is inserted between the runner connection
+and the VirtualNetwork to filter traffic. The relay is accessible via
+`Provider.Relay()` for metrics.
+
+## Extension Points
+
+```
+                    microvm.Run()
+                         |
+            +------------+------------+
+            |                         |
+     preflight.Checker          net.Provider (optional)
+     (KVM, ports, resources,    (hosted vnet,
+      disk space, custom)        + optional firewall)
+            |                         |
+            v                         v
+      Pull & Extract            Start networking
+      (via ImageFetcher)        (only if custom provider)
+            |                         |
+            v                         |
+      RootFSHook(s)                   |
+      (inject files, SSH keys,        |
+       TLS certs, config)             |
+            |                         |
+            v                         v
+      Write .krun_config.json   Socket ready
+      (WithInitOverride to            |
+       replace OCI CMD)               |
+            |                         |
+            +------------+------------+
+                         |
+                   Spawn runner
+                   (via Spawner interface;
+                    default: creates in-process
+                    VirtualNetwork if no
+                    custom provider)
+                         |
+                         v
+                  PostBootHook(s)
+                  (SSH wait, config push,
+                   health checks, service mesh)
+```
+
+### Preflight Checks
+
+Inject validation before any work begins:
+```go
+microvm.WithPreflightChecks(check1, check2)
+```
+
+### Rootfs Hooks
+
+Modify the extracted filesystem before boot:
+```go
+microvm.WithRootFSHook(func(rootfs string, cfg *image.OCIConfig) error {
+    // Write files, install keys, modify configs
+    return nil
+})
+```
+
+### Init Override
+
+Replace the OCI ENTRYPOINT/CMD:
+```go
+microvm.WithInitOverride("/sbin/my-init", "--flag")
+```
+
+### Network Provider
+
+Replace the default runner-side networking with a custom provider:
+```go
+microvm.WithNetProvider(myProvider)
+```
+
+The `net/hosted` package provides a built-in hosted provider that runs the
+VirtualNetwork in the caller's process:
+```go
+p := hosted.NewProvider()
+p.AddService(hosted.Service{Port: 4483, Handler: myHandler})
+microvm.WithNetProvider(p)
+// After Run(), p.VirtualNetwork() is available for gonet listeners.
+```
+
+### Post-Boot Hooks
+
+Run logic after the VM process is confirmed alive:
+```go
+microvm.WithPostBoot(func(ctx context.Context, vm *microvm.VM) error {
+    // Wait for SSH, push config, verify health
+    return nil
+})
+```
+
+## Preflight Check System
+
+The `preflight` package provides an extensible system for running pre-boot
+verification checks.
+
+### Core Types
+
+```go
+// Check represents a single preflight verification.
+type Check struct {
+    Name        string                          // Short identifier
+    Description string                          // Human-readable description
+    Run         func(ctx context.Context) error // Nil on success, error on failure
+    Required    bool                            // true = fatal, false = warning
+}
+
+// Checker runs preflight checks before VM creation.
+type Checker interface {
+    RunAll(ctx context.Context) error   // Run all checks, return error if any required fail
+    Register(check Check)              // Add a check
+}
+```
+
+### Built-in Checks
+
+| Check | Platform | Required | Description |
+|-------|----------|----------|-------------|
+| `kvm` | Linux | Yes | Verifies `/dev/kvm` exists, is a character device, and is read/write accessible. Error messages include remediation hints (modprobe commands, usermod). |
+| `cap-chown` | Linux | No | Verifies the process has `CAP_CHOWN` (or runs as root) so extracted rootfs files get correct ownership. Without it, guest processes may see permission errors. |
+| `disk-space` | Linux | No | Verifies at least 2.0 GB free disk space on the data directory filesystem. Walks up the directory tree to find an existing ancestor if the dir does not yet exist. |
+| `resources` | Linux | No | Verifies the host has at least 1 CPU core and 1.0 GiB RAM. |
+| `ports` | All | Yes | Verifies requested host ports are available for binding. Uses `ss` on Linux to identify the process holding a port. |
+
+On macOS, the `kvm`, `disk-space`, and `resources` checks are either no-ops
+or not registered. Hypervisor.framework is assumed available on Apple Silicon.
+
+### Execution
+
+`RunAll()` executes checks in registration order. Required check failures are
+collected into a combined error. Non-required failures are logged as warnings
+via `slog.Warn` but do not prevent the pipeline from proceeding.
+
+### Adding Custom Checks
+
+Pass checks via `WithPreflightChecks()`:
+
+```go
+microvm.Run(ctx, ref,
+    microvm.WithPreflightChecks(
+        preflight.PortCheck(8080, 2222),
+        preflight.Check{
+            Name:     "my-check",
+            Description: "Check something",
+            Run:      func(ctx context.Context) error { return nil },
+            Required: true,
+        },
+    ),
+)
+```
+
+Custom checks are appended to (not replacing) the built-in platform defaults.
+
+To replace the entire preflight checker (e.g., when the caller manages its own):
+```go
+microvm.WithPreflightChecker(preflight.NewEmpty())
+```
+
+## Guest-Side Packages
+
+The `guest/` directory contains Linux-only packages (`//go:build linux`) that
+run inside the guest VM, not on the host. These are used by custom init
+processes to orchestrate guest boot.
+
+| Package | Purpose |
+|---------|---------|
+| `guest/boot` | Orchestrates the guest boot sequence: mounts, networking, workspace, hardening, environment, SSH, capabilities. Functional options pattern for configuration. |
+| `guest/mount` | Handles essential filesystem mounts (devtmpfs, sysfs, procfs) and workspace mounts |
+| `guest/env` | Loads environment variables from `/.go-microvm/env.sh` |
+| `guest/netcfg` | Guest-side network configuration (DHCP, routes) |
+| `guest/harden` | VM kernel hardening: capability dropping (CAP_NET_ADMIN, etc.), CIS benchmark sysctls, `PR_SET_NO_NEW_PRIVS` |
+| `guest/reaper` | Zombie process reaping (init process duties) |
+| `guest/sshd` | Embedded SSH server implementation with session handling |
+
+### Supporting Packages
+
+| Package | Purpose |
+|---------|---------|
+| `hooks` | RootFS hook factories: `InjectAuthorizedKeys`, `InjectFile`, `InjectBinary`, `InjectEnvFile`. Uses `internal/pathutil` for path traversal validation. |
+| `extract` | Binary bundle caching with SHA-256 versioning, atomic extraction, and cross-process file locking. Used to cache and extract the go-microvm-runner binary and libraries. |
+| `image/disk` | Streaming disk image download with retry support and decompression (gzip, bzip2, xz). |
+
+## State Management
+
+The `state` package provides persistent VM state with file-based locking.
+
+### Directory Layout
+
+```
+~/.config/go-microvm/           (or $GO_MICROVM_DATA_DIR, or WithDataDir path)
+    go-microvm-state.json       <-- VM state (atomic JSON)
+    go-microvm-state.lock       <-- flock for exclusive access
+    cache/
+        sha256-abc123.../     <-- cached rootfs by digest
+        sha256-def456.../
+    console.log               <-- guest console output (kernel, init)
+    vm.log                    <-- go-microvm-runner stdout/stderr
+    hosted-net.sock           <-- networking Unix socket (only with hosted provider)
+```
+
+### State JSON Schema
+
+```json
+{
+  "version": 1,
+  "active": true,
+  "name": "my-vm",
+  "image": "alpine:latest",
+  "cpus": 2,
+  "memory_mb": 1024,
+  "pid": 12345,
+  "created_at": "2025-01-15T10:00:00Z"
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `version` | int | State file format version (currently 1) |
+| `active` | bool | Whether the VM is currently running |
+| `name` | string | VM name |
+| `image` | string | OCI image reference |
+| `cpus` | uint32 | Number of vCPUs |
+| `memory_mb` | uint32 | RAM in MiB |
+| `pid` | int | Runner process ID (0 if not running) |
+| `created_at` | RFC 3339 | When the state was first created |
+
+### Locking Protocol
+
+The `state.Manager` provides atomic load-and-lock semantics:
+
+1. `LoadAndLock(ctx)` acquires an exclusive `flock` on `go-microvm-state.lock`
+2. Reads and parses `go-microvm-state.json` (or returns a default State if the file
+   does not exist)
+3. Returns a `LockedState` that holds the lock
+
+The lock is held until `LockedState.Release()` is called. Callers should
+use `defer` to ensure the lock is always released:
+
+```go
+mgr := state.NewManager(dataDir)
+ls, err := mgr.LoadAndLock(ctx)
+if err != nil {
+    return err
+}
+defer ls.Release()
+
+ls.State.Active = true
+ls.State.PID = proc.PID
+return ls.Save()
+```
+
+`LoadAndLockWithRetry(ctx, timeout)` wraps `LoadAndLock` with a retry loop
+for cases where another process may hold the lock temporarily.
+
+`Load()` reads the state without locking (read-only access).
+
+### Atomic Writes
+
+`LockedState.Save()` ensures crash safety:
+
+1. Marshals the state to JSON with indentation
+2. Writes to a temporary file in the same directory (`state-*.json.tmp`)
+3. Calls `os.Rename()` to atomically replace `go-microvm-state.json`
+
+If a crash occurs during write, either the old state remains intact or the
+new state is fully written -- never a partial file. The `flock` ensures only
+one process writes at a time.
+
+## Security Model
+
+For a comprehensive security analysis including trust boundaries, guest
+escape blast radius, and hardening recommendations, see
+[docs/SECURITY.md](SECURITY.md).
+
+## SSH Utilities
+
+The `ssh` package provides two capabilities for guest communication:
+
+### Key Generation
+
+`GenerateKeyPair(keyDir)` creates an ECDSA P-256 SSH key pair:
+
+- Private key: `keyDir/id_ecdsa` with 0600 permissions, PEM-encoded EC key
+- Public key: `keyDir/id_ecdsa.pub` with 0644 permissions, OpenSSH
+  authorized_keys format
+
+If the key files already exist, they are overwritten.
+
+`GetPublicKeyContent(publicKeyPath)` reads the public key file and returns
+its content as a string for inclusion in authorized_keys.
+
+### SSH Client
+
+`ssh.Client` wraps `golang.org/x/crypto/ssh` with convenience methods:
+
+| Method | Description |
+|--------|-------------|
+| `Run(ctx, cmd)` | Execute a command, return combined stdout+stderr |
+| `RunSudo(ctx, cmd)` | Execute via `doas` (used in Alpine-based VMs) |
+| `RunStream(ctx, cmd, stdout, stderr)` | Execute with streaming I/O |
+| `CopyTo(ctx, local, remote, mode)` | Upload a file via `cat` over SSH |
+| `CopyFrom(ctx, remote, local)` | Download a file via `cat` over SSH |
+| `WaitForReady(ctx)` | Poll SSH at 2s intervals until connection succeeds |
+
+`ShellEscape(s)` wraps a string in single quotes with proper escaping for
+safe use in shell commands.
+
+### WaitForReady Pattern
+
+The standard post-boot hook pattern uses `WaitForReady`:
+
+```go
+microvm.WithPostBoot(func(ctx context.Context, vm *microvm.VM) error {
+    client := ssh.NewClient("127.0.0.1", 2222, "root", keyPath)
+    return client.WaitForReady(ctx)
+})
+```
+
+`WaitForReady` polls every 2 seconds, attempting a full SSH connection and
+running `true` as a trivial command. It returns when the connection succeeds
+or the context is cancelled. Connection timeout per attempt is 10 seconds.
+
+**Security note:** The SSH client uses `InsecureIgnoreHostKey()` for host key
+verification. This is acceptable because we trust the VM we just created -- it
+was booted from an image we pulled and configured.
+
+---
+
+# CI & Release Pipelines
+
+Source: https://github.com/stacklok/go-microvm/blob/main/docs/CI.md
+
+# CI & Release Pipelines
+
+go-microvm uses three GitHub Actions workflows. They form a dependency chain:
+the **Builder** produces a container image that **CI** and **Release** consume.
+
+## Workflows
+
+### CI (`ci.yaml`)
+
+Runs on every push to `main` and on pull requests. All jobs run in parallel.
+
+**Cross-platform jobs** (matrix: Linux + macOS, pure Go only):
+
+| Job | What it does |
+|-----|-------------|
+| Test | `task test-nocgo` — tests with race detector, excluding CGO packages |
+| Lint | golangci-lint with `CGO_ENABLED=0` |
+
+**Linux-only jobs:**
+
+| Job | What it does |
+|-----|-------------|
+| Build | `task build-nocgo` — compilation check for pure Go packages |
+| Build (Linux CGO) | `task build-runner` — full runner build inside the builder container |
+
+**macOS-only jobs:**
+
+| Job | What it does |
+|-----|-------------|
+| Build (macOS CGO) | Installs Homebrew libkrun, runs `task build-dev-darwin` (build + code sign) |
+
+All build logic lives in the Taskfile. Workflows only orchestrate (checkout,
+setup tools, call task).
+
+### Builder (`builder.yaml`)
+
+Builds the `ghcr.io/stacklok/go-microvm-builder` container image, which
+compiles libkrun and libkrunfw from source. This image provides the CGO
+toolchain that CI and Release need.
+
+**Triggers:**
+- Push to `main` that changes `images/builder/**` or `versions.env`
+- Version tags (`v*`)
+- Manual dispatch
+
+**How it works:**
+1. Builds per-architecture images natively (amd64 on `ubuntu-latest`,
+   arm64 on `ubuntu-24.04-arm`) — no QEMU emulation
+2. Pushes each image by digest
+3. Merges digests into a multi-arch manifest tagged with the libkrun
+   version (e.g., `v1.18.0`) and `latest`
+
+The build takes ~20 minutes because it compiles a Linux kernel (libkrunfw).
+Results are cached via GitHub Actions cache.
+
+### Release (`release.yaml`)
+
+Runs when a version tag (`v*`) is pushed.
+
+**How it works:**
+1. `task build-runner` — builds the runner binary and extracts libraries
+2. `task package-runtime` — creates runtime tarball (runner + libkrun, Apache-2.0)
+3. `task package-firmware` — creates firmware tarball (libkrunfw, GPL-2.0)
+
+Both architectures (amd64, arm64) build on native runners.
+
+**Where artifacts go:**
+- GitHub Release with checksums
+- OCI artifacts pushed to `ghcr.io/stacklok/go-microvm/{runtime,firmware}`
+
+The runtime and firmware are split into separate tarballs because they
+have different licenses.
+
+## Dependency Chain
+
+```
+versions.env ──► Builder Image ──► CI (Linux CGO job)
+                      │
+                      └──────────► Release (build + package)
+```
+
+When bumping libkrun/libkrunfw versions:
+
+1. Update `versions.env` and `images/builder/Containerfile`
+2. Push to `main` — this triggers both CI and Builder
+3. CI's Linux CGO job will fail (image doesn't exist yet)
+4. Wait for Builder to finish (~20 min)
+5. Re-run the failed CI job
+
+## Taskfile as Single Source of Truth
+
+All build logic lives in `Taskfile.yaml`. The container runtime is
+auto-detected (`podman` locally on Fedora/Silverblue, `docker` in CI).
+
+Key tasks used by CI/Release:
+
+| Task | Used by | Purpose |
+|------|---------|---------|
+| `test-nocgo` | CI | Tests excluding CGO packages |
+| `build-nocgo` | CI | Compilation check for pure Go |
+| `build-runner` | CI, Release | Full runner build in builder container |
+| `build-dev-darwin` | CI | macOS native build + code sign |
+| `package-runtime` | Release | Runtime tarball (Apache-2.0) |
+| `package-firmware` | Release | Firmware tarball (GPL-2.0) |
+
+Container-based builds use `-buildvcs=false` because Docker-mounted source
+directories aren't trusted by git. This is fine because version info is
+set explicitly via ldflags.
+
+---
+
+# macOS Support
+
+Source: https://github.com/stacklok/go-microvm/blob/main/docs/MACOS.md
+
+# macOS Support
+
+go-microvm supports macOS on Apple Silicon (arm64) using Hypervisor.framework.
+
+## Requirements
+
+- **Apple Silicon** (M1/M2/M3/M4) -- Intel Macs are not supported
+- **macOS 11+** -- Hypervisor.framework requires Big Sur or later
+- **libkrun** and **libkrunfw** -- install via Homebrew (see below) or build from source
+
+## Installing libkrun
+
+The easiest way to install libkrun on macOS is via Homebrew:
+
+```bash
+brew tap slp/krun
+brew trust slp/krun
+brew install libkrun libkrunfw
+```
+
+Homebrew 6.0+ requires third-party taps to be trusted before installing from
+them. `libkrun`/`libkrunfw` pull in other formulae from the same tap (e.g.
+`virglrenderer`) as dependencies, so trusting only the two top-level formulae
+by fully-qualified name is not enough -- the whole tap must be trusted.
+
+This installs the libraries and headers into Homebrew's prefix (`/opt/homebrew`
+on Apple Silicon, `/usr/local` on Intel). The CGO directives in go-microvm
+automatically search both paths.
+
+## Key Platform Differences
+
+| Aspect | Linux | macOS |
+|--------|-------|-------|
+| Hypervisor | KVM (`/dev/kvm`) | Hypervisor.framework |
+| Shared libraries | `.so` (libkrun.so.1, libkrunfw.so.5) | `.dylib` (libkrun.1.dylib, libkrunfw.5.dylib) |
+| Library path env | `LD_LIBRARY_PATH` | `DYLD_LIBRARY_PATH` |
+| Code signing | Not required | Required (hypervisor entitlement) |
+| PID identity check | `/proc/<pid>/exe` readlink | `signal(0)` best-effort |
+
+## Code Signing
+
+macOS requires binaries that use Hypervisor.framework to be signed with
+specific entitlements. Without these, the process will crash with
+`EXC_BAD_ACCESS` when trying to create a VM context.
+
+Three entitlements are required (see `assets/entitlements.plist`):
+
+- `com.apple.security.hypervisor` -- access to Hypervisor.framework
+- `com.apple.security.cs.disable-library-validation` -- allows loading
+  libkrun from non-system paths (e.g., Homebrew)
+- `com.apple.security.cs.allow-dyld-environment-variables` -- allows
+  `DYLD_LIBRARY_PATH` to propagate to the runner process (the hypervisor
+  entitlement activates hardened runtime, which silently strips `DYLD_*`
+  variables without this entitlement)
+
+The go-microvm-runner binary must be signed:
+
+```bash
+codesign --entitlements assets/entitlements.plist --force -s - bin/go-microvm-runner
+```
+
+The `task build-dev-darwin` command handles signing automatically.
+
+## DYLD_LIBRARY_PATH
+
+When using bundled (non-system) libraries, the runner subprocess needs
+`DYLD_LIBRARY_PATH` set. go-microvm handles this automatically via
+`libkrun.WithLibDir()` (passed to `libkrun.NewBackend()`).
+
+The hypervisor entitlement activates macOS **hardened runtime**, which silently
+strips `DYLD_LIBRARY_PATH` and `DYLD_FALLBACK_LIBRARY_PATH` from child
+processes. The `com.apple.security.cs.allow-dyld-environment-variables`
+entitlement (in `assets/entitlements.plist`) opts back in. If the runner fails
+to find libkrun, verify the binary is signed with all three entitlements.
+
+## Filesystem Permissions (virtiofs)
+
+On macOS, non-root users cannot `chown` files to arbitrary UIDs. When go-microvm
+extracts an OCI image, all files end up owned by the host user. libkrun's
+virtiofs FUSE server performs access checks using host-side ownership, so guest
+processes running as different UIDs (e.g., root) would get `EACCES` errors.
+
+go-microvm works around this using the `user.containers.override_stat` extended
+attribute, which libkrun's virtiofs server reads to report overridden
+uid/gid/mode to the guest. This is the same mechanism used by podman on macOS.
+The xattr is set automatically during OCI layer extraction and rootfs cloning
+-- no user action is needed.
+
+## Guest Networking
+
+On macOS, libkrun's Hypervisor.framework backend pre-configures the guest
+network interface via DHCP before the custom init process runs. go-microvm
+handles this transparently by using idempotent network configuration
+(`AddrReplace`/`RouteReplace` instead of `AddrAdd`/`RouteAdd`), so the init
+works correctly regardless of whether the interface is already configured.
+
+## Troubleshooting
+
+### Hypervisor.framework not available
+
+```bash
+sysctl kern.hv_support
+# Should return: kern.hv_support: 1
+```
+
+If 0, Hypervisor.framework is not available (Intel Mac or VM without
+nested virtualization).
+
+### Code signing errors
+
+```
+EXC_BAD_ACCESS (code=1, address=0x0)
+```
+
+The go-microvm-runner binary is not signed with the hypervisor entitlement.
+Re-sign it:
+
+```bash
+codesign --entitlements assets/entitlements.plist --force -s - bin/go-microvm-runner
+```
+
+### DYLD_LIBRARY_PATH issues
+
+```
+dyld: Library not loaded: @rpath/libkrun.1.dylib
+```
+
+The runner can't find libkrun. Set `libkrun.WithLibDir()` (via
+`libkrun.NewBackend()`) to the directory containing `libkrun.1.dylib` and
+`libkrunfw.5.dylib`.
+
+---
+
+# Migration Guide: hypervisor.Backend Abstraction
+
+Source: https://github.com/stacklok/go-microvm/blob/main/docs/MIGRATION-BACKEND-ABSTRACTION.md
+
+# Migration Guide: hypervisor.Backend Abstraction
+
+This document covers the breaking changes introduced by the
+`hypervisor.Backend` abstraction layer and how to migrate downstream
+consumers.
+
+## Breaking Changes
+
+| Removed API | Replacement | Affected projects |
+|---|---|---|
+| `microvm.WithRunnerPath(p)` | `libkrun.WithRunnerPath(p)` passed to `libkrun.NewBackend()` | waggle, apiary, toolhive-appliance |
+| `microvm.WithLibDir(d)` | `libkrun.WithLibDir(d)` passed to `libkrun.NewBackend()` | waggle, toolhive-appliance |
+| `microvm.WithSpawner(s)` | `libkrun.WithSpawner(s)` passed to `libkrun.NewBackend()` | tests only |
+| `microvm.VM.PID() int` | `microvm.VM.ID() string` | waggle, toolhive-appliance |
+
+## New Imports
+
+```go
+import "github.com/stacklok/go-microvm/hypervisor/libkrun"
+```
+
+## Migration Examples
+
+### waggle (`pkg/infra/vm/microvm.go`)
+
+**Before:**
+```go
+if opts.RunnerPath != "" {
+    microvmOpts = append(microvmOpts, microvm.WithRunnerPath(opts.RunnerPath))
+}
+if opts.LibDir != "" {
+    microvmOpts = append(microvmOpts, microvm.WithLibDir(opts.LibDir))
+}
+slog.Info("microVM created", "pid", vm.PID())
+```
+
+**After:**
+```go
+import "github.com/stacklok/go-microvm/hypervisor/libkrun"
+
+var backendOpts []libkrun.Option
+if opts.RunnerPath != "" {
+    backendOpts = append(backendOpts, libkrun.WithRunnerPath(opts.RunnerPath))
+}
+if opts.LibDir != "" {
+    backendOpts = append(backendOpts, libkrun.WithLibDir(opts.LibDir))
+}
+microvmOpts = append(microvmOpts, microvm.WithBackend(libkrun.NewBackend(backendOpts...)))
+slog.Info("microVM created", "id", vm.ID())
+```
+
+### apiary (`internal/infra/vm/runner.go`)
+
+**Before:**
+```go
+if r.runnerPath != "" {
+    opts = append(opts, microvm.WithRunnerPath(r.runnerPath))
+}
+```
+
+**After:**
+```go
+import "github.com/stacklok/go-microvm/hypervisor/libkrun"
+
+if r.runnerPath != "" {
+    opts = append(opts, microvm.WithBackend(libkrun.NewBackend(
+        libkrun.WithRunnerPath(r.runnerPath),
+    )))
+}
+```
+
+### toolhive-appliance (`internal/vm/libkrun/manager_cgo.go`)
+
+**Before:**
+```go
+if runnerPath != "" {
+    microvmOpts = append(microvmOpts, microvm.WithRunnerPath(runnerPath))
+}
+if libDir != "" {
+    microvmOpts = append(microvmOpts, microvm.WithLibDir(libDir))
+}
+PID: vmInstance.PID(),
+go m.reaperLoop(vmInstance.PID())
+```
+
+**After:**
+```go
+import (
+    "strconv"
+    "github.com/stacklok/go-microvm/hypervisor/libkrun"
+)
+
+var backendOpts []libkrun.Option
+if runnerPath != "" {
+    backendOpts = append(backendOpts, libkrun.WithRunnerPath(runnerPath))
+}
+if libDir != "" {
+    backendOpts = append(backendOpts, libkrun.WithLibDir(libDir))
+}
+microvmOpts = append(microvmOpts, microvm.WithBackend(libkrun.NewBackend(backendOpts...)))
+
+// For PID — parse ID string:
+id := vmInstance.ID()
+pid, _ := strconv.Atoi(id)
+// Use pid for state and reaper loop
+```
+
+### Test code using `WithSpawner`
+
+**Before:**
+```go
+spawner := &mockSpawner{proc: mockProc, err: nil}
+opts := []microvm.Option{
+    microvm.WithSpawner(spawner),
+}
+```
+
+**After:**
+```go
+// Implement hypervisor.Backend directly for test mocks:
+type mockBackend struct {
+    handle hypervisor.VMHandle
+    err    error
+}
+
+func (m *mockBackend) Name() string { return "mock" }
+func (m *mockBackend) PrepareRootFS(_ context.Context, p string, _ hypervisor.InitConfig) (string, error) {
+    return p, nil
+}
+func (m *mockBackend) Start(_ context.Context, _ hypervisor.VMConfig) (hypervisor.VMHandle, error) {
+    return m.handle, m.err
+}
+
+opts := []microvm.Option{
+    microvm.WithBackend(&mockBackend{handle: mockHandle}),
+}
+```
+
+---
+
+# Networking and Firewall
+
+Source: https://github.com/stacklok/go-microvm/blob/main/docs/NETWORKING.md
+
+# Networking and Firewall
+
+This document provides a deep dive into the go-microvm networking subsystem,
+including the in-process userspace network stack, wire protocol, firewall
+architecture, and extension points.
+
+## Table of Contents
+
+- [Overview](#overview)
+- [Architecture](#architecture)
+- [QEMU Wire Protocol](#qemu-wire-protocol)
+- [Network Topology](#network-topology)
+- [VirtualNetwork Lifecycle](#virtualnetwork-lifecycle)
+- [Firewall Architecture](#firewall-architecture)
+- [Performance](#performance)
+- [Usage Examples](#usage-examples)
+- [Provider Interface](#provider-interface)
+
+## Overview
+
+go-microvm uses a userspace network stack powered by
+[gvisor-tap-vsock](https://github.com/containers/gvisor-tap-vsock). All VM
+traffic flows as Ethernet frames with no kernel networking between host and
+guest, and no separate gvproxy binary is needed.
+
+The gvisor-tap-vsock library (used by podman machine, lima, and libkrun) is
+imported directly as a Go dependency. It provides a complete virtual network
+stack including DHCP, DNS, and TCP port forwarding.
+
+There are two networking modes:
+
+- **Runner-side (default)**: When no `WithNetProvider()` is set, the runner
+  process creates a VirtualNetwork connected to libkrun via a socketpair.
+  Port forwards are passed in the runner config JSON. This is the simplest
+  path -- no Unix socket, no external process coordination.
+- **Hosted (caller-side)**: When `WithNetProvider()` is set (e.g., with
+  `net/hosted.Provider`), the VirtualNetwork runs in the caller's process
+  and exposes a Unix socket that the runner connects to. This allows the
+  caller to access the VirtualNetwork directly for gonet listeners and
+  HTTP services on the gateway IP.
+
+Key properties:
+
+- **Userspace only**: All packet processing happens in Go. No iptables, no
+  eBPF, no network namespaces.
+- **Frame-level access**: Every Ethernet frame passes through Go code,
+  enabling the optional firewall to inspect and filter traffic.
+- **Shared topology**: Network constants (subnet, gateway, IPs, MTU) are
+  centralized in the `net/topology` package.
+
+## Architecture
+
+The networking subsystem has two modes depending on how the caller configures
+it, and within the hosted mode, an optional firewall relay.
+
+### Runner-Side Networking (Default)
+
+When no `WithNetProvider()` is set, the runner creates a VirtualNetwork
+in-process and connects it to libkrun via a socketpair:
+
+```
++----------------------------------go-microvm-runner process------+
+|                                                                  |
+| +----------+   socketpair      +-------------------+  Go net     |
+| | libkrun  |   (fd pair)       | VirtualNetwork    |----------+ |
+| | virtio-  |<===============>  | (gVisor netstack) |          | |
+| | net      |   Ethernet frames | DHCP, DNS,        |          | |
+| +----------+                   | port forwarding   |          | |
+|      |                         +-------------------+          | |
+|  +---v------+                       |                         | |
+|  | Guest VM |                  127.0.0.1:<port>               | |
+|  | eth0:    |                  port forward listeners         | |
+|  | 192.168. |                       |                    +---------+
+|  | 127.2    |                       +------>             |  Host   |
+|  +----------+                                            | Network |
++----------------------------------------------------------+---------+
+```
+
+Port forwards are configured via the runner config JSON. The VirtualNetwork
+runs as goroutines in the runner process, tied to the VM's lifetime.
+
+### Hosted Networking (Custom Provider)
+
+When `WithNetProvider()` is set (e.g., `net/hosted.Provider`), the
+VirtualNetwork runs in the caller's process and exposes a Unix socket:
+
+```
++----------+                    +-------------------+          +---------+
+| Guest VM |                    | VirtualNetwork    |          |  Host   |
+|          |   Unix socket      | (gVisor netstack) |  Go net  | Network |
+| virtio-  |===(QEMU wire)===>  |                   |--------->|         |
+| net      |   SOCK_STREAM      | DHCP, DNS,        |          |         |
+|          |   4B BE + frame    | port forwarding   |          |         |
++----------+                    +-------------------+          +---------+
+     (in runner process)         (in caller's process)
+```
+
+### Hosted Networking with Firewall
+
+When firewall rules are configured via `WithFirewallRules()` with a hosted
+provider, a relay is inserted between the VM socket and the VirtualNetwork.
+The relay intercepts every Ethernet frame, parses headers, and applies
+allow/deny rules with stateful connection tracking:
+
+```
++----------+                  +-----------------+               +-------------------+
+| Guest VM |                  | Relay + Filter  |               | VirtualNetwork    |
+|          |   Unix socket    |                 |   net.Pipe    | (gVisor netstack) |
+| virtio-  |===(QEMU wire)===>| egress gor. --->|===(in-mem)===>|                   |
+| net      |   SOCK_STREAM    | ingress gor.<---|<==(in-mem)====|   DHCP, DNS,      |
+|          |   4B BE + frame  |                 |               |   port forwarding |
++----------+                  | - parse ETH/IP  |               +-------------------+
+                              | - conntrack     |                        |
+                              | - rule matching |                   +---------+
+                              | - metrics       |                   |  Host   |
+                              +-----------------+                   | Network |
+                                                                    +---------+
+```
+
+The relay creates a `net.Pipe()` -- one end is passed to
+`VirtualNetwork.AcceptQemu()`, the other is used by the relay. Two goroutines
+handle egress (VM to network) and ingress (network to VM) independently.
+
+## QEMU Wire Protocol
+
+The QEMU transport is a stream protocol over a Unix domain socket
+(`SOCK_STREAM`). Every Ethernet frame is prefixed with a 4-byte big-endian
+length header.
+
+### Frame Format
+
+```
++---+---+---+---+---+---+---+---+---+---+---+...
+| Length (4B BE) |         Ethernet Frame          |
++---+---+---+---+---+---+---+---+---+---+---+...
+|<--- 4 bytes -->|<-------- N bytes ------------->|
+```
+
+- **Length field**: `uint32`, big-endian. Value is the number of bytes in the
+  Ethernet frame that follows (does NOT include the 4-byte header itself).
+- **Ethernet frame**: Raw L2 frame starting with destination MAC address.
+- **No handshake**: Data flows immediately after socket connection.
+- **Max frame size**: Practically limited by MTU (default 1500 bytes).
+
+### Why QEMU Mode
+
+libkrun's `krun_add_net_unixstream` speaks the QEMU wire protocol: a
+`SOCK_STREAM` Unix socket with 4-byte big-endian length-prefixed Ethernet
+frames. The gvisor-tap-vsock library's `AcceptQemu()` method uses the same
+framing, making them directly compatible.
+
+### Protocol Comparison
+
+| Protocol | Header | Byte Order | Socket Type | Use Case |
+|----------|--------|------------|-------------|----------|
+| **QEMU** | 4 bytes | Big-endian | SOCK_STREAM | libkrun, QEMU |
+| VfKit | None | N/A | SOCK_DGRAM | macOS Virt.framework |
+| BESS | None | N/A | SOCK_SEQPACKET | User Mode Linux |
+
+## Network Topology
+
+```
++---------------------------------------------------+
+|                   Host Machine                     |
+|                                                    |
+|  +---------------+    Unix socket   +-----------+  |
+|  | VirtualNetwork|---(SOCK_STREAM)->|  libkrun  |  |
+|  | (in-process)  |  4-byte BE len  |  virtio-  |  |
+|  |               |  prefix frames  |  net      |  |
+|  | Gateway:      |                 |           |  |
+|  | 192.168.127.1 |                 +-----------+  |
+|  |               |                      |         |
+|  | DHCP server   |                 +----v-----+   |
+|  | DNS server    |                 | Guest VM |   |
+|  | Port forwards |                 |          |   |
+|  +---------------+                 | eth0:    |   |
+|        |                           | 192.168. |   |
+|        |  Port forwards:           | 127.2    |   |
+|        |  localhost:8080           |          |   |
+|        +-----> guest:80            +----------+   |
+|        |  localhost:2222                          |
+|        +-----> guest:22                           |
++---------------------------------------------------+
+```
+
+| Property | Value |
+|----------|-------|
+| Gateway | 192.168.127.1 (VirtualNetwork, in-process) |
+| Guest IP | 192.168.127.2 (DHCP assigned) |
+| Subnet | 192.168.127.0/24 |
+| Socket type | Unix domain, SOCK_STREAM |
+| Wire format | 4-byte big-endian length prefix + Ethernet frame |
+| DHCP | Built into VirtualNetwork |
+| DNS | Built into VirtualNetwork |
+| Port forwarding | TCP, host-to-guest only |
+
+## VirtualNetwork Lifecycle
+
+### Runner-Side (Default Path)
+
+When no custom provider is set, the runner's `setupInProcessNetworking()`
+creates the VirtualNetwork during VM startup:
+
+1. Builds the port forward map from `runner.Config.PortForwards`.
+2. Creates a `virtualnetwork.New()` instance using constants from
+   `net/topology` (subnet, gateway IP/MAC, MTU).
+3. Creates a `socketpair(AF_UNIX, SOCK_STREAM)`.
+4. Wraps one end as a `net.Conn` and passes it to `AcceptQemu()` in a
+   background goroutine.
+5. Returns the other fd to be passed to `krun_add_net_unixstream()`.
+
+The VirtualNetwork goroutines run alongside `krun_start_enter()` and are
+torn down when the runner process exits (i.e., when the guest shuts down).
+
+### Hosted Provider Path
+
+When using `net/hosted.Provider`, the lifecycle is managed in the caller's
+process:
+
+#### Start
+
+`Provider.Start()` performs the following:
+
+1. Creates a `virtualnetwork.New()` instance with the network configuration
+   (subnet, gateway, port forwards, DHCP, DNS) using `net/topology` constants.
+2. Starts any registered HTTP services on the VirtualNetwork via
+   `VirtualNetwork.Listen()`.
+3. Creates a Unix listener at the socket path (`hosted-net.sock` in the data
+   directory).
+4. If firewall rules are configured, creates a `firewall.Filter` and
+   `firewall.Relay`, and starts the conntrack expiry goroutine.
+5. Starts an accept loop goroutine. For each runner connection:
+   - With firewall: creates a `net.Pipe()`, runs the relay between the
+     runner connection and the pipe, passes the pipe to `AcceptQemu()`.
+   - Without firewall: passes the runner connection directly to
+     `AcceptQemu()`.
+6. Returns once the listener is ready.
+
+#### Stop
+
+`Provider.Stop()` tears down everything:
+
+1. Gracefully shuts down HTTP services (5-second timeout per service).
+2. Cancels the context, which signals all goroutines to exit.
+3. Closes the Unix listener.
+4. Waits for the accept loop and all connection handlers to finish.
+5. Removes the socket file.
+
+All goroutines are tracked via `sync.WaitGroup` and context cancellation.
+
+## Firewall Architecture
+
+The firewall provides frame-level packet filtering with stateful connection
+tracking. It operates entirely in userspace by intercepting Ethernet frames
+as they pass between the VM socket and the VirtualNetwork.
+
+### Frame-Level Interception
+
+The firewall inserts a relay between the VM's Unix socket and the
+VirtualNetwork. The relay reads each frame, parses the Ethernet and IP
+headers, applies firewall rules, and either forwards or drops the frame.
+
+### Packet Parsing
+
+Each Ethernet frame is parsed at fixed offsets with zero allocations:
+
+1. **Ethernet header** (14 bytes): Destination MAC (6B), Source MAC (6B),
+   EtherType (2B). EtherType 0x0800 = IPv4, 0x0806 = ARP, 0x86DD = IPv6.
+
+2. **IPv4 header** (20+ bytes, starts at offset 14): Protocol field at
+   byte 23 (6=TCP, 17=UDP, 1=ICMP). Source IP at bytes 26-29, destination
+   IP at bytes 30-33. IHL field gives header length.
+
+3. **TCP/UDP header** (starts at offset 14 + IHL*4): Source port (2B),
+   destination port (2B).
+
+Non-IPv4 frames (ARP, IPv6, LLDP) are always passed through without
+filtering. They are essential for the network stack to function (ARP
+resolution, etc.).
+
+### Rule Model
+
+Each firewall rule specifies:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| Direction | Ingress/Egress | Ingress = outside to VM, Egress = VM to outside |
+| Action | Allow/Deny | What to do when matched |
+| Protocol | uint8 | 6=TCP, 17=UDP, 1=ICMP; 0=any |
+| SrcCIDR | net.IPNet | Source IP range |
+| DstCIDR | net.IPNet | Destination IP range |
+| SrcPort | uint16 | Source port; 0=any |
+| DstPort | uint16 | Destination port; 0=any |
+
+Rules are evaluated in order. **First match wins** (same as iptables). If no
+rule matches, the default action applies (configurable via
+`WithFirewallDefaultAction()`; defaults to Allow when no rules are set).
+
+### Stateful Connection Tracking
+
+The firewall tracks active connections using a 5-tuple key:
+
+```
+connKey = { protocol, srcIP, dstIP, srcPort, dstPort }
+```
+
+When a rule allows a packet, the connection tracker records the flow. Return
+traffic (with source and destination swapped) is automatically allowed via a
+reverse-lookup in the connection table. This means you do not need explicit
+ingress rules for return traffic from allowed egress connections.
+
+**TTLs**:
+- TCP connections: 5 minutes idle timeout
+- UDP flows: 30 seconds idle timeout
+
+An expiry goroutine periodically sweeps the connection table to remove stale
+entries.
+
+**Memory**: Each conntrack entry is approximately 100 bytes. A typical VM
+workload of 200-500 concurrent flows uses around 50 KB.
+
+### Filter Verdict Flow
+
+For each frame, the filter follows this path:
+
+1. **Conntrack fast path**: Check if the packet belongs to an already-allowed
+   flow via reverse-lookup. If yes, allow immediately (most common case for
+   established connections).
+2. **Rule walk**: Iterate through rules in order. First match wins. If the
+   matching rule allows the packet, record it in the connection tracker.
+3. **Default action**: If no rule matches, apply the configured default
+   action (Allow or Deny).
+
+### Relay Hot Path
+
+The relay runs two goroutines:
+
+- **Egress goroutine**: Reads frames from the VM socket, applies filter,
+  writes to the VirtualNetwork pipe.
+- **Ingress goroutine**: Reads frames from the VirtualNetwork pipe, applies
+  filter, writes to the VM socket.
+
+Each goroutine uses a buffered reader (64 KB) and a reusable frame buffer.
+Frames that the filter denies are silently dropped (not forwarded). Atomic
+counters track forwarded frames, dropped frames, and bytes forwarded.
+
+## Performance
+
+The firewall adds minimal overhead per Ethernet frame:
+
+| Operation | Cost |
+|-----------|------|
+| Read frame (4-byte prefix + payload) | Required regardless -- no added cost |
+| Parse Ethernet + IPv4 headers | ~10ns -- fixed-offset reads, no allocations |
+| Connection tracker lookup | ~20ns -- map lookup under RLock |
+| Rule matching (per rule, on miss) | ~5ns -- simple comparisons |
+| Write frame (forward) | Required regardless -- no added cost |
+
+**Total added latency**: ~50-100ns per frame. At 1 Gbps with 1500-byte frames
+(~83,000 frames/sec), the firewall adds roughly 4ms of CPU time per second.
+This is negligible at typical VM throughput.
+
+**Memory overhead**:
+- Connection tracker: ~100 bytes per entry, typically 200-500 entries = ~50 KB
+- Frame buffer: ~2 KB per direction, reused
+- Rule slice: typically <20 rules = negligible
+
+## Usage Examples
+
+### Default-Deny with DNS and HTTPS Egress
+
+Allow the VM to make DNS queries and HTTPS connections, but deny all other
+outbound traffic. Inbound traffic is denied except on explicitly allowed ports.
+Return traffic for allowed connections is automatically permitted via
+connection tracking.
+
+```go
+import "github.com/stacklok/go-microvm/net/firewall"
+
+vm, err := microvm.Run(ctx, "my-app:latest",
+    microvm.WithPorts(
+        microvm.PortForward{Host: 8080, Guest: 80},
+        microvm.PortForward{Host: 2222, Guest: 22},
+    ),
+    microvm.WithFirewallDefaultAction(firewall.Deny),
+    microvm.WithFirewallRules(
+        // Egress: allow DNS and HTTPS
+        firewall.Rule{
+            Direction: firewall.Egress,
+            Action:    firewall.Allow,
+            Protocol:  17, // UDP
+            DstPort:   53, // DNS
+        },
+        firewall.Rule{
+            Direction: firewall.Egress,
+            Action:    firewall.Allow,
+            Protocol:  6, // TCP
+            DstPort:   443, // HTTPS
+        },
+        // Ingress: allow SSH and HTTP
+        firewall.Rule{
+            Direction: firewall.Ingress,
+            Action:    firewall.Allow,
+            Protocol:  6,
+            DstPort:   22,
+        },
+        firewall.Rule{
+            Direction: firewall.Ingress,
+            Action:    firewall.Allow,
+            Protocol:  6,
+            DstPort:   80,
+        },
+    ),
+)
+```
+
+### Allow Specific Ingress Ports Only
+
+```go
+vm, err := microvm.Run(ctx, "my-server:latest",
+    microvm.WithPorts(
+        microvm.PortForward{Host: 8443, Guest: 443},
+        microvm.PortForward{Host: 6443, Guest: 6443},
+    ),
+    microvm.WithFirewallDefaultAction(firewall.Deny),
+    microvm.WithFirewallRules(
+        // Allow all egress (VM can reach the internet)
+        firewall.Rule{
+            Direction: firewall.Egress,
+            Action:    firewall.Allow,
+        },
+        // Allow specific ingress ports
+        firewall.Rule{
+            Direction: firewall.Ingress,
+            Action:    firewall.Allow,
+            Protocol:  6,
+            DstPort:   443,
+        },
+        firewall.Rule{
+            Direction: firewall.Ingress,
+            Action:    firewall.Allow,
+            Protocol:  6,
+            DstPort:   6443,
+        },
+        firewall.Rule{
+            Direction: firewall.Ingress,
+            Action:    firewall.Allow,
+            Protocol:  6,
+            DstPort:   22,
+        },
+    ),
+)
+```
+
+### No Firewall (Default)
+
+When no firewall rules are configured, all traffic passes through
+unrestricted. This is the default behavior:
+
+```go
+vm, err := microvm.Run(ctx, "alpine:latest",
+    microvm.WithPorts(microvm.PortForward{Host: 8080, Guest: 80}),
+)
+```
+
+### DNS-Based Egress Policy
+
+`WithEgressPolicy()` restricts VM outbound traffic to a set of allowed DNS
+hostnames. Instead of writing firewall rules for specific IPs (which change
+often), you specify hostnames and let go-microvm handle the rest.
+
+```go
+vm, err := microvm.Run(ctx, "my-app:latest",
+    microvm.WithPorts(microvm.PortForward{Host: 8080, Guest: 80}),
+    microvm.WithEgressPolicy(microvm.EgressPolicy{
+        AllowedHosts: []microvm.EgressHost{
+            {Name: "api.github.com", Ports: []uint16{443}},
+            {Name: "*.docker.io"},
+            {Name: "ntp.ubuntu.com", Ports: []uint16{123}, Protocol: 17},
+        },
+    }),
+)
+```
+
+**How it works:**
+
+1. The firewall default action is forced to Deny. A hosted network provider
+   is auto-created if none was configured.
+2. Implicit firewall rules are added for DNS (to gateway), DHCP, and
+   port-forwarded ingress ports.
+3. A `DNSInterceptor` is wired into the relay between the VM and the
+   VirtualNetwork.
+4. **Egress DNS queries**: The interceptor parses each outbound DNS query.
+   If the queried hostname is not in the allowlist, it returns an NXDOMAIN
+   response directly to the VM. Allowed queries pass through normally.
+5. **Ingress DNS responses**: For allowed hostnames, the interceptor parses
+   A records from responses and creates temporary firewall rules for those
+   IPs. The rule TTL matches the DNS record TTL (minimum 60 seconds).
+6. The VM can only connect to IPs that were resolved from allowed hostnames.
+   All other egress traffic is denied by the default-deny policy.
+
+**Interaction with static firewall rules:**
+
+Static rules added via `WithFirewallRules()` are evaluated before dynamic
+rules. You can use static rules alongside an egress policy to allow
+additional traffic (e.g., specific IP ranges) that doesn't go through DNS.
+Implicit rules (DNS, DHCP, port forwards) are prepended before user rules.
+
+**Limitations:**
+
+- **Hardcoded IPs bypass DNS**: If the VM connects to an IP directly
+  (without DNS resolution), the egress policy cannot block it unless the
+  default-deny catches it. This is mitigated by the default-deny policy —
+  only IPs learned from allowed DNS responses get dynamic allow rules.
+- **DNS-over-HTTPS (DoH)**: Blocked by the default-deny policy since HTTPS
+  to DoH servers would need to be in the allowlist. Standard DNS over
+  UDP port 53 is the only supported resolution path.
+- **IPv6**: Only IPv4 A records create dynamic rules. AAAA records are
+  ignored.
+
+## Provider Interface
+
+The networking layer is abstracted behind the `net.Provider` interface:
+
+```go
+type Provider interface {
+    // Start launches the network provider. Must block until ready.
+    Start(ctx context.Context, cfg Config) error
+
+    // SocketPath returns the Unix socket path for virtio-net.
+    SocketPath() string
+
+    // Stop terminates the provider and cleans up.
+    Stop()
+}
+```
+
+`Config` contains:
+- `LogDir` -- directory for log files
+- `Forwards` -- slice of `PortForward{Host, Guest}` for TCP forwarding
+- `FirewallRules` -- optional packet filtering rules for frame-level filtering
+- `FirewallDefaultAction` -- default action when no rule matches (Allow or Deny)
+
+By default (no `WithNetProvider()`), networking runs inside the runner
+process. The `net/hosted` package provides a ready-made hosted provider
+that runs the VirtualNetwork in the caller's process with support for
+HTTP services on the gateway IP.
+
+### Implementing a Custom Provider
+
+To replace the default runner-side networking with an alternative backend
+(e.g., passt, slirp4netns, or a custom bridge):
+
+1. Implement the `net.Provider` interface.
+2. `Start()` must block until the Unix socket is ready for connections.
+3. The socket must use `SOCK_STREAM` with 4-byte big-endian length-prefixed
+   Ethernet frames (the QEMU transport protocol).
+4. Pass your provider via `microvm.WithNetProvider(myProvider)`.
+
+The `SocketPath()` return value is passed to the runner as the Unix socket
+path for `krun_add_net_unixstream`. See `net/hosted/provider.go` for the
+reference implementation.
+
+---
+
+# Security Model
+
+Source: https://github.com/stacklok/go-microvm/blob/main/docs/SECURITY.md
+
+# Security Model
+
+This document describes the security properties, trust boundaries, and
+hardening recommendations for go-microvm.
+
+## Table of Contents
+
+- [Trust Boundaries](#trust-boundaries)
+- [Guest-VMM Trust Boundary](#guest-vmm-trust-boundary)
+- [Networking Trust Boundary](#networking-trust-boundary)
+- [Guest Escape Blast Radius](#guest-escape-blast-radius)
+- [Hardening Recommendations](#hardening-recommendations)
+- [Guest Hardening](#guest-hardening)
+- [Egress Policy Security Model](#egress-policy-security-model)
+- [Tar Extraction Defenses](#tar-extraction-defenses)
+- [Process Identity Verification](#process-identity-verification)
+- [File Permissions](#file-permissions)
+- [SSH Client Security](#ssh-client-security)
+
+## Trust Boundaries
+
+go-microvm has two trust boundaries:
+
+```
+                    Trust boundary 1: KVM/HVF
+                    (hardware isolation)
+                           |
++-------------------------+|+------------------------------------------+
+|       Guest VM          |||       go-microvm-runner                     |
+|    (untrusted code)     ||| +------------------+ +------------------+|
+|                         ||| | libkrun VMM      | | VirtualNetwork   ||
+|  Runs user workload     ||| | (virtio devices, | | (gvisor-tap-vsock||
+|  inside hardware-       ||| |  VM supervisor)  | |  DHCP, DNS, NAT, ||
+|  isolated VM            ||| |                  | |  port forwarding)||
+|                         ||| +------------------+ +------------------+|
++-------------------------+|+------------------------------------------+
+                           |           |
+                           |    Trust boundary 2: process isolation
+                           |    (OS-level, user privileges)
+                           |           |
+                    +------+-----------+------+
+                    |      Host OS            |
+                    |  (caller's user context)|
+                    +-------------------------+
+```
+
+## Guest-VMM Trust Boundary
+
+libkrun runs the guest and VMM in the same process. The microVM provides
+hardware-level isolation via KVM (Linux) or Hypervisor.framework (macOS),
+but the VMM itself is not sandboxed from the host process.
+
+This means:
+- The VM provides stronger isolation than containers (hardware MMU separation)
+- The VMM process has the same privileges as the user running it
+- A guest escape would land in the VMM process context
+- This is the same model used by krunvm and crun+libkrun
+
+## Networking Trust Boundary
+
+The location of the VirtualNetwork depends on the networking mode:
+
+- **Default (runner-side)**: The runner process hosts both the libkrun VMM
+  and the VirtualNetwork in the same OS process. The network stack's
+  lifecycle is tied to the VM's lifetime.
+- **Hosted (caller-side)**: The VirtualNetwork runs in the caller's process
+  via `net/hosted.Provider`. The runner connects over a Unix socket.
+
+### What shares the runner process (default mode)
+
+| Component | Role |
+|-----------|------|
+| libkrun VMM | VM supervisor, virtio device emulation |
+| VirtualNetwork | Userspace TCP/IP stack (gVisor netstack) |
+| DHCP server | Assigns guest IP (192.168.127.2) |
+| DNS server | Resolves names for the guest |
+| Port forward listeners | TCP listeners on 127.0.0.1 for host-to-guest forwarding |
+
+### What shares the runner process (hosted mode)
+
+| Component | Role |
+|-----------|------|
+| libkrun VMM | VM supervisor, virtio device emulation |
+
+In hosted mode, the VirtualNetwork, DHCP, DNS, port forwards, and any
+HTTP services run in the caller's process instead. A guest escape still
+lands in the runner process, but the network stack is in a separate
+process, providing better isolation.
+
+### Why the default mode is acceptable
+
+1. **Single-VM model.** There is exactly one guest per runner process.
+   The network stack serves only that guest. There is no cross-tenant
+   risk because there is no second tenant.
+
+2. **Port forwards are localhost-only.** All port forward listeners bind
+   to `127.0.0.1`, hardcoded in the runner. There is no configuration
+   path to bind to `0.0.0.0` or an external interface.
+
+3. **The VMM was already unsandboxed.** A guest escape already gives the
+   attacker full user-level host access (the runner's UID). Adding the
+   network stack to the same process does not meaningfully widen this --
+   the attacker could already open sockets and access the network.
+
+4. **No secrets in the network stack.** The VirtualNetwork does not hold
+   TLS keys, credentials, or tokens. Port forwards are simple TCP
+   proxies. The DHCP/DNS servers have no auth material.
+
+## Guest Escape Blast Radius
+
+If an attacker exploits a KVM/HVF vulnerability or a libkrun bug to
+escape the guest, they land in the runner process with:
+
+| Capability | Default mode | Hosted mode |
+|-----------|------|------|
+| Runner's UID privileges | Yes | Yes |
+| Rootfs directory access | Yes | Yes |
+| Console/VM log files | Yes | Yes |
+| VirtualNetwork goroutines | Yes | No (separate process) |
+| Port forward listeners on 127.0.0.1 | Yes | No (separate process) |
+| DHCP/DNS servers | Yes | No (separate process) |
+| Socketpair fd to krun | Yes (inject/modify frames) | Unix socket (inject/modify frames) |
+
+What they do NOT get:
+- Root privileges (unless the runner was run as root)
+- Access to other users' processes or files
+- Kernel-level access (the escape lands in userspace)
+- Network listeners on external interfaces
+
+In hosted mode, the network stack is in the caller's process, so a guest
+escape does not directly compromise it. This provides better isolation for
+security-sensitive deployments.
+
+### Where this would be a higher concern
+
+The collapsed trust boundary (default mode) would matter more if:
+
+- **Multiple VMs shared a VirtualNetwork** (multi-tenant): one VM could
+  sniff or poison another's traffic. go-microvm does not support this.
+- **The network stack held secrets** (TLS termination, auth tokens):
+  a guest escape would expose them. go-microvm port forwards are plain TCP.
+- **The network stack ran with higher privileges** than the VMM: not the
+  case here, both share the same process and UID.
+
+For deployments where these concerns apply, use the hosted provider
+(`net/hosted.Provider`) which moves the network stack to the caller's
+process, providing natural process-level separation.
+
+## Hardening Recommendations
+
+For security-critical deployments, layer additional isolation around
+the runner process:
+
+### seccomp — guest-side (built-in)
+
+The `guest/harden` package provides a built-in seccomp BPF blocklist
+filter for the guest VM. Enable it with `boot.WithSeccomp(true)` or
+call `harden.ApplySeccomp()` directly. See [Seccomp BPF filter](#seccomp-bpf-filter)
+for the full blocklist.
+
+### seccomp — runner-side (recommended)
+
+Restrict the runner's syscalls to only what libkrun and gvisor-tap-vsock
+need. This is the highest-impact host-side hardening measure. After a
+guest escape, the attacker lands in a seccomp jail that limits what
+syscalls they can make.
+
+```
+Runner process
+  └── seccomp filter: allow only needed syscalls
+       ├── ioctl (KVM/HVF)
+       ├── read/write/close (fd operations)
+       ├── mmap/mprotect (memory management)
+       ├── socket/bind/listen/accept (networking)
+       ├── epoll/poll (event loop)
+       └── deny everything else
+```
+
+### Linux namespaces
+
+Run the runner in restricted namespaces:
+
+- **User namespace**: map the runner's UID to an unprivileged range
+- **Mount namespace**: limit filesystem visibility to rootfs + data dir
+- **Network namespace**: not applicable (the network stack needs host
+  access for port forwarding), but PID namespace limits process visibility
+
+### SELinux / AppArmor
+
+Confine the runner to a policy that restricts:
+- File access to the data directory and rootfs only
+- Network access to localhost port forwards only
+- No access to other users' home directories or system paths
+
+### Process separation (defense in depth)
+
+Use the hosted networking provider (`net/hosted.Provider`) to move the
+network stack out of the runner process. This achieves process-level
+separation without a custom helper binary:
+
+```
+go-microvm-runner (VMM only)
+    └── Unix socket → hosted provider in caller's process
+caller's process (network stack)
+    └── hosted.Provider → VirtualNetwork + HTTP services
+```
+
+This is not the default because it requires the caller's process to
+remain alive for networking to function. For the simplest deployments,
+the default runner-side networking ties the network stack to the VM's
+lifetime with no extra coordination.
+
+## Guest Hardening
+
+The `guest/harden` package provides reusable kernel, capability, and
+syscall hardening for microVM init processes. It is guest-side code
+(`//go:build linux`) with no CGO or krun dependencies.
+
+### Recommended usage
+
+Call the hardening functions in your guest init boot sequence:
+
+1. Mount `/proc` and `/sys` first (sysctls need procfs).
+2. Call `harden.KernelDefaults(logger)` to apply sysctls.
+3. Perform all privileged operations (mounts, network config, chown).
+4. Call `harden.DropBoundingCaps(keep...)` as the last privileged step.
+5. Call `harden.ApplySeccomp()` as the very last hardening step.
+
+Alternatively, use `boot.WithSeccomp(true)` to have the boot sequence
+apply the seccomp filter automatically after SSH starts.
+
+### Kernel sysctls
+
+`KernelDefaults` applies the following sysctls. Each is set
+independently; individual failures are logged as warnings rather than
+aborting boot, because not all kernels support every sysctl.
+
+| Sysctl | Value | Purpose |
+|--------|-------|---------|
+| `kernel.kptr_restrict` | `2` | Hide kernel pointers from all users. Prevents information leaks that aid exploit development. |
+| `kernel.dmesg_restrict` | `1` | Restrict `dmesg` to privileged users. Prevents unprivileged processes from reading kernel log messages that may contain sensitive addresses or operations. |
+| `kernel.unprivileged_bpf_disabled` | `1` | Disable unprivileged BPF. Prevents unprivileged users from loading BPF programs, which have historically been a source of kernel privilege escalation vulnerabilities. |
+| `kernel.perf_event_paranoid` | `3` | Disallow all perf events for unprivileged users. Prevents unprivileged access to performance counters, which can be used for side-channel attacks. |
+| `kernel.yama.ptrace_scope` | `2` | Restrict ptrace to `CAP_SYS_PTRACE` holders. Prevents unprivileged processes from attaching to other processes to inspect memory or inject code. |
+| `net.core.bpf_jit_harden` | `2` | Harden BPF JIT against spraying attacks. Forces constant blinding and disables JIT kallsyms exposure. |
+| `kernel.sysrq` | `0` | Disable magic SysRq key. Prevents unprivileged users from triggering kernel debugging and recovery commands. |
+
+### Capability bounding set
+
+`DropBoundingCaps(keep...)` drops all Linux capabilities from the
+bounding set except those explicitly listed. This limits what
+capabilities child processes can acquire, even through setuid binaries
+or file capabilities.
+
+For a typical SSH-based guest, the minimal keep set is:
+
+| Capability | Number | Reason |
+|-----------|--------|--------|
+| `CAP_SETUID` | 7 | sshd credential switching to sandbox user |
+| `CAP_SETGID` | 6 | sshd group switching |
+| `CAP_NET_BIND_SERVICE` | 10 | Binding port 22 (privileged port) |
+
+### Process privilege restriction
+
+`SetNoNewPrivs()` sets the `PR_SET_NO_NEW_PRIVS` bit on the calling
+process. Once set, the process and all descendants (via fork/exec)
+cannot gain new privileges through `execve` — setuid binaries run
+without elevation and file capabilities are ignored.
+
+This is intended to be called after all privileged operations are
+complete (mounts, network config, credential setup, capability
+dropping). Consumers that spawn child processes via `os/exec` inherit
+the bit automatically; consumers that need to set it on the calling
+process itself (e.g., an init that doesn't use `os/exec`) can call
+`SetNoNewPrivs()` directly.
+
+Note: `no_new_privs` does not affect `setresuid`/`setresgid` syscalls
+used by Go's `SysProcAttr.Credential` — credential switching for SSH
+sessions continues to work after the bit is set.
+
+### Seccomp BPF filter
+
+`ApplySeccomp()` installs a seccomp BPF blocklist filter on all OS
+threads. The filter uses `SECCOMP_FILTER_FLAG_TSYNC` to synchronize
+across threads and sets `no_new_privs`. Once applied, it is inherited
+by all child processes and cannot be removed.
+
+The blocklist is split into two tiers:
+
+**Exploitation indicators** (`SECCOMP_RET_KILL_PROCESS`): syscalls that
+legitimate workloads never call — any attempt strongly indicates
+active exploitation.
+
+| Syscall | Reason |
+|---------|--------|
+| `io_uring_setup/enter/register` | Prolific source of kernel CVEs |
+| `ptrace`, `process_vm_readv/writev` | Process debugging / cross-process memory access |
+| `kexec_load/file_load` | Kernel replacement |
+| `init_module/finit_module/delete_module` | Kernel module loading |
+| `bpf` | eBPF — kernel attack surface |
+| `seccomp` | Prevent installing additional filters |
+
+**Operational blocks** (`SECCOMP_RET_ERRNO`/`EPERM`): syscalls that
+runtimes or build tools might innocuously probe — fail gracefully.
+
+| Category | Syscalls |
+|----------|----------|
+| Filesystem manipulation | `mount`, `umount2`, `pivot_root`, `chroot`, `fsopen`, `fsconfig`, `fspick`, `move_mount`, `open_tree` |
+| Namespace creation | `unshare`, `setns`, `clone` (with `CLONE_NEW*` flags) |
+| Side-channel attacks | `perf_event_open`, `userfaultfd` |
+| Kernel keyring | `add_key`, `request_key`, `keyctl` |
+| Landlock | `landlock_create_ruleset`, `landlock_add_rule`, `landlock_restrict_self` |
+| Dangerous socket families | `AF_NETLINK`, `AF_PACKET`, `AF_KEY`, `AF_ALG`, `AF_VSOCK` |
+
+`AF_INET`, `AF_INET6`, and `AF_UNIX` remain allowed for normal
+workload operation.
+
+Note: `clone3` is NOT blocked because glibc 2.34+ uses it for
+`fork()`. Its namespace flags live inside a struct pointer (`arg0`)
+which seccomp BPF cannot inspect.
+
+### Filesystem hardening
+
+Consumers should lock down `/root/` (mode `0700`) after completing
+initial setup so the sandbox user cannot read root's home directory
+contents (bootstrap config, debug logs, credentials). This is not
+performed by the `harden` package itself but is a recommended consumer
+practice — see apiary's `lockdownRoot()` for an example.
+
+### Threat model
+
+These hardening measures are defense-in-depth for the guest
+environment. An attacker who has compromised the guest workload would
+need a hypervisor escape to reach the host; however, guest hardening:
+
+- Raises the bar for local privilege escalation within the guest
+- Reduces information available for exploit development (kernel pointers, dmesg)
+- Limits the attack surface of dangerous subsystems (BPF)
+- Constrains what a compromised process can do even with root inside the guest
+
+## Egress Policy Security Model
+
+The DNS-based egress policy (`WithEgressPolicy()`) restricts VM outbound
+connections to a set of allowed hostnames. It operates at the relay level,
+intercepting DNS traffic between the VM and the VirtualNetwork.
+
+### Threat Model
+
+The egress policy prevents a compromised or untrusted VM from:
+
+- Exfiltrating data to arbitrary external hosts
+- Communicating with command-and-control servers
+- Scanning or connecting to internal network resources
+
+### How It Works
+
+1. DNS queries for non-allowed hostnames receive NXDOMAIN responses
+   directly from the relay — the query never reaches the DNS server.
+2. DNS responses for allowed hostnames are snooped to extract A-record IPs.
+   These IPs become temporary firewall rules with TTLs matching the DNS
+   record TTLs (minimum 60 seconds).
+3. All other egress traffic is denied by the default-deny firewall policy.
+4. Implicit rules allow DNS to the gateway, DHCP, and ingress on
+   port-forwarded ports.
+
+### Bypass Vectors and Mitigations
+
+| Vector | Mitigation |
+|--------|------------|
+| **Hardcoded IPs** | Default-deny blocks connections to IPs not learned from DNS. The VM cannot reach arbitrary IPs without first resolving them through the interceptor. |
+| **DNS-over-HTTPS (DoH)** | HTTPS to DoH providers (e.g., 1.1.1.1, 8.8.8.8) is blocked by default-deny unless the DoH server hostname is in the allowlist. |
+| **DNS-over-TLS (DoT)** | TCP port 853 is blocked by default-deny. |
+| **IP-in-hostname** | The policy matches hostname strings, not resolved IPs. An attacker-controlled DNS server could return arbitrary IPs for an allowed hostname, but the attacker would need to control the DNS server the gateway uses. |
+| **Tunneling over DNS** | DNS queries to allowed domains pass through, so DNS tunneling to an allowed domain is theoretically possible. This is a limitation of DNS-level filtering. |
+| **TTL racing** | After a dynamic rule expires, the connection may survive via conntrack (if already established). This is by design — conntrack ensures established connections are not disrupted by TTL expiry. |
+
+### What It Does NOT Protect Against
+
+- **Established connection survival**: Once a connection is tracked by
+  conntrack, it persists until the conntrack entry expires (5 minutes for
+  TCP, 30 seconds for UDP), even if the dynamic rule has expired.
+- **Same-subnet traffic**: Traffic within the virtual network subnet
+  (192.168.127.0/24) is subject to the same firewall rules but does not
+  typically involve DNS resolution.
+- **IPv6**: AAAA records are not processed. IPv6 traffic is non-IPv4 and
+  passes through the firewall unfiltered (same as ARP).
+
+## Tar Extraction Defenses
+
+When extracting OCI image layers, go-microvm applies multiple layers of
+defense against malicious tar archives:
+
+**Path traversal prevention.** Every tar entry name is cleaned via
+`filepath.Clean()`, absolute paths are rejected, and the resolved path
+is verified to stay under the destination directory.
+
+**Symlink traversal prevention.** Directories are created one component
+at a time. Each existing component is checked with `os.Lstat()` (not
+`os.Stat()`, which would follow symlinks). If any component is a symlink,
+extraction is refused.
+
+**Symlink leaf validation.** Before writing a regular file, the target
+path is checked with `os.Lstat()`. If the target is a symlink or a
+directory, writing is refused.
+
+**Symlink target validation.** Absolute symlink targets are resolved
+relative to the rootfs and checked to stay within bounds. Relative
+symlink targets are resolved from the parent directory.
+
+**Hardlink boundary enforcement.** Hard links are validated to ensure
+both source and target remain within the rootfs directory.
+
+**Decompression bomb limit.** The tar reader is wrapped in
+`io.LimitedReader` with a 30 GiB cap.
+
+**Entry type filtering.** Character devices, block devices, and FIFOs
+are silently skipped.
+
+## Process Identity Verification
+
+When managing VM lifecycle, go-microvm verifies process identity before
+sending signals:
+
+- `IsAlive()` sends signal 0 to the PID (no-op that verifies the
+  process exists and the caller has permission to signal it)
+- `Stop()` checks `IsAlive()` before SIGTERM, and checks again during
+  the poll loop before SIGKILL
+- The `isNoSuchProcess()` helper handles `ESRCH` gracefully
+
+This prevents sending signals to unrelated processes if the PID has
+been reused.
+
+## Host Capabilities (Linux)
+
+When running as a non-root user on Linux, go-microvm requires `CAP_CHOWN` on the
+process to set correct file ownership during OCI image extraction. Without it,
+all extracted rootfs files are owned by the host user, and the guest sees
+incorrect ownership — which can cause permission errors for processes running
+as different UIDs inside the VM.
+
+A non-required preflight check (`cap-chown`) warns at startup if `CAP_CHOWN`
+is missing. To grant it:
+
+```bash
+# File capability on the binary (persistent across invocations):
+sudo setcap cap_chown+ep /path/to/your-binary
+
+# Or grant via ambient capabilities for a specific invocation:
+capsh --addamb=cap_chown -- -c '/path/to/your-binary'
+```
+
+### override_stat xattr (macOS and Linux)
+
+go-microvm also sets the `user.containers.override_stat` extended attribute on
+extracted files so that libkrun's virtiofs server reports correct ownership to
+the guest. This is the same mechanism that podman uses on macOS.
+
+On Linux, the xattr is set on regular files and directories. The kernel
+restricts `user.*` xattrs on symlinks and special files, so those are silently
+skipped. Once libkrun's Linux virtiofs passthrough adds support for reading
+these xattrs (the same support already exists on macOS), file ownership in the
+guest will be correct without requiring `CAP_CHOWN`.
+
+See the `internal/xattr` package for details.
+
+## File Permissions
+
+| Resource | Mode | Description |
+|----------|------|-------------|
+| State directory | 0700 | Owner only |
+| State lock file | flock | Exclusive access |
+| SSH private keys | 0600 | Owner read/write |
+| SSH public keys | 0644 | World readable |
+| VM log files | 0600 | Owner only |
+| Cache directories | 0700 | Owner only |
+| Unix socket (vnet.sock) | 0700 dir | Protected by parent directory permissions |
+
+## SSH Client Security
+
+The SSH client uses `InsecureIgnoreHostKey()` for host key verification.
+This is acceptable because the client only connects to VMs that go-microvm
+just created -- the guest was booted from an image we pulled and configured,
+and the connection is over a localhost port forward that is not exposed to
+the network.
+
+If go-microvm is used in a scenario where the SSH connection traverses an
+untrusted network, host key verification should be implemented by the
+caller using a custom SSH client rather than the built-in one.
+
+---
+
+# Troubleshooting
+
+Source: https://github.com/stacklok/go-microvm/blob/main/docs/TROUBLESHOOTING.md
+
+# Troubleshooting
+
+Common issues when using go-microvm and how to resolve them.
+
+## VM Fails to Start
+
+### KVM not available (Linux)
+
+```bash
+# Check KVM device exists
+ls -la /dev/kvm
+
+# If missing, load the module
+sudo modprobe kvm
+sudo modprobe kvm_intel  # or kvm_amd
+
+# Check permissions
+groups | grep -q kvm || sudo usermod -aG kvm $USER
+# Log out and back in after adding to group
+```
+
+### Hypervisor.framework not available (macOS)
+
+```bash
+sysctl kern.hv_support
+# Must return 1. If 0, Apple Silicon with Hypervisor.framework is required.
+```
+
+### Code signing required (macOS)
+
+If go-microvm-runner crashes immediately with `EXC_BAD_ACCESS`, it needs the
+hypervisor entitlement. See [docs/MACOS.md](MACOS.md).
+
+## Log Files
+
+go-microvm writes log files to the data directory
+(`~/.config/go-microvm/` by default, or the path set via `WithDataDir()`):
+
+| File | Contents |
+|------|----------|
+| `console.log` | Guest console output (kernel messages, init script) |
+| `vm.log` | go-microvm-runner stdout/stderr (libkrun errors) |
+
+Networking logs are emitted via `log/slog` and appear in the application's
+structured logging output rather than a separate file.
+
+```bash
+# Check for guest-side errors (kernel, init script)
+cat ~/.config/go-microvm/console.log
+
+# Check for host-side runner errors
+cat ~/.config/go-microvm/vm.log
+```
+
+## Port Conflicts
+
+If `Run()` fails with a port availability error:
+
+```bash
+# Find what's using the port (Linux)
+ss -tlnp | grep ':8080'
+
+# Find what's using the port (macOS)
+lsof -iTCP:8080 -sTCP:LISTEN
+```
+
+## Networking Issues
+
+### Guest has no network
+
+The guest should get IP `192.168.127.2` via DHCP from the in-process
+VirtualNetwork. Check `console.log` for DHCP client output.
+
+If the guest has no network, verify that the networking provider started
+successfully by checking the application's log output for errors from
+`net.Provider.Start()`.
+
+## Runner Binary Not Found
+
+go-microvm searches for `go-microvm-runner` in this order:
+1. Explicit path via `libkrun.WithRunnerPath()` (passed to `libkrun.NewBackend()`)
+2. System `$PATH`
+3. Next to the calling executable
+
+```bash
+# Check if it's in PATH
+which go-microvm-runner
+
+# Build it (requires system libkrun-devel)
+cd go-microvm && task build-dev
+```
+
+## Resource Limits
+
+### vCPU limit
+
+The stock libkrunfw kernel is compiled with `CONFIG_NR_CPUS=8`, limiting
+guests to 8 vCPUs. Requesting more will fail at `SetVMConfig()`.
+
+### Memory
+
+There is no hard memory limit from libkrun. The practical limit is
+available host RAM. go-microvm defaults to 512 MiB.
+
+## Licensing
+
+libkrunfw bundles a Linux kernel compiled with the `kvm` guest patches.
+The kernel is licensed under GPL-2.0-only. If you distribute a binary
+that embeds libkrunfw, you must provide the corresponding kernel source
+(or a written offer to provide it). See the
+[libkrunfw repository](https://github.com/containers/libkrunfw) for
+source availability.
+
+---
