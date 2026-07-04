@@ -1,0 +1,1421 @@
+# Membrane Framework AI Skill
+
+Source: https://membrane-core.hexdocs.pm/skill.md
+
+---
+name: membrane-framework
+description: Work with the Membrane multimedia streaming framework in Elixir. Use this skill whenever the user is building or debugging Membrane pipelines, writing custom Elements, Bins, or Filters, connecting pads, implementing callbacks, handling stream formats or EOS, or asking about Membrane architecture. Trigger on any mention of membrane_core, membrane, membrane framework, Membrane.Pipeline, Membrane.Sink, Membrane.Source, Membrane.Filter, Membrane.Endpoint, Membrane.Bin, Membrane.Pad, or multimedia streaming in an Elixir context — even if the user doesn't say "Membrane" explicitly but is clearly working on this codebase.
+globs: ["**/*.ex", "**/*.exs"]
+alwaysApply: false
+---
+
+# Membrane Framework
+
+**Package**: `membrane_core` ~> 1.3 | **Docs**: https://hexdocs.pm/membrane_core/ | **Module index**: https://hexdocs.pm/membrane_core/llms.txt | **Demos**: https://github.com/membraneframework/membrane_demo | **All packages**: [packages_list.md](../../guides/llms/packages_list.md)
+
+## How to Approach Tasks
+
+- **New component** — before writing a new element, check [packages_list.md](../../guides/llms/packages_list.md) to see if it already exists in an existing plugin; if not, identify subtype (Source/Filter/Sink/Endpoint/Bin), define pads, implement required callbacks (`handle_buffer/4` for filters/sinks, `handle_demand/5` for manual-flow sources)
+- **Generating boilerplate** — use `mix membrane.gen.filter MyApp.MyFilter`, `mix membrane.gen.source`, `mix membrane.gen.sink`, `mix membrane.gen.endpoint`, `mix membrane.gen.bin`, `mix membrane.gen.pipeline` instead of writing component skeletons by hand
+- **Choosing element subtype** — prefer `Filter` for transformations (has sensible defaults for stream_format forwarding); use `Endpoint` only when output is unrelated to input (e.g. a UDP Endpoint); use `Source`/`Sink` for pure producers/consumers
+- **Flow control** — default to `:auto` on all pads; only use `:manual` when you need fine-grained backpressure control; Almost the only use case of `:push` are output pads of Sources/Endpoints that cannot control when they produce data, e.g. UDP Source/Endpoint.
+- **Pipeline topology** — use the ChildrenSpec DSL (`child/2`, `get_child/1`, `via_in/2`, `via_out/2`) (more info: [Membrane.ChildrenSpec](https://hexdocs.pm/membrane_core/Membrane.ChildrenSpec.md))
+- **Static vs dynamic topology** — return `spec:` from `handle_init/2` for static pipelines; return additional `spec:` actions from any callback (e.g. `handle_child_notification/4`) to grow the topology at runtime
+- **Naming children** — use atoms (`:source`) for singletons, tuples (`{:decoder, track_id}`) for multi-instance children of the same type
+- **Detecting pipeline completion** — implement `handle_element_end_of_stream/4` in the pipeline to know when a sink's input pad received EOS; then return `{[terminate: :normal], state}` (doesn't work if sink is a Membrane.Bin - then expect a custom message from the bin in `handle_child_notification` callback instead, if the bin sends it)
+- **Dynamic tracks** (demuxers, variable inputs) — use the Dynamic Pads Pattern below
+- **Crash isolation** — group children with `{spec, group: <name>, crash_group_mode: :temporary}`; handle recovery in `handle_crash_group_down/3`; see [Crash Groups guide](https://hexdocs.pm/membrane_core/crash_groups.md)
+- **Inserting debug probes** — add `child(:probe, %Membrane.Debug.Filter{handle_buffer: &IO.inspect(&1, label: :buffer)})` between any two elements to log buffers without changing pipeline logic. You can use different logging functions than `IO.inspect/2`. More info: [Membrane.Debug.Filter](https://hexdocs.pm/membrane_core/Membrane.Debug.Filter.md).
+- **Linking children** - linked children pads accepted formats must have non-empty intersections
+- **Debugging** — check pad `accepted_format` compatibility
+- **Callback context** — every callback receives `ctx`; key fields: `ctx.children`, `ctx.pads`, `ctx.playback`; crash callbacks also have `ctx.crash_initiator`, `ctx.exit_reason`, `ctx.group_name`; see [Pipeline.CallbackContext](https://hexdocs.pm/membrane_core/Membrane.Pipeline.CallbackContext.md), [Bin.CallbackContext](https://hexdocs.pm/membrane_core/Membrane.Bin.CallbackContext.md), [Element.CallbackContext](https://hexdocs.pm/membrane_core/Membrane.Element.CallbackContext.md)
+- **Logging** — utilize `Membrane.Logger` instead of `Logger` in Membrane components; it prepends component path and name to log messages. Requires `require Membrane.Logger` in the module before calling any logging functions.
+- **Use `mix hex.info <plugin name>` when you need to check the newest version of a plugin**
+- **Search for appropriate plugins in [packages_list.md](../../guides/llms/packages_list.md)** before writing one
+- **Check input and output pad definitions of elements in `deps/` (use `cat <filename> | grep def_input_pad` and `cat <filename> | grep def_output pad`) to make sure output pad's `accepted_stream_format` is compatible with `accepted_stream_format` of the input pad which it is linked to.**
+- **If the `accepted_stream_format` doesn't match, search for an element which can act as an adapter**
+- **When constructing Membrane Pipeline, lean towards using most powerful Membrane Components, which are [Boombox.Bin](https://hexdocs.pm/boombox/llms.txt) and [Membrane.Transcoder](https://hexdocs.pm/membrane_transcoder_plugin/llms.txt), instead of using many smaller plugins**
+
+---
+
+## Common Pitfalls
+
+- **Modifying code in `deps/` directory** - never do that
+- **Using `child/2` for an already-spawned child** — `child/2` always spawns a new process; use `get_child/1` to reference an existing one; duplicating a name raises an error
+- **Linking static pads outside the spawning spec** — static pads must be linked in the same `spec` that spawns the component; linking them later raises a `LinkError`
+- **Not wiring a dynamic bin pad in `handle_pad_added/3`** — a dynamic bin input pad must be connected to an internal child within 5 seconds or a `LinkError` is raised
+- **Heavy work in `handle_init/2`** — `handle_init` is synchronous and blocks the parent; move file I/O, network connections, etc. to `handle_setup/2`
+- **Producing data before `handle_playing/2`** — pads are not ready until `:playing`; don't send buffers from `handle_setup/2`
+- **Returning non-spec actions from `handle_init/2`** — we recommend to return only `:spec` action from this callback.
+
+---
+
+## Architecture
+
+```
+Pipeline
+├── Element (Source/Filter/Sink/Endpoint)  ← leaf, processes data
+├── Bin                                     ← dual role: parent (has children) + child (has pads)
+│   ├── Element
+│   └── Bin                                ← bins nest arbitrarily deep
+└── ...
+```
+
+| Type | Parent | Child | Has Pads |
+|------|--------|-------|----------|
+| **Pipeline** | yes | no | no |
+| **Bin** | yes | yes | yes |
+| **Element** | no | yes | yes |
+
+Element subtypes: **Source** (output only) · **Filter** (in + out, output is transformed input) · **Sink** (input only) · **Endpoint** (in + out, but output might be not related to input)
+
+---
+
+## Pads
+
+Defined on Elements and Bins (not Pipelines) using `def_input_pad/2` (`Membrane.Element.WithInputPads`) and `def_output_pad/2` (`Membrane.Element.WithOutputPads`):
+
+```elixir
+def_input_pad :input, accepted_format: _any
+def_output_pad :output, accepted_format: Membrane.RawAudio, flow_control: :auto
+```
+
+- **Availability**: `:always` (static, one instance, referenced by atom) or `:on_request` (dynamic, reference via `Pad.ref(:name, id)`)
+- **Flow control**: `:auto` (framework manages demand — preferred), `:manual` (explicit via `:demand`/`:redemand`), `:push` (no demand, risk of overflow)
+- One input pad ↔ one output pad only; pads must have compatible `accepted_format`
+- Default pad names `:input`/`:output` allow omitting `via_in`/`via_out` in specs
+- **`accepted_format` matching syntax**: `_any` (accept anything) · `Membrane.RawAudio` (any struct of that type) · `%Membrane.RawAudio{channels: 2}` (match specific fields) · `%Membrane.RemoteStream{}` (unknown/unparsed stream). `any_of(pattern1, pattern2, ...)` matches if any pattern matches. 
+- **Full pads guide** (static vs dynamic, bin pads, lifecycle): [Everything about pads](https://hexdocs.pm/membrane_core/pads.md)
+
+---
+
+## Component Lifecycle
+
+```
+handle_init/2      sync, blocks parent — parse opts, return initial spec
+handle_setup/2     async — heavy init (open files, connect services)
+                   return {[setup: :incomplete], state} to delay :playing
+handle_pad_added/3 fires for dynamic pads linked in the same spec
+handle_playing/2   component is ready — start producing/consuming data
+```
+
+All components spawned in the same `:spec` action enter `:playing` together (they synchronize to the slowest setup). Elements and Bins wait for their parent before `handle_playing/2`.
+
+**Stream format and EOS rules (critical for filter authors):**
+- A source/filter **must send `{:stream_format, {pad, format}}` before the first buffer** on each output pad, or downstream elements crash
+- The default [`handle_stream_format/4`](https://hexdocs.pm/membrane_core/Membrane.Element.WithInputPads.md) in filters forwards the format downstream — if you override it, you must forward manually or return the `{:stream_format, ...}` action yourself
+- The default [`handle_end_of_stream/3`](https://hexdocs.pm/membrane_core/Membrane.Element.WithInputPads.md) in filters forwards EOS downstream — overriding without forwarding will stall the pipeline
+
+Full lifecycle guide: [Lifecycle of Membrane Components](https://hexdocs.pm/membrane_core/components_lifecycle.md)
+
+---
+
+## Pipeline & Bin DSL (ChildrenSpec)
+
+```elixir
+# Linear chain — child/2 spawns a new named child
+child(:source, %Membrane.File.Source{location: "input.mp4"})
+|> child(:filter, MyFilter)
+|> child(:sink, %Membrane.File.Sink{location: "out.raw"})
+
+# Explicit pad names (required for non-default names or dynamic pads)
+get_child(:demuxer)
+|> via_out(Pad.ref(:output, track_id))
+|> via_in(:video_input)
+|> child(:decoder, Membrane.H264.FFmpeg.Decoder)
+
+# Link to an already-existing child
+get_child(:existing_filter) |> child(:new_sink, MySink)
+
+# Inside a Bin — bin_input/bin_output connect the bin's own pads to internal children
+bin_input(:input) |> child(:filter, MyFilter) |> bin_output(:output)
+
+# Crash group — all children in the spec share the group; a crash in any terminates all
+{child(:source, Source) |> child(:sink, Sink), group: :my_group, crash_group_mode: :temporary}
+```
+
+**Bin pad wiring rules:**
+- `bin_input(pad_ref)` / `bin_output(pad_ref)` are the interior side of the bin's own pads
+- Dynamic bin input pads **must** be wired inside `handle_pad_added/3` within 5 seconds or a `LinkError` is raised
+- Linking to a bin actually links directly to the inner component (no extra message hop)
+
+---
+
+## Dynamic Pads Pattern
+
+The standard approach for variable-track streams (e.g. MP4 demuxers):
+
+```elixir
+# 1. Spawn source + demuxer; demuxer hasn't identified tracks yet
+def handle_init(_ctx, state) do
+  {[spec: child(:source, Source) |> child(:demuxer, Demuxer)], state}
+end
+
+# 2. Demuxer notifies parent once tracks are known
+def handle_child_notification({:new_tracks, tracks}, :demuxer, _ctx, state) do
+  spec = Enum.map(tracks, fn {id, _fmt} ->
+    get_child(:demuxer)
+    |> via_out(Pad.ref(:output, id))
+    |> child({:decoder, id}, Decoder)
+    |> child({:sink, id}, Sink)
+  end)
+  {[spec: spec], state}
+end
+```
+
+---
+
+## Built-in Utility Elements
+
+| Module | Purpose |
+|--------|---------|
+| `Membrane.Funnel` | Multiple inputs → one output |
+| `Membrane.Tee` | One input → multiple outputs |
+| `Membrane.Connector` | Connect dynamic pads with internal buffering |
+| `Membrane.Testing.Source` | Inject buffers into a pipeline in tests |
+| `Membrane.Testing.Sink` | Capture and assert on buffers in tests |
+| `Membrane.Debug.Filter` | Log/inspect buffers flowing through pipeline |
+| `Membrane.Debug.Sink` | Log/inspect buffers at pipeline end |
+| `Membrane.FilterAggregator` | It is deprecated, just don't use it |
+
+---
+
+## Testing
+
+```elixir
+import Membrane.ChildrenSpec
+import Membrane.Testing.Assertions
+alias Membrane.Testing
+
+pipeline = Testing.Pipeline.start_link_supervised!(spec: [
+  child(:source, %Testing.Source{output: [<<1, 2, 3>>, <<4, 5, 6>>]})
+  |> child(:sink, Testing.Sink)
+])
+
+assert_sink_buffer(pipeline, :sink, %Membrane.Buffer{payload: <<1, 2, 3>>})
+assert_start_of_stream(pipeline, :sink)
+assert_end_of_stream(pipeline, :sink)
+```
+
+- `Testing.DynamicSource` — like `Testing.Source` but with a dynamic output pad
+
+---
+
+## Timing
+
+All timestamps are `Membrane.Time.t()`. It is integer nanoseconds under the hood, but don't use this information, because it is a part of the private API. However, keep in mind you can perform operations on `Membrane.Time.t()` using `+` or `-` operators. Helpers: `Membrane.Time.seconds/1`, `Membrane.Time.milliseconds/1`, `Membrane.Time.microseconds/1`, etc. Timers started with `:start_timer` action fire `handle_tick/3`.
+
+More info: [Membrane.Time](https://hexdocs.pm/membrane_core/Membrane.Time.md), [Timestamps guide](https://hexdocs.pm/membrane_core/timestamps.md).
+
+---
+
+## Actions
+
+Actions are returned from callbacks as `{[action_list], state}`. Full reference by component type:
+
+- [Membrane.Element.Action](https://hexdocs.pm/membrane_core/Membrane.Element.Action.md) — buffers, stream_format, events, EOS, demand, timers, notify_parent, setup, terminate
+- [Membrane.Bin.Action](https://hexdocs.pm/membrane_core/Membrane.Bin.Action.md) — spec, remove_children, remove_link, notify_parent, notify_child, timers, setup, terminate
+- [Membrane.Pipeline.Action](https://hexdocs.pm/membrane_core/Membrane.Pipeline.Action.md) — spec, remove_children, remove_link, notify_child, timers, terminate
+
+---
+
+## Key Source Files
+
+| Module | Purpose |
+|--------|---------|
+| [`Membrane.Pipeline`](https://hexdocs.pm/membrane_core/Membrane.Pipeline.md) | Pipeline behaviour & all callbacks |
+| [`Membrane.Pipeline.Action`](https://hexdocs.pm/membrane_core/Membrane.Pipeline.Action.md) | Pipeline action type specs |
+| [`Membrane.Bin`](https://hexdocs.pm/membrane_core/Membrane.Bin.md) | Bin behaviour & all callbacks |
+| [`Membrane.Bin.Action`](https://hexdocs.pm/membrane_core/Membrane.Bin.Action.md) | Bin action type specs |
+| [`Membrane.Element.Base`](https://hexdocs.pm/membrane_core/Membrane.Element.Base.md) | Shared element callbacks |
+| [`Membrane.Element.WithInputPads`](https://hexdocs.pm/membrane_core/Membrane.Element.WithInputPads.md) | `handle_buffer/4`, `handle_stream_format/4`, `handle_end_of_stream/3` |
+| [`Membrane.Element.WithOutputPads`](https://hexdocs.pm/membrane_core/Membrane.Element.WithOutputPads.md) | `handle_demand/5` |
+| [`Membrane.Element.Action`](https://hexdocs.pm/membrane_core/Membrane.Element.Action.md) | Element action type specs |
+| [`Membrane.Pad`](https://hexdocs.pm/membrane_core/Membrane.Pad.md) | Pad definitions, `Pad.ref/2` |
+| [`Membrane.Buffer`](https://hexdocs.pm/membrane_core/Membrane.Buffer.md) | Buffer struct |
+| [`Membrane.ChildrenSpec`](https://hexdocs.pm/membrane_core/Membrane.ChildrenSpec.md) | Topology DSL |
+
+---
+
+## Callback Reference
+
+Callbacks are documented in the relevant behaviour modules:
+
+- [Membrane.Pipeline](https://hexdocs.pm/membrane_core/Membrane.Pipeline.md) — `handle_init`, `handle_setup`, `handle_playing`, `handle_call`, `handle_child_notification`, `handle_child_terminated`, `handle_crash_group_down`, `handle_element_end_of_stream`, etc.
+- [Membrane.Bin](https://hexdocs.pm/membrane_core/Membrane.Bin.md) — same as Pipeline plus `handle_pad_added`, `handle_pad_removed`, `handle_parent_notification`
+- [Membrane.Element.Base](https://hexdocs.pm/membrane_core/Membrane.Element.Base.md) — callbacks common to all elements: `handle_init`, `handle_setup`, `handle_playing`, `handle_pad_added`, `handle_pad_removed`, `handle_parent_notification`, `handle_info`, `handle_tick`
+- [Membrane.Element.WithInputPads](https://hexdocs.pm/membrane_core/Membrane.Element.WithInputPads.md) — `handle_buffer`, `handle_stream_format`, `handle_start_of_stream`, `handle_end_of_stream`
+- [Membrane.Element.WithOutputPads](https://hexdocs.pm/membrane_core/Membrane.Element.WithOutputPads.md) — `handle_demand`
+- [Membrane.Source](https://hexdocs.pm/membrane_core/Membrane.Source.md), [Membrane.Filter](https://hexdocs.pm/membrane_core/Membrane.Filter.md), [Membrane.Sink](https://hexdocs.pm/membrane_core/Membrane.Sink.md), [Membrane.Endpoint](https://hexdocs.pm/membrane_core/Membrane.Endpoint.md) — combine the above with default implementations
+
+---
+
+# Membrane Framework
+
+Source: https://membrane-core.hexdocs.pm/readme.md
+
+# Membrane Framework
+
+[![Hex.pm](https://img.shields.io/hexpm/v/membrane_core.svg)](https://hex.pm/packages/membrane_core)
+[![API Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_core/)
+[![CircleCI](https://circleci.com/gh/membraneframework/membrane_core.svg?style=svg)](https://circleci.com/gh/membraneframework/membrane_core)
+[![Ad](https://swm-delivery.com/www/images/zone-gh-membrane-1?n=1)](https://swm-delivery.com/www/delivery/ck-slug.php?zoneid=zone-gh-membrane-1&n=1)
+[![Ad](https://swm-delivery.com/www/images/zone-gh-membrane-2?n=1)](https://swm-delivery.com/www/delivery/ck-slug.php?zoneid=zone-gh-membrane-2&n=1)
+[![Ad](https://swm-delivery.com/www/images/zone-gh-membrane-3?n=1)](https://swm-delivery.com/www/delivery/ck-slug.php?zoneid=zone-gh-membrane-3&n=1)
+
+Membrane is a versatile multimedia streaming & processing framework. You can use it to build a media server of your need, that can:
+
+- stream via WebRTC, RTSP, RTMP, HLS, HTTP and other protocols,
+- transcode, mix and apply custom processing of video & audio,
+- accept and generate / record to MP4, MKV, FLV and other containers,
+- handle dynamically connecting and disconnecting streams,
+- seamlessly scale and recover from errors,
+- do whatever you imagine if you implement it yourself :D Membrane makes it easy to plug in your code at almost any point of processing.
+
+The abbreviations above don't ring any bells? Visit [membrane.stream/learn](https://membrane.stream/learn) and let Membrane introduce you to the multimedia world!
+
+If you have questions or need consulting, we're for you at our [Discord](https://discord.gg/nwnfVSY), [forum](https://elixirforum.com/c/elixir-framework-forums/membrane-forum/), [GitHub discussions](https://github.com/orgs/membraneframework/discussions), [X (Twitter)](https://twitter.com/ElixirMembrane) and via [e-mail](mailto:info@membraneframework.org).
+
+You can also [follow Membrane on X (Twitter)](https://twitter.com/ElixirMembrane) or [join our Discord](https://discord.gg/nwnfVSY) to be up to date and get involved in the community.
+
+If you already had a chance to use Membrane, we will be greateful if could fill out quick [survey](https://forms.gle/dgVDFHUD7CUGxU5VA) to help us improve framework and decide on what to do next.
+
+For people who write Membrane code with AI assistants, we ship a [dedicated skill](#membrane-skill-for-ai-assistants) for them.
+
+Membrane is maintained by [Software Mansion](https://swmansion.com).
+
+## Quick start
+
+```elixir
+Mix.install([
+  :membrane_hackney_plugin,
+  :membrane_mp3_mad_plugin,
+  :membrane_portaudio_plugin,
+])
+
+defmodule MyPipeline do
+  use Membrane.Pipeline
+
+  @impl true
+  def handle_init(_ctx, mp3_url) do
+    spec =
+      child(%Membrane.Hackney.Source{
+        location: mp3_url, hackney_opts: [follow_redirect: true]
+      })
+      |> child(Membrane.MP3.MAD.Decoder)
+      |> child(Membrane.PortAudio.Sink)
+
+    {[spec: spec], %{}}
+  end
+end
+
+mp3_url = "https://raw.githubusercontent.com/membraneframework/membrane_demo/master/simple_pipeline/sample.mp3"
+
+Membrane.Pipeline.start_link(MyPipeline, mp3_url)
+```
+
+This is an [Elixir](elixir-lang.org) snippet, that streams an mp3 via HTTP and plays it on your speaker. Here's how to run it:
+
+- Option 1: Click the button below:
+
+  [![Run in Livebook](https://livebook.dev/badge/v1/blue.svg)](https://livebook.dev/run?url=https%3A%2F%2Fgithub.com%2Fmembraneframework%2Fmembrane_core%2Fblob%2Fmaster%2Fexample.livemd)
+
+  It will install [Livebook](livebook.dev), an interactive notebook similar to Jupyter, and it'll open the snippet in there for you. Then just click the 'run' button in there.
+
+- Option 2: If you don't want to use Livebook, you can [install Elixir](https://elixir-lang.org/install.html), type `iex` to run the interactive shell and paste the snippet there.
+
+After that, you should hear music playing on your speaker :tada:
+
+To learn step-by-step what exactly happens here, follow [this tutorial](https://membrane.stream/learn/get_started_with_membrane).
+
+## Learning
+
+The best place to learn Membrane is the [membrane.stream/learn](https://membrane.stream/learn) website and the [membrane_demo](https://github.com/membraneframework/membrane_demo) repository. Try them out, then hack something exciting!
+
+## Membrane skill for AI assistants
+
+This repo includes [`skills/membrane-framework/SKILL.md`](skills/membrane-framework/SKILL.md), a structured guide that helps AI coding assistants write Membrane code.
+
+If you use [Claude Code](https://docs.claude.com/en/docs/claude-code), install it via the plugin system:
+
+```
+/plugin marketplace add membraneframework/membrane_core
+/plugin install membrane-framework@membrane
+```
+
+After install, Claude automatically pulls in the skill whenever you work on Membrane code (mentioning `Membrane.Pipeline`, `Bin`, `Filter`, `Pad`, etc).
+
+If you use [Cursor](https://www.cursor.com/), drop the skill into your project's rules directory:
+
+```
+mkdir -p .cursor/rules && curl -fL https://raw.githubusercontent.com/membraneframework/membrane_core/master/skills/membrane-framework/SKILL.md -o .cursor/rules/membrane-framework.mdc
+```
+
+For a cross-agent install, use [skills.sh](https://skills.sh)'s CLI via [`npx`](https://docs.npmjs.com/cli/v10/commands/npx):
+
+```
+npx skills add membraneframework/membrane_core -g
+```
+
+For agents `skills.sh` doesn't support, include the `SKILL.md` file directly in the agent's context, or copy its contents into whatever instruction file the tool reads.
+
+## Structure of the framework
+
+The most basic media processing entities of Membrane are `Element`s. An element might be able, for example, to mux incoming audio and video streams into MP4, or play raw audio using your sound card. You can create elements yourself, or choose from the ones provided by the framework.
+
+Elements can be organized into a pipeline - a sequence of linked elements that perform a specific task. For example, a pipeline might receive an incoming RTSP stream from a webcam and convert it to an HLS stream, or act as a selective forwarding unit (SFU) to implement your own videoconferencing room. The [Quick start](#quick-start) section above shows how to create a simple pipeline.
+
+### Membrane packages
+
+To embrace modularity, Membrane is delivered to you in multiple packages, including plugins, formats, core and standalone libraries. The complete list of all the Membrane packages maintained by the Membrane team is available [here](#membrane-packages).
+
+**Plugins**
+
+Plugins provide elements that you can use in your pipeline. Each plugin lives in a `membrane_X_plugin` repository, where X can be a protocol, codec, container or functionality, for example [membrane_opus_plugin](https://github.com/membraneframework/membrane_opus_plugin). Plugins wrapping a tool or library are named `membrane_X_LIBRARYNAME_plugin` or just `membrane_LIBRARYNAME_plugin`, like [membrane_mp3_mad_plugin](https://github.com/membraneframework/membrane_mp3_mad_plugin). Plugins are published on [hex.pm](https://hex.pm), for example [hex.pm/packages/membrane_opus_plugin](https://hex.pm/pakcages/membrane_opus_plugin) and docs are at [hexdocs](https://hexdocs.pm), like [hexdocs.pm/membrane_opus_plugin](https://hexdocs.pm/membrane_opus_plugin). Some plugins require native libraries installed in your OS. Those requirements, along with usage examples are outlined in each plugin's readme.
+
+**Formats**
+
+Apart from plugins, Membrane has stream formats, which live in `membrane_X_format` repositories, where X is usually a codec or container, for example [membrane_opus_format](https://github.com/membraneframework/membrane_opus_format). Stream formats are published the same way as packages and are used by elements to define what kind of stream can be sent or received. They also provide utility functions to deal with a given codec/container.
+
+**Core**
+
+The API for creating pipelines (and custom elements too) is provided by [membrane_core](https://github.com/membraneframework/membrane_core). To install it, add the following line to your `deps` in `mix.exs` and run `mix deps.get`
+
+```elixir
+{:membrane_core, "~> 1.3"}
+```
+
+**Standalone libraries**
+
+Last but not least, Membrane provides tools and libraries that can be used standalone and don't depend on the membrane_core, for example [video_compositor](https://github.com/membraneframework/video_compositor), [ex_sdp](https://github.com/membraneframework/ex_sdp) or [unifex](https://github.com/membraneframework/unifex).
+
+## Goals
+
+The main goals of Membrane are:
+
+- To make work with multimedia a more pleasant experience than it is now.
+- To provide a welcoming ecosystem for learning multimedia development.
+- To power resilient, maintainable and scalable systems.
+
+## Elixir language
+
+We chose Elixir for Membrane because it's a modern, high-level, easy-to-learn language, that lets us rapidly develop media solutions. Elixir's main selling points are built-in parallelism and fault-tolerance features, so we can build scalable systems that are self-healing. It also runs on the battle-tested BEAM VM, that's been widely used and actively developed since the '80s. When we need the performance of a low-level language, we delegate to Rust or C.
+
+If you don't know Elixir, try [this tutorial](https://elixir-lang.org/getting-started) - it shouldn't take long and you'll know more than enough to get started with Membrane.
+
+## Supported platforms
+
+Membrane was created and is being worked on mainly with UNIX-based operating
+systems in mind - in most cases that means MacOS and Linux. When it comes to
+Windows, if a project uses any native code, not just pure Elixir, we can't
+guarantee it works correctly. To use Membrane on Windows we strongly
+recommend using WSL (Windows Subsystem for Linux), which allows for running a
+Linux environment on a Windows machine. If you wish to get more insight into
+direct support for Windows, see this
+[discussion](https://github.com/orgs/membraneframework/discussions/857).
+
+## Contributing
+
+We welcome everyone to contribute to Membrane. Here are some ways to contribute:
+
+- Spread the word about Membrane! Even though multimedia are present everywhere today, media dev is still quite niche. Let it be no longer!
+- Create learning materials. We try our best but can cover only a limited number of Membrane use cases.
+- Improve docs. We know it's not the most exciting part, but if you had a hard time understanding the docs, you're the best person to fix them ;)
+- Contribute code - plugins, features and bug fixes. It's best to contact us before, so we can provide our help & assistance, and agree on important matters. For details see the [contribution guide](CONTRIBUTING.md).
+
+## Support and questions
+
+If you have any questions regarding Membrane Framework or need consulting, feel free to contact us via [Discord](https://discord.gg/nwnfVSY), [forum](https://elixirforum.com/c/elixir-framework-forums/membrane-forum/), [GitHub discussions](https://github.com/orgs/membraneframework/discussions), [X (Twitter)](https://twitter.com/ElixirMembrane) or [e-mail](mailto:info@membraneframework.org).
+
+## All packages
+
+<!-- packages-list-start -->
+<!-- Generated code, do not edit. See `scripts/elixir/update_packages_list.exs`. -->
+
+### General
+
+| Package | Description | Links |
+| --- | --- | --- |
+| [membrane_sdk](https://github.com/membraneframework/membrane_sdk) | Full power of Membrane in a single package | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_sdk.svg)](https://hex.pm/api/packages/membrane_sdk) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_sdk/) |
+| [membrane_core](https://github.com/membraneframework/membrane_core) | The core of Membrane Framework, multimedia processing framework written in Elixir | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_core.svg)](https://hex.pm/api/packages/membrane_core) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_core/) |
+| [membrane_rtc_engine](https://github.com/fishjam-dev/membrane_rtc_engine) | [Maintainer: [fishjam-dev](https://github.com/fishjam-dev)] Customizable Real-time Communication Engine/SFU library focused on WebRTC. | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_rtc_engine.svg)](https://hex.pm/api/packages/membrane_rtc_engine) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_rtc_engine/) |
+| [kino_membrane](https://github.com/membraneframework/kino_membrane) | Utilities for introspecting Membrane pipelines in Livebook | [![Hex.pm](https://img.shields.io/hexpm/v/kino_membrane.svg)](https://hex.pm/api/packages/kino_membrane) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/kino_membrane/) |
+| [docker_membrane](https://github.com/membraneframework-labs/docker_membrane) | [Labs] A docker image based on Ubuntu, with Erlang, Elixir and libraries necessary to test and run the Membrane Framework. |   |
+| [membrane_demo](https://github.com/membraneframework/membrane_demo) | Examples of using the Membrane Framework |   |
+| [membrane_tutorials](https://github.com/membraneframework/membrane_tutorials) | Repository which contains text and assets used in Membrane Framework tutorials. |   |
+| [boombox](https://github.com/membraneframework/boombox) | Boombox is a simple streaming tool built on top of Membrane | [![Hex.pm](https://img.shields.io/hexpm/v/boombox.svg)](https://hex.pm/api/packages/boombox) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/boombox/) |
+
+### Plugins
+
+#### General purpose
+
+| Package | Description | Links |
+| --- | --- | --- |
+| [membrane_file_plugin](https://github.com/membraneframework/membrane_file_plugin) | Membrane plugin for reading and writing to files | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_file_plugin.svg)](https://hex.pm/api/packages/membrane_file_plugin) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_file_plugin/) |
+| [membrane_hackney_plugin](https://github.com/membraneframework/membrane_hackney_plugin) | HTTP sink and source based on Hackney | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_hackney_plugin.svg)](https://hex.pm/api/packages/membrane_hackney_plugin) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_hackney_plugin/) |
+| [membrane_scissors_plugin](https://github.com/membraneframework/membrane_scissors_plugin) | Element for cutting off parts of the stream | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_scissors_plugin.svg)](https://hex.pm/api/packages/membrane_scissors_plugin) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_scissors_plugin/) |
+| [membrane_tee_plugin](https://github.com/membraneframework/membrane_tee_plugin) | Membrane plugin for splitting data from a single input to multiple outputs | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_tee_plugin.svg)](https://hex.pm/api/packages/membrane_tee_plugin) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_tee_plugin/) |
+| [membrane_funnel_plugin](https://github.com/membraneframework/membrane_funnel_plugin) | Membrane plugin for merging multiple input streams into a single output | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_funnel_plugin.svg)](https://hex.pm/api/packages/membrane_funnel_plugin) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_funnel_plugin/) |
+| [membrane_realtimer_plugin](https://github.com/membraneframework/membrane_realtimer_plugin) | Membrane element limiting playback speed to realtime, according to buffers' timestamps | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_realtimer_plugin.svg)](https://hex.pm/api/packages/membrane_realtimer_plugin) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_realtimer_plugin/) |
+| [membrane_stream_plugin](https://github.com/membraneframework/membrane_stream_plugin) | Plugin for recording the entire stream sent through Membrane pads into a binary format and replaying it | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_stream_plugin.svg)](https://hex.pm/api/packages/membrane_stream_plugin) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_stream_plugin/) |
+| [membrane_fake_plugin](https://github.com/membraneframework/membrane_fake_plugin) | Fake Membrane sinks that drop incoming data | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_fake_plugin.svg)](https://hex.pm/api/packages/membrane_fake_plugin) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_fake_plugin/) |
+| [membrane_pcap_plugin](https://github.com/membraneframework-labs/membrane_pcap_plugin) | [Labs] Membrane PCAP source, capable of reading captured packets in pcap format |   |
+| [membrane_transcoder_plugin](https://github.com/membraneframework/membrane_transcoder_plugin) | Membrane plugin providing audio and video transcoding capabilities | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_transcoder_plugin.svg)](https://hex.pm/api/packages/membrane_transcoder_plugin) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_transcoder_plugin/) |
+| [membrane_generator_plugin](https://github.com/membraneframework/membrane_generator_plugin) | Video and audio samples generator | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_generator_plugin.svg)](https://hex.pm/api/packages/membrane_generator_plugin) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_generator_plugin/) |
+| [membrane_live_framerate_converter_plugin](https://github.com/kim-company/membrane_live_framerate_converter_plugin) | [Maintainer: [kim-company](https://github.com/kim-company)] Membrane.Filter that drops or duplicates frames to match a target framerate. Designed for realtime applications | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_live_framerate_converter_plugin.svg)](https://hex.pm/api/packages/membrane_live_framerate_converter_plugin) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_live_framerate_converter_plugin/) |
+| [membrane_template_plugin](https://github.com/membraneframework/membrane_template_plugin) | Template for Membrane Elements |   |
+
+#### AI
+
+| Package | Description | Links |
+| --- | --- | --- |
+| [membrane_whisper_plugin](https://github.com/membraneframework/membrane_whisper_plugin) | Membrane plugin for integrating OpenAI's Whisper in audio processing pipelines | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_whisper_plugin.svg)](https://hex.pm/api/packages/membrane_whisper_plugin) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_whisper_plugin/) |
+| [membrane_yolo_plugin](https://github.com/membraneframework/membrane_yolo_plugin) | Membrane Plugin for applying YOLO object detection on raw video frames | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_yolo_plugin.svg)](https://hex.pm/api/packages/membrane_yolo_plugin) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_yolo_plugin/) |
+
+#### Streaming protocols
+
+| Package | Description | Links |
+| --- | --- | --- |
+| [membrane_webrtc_plugin](https://github.com/membraneframework/membrane_webrtc_plugin) | Plugin for streaming via WebRTC | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_webrtc_plugin.svg)](https://hex.pm/api/packages/membrane_webrtc_plugin) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_webrtc_plugin/) |
+| [membrane_rtmp_plugin](https://github.com/membraneframework/membrane_rtmp_plugin) | RTMP server & client | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_rtmp_plugin.svg)](https://hex.pm/api/packages/membrane_rtmp_plugin) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_rtmp_plugin/) |
+| [membrane_http_adaptive_stream_plugin](https://github.com/membraneframework/membrane_http_adaptive_stream_plugin) | Plugin generating manifests for HLS | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_http_adaptive_stream_plugin.svg)](https://hex.pm/api/packages/membrane_http_adaptive_stream_plugin) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_http_adaptive_stream_plugin/) |
+| [membrane_srt_plugin](https://github.com/membraneframework/membrane_srt_plugin) |  | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_srt_plugin.svg)](https://hex.pm/api/packages/membrane_srt_plugin) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_srt_plugin/) |
+| [membrane_udp_plugin](https://github.com/membraneframework/membrane_udp_plugin) | Membrane plugin for sending and receiving UDP streams | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_udp_plugin.svg)](https://hex.pm/api/packages/membrane_udp_plugin) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_udp_plugin/) |
+| [membrane_tcp_plugin](https://github.com/membraneframework/membrane_tcp_plugin) | Membrane plugin for sending and receiving TCP streams | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_tcp_plugin.svg)](https://hex.pm/api/packages/membrane_tcp_plugin) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_tcp_plugin/) |
+| [membrane_rtp_plugin](https://github.com/membraneframework/membrane_rtp_plugin) | Membrane bins and elements for sending and receiving RTP/SRTP and RTCP/SRTCP streams | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_rtp_plugin.svg)](https://hex.pm/api/packages/membrane_rtp_plugin) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_rtp_plugin/) |
+| [membrane_rtp_h264_plugin](https://github.com/membraneframework/membrane_rtp_h264_plugin) | Membrane RTP payloader and depayloader for H264 | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_rtp_h264_plugin.svg)](https://hex.pm/api/packages/membrane_rtp_h264_plugin) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_rtp_h264_plugin/) |
+| [membrane_rtp_aac_plugin](https://github.com/membraneframework/membrane_rtp_aac_plugin) | RTP AAC depayloader | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_rtp_aac_plugin.svg)](https://hex.pm/api/packages/membrane_rtp_aac_plugin) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_rtp_aac_plugin/) |
+| [membrane_rtp_vp8_plugin](https://github.com/membraneframework/membrane_rtp_vp8_plugin) | Membrane elements for payloading and depayloading VP8 into RTP | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_rtp_vp8_plugin.svg)](https://hex.pm/api/packages/membrane_rtp_vp8_plugin) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_rtp_vp8_plugin/) |
+| [membrane_rtp_vp9_plugin](https://github.com/membraneframework-labs/membrane_rtp_vp9_plugin) | [Labs] Membrane elements for payloading and depayloading VP9 into RTP |   |
+| [membrane_rtp_mpegaudio_plugin](https://github.com/membraneframework/membrane_rtp_mpegaudio_plugin) | Membrane RTP MPEG Audio depayloader | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_rtp_mpegaudio_plugin.svg)](https://hex.pm/api/packages/membrane_rtp_mpegaudio_plugin) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_rtp_mpegaudio_plugin/) |
+| [membrane_rtp_opus_plugin](https://github.com/membraneframework/membrane_rtp_opus_plugin) | Membrane RTP payloader and depayloader for OPUS audio | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_rtp_opus_plugin.svg)](https://hex.pm/api/packages/membrane_rtp_opus_plugin) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_rtp_opus_plugin/) |
+| [membrane_rtp_g711_plugin](https://github.com/membraneframework/membrane_rtp_g711_plugin) | Membrane RTP payloader and depayloader for G711 audio | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_rtp_g711_plugin.svg)](https://hex.pm/api/packages/membrane_rtp_g711_plugin) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_rtp_g711_plugin/) |
+| [membrane_rtsp_plugin](https://github.com/gBillal/membrane_rtsp_plugin) | [Maintainer: [gBillal](https://github.com/gBillal)] Simplify connecting to RTSP server | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_rtsp_plugin.svg)](https://hex.pm/api/packages/membrane_rtsp_plugin) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_rtsp_plugin/) |
+| [membrane_mpeg_ts_plugin](https://github.com/kim-company/membrane_mpeg_ts_plugin) | [Maintainer: [kim-company](https://github.com/kim-company)] Membrane.Filter that demuxes MPEG-TS streams | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_mpeg_ts_plugin.svg)](https://hex.pm/api/packages/membrane_mpeg_ts_plugin) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_mpeg_ts_plugin/) |
+| [membrane_hls_plugin](https://github.com/kim-company/membrane_hls_plugin) | [Maintainer: [kim-company](https://github.com/kim-company)] Adaptive live streaming plugin (HLS) for the Membrane Framework | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_hls_plugin.svg)](https://hex.pm/api/packages/membrane_hls_plugin) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_hls_plugin/) |
+
+#### Containers
+
+| Package | Description | Links |
+| --- | --- | --- |
+| [membrane_mp4_plugin](https://github.com/membraneframework/membrane_mp4_plugin) | Utilities for MP4 container parsing and serialization and elements for muxing the stream to CMAF | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_mp4_plugin.svg)](https://hex.pm/api/packages/membrane_mp4_plugin) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_mp4_plugin/) |
+| [membrane_matroska_plugin](https://github.com/membraneframework/membrane_matroska_plugin) | Matroska muxer and demuxer | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_matroska_plugin.svg)](https://hex.pm/api/packages/membrane_matroska_plugin) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_matroska_plugin/) |
+| [membrane_flv_plugin](https://github.com/membraneframework/membrane_flv_plugin) | Muxer and demuxer elements for FLV format | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_flv_plugin.svg)](https://hex.pm/api/packages/membrane_flv_plugin) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_flv_plugin/) |
+| [membrane_ivf_plugin](https://github.com/membraneframework/membrane_ivf_plugin) | Plugin for converting video stream into IVF format | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_ivf_plugin.svg)](https://hex.pm/api/packages/membrane_ivf_plugin) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_ivf_plugin/) |
+| [membrane_ogg_plugin](https://github.com/membraneframework/membrane_ogg_plugin) | Plugin for depayloading an Ogg file into an Opus stream | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_ogg_plugin.svg)](https://hex.pm/api/packages/membrane_ogg_plugin) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_ogg_plugin/) |
+
+#### Audio codecs
+
+| Package | Description | Links |
+| --- | --- | --- |
+| [membrane_aac_plugin](https://github.com/membraneframework/membrane_aac_plugin) | AAC parser and complementary elements for AAC codec | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_aac_plugin.svg)](https://hex.pm/api/packages/membrane_aac_plugin) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_aac_plugin/) |
+| [membrane_aac_fdk_plugin](https://github.com/membraneframework/membrane_aac_fdk_plugin) | Membrane AAC decoder and encoder based on FDK library | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_aac_fdk_plugin.svg)](https://hex.pm/api/packages/membrane_aac_fdk_plugin) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_aac_fdk_plugin/) |
+| [membrane_flac_plugin](https://github.com/membraneframework/membrane_flac_plugin) | Parser for files in FLAC bitstream format | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_flac_plugin.svg)](https://hex.pm/api/packages/membrane_flac_plugin) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_flac_plugin/) |
+| [membrane_mp3_lame_plugin](https://github.com/membraneframework/membrane_mp3_lame_plugin) | Membrane MP3 encoder based on Lame | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_mp3_lame_plugin.svg)](https://hex.pm/api/packages/membrane_mp3_lame_plugin) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_mp3_lame_plugin/) |
+| [membrane_mp3_mad_plugin](https://github.com/membraneframework/membrane_mp3_mad_plugin) | Membrane MP3 decoder based on MAD. | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_mp3_mad_plugin.svg)](https://hex.pm/api/packages/membrane_mp3_mad_plugin) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_mp3_mad_plugin/) |
+| [membrane_opus_plugin](https://github.com/membraneframework/membrane_opus_plugin) | Membrane Opus encoder and decoder | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_opus_plugin.svg)](https://hex.pm/api/packages/membrane_opus_plugin) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_opus_plugin/) |
+| [membrane_wav_plugin](https://github.com/membraneframework/membrane_wav_plugin) | Plugin providing elements handling audio in WAV file format. | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_wav_plugin.svg)](https://hex.pm/api/packages/membrane_wav_plugin) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_wav_plugin/) |
+| [membrane_g711_plugin](https://github.com/membraneframework/membrane_g711_plugin) | Membrane G.711 decoder, encoder and parser | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_g711_plugin.svg)](https://hex.pm/api/packages/membrane_g711_plugin) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_g711_plugin/) |
+| [membrane_g711_ffmpeg_plugin](https://github.com/membraneframework/membrane_g711_ffmpeg_plugin) | Membrane G.711 decoder and encoder based on FFmpeg | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_g711_ffmpeg_plugin.svg)](https://hex.pm/api/packages/membrane_g711_ffmpeg_plugin) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_g711_ffmpeg_plugin/) |
+
+#### Video codecs
+
+| Package | Description | Links |
+| --- | --- | --- |
+| [membrane_h26x_plugin](https://github.com/membraneframework/membrane_h26x_plugin) | Membrane h264 and h265 parsers | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_h26x_plugin.svg)](https://hex.pm/api/packages/membrane_h26x_plugin) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_h26x_plugin/) |
+| [membrane_h264_ffmpeg_plugin](https://github.com/membraneframework/membrane_h264_ffmpeg_plugin) | Membrane H264 decoder and encoder based on FFmpeg and x264 | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_h264_ffmpeg_plugin.svg)](https://hex.pm/api/packages/membrane_h264_ffmpeg_plugin) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_h264_ffmpeg_plugin/) |
+| [membrane_vpx_plugin](https://github.com/membraneframework/membrane_vpx_plugin) | Membrane plugin for decoding and encoding VP8 and VP9 streams | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_vpx_plugin.svg)](https://hex.pm/api/packages/membrane_vpx_plugin) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_vpx_plugin/) |
+| [membrane_abr_transcoder_plugin](https://github.com/membraneframework/membrane_abr_transcoder_plugin) | ABR (adaptive bitrate) transcoder, that accepts an h.264 video and outputs multiple variants of it with different qualities. | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_abr_transcoder_plugin.svg)](https://hex.pm/api/packages/membrane_abr_transcoder_plugin) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_abr_transcoder_plugin/) |
+| [membrane_vk_video_plugin](https://github.com/membraneframework/membrane_vk_video_plugin) | Membrane H.264 decoder and encoder based on vk-video | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_vk_video_plugin.svg)](https://hex.pm/api/packages/membrane_vk_video_plugin) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_vk_video_plugin/) |
+| [membrane_h265_ffmpeg_plugin](https://github.com/gBillal/membrane_h265_ffmpeg_plugin) | [Maintainer: [gBillal](https://github.com/gBillal)] Membrane H265 decoder and encoder based on FFmpeg and x265 | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_h265_ffmpeg_plugin.svg)](https://hex.pm/api/packages/membrane_h265_ffmpeg_plugin) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_h265_ffmpeg_plugin/) |
+| [elixir-turbojpeg](https://github.com/BinaryNoggin/elixir-turbojpeg) | [Maintainer: [BinaryNoggin](https://github.com/BinaryNoggin)] libjpeg-turbo bindings for Elixir |   |
+| [membrane_subtitle_mixer_plugin](https://github.com/kim-company/membrane_subtitle_mixer_plugin) | [Maintainer: [kim-company](https://github.com/kim-company)] Membrane.Filter that uses CEA708 to merge subtitles directly in H264 packets. |   |
+
+#### Raw audio
+
+| Package | Description | Links |
+| --- | --- | --- |
+| [membrane_raw_audio_parser_plugin](https://github.com/membraneframework/membrane_raw_audio_parser_plugin) | Membrane element for parsing raw audio | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_raw_audio_parser_plugin.svg)](https://hex.pm/api/packages/membrane_raw_audio_parser_plugin) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_raw_audio_parser_plugin/) |
+| [membrane_portaudio_plugin](https://github.com/membraneframework/membrane_portaudio_plugin) | Raw audio retriever and player based on PortAudio | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_portaudio_plugin.svg)](https://hex.pm/api/packages/membrane_portaudio_plugin) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_portaudio_plugin/) |
+| [membrane_audio_mix_plugin](https://github.com/membraneframework/membrane_audio_mix_plugin) | Plugin providing an element mixing raw audio frames. | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_audio_mix_plugin.svg)](https://hex.pm/api/packages/membrane_audio_mix_plugin) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_audio_mix_plugin/) |
+| [membrane_audio_filler_plugin](https://github.com/membraneframework/membrane_audio_filler_plugin) | Element for filling missing buffers in audio stream | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_audio_filler_plugin.svg)](https://hex.pm/api/packages/membrane_audio_filler_plugin) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_audio_filler_plugin/) |
+| [membrane_ffmpeg_swresample_plugin](https://github.com/membraneframework/membrane_ffmpeg_swresample_plugin) | Plugin performing audio conversion, resampling and channel mixing, using SWResample module of FFmpeg library | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_ffmpeg_swresample_plugin.svg)](https://hex.pm/api/packages/membrane_ffmpeg_swresample_plugin) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_ffmpeg_swresample_plugin/) |
+| [membrane_audiometer_plugin](https://github.com/membraneframework/membrane_audiometer_plugin) | Elements for measuring the level of the audio stream | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_audiometer_plugin.svg)](https://hex.pm/api/packages/membrane_audiometer_plugin) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_audiometer_plugin/) |
+
+#### Raw video
+
+| Package | Description | Links |
+| --- | --- | --- |
+| [membrane_raw_video_parser_plugin](https://github.com/membraneframework/membrane_raw_video_parser_plugin) | Membrane plugin for parsing raw video streams | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_raw_video_parser_plugin.svg)](https://hex.pm/api/packages/membrane_raw_video_parser_plugin) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_raw_video_parser_plugin/) |
+| [membrane_video_merger_plugin](https://github.com/membraneframework/membrane_video_merger_plugin) | Membrane raw video cutter, merger and cut & merge bin | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_video_merger_plugin.svg)](https://hex.pm/api/packages/membrane_video_merger_plugin) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_video_merger_plugin/) |
+| [membrane_smelter_plugin](https://github.com/membraneframework/membrane_smelter_plugin) | Membrane plugin for video and audio mixing/compositing | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_smelter_plugin.svg)](https://hex.pm/api/packages/membrane_smelter_plugin) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_smelter_plugin/) |
+| [membrane_camera_capture_plugin](https://github.com/membraneframework/membrane_camera_capture_plugin) | A set of elements allowing for capturing local media such as camera or microphone | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_camera_capture_plugin.svg)](https://hex.pm/api/packages/membrane_camera_capture_plugin) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_camera_capture_plugin/) |
+| [membrane_rpicam_plugin](https://github.com/membraneframework/membrane_rpicam_plugin) | Membrane rpicam plugin | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_rpicam_plugin.svg)](https://hex.pm/api/packages/membrane_rpicam_plugin) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_rpicam_plugin/) |
+| [membrane_framerate_converter_plugin](https://github.com/membraneframework/membrane_framerate_converter_plugin) | Element for converting frame rate of raw video stream | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_framerate_converter_plugin.svg)](https://hex.pm/api/packages/membrane_framerate_converter_plugin) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_framerate_converter_plugin/) |
+| [membrane_sdl_plugin](https://github.com/membraneframework/membrane_sdl_plugin) | Membrane video player based on SDL | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_sdl_plugin.svg)](https://hex.pm/api/packages/membrane_sdl_plugin) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_sdl_plugin/) |
+| [membrane_overlay_plugin](https://github.com/membraneframework/membrane_overlay_plugin) | Filter for applying overlay image or text on top of video | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_overlay_plugin.svg)](https://hex.pm/api/packages/membrane_overlay_plugin) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_overlay_plugin/) |
+| [membrane_ffmpeg_swscale_plugin](https://github.com/membraneframework/membrane_ffmpeg_swscale_plugin) | Plugin providing an element scaling raw video frames, using SWScale module of FFmpeg library. | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_ffmpeg_swscale_plugin.svg)](https://hex.pm/api/packages/membrane_ffmpeg_swscale_plugin) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_ffmpeg_swscale_plugin/) |
+| [membrane_ffmpeg_video_filter_plugin](https://github.com/membraneframework/membrane_ffmpeg_video_filter_plugin) | FFmpeg-based video filters | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_ffmpeg_video_filter_plugin.svg)](https://hex.pm/api/packages/membrane_ffmpeg_video_filter_plugin) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_ffmpeg_video_filter_plugin/) |
+| [membrane_video_mixer_plugin](https://github.com/kim-company/membrane_video_mixer_plugin) | [Maintainer: [kim-company](https://github.com/kim-company)] Membrane.Filter that mixes a variable number of input videos into one output using ffmpeg filters | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_video_mixer_plugin.svg)](https://hex.pm/api/packages/membrane_video_mixer_plugin) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_video_mixer_plugin/) |
+
+#### External APIs
+
+| Package | Description | Links |
+| --- | --- | --- |
+| [membrane_aws_plugin](https://github.com/fishjam-dev/membrane_aws_plugin) | [Maintainer: [fishjam-dev](https://github.com/fishjam-dev)]  |   |
+| [membrane_agora_plugin](https://github.com/membraneframework/membrane_agora_plugin) | Membrane Sink for Agora Server Gateway | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_agora_plugin.svg)](https://hex.pm/api/packages/membrane_agora_plugin) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_agora_plugin/) |
+| [membrane_element_gcloud_speech_to_text](https://github.com/membraneframework/membrane_element_gcloud_speech_to_text) | Membrane plugin providing speech recognition via Google Cloud Speech-to-Text API | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_element_gcloud_speech_to_text.svg)](https://hex.pm/api/packages/membrane_element_gcloud_speech_to_text) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_element_gcloud_speech_to_text/) |
+| [membrane_element_ibm_speech_to_text](https://github.com/membraneframework/membrane_element_ibm_speech_to_text) | Membrane plugin providing speech recognition via IBM Cloud Speech-to-Text service | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_element_ibm_speech_to_text.svg)](https://hex.pm/api/packages/membrane_element_ibm_speech_to_text) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_element_ibm_speech_to_text/) |
+| [membrane_s3_plugin](https://github.com/YuzuTen/membrane_s3_plugin) | [Maintainer: [YuzuTen](https://github.com/YuzuTen)] Membrane framework plugin to support S3 sources/destinations | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_s3_plugin.svg)](https://hex.pm/api/packages/membrane_s3_plugin) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_s3_plugin/) |
+| [membrane_transcription](https://github.com/lawik/membrane_transcription) | [Maintainer: [lawik](https://github.com/lawik)] Prototype transcription for Membrane |   |
+
+### Formats
+
+| Package | Description | Links |
+| --- | --- | --- |
+| [membrane_rtp_format](https://github.com/membraneframework/membrane_rtp_format) | Real-time Transport Protocol format for Membrane Framework | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_rtp_format.svg)](https://hex.pm/api/packages/membrane_rtp_format) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_rtp_format/) |
+| [membrane_cmaf_format](https://github.com/membraneframework/membrane_cmaf_format) | Membrane description for Common Media Application Format | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_cmaf_format.svg)](https://hex.pm/api/packages/membrane_cmaf_format) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_cmaf_format/) |
+| [membrane_matroska_format](https://github.com/membraneframework/membrane_matroska_format) | Matroska Membrane format | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_matroska_format.svg)](https://hex.pm/api/packages/membrane_matroska_format) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_matroska_format/) |
+| [membrane_mp4_format](https://github.com/membraneframework/membrane_mp4_format) | MPEG-4 container Membrane format | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_mp4_format.svg)](https://hex.pm/api/packages/membrane_mp4_format) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_mp4_format/) |
+| [membrane_raw_audio_format](https://github.com/membraneframework/membrane_raw_audio_format) | Raw audio format definition for the Membrane Multimedia Framework | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_raw_audio_format.svg)](https://hex.pm/api/packages/membrane_raw_audio_format) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_raw_audio_format/) |
+| [membrane_raw_video_format](https://github.com/membraneframework/membrane_raw_video_format) | Membrane Multimedia Framework: Raw video format definition | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_raw_video_format.svg)](https://hex.pm/api/packages/membrane_raw_video_format) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_raw_video_format/) |
+| [membrane_aac_format](https://github.com/membraneframework/membrane_aac_format) | Advanced Audio Codec Membrane format | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_aac_format.svg)](https://hex.pm/api/packages/membrane_aac_format) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_aac_format/) |
+| [membrane_opus_format](https://github.com/membraneframework/membrane_opus_format) | Opus audio format definition for Membrane Framework | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_opus_format.svg)](https://hex.pm/api/packages/membrane_opus_format) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_opus_format/) |
+| [membrane_flac_format](https://github.com/membraneframework/membrane_flac_format) | FLAC audio format description for Membrane Framework | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_flac_format.svg)](https://hex.pm/api/packages/membrane_flac_format) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_flac_format/) |
+| [membrane_mpegaudio_format](https://github.com/membraneframework/membrane_mpegaudio_format) | MPEG audio format definition for Membrane Framework | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_mpegaudio_format.svg)](https://hex.pm/api/packages/membrane_mpegaudio_format) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_mpegaudio_format/) |
+| [membrane_h264_format](https://github.com/membraneframework/membrane_h264_format) | Membrane Multimedia Framework: H264 video format definition | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_h264_format.svg)](https://hex.pm/api/packages/membrane_h264_format) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_h264_format/) |
+| [membrane_vp8_format](https://github.com/membraneframework/membrane_vp8_format) | VP8 Membrane format | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_vp8_format.svg)](https://hex.pm/api/packages/membrane_vp8_format) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_vp8_format/) |
+| [membrane_vp9_format](https://github.com/membraneframework/membrane_vp9_format) | VP9 Membrane format | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_vp9_format.svg)](https://hex.pm/api/packages/membrane_vp9_format) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_vp9_format/) |
+| [membrane_g711_format](https://github.com/membraneframework/membrane_g711_format) | Membrane Multimedia Framework: G711 audio format definition | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_g711_format.svg)](https://hex.pm/api/packages/membrane_g711_format) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_g711_format/) |
+| [membrane_av1_format](https://github.com/membraneframework/membrane_av1_format) | About Membrane Multimedia Framework: AV1 video format definition | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_av1_format.svg)](https://hex.pm/api/packages/membrane_av1_format) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_av1_format/) |
+| [membrane_h265_format](https://github.com/gBillal/membrane_h265_format) | [Maintainer: [gBillal](https://github.com/gBillal)] H265 video format definition | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_h265_format.svg)](https://hex.pm/api/packages/membrane_h265_format) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_h265_format/) |
+
+### Standalone media libs
+
+| Package | Description | Links |
+| --- | --- | --- |
+| [ex_webrtc](https://github.com/elixir-webrtc/ex_webrtc) | [Maintainer: [elixir-webrtc](https://github.com/elixir-webrtc)] An Elixir implementation of the W3C WebRTC API | [![Hex.pm](https://img.shields.io/hexpm/v/ex_webrtc.svg)](https://hex.pm/api/packages/ex_webrtc) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/ex_webrtc/) |
+| [ex_sdp](https://github.com/membraneframework/ex_sdp) | Parser and serializer for Session Description Protocol | [![Hex.pm](https://img.shields.io/hexpm/v/ex_sdp.svg)](https://hex.pm/api/packages/ex_sdp) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/ex_sdp/) |
+| [ex_libnice](https://github.com/membraneframework/ex_libnice) | Libnice-based Interactive Connectivity Establishment (ICE) protocol support for Elixir | [![Hex.pm](https://img.shields.io/hexpm/v/ex_libnice.svg)](https://hex.pm/api/packages/ex_libnice) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/ex_libnice/) |
+| [ex_libsrtp](https://github.com/membraneframework/ex_libsrtp) | Elixir bindings for libsrtp | [![Hex.pm](https://img.shields.io/hexpm/v/ex_libsrtp.svg)](https://hex.pm/api/packages/ex_libsrtp) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/ex_libsrtp/) |
+| [ex_m3u8](https://github.com/membraneframework/ex_m3u8) | Elixir package for serializing and deserializing M3U8 manifests. | [![Hex.pm](https://img.shields.io/hexpm/v/ex_m3u8.svg)](https://hex.pm/api/packages/ex_m3u8) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/ex_m3u8/) |
+| [ex_hls](https://github.com/membraneframework/ex_hls) | An Elixir package for handling HLS streams | [![Hex.pm](https://img.shields.io/hexpm/v/ex_hls.svg)](https://hex.pm/api/packages/ex_hls) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/ex_hls/) |
+| [ex_libsrt](https://github.com/membraneframework/ex_libsrt) | Elixir bindings to libsrt library exposing client and server APIs | [![Hex.pm](https://img.shields.io/hexpm/v/ex_libsrt.svg)](https://hex.pm/api/packages/ex_libsrt) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/ex_libsrt/) |
+| [membrane_rtsp](https://github.com/membraneframework/membrane_rtsp) | RTSP client for Elixir | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_rtsp.svg)](https://hex.pm/api/packages/membrane_rtsp) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_rtsp/) |
+| [membrane_ffmpeg_generator](https://github.com/membraneframework-labs/membrane_ffmpeg_generator) | [Labs] FFmpeg video and audio generator for tests, benchmarks and demos. | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_ffmpeg_generator.svg)](https://hex.pm/api/packages/membrane_ffmpeg_generator) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_ffmpeg_generator/) |
+
+### Utils
+
+| Package | Description | Links |
+| --- | --- | --- |
+| [unifex](https://github.com/membraneframework/unifex) | Tool for generating interfaces between native C code and Elixir | [![Hex.pm](https://img.shields.io/hexpm/v/unifex.svg)](https://hex.pm/api/packages/unifex) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/unifex/) |
+| [bundlex](https://github.com/membraneframework/bundlex) | Multiplatform app bundler tool for Elixir | [![Hex.pm](https://img.shields.io/hexpm/v/bundlex.svg)](https://hex.pm/api/packages/bundlex) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/bundlex/) |
+| [beamchmark](https://github.com/membraneframework/beamchmark) | Elixir tool for benchmarking EVM performance | [![Hex.pm](https://img.shields.io/hexpm/v/beamchmark.svg)](https://hex.pm/api/packages/beamchmark) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/beamchmark/) |
+| [bunch](https://github.com/membraneframework/bunch) | A bunch of helper functions, intended to make life easier | [![Hex.pm](https://img.shields.io/hexpm/v/bunch.svg)](https://hex.pm/api/packages/bunch) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/bunch/) |
+| [bunch_native](https://github.com/membraneframework/bunch_native) | Native part of the Bunch package | [![Hex.pm](https://img.shields.io/hexpm/v/bunch_native.svg)](https://hex.pm/api/packages/bunch_native) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/bunch_native/) |
+| [shmex](https://github.com/membraneframework/shmex) | Elixir bindings for shared memory | [![Hex.pm](https://img.shields.io/hexpm/v/shmex.svg)](https://hex.pm/api/packages/shmex) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/shmex/) |
+| [membrane_timestamp_queue](https://github.com/membraneframework/membrane_timestamp_queue) | Queue that aligns streams from multiple sources basing on timestamps | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_timestamp_queue.svg)](https://hex.pm/api/packages/membrane_timestamp_queue) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_timestamp_queue/) |
+| [membrane_common_c](https://github.com/membraneframework/membrane_common_c) | Membrane Multimedia Framework: Common C Routines | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_common_c.svg)](https://hex.pm/api/packages/membrane_common_c) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_common_c/) |
+| [membrane_telemetry_metrics](https://github.com/membraneframework/membrane_telemetry_metrics) | Membrane tool for generating metrics | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_telemetry_metrics.svg)](https://hex.pm/api/packages/membrane_telemetry_metrics) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_telemetry_metrics/) |
+| [membrane_opentelemetry](https://github.com/membraneframework-labs/membrane_opentelemetry) | [Labs] Utilities for using OpenTelemetry with Membrane | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_opentelemetry.svg)](https://hex.pm/api/packages/membrane_opentelemetry) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_opentelemetry/) |
+| [membrane_precompiled_dependency_provider](https://github.com/membraneframework/membrane_precompiled_dependency_provider) | Provides URLs for precompiled dependencies used by Membrane plugins. | [![Hex.pm](https://img.shields.io/hexpm/v/membrane_precompiled_dependency_provider.svg)](https://hex.pm/api/packages/membrane_precompiled_dependency_provider) [![Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/membrane_precompiled_dependency_provider/) |
+
+<!-- packages-list-end -->
+
+## Authors
+
+Membrane Framework is created by Software Mansion.
+
+Since 2012 [Software Mansion](https://swmansion.com/?utm_source=git&utm_medium=readme&utm_campaign=membrane) is a software agency with experience in building web and mobile apps as well as complex multimedia solutions. We are Core React Native Contributors and experts in live streaming and broadcasting technologies. We can help you build your next dream product – [Hire us](https://swmansion.com/contact/projects).
+
+Copyright 2018, [Software Mansion](https://swmansion.com/?utm_source=git&utm_medium=readme&utm_campaign=membrane)
+
+[![Software Mansion](https://logo.swmansion.com/logo?color=white&variant=desktop&width=200&tag=membrane-github)](https://swmansion.com/?utm_source=git&utm_medium=readme&utm_campaign=membrane)
+
+Licensed under the [Apache License, Version 2.0](LICENSE)
+
+---
+
+# Packages in the Membrane ecosystem
+
+Source: https://membrane-core.hexdocs.pm/packages_list.md
+
+### General
+| Package | Description |
+| --- | --- |
+| [membrane_sdk](https://github.com/membraneframework/membrane_sdk) | Full power of Membrane in a single package |
+| [membrane_core](https://github.com/membraneframework/membrane_core) | The core of Membrane Framework, multimedia processing framework written in Elixir |
+| [membrane_rtc_engine](https://github.com/fishjam-dev/membrane_rtc_engine) | [Maintainer: [fishjam-dev](https://github.com/fishjam-dev)] Customizable Real-time Communication Engine/SFU library focused on WebRTC. |
+| [kino_membrane](https://github.com/membraneframework/kino_membrane) | Utilities for introspecting Membrane pipelines in Livebook |
+| [docker_membrane](https://github.com/membraneframework-labs/docker_membrane) | [Labs] A docker image based on Ubuntu, with Erlang, Elixir and libraries necessary to test and run the Membrane Framework. |
+| [membrane_demo](https://github.com/membraneframework/membrane_demo) | Examples of using the Membrane Framework |
+| [membrane_tutorials](https://github.com/membraneframework/membrane_tutorials) | Repository which contains text and assets used in Membrane Framework tutorials. |
+| [boombox](https://github.com/membraneframework/boombox) | Boombox is a simple streaming tool built on top of Membrane |
+
+### Plugins
+
+#### General purpose
+| Package | Description |
+| --- | --- |
+| [membrane_file_plugin](https://github.com/membraneframework/membrane_file_plugin) | Membrane plugin for reading and writing to files |
+| [membrane_hackney_plugin](https://github.com/membraneframework/membrane_hackney_plugin) | HTTP sink and source based on Hackney |
+| [membrane_scissors_plugin](https://github.com/membraneframework/membrane_scissors_plugin) | Element for cutting off parts of the stream |
+| [membrane_tee_plugin](https://github.com/membraneframework/membrane_tee_plugin) | Membrane plugin for splitting data from a single input to multiple outputs |
+| [membrane_funnel_plugin](https://github.com/membraneframework/membrane_funnel_plugin) | Membrane plugin for merging multiple input streams into a single output |
+| [membrane_realtimer_plugin](https://github.com/membraneframework/membrane_realtimer_plugin) | Membrane element limiting playback speed to realtime, according to buffers' timestamps |
+| [membrane_stream_plugin](https://github.com/membraneframework/membrane_stream_plugin) | Plugin for recording the entire stream sent through Membrane pads into a binary format and replaying it |
+| [membrane_fake_plugin](https://github.com/membraneframework/membrane_fake_plugin) | Fake Membrane sinks that drop incoming data |
+| [membrane_pcap_plugin](https://github.com/membraneframework-labs/membrane_pcap_plugin) | [Labs] Membrane PCAP source, capable of reading captured packets in pcap format |
+| [membrane_transcoder_plugin](https://github.com/membraneframework/membrane_transcoder_plugin) | Membrane plugin providing audio and video transcoding capabilities |
+| [membrane_generator_plugin](https://github.com/membraneframework/membrane_generator_plugin) | Video and audio samples generator |
+| [membrane_live_framerate_converter_plugin](https://github.com/kim-company/membrane_live_framerate_converter_plugin) | [Maintainer: [kim-company](https://github.com/kim-company)] Membrane.Filter that drops or duplicates frames to match a target framerate. Designed for realtime applications |
+| [membrane_template_plugin](https://github.com/membraneframework/membrane_template_plugin) | Template for Membrane Elements |
+
+#### AI
+| Package | Description |
+| --- | --- |
+| [membrane_whisper_plugin](https://github.com/membraneframework/membrane_whisper_plugin) | Membrane plugin for integrating OpenAI's Whisper in audio processing pipelines |
+| [membrane_yolo_plugin](https://github.com/membraneframework/membrane_yolo_plugin) | Membrane Plugin for applying YOLO object detection on raw video frames |
+
+#### Streaming protocols
+| Package | Description |
+| --- | --- |
+| [membrane_webrtc_plugin](https://github.com/membraneframework/membrane_webrtc_plugin) | Plugin for streaming via WebRTC |
+| [membrane_rtmp_plugin](https://github.com/membraneframework/membrane_rtmp_plugin) | RTMP server & client |
+| [membrane_http_adaptive_stream_plugin](https://github.com/membraneframework/membrane_http_adaptive_stream_plugin) | Plugin generating manifests for HLS |
+| [membrane_srt_plugin](https://github.com/membraneframework/membrane_srt_plugin) |  |
+| [membrane_udp_plugin](https://github.com/membraneframework/membrane_udp_plugin) | Membrane plugin for sending and receiving UDP streams |
+| [membrane_tcp_plugin](https://github.com/membraneframework/membrane_tcp_plugin) | Membrane plugin for sending and receiving TCP streams |
+| [membrane_rtp_plugin](https://github.com/membraneframework/membrane_rtp_plugin) | Membrane bins and elements for sending and receiving RTP/SRTP and RTCP/SRTCP streams |
+| [membrane_rtp_h264_plugin](https://github.com/membraneframework/membrane_rtp_h264_plugin) | Membrane RTP payloader and depayloader for H264 |
+| [membrane_rtp_aac_plugin](https://github.com/membraneframework/membrane_rtp_aac_plugin) | RTP AAC depayloader |
+| [membrane_rtp_vp8_plugin](https://github.com/membraneframework/membrane_rtp_vp8_plugin) | Membrane elements for payloading and depayloading VP8 into RTP |
+| [membrane_rtp_vp9_plugin](https://github.com/membraneframework-labs/membrane_rtp_vp9_plugin) | [Labs] Membrane elements for payloading and depayloading VP9 into RTP |
+| [membrane_rtp_mpegaudio_plugin](https://github.com/membraneframework/membrane_rtp_mpegaudio_plugin) | Membrane RTP MPEG Audio depayloader |
+| [membrane_rtp_opus_plugin](https://github.com/membraneframework/membrane_rtp_opus_plugin) | Membrane RTP payloader and depayloader for OPUS audio |
+| [membrane_rtp_g711_plugin](https://github.com/membraneframework/membrane_rtp_g711_plugin) | Membrane RTP payloader and depayloader for G711 audio |
+| [membrane_rtsp_plugin](https://github.com/gBillal/membrane_rtsp_plugin) | [Maintainer: [gBillal](https://github.com/gBillal)] Simplify connecting to RTSP server |
+| [membrane_mpeg_ts_plugin](https://github.com/kim-company/membrane_mpeg_ts_plugin) | [Maintainer: [kim-company](https://github.com/kim-company)] Membrane.Filter that demuxes MPEG-TS streams |
+| [membrane_hls_plugin](https://github.com/kim-company/membrane_hls_plugin) | [Maintainer: [kim-company](https://github.com/kim-company)] Adaptive live streaming plugin (HLS) for the Membrane Framework |
+
+#### Containers
+| Package | Description |
+| --- | --- |
+| [membrane_mp4_plugin](https://github.com/membraneframework/membrane_mp4_plugin) | Utilities for MP4 container parsing and serialization and elements for muxing the stream to CMAF |
+| [membrane_matroska_plugin](https://github.com/membraneframework/membrane_matroska_plugin) | Matroska muxer and demuxer |
+| [membrane_flv_plugin](https://github.com/membraneframework/membrane_flv_plugin) | Muxer and demuxer elements for FLV format |
+| [membrane_ivf_plugin](https://github.com/membraneframework/membrane_ivf_plugin) | Plugin for converting video stream into IVF format |
+| [membrane_ogg_plugin](https://github.com/membraneframework/membrane_ogg_plugin) | Plugin for depayloading an Ogg file into an Opus stream |
+
+#### Audio codecs
+| Package | Description |
+| --- | --- |
+| [membrane_aac_plugin](https://github.com/membraneframework/membrane_aac_plugin) | AAC parser and complementary elements for AAC codec |
+| [membrane_aac_fdk_plugin](https://github.com/membraneframework/membrane_aac_fdk_plugin) | Membrane AAC decoder and encoder based on FDK library |
+| [membrane_flac_plugin](https://github.com/membraneframework/membrane_flac_plugin) | Parser for files in FLAC bitstream format |
+| [membrane_mp3_lame_plugin](https://github.com/membraneframework/membrane_mp3_lame_plugin) | Membrane MP3 encoder based on Lame |
+| [membrane_mp3_mad_plugin](https://github.com/membraneframework/membrane_mp3_mad_plugin) | Membrane MP3 decoder based on MAD. |
+| [membrane_opus_plugin](https://github.com/membraneframework/membrane_opus_plugin) | Membrane Opus encoder and decoder |
+| [membrane_wav_plugin](https://github.com/membraneframework/membrane_wav_plugin) | Plugin providing elements handling audio in WAV file format. |
+| [membrane_g711_plugin](https://github.com/membraneframework/membrane_g711_plugin) | Membrane G.711 decoder, encoder and parser |
+| [membrane_g711_ffmpeg_plugin](https://github.com/membraneframework/membrane_g711_ffmpeg_plugin) | Membrane G.711 decoder and encoder based on FFmpeg |
+
+#### Video codecs
+| Package | Description |
+| --- | --- |
+| [membrane_h26x_plugin](https://github.com/membraneframework/membrane_h26x_plugin) | Membrane h264 and h265 parsers |
+| [membrane_h264_ffmpeg_plugin](https://github.com/membraneframework/membrane_h264_ffmpeg_plugin) | Membrane H264 decoder and encoder based on FFmpeg and x264 |
+| [membrane_vpx_plugin](https://github.com/membraneframework/membrane_vpx_plugin) | Membrane plugin for decoding and encoding VP8 and VP9 streams |
+| [membrane_abr_transcoder_plugin](https://github.com/membraneframework/membrane_abr_transcoder_plugin) | ABR (adaptive bitrate) transcoder, that accepts an h.264 video and outputs multiple variants of it with different qualities. |
+| [membrane_vk_video_plugin](https://github.com/membraneframework/membrane_vk_video_plugin) | Membrane H.264 decoder and encoder based on vk-video |
+| [membrane_h265_ffmpeg_plugin](https://github.com/gBillal/membrane_h265_ffmpeg_plugin) | [Maintainer: [gBillal](https://github.com/gBillal)] Membrane H265 decoder and encoder based on FFmpeg and x265 |
+| [elixir-turbojpeg](https://github.com/BinaryNoggin/elixir-turbojpeg) | [Maintainer: [BinaryNoggin](https://github.com/BinaryNoggin)] libjpeg-turbo bindings for Elixir |
+| [membrane_subtitle_mixer_plugin](https://github.com/kim-company/membrane_subtitle_mixer_plugin) | [Maintainer: [kim-company](https://github.com/kim-company)] Membrane.Filter that uses CEA708 to merge subtitles directly in H264 packets. |
+
+#### Raw audio
+| Package | Description |
+| --- | --- |
+| [membrane_raw_audio_parser_plugin](https://github.com/membraneframework/membrane_raw_audio_parser_plugin) | Membrane element for parsing raw audio |
+| [membrane_portaudio_plugin](https://github.com/membraneframework/membrane_portaudio_plugin) | Raw audio retriever and player based on PortAudio |
+| [membrane_audio_mix_plugin](https://github.com/membraneframework/membrane_audio_mix_plugin) | Plugin providing an element mixing raw audio frames. |
+| [membrane_audio_filler_plugin](https://github.com/membraneframework/membrane_audio_filler_plugin) | Element for filling missing buffers in audio stream |
+| [membrane_ffmpeg_swresample_plugin](https://github.com/membraneframework/membrane_ffmpeg_swresample_plugin) | Plugin performing audio conversion, resampling and channel mixing, using SWResample module of FFmpeg library |
+| [membrane_audiometer_plugin](https://github.com/membraneframework/membrane_audiometer_plugin) | Elements for measuring the level of the audio stream |
+
+#### Raw video
+| Package | Description |
+| --- | --- |
+| [membrane_raw_video_parser_plugin](https://github.com/membraneframework/membrane_raw_video_parser_plugin) | Membrane plugin for parsing raw video streams |
+| [membrane_video_merger_plugin](https://github.com/membraneframework/membrane_video_merger_plugin) | Membrane raw video cutter, merger and cut & merge bin |
+| [membrane_smelter_plugin](https://github.com/membraneframework/membrane_smelter_plugin) | Membrane plugin for video and audio mixing/compositing |
+| [membrane_camera_capture_plugin](https://github.com/membraneframework/membrane_camera_capture_plugin) | A set of elements allowing for capturing local media such as camera or microphone |
+| [membrane_rpicam_plugin](https://github.com/membraneframework/membrane_rpicam_plugin) | Membrane rpicam plugin |
+| [membrane_framerate_converter_plugin](https://github.com/membraneframework/membrane_framerate_converter_plugin) | Element for converting frame rate of raw video stream |
+| [membrane_sdl_plugin](https://github.com/membraneframework/membrane_sdl_plugin) | Membrane video player based on SDL |
+| [membrane_overlay_plugin](https://github.com/membraneframework/membrane_overlay_plugin) | Filter for applying overlay image or text on top of video |
+| [membrane_ffmpeg_swscale_plugin](https://github.com/membraneframework/membrane_ffmpeg_swscale_plugin) | Plugin providing an element scaling raw video frames, using SWScale module of FFmpeg library. |
+| [membrane_ffmpeg_video_filter_plugin](https://github.com/membraneframework/membrane_ffmpeg_video_filter_plugin) | FFmpeg-based video filters |
+| [membrane_video_mixer_plugin](https://github.com/kim-company/membrane_video_mixer_plugin) | [Maintainer: [kim-company](https://github.com/kim-company)] Membrane.Filter that mixes a variable number of input videos into one output using ffmpeg filters |
+
+#### External APIs
+| Package | Description |
+| --- | --- |
+| [membrane_aws_plugin](https://github.com/fishjam-dev/membrane_aws_plugin) | [Maintainer: [fishjam-dev](https://github.com/fishjam-dev)]  |
+| [membrane_agora_plugin](https://github.com/membraneframework/membrane_agora_plugin) | Membrane Sink for Agora Server Gateway |
+| [membrane_element_gcloud_speech_to_text](https://github.com/membraneframework/membrane_element_gcloud_speech_to_text) | Membrane plugin providing speech recognition via Google Cloud Speech-to-Text API |
+| [membrane_element_ibm_speech_to_text](https://github.com/membraneframework/membrane_element_ibm_speech_to_text) | Membrane plugin providing speech recognition via IBM Cloud Speech-to-Text service |
+| [membrane_s3_plugin](https://github.com/YuzuTen/membrane_s3_plugin) | [Maintainer: [YuzuTen](https://github.com/YuzuTen)] Membrane framework plugin to support S3 sources/destinations |
+| [membrane_transcription](https://github.com/lawik/membrane_transcription) | [Maintainer: [lawik](https://github.com/lawik)] Prototype transcription for Membrane |
+
+### Formats
+| Package | Description |
+| --- | --- |
+| [membrane_rtp_format](https://github.com/membraneframework/membrane_rtp_format) | Real-time Transport Protocol format for Membrane Framework |
+| [membrane_cmaf_format](https://github.com/membraneframework/membrane_cmaf_format) | Membrane description for Common Media Application Format |
+| [membrane_matroska_format](https://github.com/membraneframework/membrane_matroska_format) | Matroska Membrane format |
+| [membrane_mp4_format](https://github.com/membraneframework/membrane_mp4_format) | MPEG-4 container Membrane format |
+| [membrane_raw_audio_format](https://github.com/membraneframework/membrane_raw_audio_format) | Raw audio format definition for the Membrane Multimedia Framework |
+| [membrane_raw_video_format](https://github.com/membraneframework/membrane_raw_video_format) | Membrane Multimedia Framework: Raw video format definition |
+| [membrane_aac_format](https://github.com/membraneframework/membrane_aac_format) | Advanced Audio Codec Membrane format |
+| [membrane_opus_format](https://github.com/membraneframework/membrane_opus_format) | Opus audio format definition for Membrane Framework |
+| [membrane_flac_format](https://github.com/membraneframework/membrane_flac_format) | FLAC audio format description for Membrane Framework |
+| [membrane_mpegaudio_format](https://github.com/membraneframework/membrane_mpegaudio_format) | MPEG audio format definition for Membrane Framework |
+| [membrane_h264_format](https://github.com/membraneframework/membrane_h264_format) | Membrane Multimedia Framework: H264 video format definition |
+| [membrane_vp8_format](https://github.com/membraneframework/membrane_vp8_format) | VP8 Membrane format |
+| [membrane_vp9_format](https://github.com/membraneframework/membrane_vp9_format) | VP9 Membrane format |
+| [membrane_g711_format](https://github.com/membraneframework/membrane_g711_format) | Membrane Multimedia Framework: G711 audio format definition |
+| [membrane_av1_format](https://github.com/membraneframework/membrane_av1_format) | About Membrane Multimedia Framework: AV1 video format definition |
+| [membrane_h265_format](https://github.com/gBillal/membrane_h265_format) | [Maintainer: [gBillal](https://github.com/gBillal)] H265 video format definition |
+
+### Standalone media libs
+| Package | Description |
+| --- | --- |
+| [ex_webrtc](https://github.com/elixir-webrtc/ex_webrtc) | [Maintainer: [elixir-webrtc](https://github.com/elixir-webrtc)] An Elixir implementation of the W3C WebRTC API |
+| [ex_sdp](https://github.com/membraneframework/ex_sdp) | Parser and serializer for Session Description Protocol |
+| [ex_libnice](https://github.com/membraneframework/ex_libnice) | Libnice-based Interactive Connectivity Establishment (ICE) protocol support for Elixir |
+| [ex_libsrtp](https://github.com/membraneframework/ex_libsrtp) | Elixir bindings for libsrtp |
+| [ex_m3u8](https://github.com/membraneframework/ex_m3u8) | Elixir package for serializing and deserializing M3U8 manifests. |
+| [ex_hls](https://github.com/membraneframework/ex_hls) | An Elixir package for handling HLS streams |
+| [ex_libsrt](https://github.com/membraneframework/ex_libsrt) | Elixir bindings to libsrt library exposing client and server APIs |
+| [membrane_rtsp](https://github.com/membraneframework/membrane_rtsp) | RTSP client for Elixir |
+| [membrane_ffmpeg_generator](https://github.com/membraneframework-labs/membrane_ffmpeg_generator) | [Labs] FFmpeg video and audio generator for tests, benchmarks and demos. |
+
+### Utils
+| Package | Description |
+| --- | --- |
+| [unifex](https://github.com/membraneframework/unifex) | Tool for generating interfaces between native C code and Elixir |
+| [bundlex](https://github.com/membraneframework/bundlex) | Multiplatform app bundler tool for Elixir |
+| [beamchmark](https://github.com/membraneframework/beamchmark) | Elixir tool for benchmarking EVM performance |
+| [bunch](https://github.com/membraneframework/bunch) | A bunch of helper functions, intended to make life easier |
+| [bunch_native](https://github.com/membraneframework/bunch_native) | Native part of the Bunch package |
+| [shmex](https://github.com/membraneframework/shmex) | Elixir bindings for shared memory |
+| [membrane_timestamp_queue](https://github.com/membraneframework/membrane_timestamp_queue) | Queue that aligns streams from multiple sources basing on timestamps |
+| [membrane_common_c](https://github.com/membraneframework/membrane_common_c) | Membrane Multimedia Framework: Common C Routines |
+| [membrane_telemetry_metrics](https://github.com/membraneframework/membrane_telemetry_metrics) | Membrane tool for generating metrics |
+| [membrane_opentelemetry](https://github.com/membraneframework-labs/membrane_opentelemetry) | [Labs] Utilities for using OpenTelemetry with Membrane |
+| [membrane_precompiled_dependency_provider](https://github.com/membraneframework/membrane_precompiled_dependency_provider) | Provides URLs for precompiled dependencies used by Membrane plugins. |
+
+---
+
+# Changelog
+
+Source: https://membrane-core.hexdocs.pm/changelog.md
+
+# Changelog
+
+## 1.3.0
+* Make errors more descriptive [#1102](https://github.com/membraneframework/membrane_core/pull/1102)
+* Add `:broadcast` action for sending data to all output pads of an element
+* Deprecate `:forward` action in favour of `:broadcast`
+* Handle removed pads properly in `Membrane.Connector` [#1075](https://github.com/membraneframework/membrane_core/pull/1075)
+* Improve remove_link action docs
+* Deprecate `:components` option for `:unsafely_name_processes_for_observer`
+* Deprecate `:links` option for `:unsafely_name_processes_for_observer` in favour of `:report_links_to_observer` configuration entry
+* [Set label](https://hexdocs.pm/elixir/Process.html#set_label/1) for all the Membrane processes (i.e. for both Membrane components like pipelines, elements and bins and for utility components like subprocess supervisors)
+* Update required Elixir version to `~> 1.17`
+* Add a Mix task for generating demos [#1067](https://github.com/membraneframework/membrane_core/pull/1067)
+* Add Mix tasks for easier initialization of components [#1059](https://github.com/membraneframework/membrane_core/pull/1059)
+* Support input demand unit expressed in timestamps [#1079](https://github.com/membraneframework/membrane_core/pull/1079)
+
+## 1.2.6
+ * Add tutorials [#1007](https://github.com/membraneframework/membrane_core/pull/1007), plugins [#1012](https://github.com/membraneframework/membrane_core/pull/1012) and demos [#1013](https://github.com/membraneframework/membrane_core/pull/1013) to the docs.
+ * Avoid division by 0 in stalker under weird timer behaviour [#1035](https://github.com/membraneframework/membrane_core/pull/1035)
+
+
+## 1.2.5
+_Release retired, please use 1.2.6_
+
+## 1.2.4
+ * Add `:handle_end_of_stream` and `:handle_start_of_stream` options to debug elements. [#993](https://github.com/membraneframework/membrane_core/pull/993)
+
+## 1.2.3
+ * Deprecate calling a children group `nil` in [#964](https://github.com/membraneframework/membrane_core/pull/964)
+ * Adds new fields for the handle_child_terminated context: crash_initiator, exit_reason and group_name in [#964](https://github.com/membraneframework/membrane_core/pull/964)
+ * Makes sure that all handle_child_terminated callbacks for children in crash group are called before handle_crash_group_down of that group in [#962](https://github.com/membraneframework/membrane_core/pull/962)
+ * Telemetry event's metadata `component_type` now correctly refers to the root type and not the implementing module [#958](https://github.com/membraneframework/membrane_core/pull/958)
+
+## 1.2.2
+ * Improve conditions for generating compilation warnings. [#956](https://github.com/membraneframework/membrane_core/pull/956)
+
+## 1.2.1
+ * Improve stream format error. [#950](https://github.com/membraneframework/membrane_core/pull/950)
+ * Minor fixes in `Membrane.Connector`. [#952](https://github.com/membraneframework/membrane_core/pull/952)
+
+## 1.2.0
+ * Add `:max_instances` option for dynamic pads. [#876](https://github.com/membraneframework/membrane_core/pull/876)
+ * Implement `Membrane.Connector`. [#904](https://github.com/membraneframework/membrane_core/pull/904)
+ * Implememnt diamonds detection. [#909](https://github.com/membraneframework/membrane_core/pull/909)
+ * Incorporate `Membrane.Funnel`, `Membrane.Tee` and `Membane.Fake.Sink`. [#922](https://github.com/membraneframework/membrane_core/issues/922)
+ * Added new, revised Telemetry system [#905](https://github.com/membraneframework/membrane_core/pull/918)
+
+## 1.1.2
+ * Add new callback `handle_child_terminated/3` along with new assertions. [#894](https://github.com/membraneframework/membrane_core/pull/894)
+ * Remove 'failed to insert a metric' stalker warning. [#849](https://github.com/membraneframework/membrane_core/pull/849)
+
+## 1.1.1
+ * Fix 'table identifier does not refer to an existing ETS table' error when inserting metrics into the observability ETS. [#835](https://github.com/membraneframework/membrane_core/pull/835)
+ * Fix bug occuring in distributed atomic implementation. [#837](https://github.com/membraneframework/membrane_core/pull/837)
+
+## 1.1.0
+ * Add new callbacks `handle_child_setup_completed/3` and `handle_child_playing/3` in Bins and Pipelines. [#801](https://github.com/membraneframework/membrane_core/pull/801)
+ * Deprecate `handle_spec_started/3` callback in Bins and Pipelines. [#708](https://github.com/membraneframework/membrane_core/pull/708)
+ * Handle buffers from input pads having `flow_control: :auto` only if demand on all output pads having `flow_control: :auto` is positive. [#693](https://github.com/membraneframework/membrane_core/pull/693)
+ * Set `:ratio` dependency version to `"~> 3.0 or ~> 4.0"`. [#780](https://github.com/membraneframework/membrane_core/pull/780)
+ * Deprecate `Membrane.Testing.Pipeline.message_child/3`. Introduce `Membrane.Testing.Pipeline.notify_child/3` instead. [#779](https://github.com/membraneframework/membrane_core/pull/779)
+
+## 1.0.1
+ * Specify the order in which state fields will be printed in the error logs. [#614](https://github.com/membraneframework/membrane_core/pull/614)
+ * Fix clock selection [#626](https://github.com/membraneframework/membrane_core/pull/626)
+ * Log messages in the default handle_info implementation [#680](https://github.com/membraneframework/membrane_core/pull/680)
+ * Fix typespecs in Membrane.UtilitySupervisor [#681](https://github.com/membraneframework/membrane_core/pull/681)
+ * Improve callback return types and group actions types [#702](https://github.com/membraneframework/membrane_core/pull/702) 
+ * Add `crash_reason` to `handle_crash_group_down/3` callback context in bins and pipelines. [#720](https://github.com/membraneframework/membrane_core/pull/720)
+
+## 1.0.0
+ * Introduce `:remove_link` action in pipelines and bins.
+ * Add children groups - a mechanism that allows refering to multiple children with a single identifier. 
+ * Rename `remove_child` action into `remove_children` and allow for removing a children group with a single action.
+ * Add an ability to spawn anonymous children.
+ * Replace `Membrane.Time.round_to_<unit_name>` with `Membrane.Time.as_<unit_name>/2` with second argument equal `:round`. Rename `Membrane.Time.round_to_timebase` to `Membrane.Time.divide_by_timebase/2`. [#494](https://github.com/membraneframework/membrane_core/pull/494)
+ * Remove `:playback` action. Introduce `:setup` action. [#496](https://github.com/membraneframework/membrane_core/pull/496)
+ * Add `Membrane.Testing.Pipeline.get_child_pid/2`. [#497](https://github.com/membraneframework/membrane_core/pull/497)
+ * Make callback contexts to be maps. [#504](https://github.com/membraneframework/membrane_core/pull/504)
+ * All Membrane Elements can be compatible till now on - pads working in `:pull` mode, handling different `demand_units`, can be now linked.
+ * Output pads working in `:pull` mode should have their `demand_unit` specified. If case it's not available, it's assumed that the pad handles demands in both `:bytes` and `:buffers` units.
+ * Rename callbacks `handle_process/4` and `handle_write/4` to `handle_buffer/4` in [#506](https://github.com/membraneframework/membrane_core/pull/506)
+ * The flow control of the pad is now set with a single `:flow_control` option instead of `:mode` and `:demand_mode` options.
+ * Remove _t suffix from types [#509](https://github.com/membraneframework/membrane_core/pull/509)
+ * Implement automatic demands in Membrane Sinks and Endpoints. [#512](https://github.com/membraneframework/membrane_core/pull/512)
+ * Add `handle_child_pad_removed/4` callback in Bins and Pipelines. [#513](https://github.com/membraneframework/membrane_core/pull/513)
+ * Introduce support for crash groups in Bins. [#521](https://github.com/membraneframework/membrane_core/pull/521)
+ * Remove `assert_pipeline_play/2` from `Membrane.Testing.Assertions`. [#528](https://github.com/membraneframework/membrane_core/pull/528)
+ * Make sure enumerable with all elements being `Membrane.Buffer.t()`, passed as `:output` parameter for `Membrane.Testing.Source` won't get rewrapped in `Membrane.Buffer.t()` struct.
+ * Implement `Membrane.Debug.Filter` and `Membrane.Debug.Sink`. [#552](https://github.com/membraneframework/membrane_core/pull/552)
+ * Add `:pause_auto_demand` and `:resume_auto_demand` actions. [#586](https://github.com/membraneframework/membrane_core/pull/586)
+ * Send `:end_of_stream`, even if it is not preceded by `:start_of_stream`. [#557](https://github.com/membraneframework/membrane_core/pull/577)
+ * Fix process leak in starting clocks. [#594](https://github.com/membraneframework/membrane_core/pull/594)
+ * Add child exit reason to the supervisor exit reason. [#595](https://github.com/membraneframework/membrane_core/pull/595)
+ * Remove default implementation of `start_/2`, `start_link/2` and `terminate/2` in modules using `Membrane.Pipeline`. [#598](https://github.com/membraneframework/membrane_core/pull/598) 
+ * Remove callback _Membrane.Element.WithInputPads.handle_buffers_batch/4_. [#601](https://github.com/membraneframework/membrane_core/pull/601)
+ * Sort component state fields in the error logs in the order from the most to the least important. [#614](https://github.com/membraneframework/membrane_core/pull/614)
+ 
+## 0.11.0
+ * Separate element_name and pad arguments in handle_element_{start, end}_of_stream signature [#219](https://github.com/membraneframework/membrane_core/issues/219)
+ * Refine communication between parent and its children [#270](https://github.com/membraneframework/membrane_core/issues/270)
+ * Add `handle_call/3` callback in the pipeline, as well as a `:reply` and `:reply_to` actions. Rename `handle_other/3` callback into `handle_info/3` [#334](https://github.com/membraneframework/membrane_core/issues/334)
+ * Add `Membrane.FilterAggregator` that allows to run multiple filters sequentially within one process. [#355](https://github.com/membraneframework/membrane_core/pull/355)
+ * Log info about element's playback state change as debug, not as debug_verbose. [#430](https://github.com/membraneframework/membrane_core/pull/430)
+ * Rename `Membrane.Time.to_<unit name>/1` into `Membrane.Time.round_to_<unit name>/1` to indicate that the result will be rounded. Make `Membrane.Time.<plural unit name>/1` accept `%Ratio{}` as an argument. Add `Membrane.Time.round_to_timebase` function.
+ * New `spec` action syntax - the structure of pipeline is now defined with the use of `Membrane.ChildrenSpec`
+ * Rename `:caps` to `:stream_format`.
+ * Use Elixir patterns as `:accepted_format` in pad definition.
+ * Delete `:ok` from tuples returned from callbacks.
+ * Remove `:type` from specs passed to `def_options/1` macro in bins and elements.
+ * Add `Membrane.Testing.MockResourceGuard`.
+
+## 0.10.0
+ * Remove all deprecated stuff [#399](https://github.com/membraneframework/membrane_core/pull/399)
+ * Make `Membrane.Pipeline.{prepare, play, stop}` deprecated and add `:playback` action instead
+ * Make `Membrane.Pipeline.stop_and_terminate` deprecated and add `Membrane.Pipeline.terminate/2` instead
+ * Add `Membrane.RemoteControlled.Pipeline` - a basic implementation of a `Membrane.Pipeline` that can be spawned and controlled by an external process [#366](https://github.com/membraneframework/membrane_core/pull/366)
+ * Disallow sending buffers without sending caps first [#341](https://github.com/membraneframework/membrane_core/issues/341)
+ * Refine the `Membrane.Testing.Pipeline` API - deprecate the `Membrane.Testing.Pipeline.Options` usage, use keyword list as options in `Membrane.Testing.Pipeline.start/1` and `Membrane.Testing.Pipeline.start_link/1`
+
+## 0.9.0
+ * Automatic demands [#313](https://github.com/membraneframework/membrane_core/pull/313)
+ * Stop forwarding notifications by default in bins [#358](https://github.com/membraneframework/membrane_core/pull/358)
+ * More fine-grained control over emitted metrics [#365](https://github.com/membraneframework/membrane_core/pull/365)
+
+ ### PRs not influencing public API:
+ * Added log metadata when reporting init in telemetry [#376](https://github.com/membraneframework/membrane_core/pull/376)
+ * Fix generation of pad documentation inside an element [#377](https://github.com/membraneframework/membrane_core/pull/377)
+ * Leaving static pads unlinked and transiting to a playback state other than `:stopped` will result
+ in runtime error (previously only a warning was printed out). [#389](https://github.com/membraneframework/membrane_core/pull/389)
+ * It is possible now to assert on crash group down when using Testing.Pipeline. [#391](https://github.com/membraneframework/membrane_core/pull/391)
+
+## 0.8.2
+ * Fixed PadAdded spec [#359](https://github.com/membraneframework/membrane_core/pull/359)
+### PRs not influencing public API:
+ * Prevent internal testing notifications from reaching pipeline module [#350](https://github.com/membraneframework/membrane_core/pull/350)
+ * Fix unknown node error on distribution changes [#352](https://github.com/membraneframework/membrane_core/pull/352)
+ * Add new type of element, `Membrane.Endpoint` [#382](https://github.com/membraneframework/membrane_core/pull/382)
+
+## 0.8.1
+ * allow telemetry in version 1.0 only [#347](https://github.com/membraneframework/membrane_core/pull/347)
+### PRs not influencing public API:
+ * fix action enforcing CHANGELOG update with PR [#345](https://github.com/membraneframework/membrane_core/pull/345)
+ * Release membrane_core v0.8.1 [#348](https://github.com/membraneframework/membrane_core/pull/348)
+
+## 0.8.0
+### Release notes:
+  * PTS and DTS timestamps were added to `Membrane.Buffer` structure explicitly. Timestamps should no longer live in `Membrane.Buffer.metadata` field [#335](https://github.com/membraneframework/membrane_core/pull/335).
+
+### PRs not influencing public API:
+  * add CHANGELOG update verification [#340](https://github.com/membraneframework/membrane_core/pull/340)
+  * action enforcing changelog fix [#342](https://github.com/membraneframework/membrane_core/pull/342)
+  * bump version to 0.8.0 [#344](https://github.com/membraneframework/membrane_core/pull/344)
+
+---
+
+# Contributing
+
+Source: https://membrane-core.hexdocs.pm/contributing.md
+
+# Contributing
+
+Any contributions to Membrane Framework are welcome. If you would like contribute, but you're not sure how to start or have some questions, don't hesitate to contact us via channels described in [README](README.md#support-and-questions)
+
+Before submitting code please read our [Coding style guide](https://membrane.stream/guide/v0.9/contributing_guide.html)
+
+When contributing to existing repo:
+
+- fork it
+- apply change on some branch
+- create a PR from fork to our repo
+- await feedback from someone from the team
+- after passing the review, the PR will be merged
+
+If you wish to create a new plugin you can give us a shout and if it's something we want as a part of our ecosystem we'll create a repo for you, guide you on your work and maintain the plugin in future.
+
+However, if you feel confident enough to maintain it on your own, you can, of course, create your own repo and hex package - we only ask you to follow the naming convetions of the framework package and modules. In that case, don't forget to let us know about your work so we could include it on the list of available plugins.
+
+---
+
+# License
+
+Source: https://membrane-core.hexdocs.pm/license.md
+
+Apache License
+                           Version 2.0, January 2004
+                        http://www.apache.org/licenses/
+
+   TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
+
+   1. Definitions.
+
+      "License" shall mean the terms and conditions for use, reproduction,
+      and distribution as defined by Sections 1 through 9 of this document.
+
+      "Licensor" shall mean the copyright owner or entity authorized by
+      the copyright owner that is granting the License.
+
+      "Legal Entity" shall mean the union of the acting entity and all
+      other entities that control, are controlled by, or are under common
+      control with that entity. For the purposes of this definition,
+      "control" means (i) the power, direct or indirect, to cause the
+      direction or management of such entity, whether by contract or
+      otherwise, or (ii) ownership of fifty percent (50%) or more of the
+      outstanding shares, or (iii) beneficial ownership of such entity.
+
+      "You" (or "Your") shall mean an individual or Legal Entity
+      exercising permissions granted by this License.
+
+      "Source" form shall mean the preferred form for making modifications,
+      including but not limited to software source code, documentation
+      source, and configuration files.
+
+      "Object" form shall mean any form resulting from mechanical
+      transformation or translation of a Source form, including but
+      not limited to compiled object code, generated documentation,
+      and conversions to other media types.
+
+      "Work" shall mean the work of authorship, whether in Source or
+      Object form, made available under the License, as indicated by a
+      copyright notice that is included in or attached to the work
+      (an example is provided in the Appendix below).
+
+      "Derivative Works" shall mean any work, whether in Source or Object
+      form, that is based on (or derived from) the Work and for which the
+      editorial revisions, annotations, elaborations, or other modifications
+      represent, as a whole, an original work of authorship. For the purposes
+      of this License, Derivative Works shall not include works that remain
+      separable from, or merely link (or bind by name) to the interfaces of,
+      the Work and Derivative Works thereof.
+
+      "Contribution" shall mean any work of authorship, including
+      the original version of the Work and any modifications or additions
+      to that Work or Derivative Works thereof, that is intentionally
+      submitted to Licensor for inclusion in the Work by the copyright owner
+      or by an individual or Legal Entity authorized to submit on behalf of
+      the copyright owner. For the purposes of this definition, "submitted"
+      means any form of electronic, verbal, or written communication sent
+      to the Licensor or its representatives, including but not limited to
+      communication on electronic mailing lists, source code control systems,
+      and issue tracking systems that are managed by, or on behalf of, the
+      Licensor for the purpose of discussing and improving the Work, but
+      excluding communication that is conspicuously marked or otherwise
+      designated in writing by the copyright owner as "Not a Contribution."
+
+      "Contributor" shall mean Licensor and any individual or Legal Entity
+      on behalf of whom a Contribution has been received by Licensor and
+      subsequently incorporated within the Work.
+
+   2. Grant of Copyright License. Subject to the terms and conditions of
+      this License, each Contributor hereby grants to You a perpetual,
+      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
+      copyright license to reproduce, prepare Derivative Works of,
+      publicly display, publicly perform, sublicense, and distribute the
+      Work and such Derivative Works in Source or Object form.
+
+   3. Grant of Patent License. Subject to the terms and conditions of
+      this License, each Contributor hereby grants to You a perpetual,
+      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
+      (except as stated in this section) patent license to make, have made,
+      use, offer to sell, sell, import, and otherwise transfer the Work,
+      where such license applies only to those patent claims licensable
+      by such Contributor that are necessarily infringed by their
+      Contribution(s) alone or by combination of their Contribution(s)
+      with the Work to which such Contribution(s) was submitted. If You
+      institute patent litigation against any entity (including a
+      cross-claim or counterclaim in a lawsuit) alleging that the Work
+      or a Contribution incorporated within the Work constitutes direct
+      or contributory patent infringement, then any patent licenses
+      granted to You under this License for that Work shall terminate
+      as of the date such litigation is filed.
+
+   4. Redistribution. You may reproduce and distribute copies of the
+      Work or Derivative Works thereof in any medium, with or without
+      modifications, and in Source or Object form, provided that You
+      meet the following conditions:
+
+      (a) You must give any other recipients of the Work or
+          Derivative Works a copy of this License; and
+
+      (b) You must cause any modified files to carry prominent notices
+          stating that You changed the files; and
+
+      (c) You must retain, in the Source form of any Derivative Works
+          that You distribute, all copyright, patent, trademark, and
+          attribution notices from the Source form of the Work,
+          excluding those notices that do not pertain to any part of
+          the Derivative Works; and
+
+      (d) If the Work includes a "NOTICE" text file as part of its
+          distribution, then any Derivative Works that You distribute must
+          include a readable copy of the attribution notices contained
+          within such NOTICE file, excluding those notices that do not
+          pertain to any part of the Derivative Works, in at least one
+          of the following places: within a NOTICE text file distributed
+          as part of the Derivative Works; within the Source form or
+          documentation, if provided along with the Derivative Works; or,
+          within a display generated by the Derivative Works, if and
+          wherever such third-party notices normally appear. The contents
+          of the NOTICE file are for informational purposes only and
+          do not modify the License. You may add Your own attribution
+          notices within Derivative Works that You distribute, alongside
+          or as an addendum to the NOTICE text from the Work, provided
+          that such additional attribution notices cannot be construed
+          as modifying the License.
+
+      You may add Your own copyright statement to Your modifications and
+      may provide additional or different license terms and conditions
+      for use, reproduction, or distribution of Your modifications, or
+      for any such Derivative Works as a whole, provided Your use,
+      reproduction, and distribution of the Work otherwise complies with
+      the conditions stated in this License.
+
+   5. Submission of Contributions. Unless You explicitly state otherwise,
+      any Contribution intentionally submitted for inclusion in the Work
+      by You to the Licensor shall be under the terms and conditions of
+      this License, without any additional terms or conditions.
+      Notwithstanding the above, nothing herein shall supersede or modify
+      the terms of any separate license agreement you may have executed
+      with Licensor regarding such Contributions.
+
+   6. Trademarks. This License does not grant permission to use the trade
+      names, trademarks, service marks, or product names of the Licensor,
+      except as required for reasonable and customary use in describing the
+      origin of the Work and reproducing the content of the NOTICE file.
+
+   7. Disclaimer of Warranty. Unless required by applicable law or
+      agreed to in writing, Licensor provides the Work (and each
+      Contributor provides its Contributions) on an "AS IS" BASIS,
+      WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+      implied, including, without limitation, any warranties or conditions
+      of TITLE, NON-INFRINGEMENT, MERCHANTABILITY, or FITNESS FOR A
+      PARTICULAR PURPOSE. You are solely responsible for determining the
+      appropriateness of using or redistributing the Work and assume any
+      risks associated with Your exercise of permissions under this License.
+
+   8. Limitation of Liability. In no event and under no legal theory,
+      whether in tort (including negligence), contract, or otherwise,
+      unless required by applicable law (such as deliberate and grossly
+      negligent acts) or agreed to in writing, shall any Contributor be
+      liable to You for damages, including any direct, indirect, special,
+      incidental, or consequential damages of any character arising as a
+      result of this License or out of the use or inability to use the
+      Work (including but not limited to damages for loss of goodwill,
+      work stoppage, computer failure or malfunction, or any and all
+      other commercial damages or losses), even if such Contributor
+      has been advised of the possibility of such damages.
+
+   9. Accepting Warranty or Additional Liability. While redistributing
+      the Work or Derivative Works thereof, You may choose to offer,
+      and charge a fee for, acceptance of support, warranty, indemnity,
+      or other liability obligations and/or rights consistent with this
+      License. However, in accepting such obligations, You may act only
+      on Your own behalf and on Your sole responsibility, not on behalf
+      of any other Contributor, and only if You agree to indemnify,
+      defend, and hold each Contributor harmless for any liability
+      incurred by, or claims asserted against, such Contributor by reason
+      of your accepting any such warranty or additional liability.
+
+   END OF TERMS AND CONDITIONS
+
+   APPENDIX: How to apply the Apache License to your work.
+
+      To apply the Apache License to your work, attach the following
+      boilerplate notice, with the fields enclosed by brackets "[]"
+      replaced with your own identifying information. (Don't include
+      the brackets!)  The text should be enclosed in the appropriate
+      comment syntax for the file format. We also recommend that a
+      file or class name and description of purpose be included on the
+      same "printed page" as the copyright notice for easier
+      identification within third-party archives.
+
+   Copyright 2018 Software Mansion
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+
+---
+
+# mix membrane.demo
+
+Source: https://membrane-core.hexdocs.pm/Mix.Tasks.Membrane.Demo.md
+
+# `mix membrane.demo`
+[🔗](https://github.com/membraneframework/membrane_core/blob/v1.3.4/lib/mix/tasks/membrane.demo.ex#L1)
+
+Download Membrane demos and examples. Requires `git` installed.
+
+  $ mix membrane.demo [-a] [-l] [-d <repo_path>] [<demos> ...]
+
+## Options
+* `-l, --list` - List all demos available and their brief descriptions.
+* `-a, --all` - Pull the repository with all demos. 
+* `-d, --directory` - Specify a directory where the demos should be placed in. By default they're placed in the current working directory 
+
+---
+
+*Consult [api-reference.md](api-reference.md) for complete listing*
+
+---
+
+# mix membrane.gen
+
+Source: https://membrane-core.hexdocs.pm/Mix.Tasks.Membrane.Gen.md
+
+# `mix membrane.gen`
+[🔗](https://github.com/membraneframework/membrane_core/blob/v1.3.4/lib/mix/tasks/membrane.gen.ex#L1)
+
+Lists all available Membrane component generators
+
+---
+
+*Consult [api-reference.md](api-reference.md) for complete listing*
+
+---
+
+# mix membrane.gen.bin
+
+Source: https://membrane-core.hexdocs.pm/Mix.Tasks.Membrane.Gen.Bin.md
+
+# `mix membrane.gen.bin`
+[🔗](https://github.com/membraneframework/membrane_core/blob/v1.3.4/lib/mix/tasks/membrane.gen.component.ex#L5)
+
+Generates a template for a Membrane Bin with the provided module name.
+
+  $ mix membrane.gen.bin module_name [-l target_location]
+
+## Options
+* `-l, --location` - If a target location is provided, the Bin will be created there, relative to the `lib` directory.
+  The filename must also be present and have an `.ex` extension. If location is not provided, then it will be
+  inferred from the provided module name - it will be converted to lowercase and `.` separators will be interpreted
+  as directory separators. For example, a Bin with module name `Foo.Bar` will be created at `lib/foo/bar.ex`. 
+
+# `do_run`
+
+```elixir
+@spec do_run(binary(), [binary()]) :: any()
+```
+
+---
+
+*Consult [api-reference.md](api-reference.md) for complete listing*
+
+---
+
+# mix membrane.gen.endpoint
+
+Source: https://membrane-core.hexdocs.pm/Mix.Tasks.Membrane.Gen.Endpoint.md
+
+# `mix membrane.gen.endpoint`
+[🔗](https://github.com/membraneframework/membrane_core/blob/v1.3.4/lib/mix/tasks/membrane.gen.component.ex#L5)
+
+Generates a template for a Membrane Endpoint with the provided module name.
+
+  $ mix membrane.gen.endpoint module_name [-l target_location]
+
+## Options
+* `-l, --location` - If a target location is provided, the Endpoint will be created there, relative to the `lib` directory.
+  The filename must also be present and have an `.ex` extension. If location is not provided, then it will be
+  inferred from the provided module name - it will be converted to lowercase and `.` separators will be interpreted
+  as directory separators. For example, a Endpoint with module name `Foo.Bar` will be created at `lib/foo/bar.ex`. 
+
+# `do_run`
+
+```elixir
+@spec do_run(binary(), [binary()]) :: any()
+```
+
+---
+
+*Consult [api-reference.md](api-reference.md) for complete listing*
+
+---
+
+# mix membrane.gen.filter
+
+Source: https://membrane-core.hexdocs.pm/Mix.Tasks.Membrane.Gen.Filter.md
+
+# `mix membrane.gen.filter`
+[🔗](https://github.com/membraneframework/membrane_core/blob/v1.3.4/lib/mix/tasks/membrane.gen.component.ex#L5)
+
+Generates a template for a Membrane Filter with the provided module name.
+
+  $ mix membrane.gen.filter module_name [-l target_location]
+
+## Options
+* `-l, --location` - If a target location is provided, the Filter will be created there, relative to the `lib` directory.
+  The filename must also be present and have an `.ex` extension. If location is not provided, then it will be
+  inferred from the provided module name - it will be converted to lowercase and `.` separators will be interpreted
+  as directory separators. For example, a Filter with module name `Foo.Bar` will be created at `lib/foo/bar.ex`. 
+
+# `do_run`
+
+```elixir
+@spec do_run(binary(), [binary()]) :: any()
+```
+
+---
+
+*Consult [api-reference.md](api-reference.md) for complete listing*
+
+---
+
+# mix membrane.gen.pipeline
+
+Source: https://membrane-core.hexdocs.pm/Mix.Tasks.Membrane.Gen.Pipeline.md
+
+# `mix membrane.gen.pipeline`
+[🔗](https://github.com/membraneframework/membrane_core/blob/v1.3.4/lib/mix/tasks/membrane.gen.component.ex#L5)
+
+Generates a template for a Membrane Pipeline with the provided module name.
+
+  $ mix membrane.gen.pipeline module_name [-l target_location]
+
+## Options
+* `-l, --location` - If a target location is provided, the Pipeline will be created there, relative to the `lib` directory.
+  The filename must also be present and have an `.ex` extension. If location is not provided, then it will be
+  inferred from the provided module name - it will be converted to lowercase and `.` separators will be interpreted
+  as directory separators. For example, a Pipeline with module name `Foo.Bar` will be created at `lib/foo/bar.ex`. 
+
+# `do_run`
+
+```elixir
+@spec do_run(binary(), [binary()]) :: any()
+```
+
+---
+
+*Consult [api-reference.md](api-reference.md) for complete listing*
+
+---
+
+# mix membrane.gen.sink
+
+Source: https://membrane-core.hexdocs.pm/Mix.Tasks.Membrane.Gen.Sink.md
+
+# `mix membrane.gen.sink`
+[🔗](https://github.com/membraneframework/membrane_core/blob/v1.3.4/lib/mix/tasks/membrane.gen.component.ex#L5)
+
+Generates a template for a Membrane Sink with the provided module name.
+
+  $ mix membrane.gen.sink module_name [-l target_location]
+
+## Options
+* `-l, --location` - If a target location is provided, the Sink will be created there, relative to the `lib` directory.
+  The filename must also be present and have an `.ex` extension. If location is not provided, then it will be
+  inferred from the provided module name - it will be converted to lowercase and `.` separators will be interpreted
+  as directory separators. For example, a Sink with module name `Foo.Bar` will be created at `lib/foo/bar.ex`. 
+
+# `do_run`
+
+```elixir
+@spec do_run(binary(), [binary()]) :: any()
+```
+
+---
+
+*Consult [api-reference.md](api-reference.md) for complete listing*
+
+---
+
+# mix membrane.gen.source
+
+Source: https://membrane-core.hexdocs.pm/Mix.Tasks.Membrane.Gen.Source.md
+
+# `mix membrane.gen.source`
+[🔗](https://github.com/membraneframework/membrane_core/blob/v1.3.4/lib/mix/tasks/membrane.gen.component.ex#L5)
+
+Generates a template for a Membrane Source with the provided module name.
+
+  $ mix membrane.gen.source module_name [-l target_location]
+
+## Options
+* `-l, --location` - If a target location is provided, the Source will be created there, relative to the `lib` directory.
+  The filename must also be present and have an `.ex` extension. If location is not provided, then it will be
+  inferred from the provided module name - it will be converted to lowercase and `.` separators will be interpreted
+  as directory separators. For example, a Source with module name `Foo.Bar` will be created at `lib/foo/bar.ex`. 
+
+# `do_run`
+
+```elixir
+@spec do_run(binary(), [binary()]) :: any()
+```
+
+---
+
+*Consult [api-reference.md](api-reference.md) for complete listing*
+
+---
