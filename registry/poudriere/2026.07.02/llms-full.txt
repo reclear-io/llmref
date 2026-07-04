@@ -1,0 +1,990 @@
+# README.md
+
+Source: https://github.com/freebsd/poudriere/blob/master/README.md
+
+Welcome to poudriere!
+---------------------
+
+poudriere is a tool primarily designed to test package production on
+FreeBSD. However, most people will find it useful to bulk build ports
+for FreeBSD.
+
+Its goals are to use modern facilities present in FreeBSD (such as ZFS,
+jails), to be easy to use and to depend only on base.
+
+Where is the documentation?
+---------------------------
+
+The canonical documentation is located at:
+
+https://github.com/freebsd/poudriere/wiki
+
+A copy of this documentation could be found in the doc directory.
+
+You can also open the poudriere's manpage, located in the 8th section.
+
+Support
+-------
+
+IRC:          #poudriere on EFNet
+Mailing list: [freebsd-pkg@FreeBSD.org (lists.freebsd.org)](https://lists.freebsd.org/subscription/freebsd-pkg)
+
+Getting started with poudriere
+------------------------------
+
+1. Install it by typing `./configure`, `make` and `make install` at the top-level directory
+2. Copy `/usr/local/etc/poudriere.conf.sample` to `/usr/local/etc/poudriere.conf`
+3. Edit it to suit your needs
+4. `man poudriere`, search for `EXAMPLES`, read the [wiki](https://github.com/freebsd/poudriere/wiki)
+5. Follow "bulk build of binary packages" steps
+6. Enjoy your new fresh binary packages!
+
+Build status
+------------------------------
+
+* [![Build Status](https://api.cirrus-ci.com/github/freebsd/poudriere.svg?branch=master)](https://cirrus-ci.com/github/freebsd/poudriere)
+
+---
+
+# New Incremental Mode
+
+Source: https://github.com/freebsd/poudriere/blob/master/docs/pkg_no_version_for_deps.md
+
+# New Incremental Mode
+
+## Overview
+
+Poudriere has 2 incremental build modes
+
+1. Rebuild everything downstream if a dependency is missing or changed. This is the **curent default**.
+2. Only rebuild what `pkg upgrade` would [re]install for, but also ensure build reproducibility. Enabled with `PKG_NO_VERSION_FOR_DEPS=yes`.
+  - **Guiding principle is to only rebuild what `pkg upgrade` would upgrade for; build for `pkg upgrade` behavior.**
+  - In that sense the current algorithm rebuilds _a lot_ that `pkg upgrade` does not care about; we rebuild a lot needlessly.
+
+This document describes the algorithm for (2).
+
+## Current algorithm
+
+The current default behavior is to recursively delete all packages that depend
+on a package that is updated. This effectively forces a `PORTREVISION` chase on
+those packages.
+
+A major flaw with this is that a package will often rebuild while having the same
+version as it did before. Then `pkg upgrade` has no clue there is a _rebuilt_
+package available to upgrade to, and it does nothing. So we are building packages
+that never get used unless someone does `pkg install -f pkgname`.
+
+## New algorithm
+
+[Commit 6c8c538f](https://github.com/freebsd/poudriere/commit/6c8c538ffcad3b88bc807b15cc69acc6c72d8962)
+introduced a new mode named `PKG_NO_VERSION_FOR_DEPS`.
+
+For `PKG_NO_VERSION_FOR_DEPS=yes` we do not store the versions for
+dependencies. If a dependency `foo-1.2` used to be registered but was bumped to
+`foo-1.3` it used to force a rebuild because the dependency was missing. Now we
+only store `foo` as a dependency, such that version bumps do not themselves
+force a rebuild.
+
+Always rebuild cases are:
+
+```
+# _delete_old_pkg():
+# We delete [a package] and force a rebuild in these cases:
+# - pkg bootstrap is not available
+# - FORBIDDEN is set for the port
+# - Corrupted package file
+# - bulk -a: A package which the tree no longer creates.
+#   For example, a package with a removed FLAVOR.
+# - Wrong origin cases:
+#   o MOVED: origin moved to a new location
+#   o MOVED: origin expired
+#   o Nonexistent origin
+#   o A package with the wrong origin for its PKGNAME
+# - Changed PKGNAME
+# - PORTVERSION, PORTREVISION, or PORTEPOCH bump.
+# - Changed ABI/ARCH/NOARCH
+# - FLAVOR for a PKGNAME changed
+# - New list of dependencies (not including versions)
+#   (requires default-on CHECK_CHANGED_DEPS)
+# - Changed options
+#   (requires default-on CHECK_CHANGED_OPTIONS)
+#
+# These are handled by pkg (pkg_jobs_need_upgrade()) but not Poudriere yet:
+#
+# - changed conflicts		# not used by ports
+# - changed provides		# not used by ports
+# - changed requires		# not used by ports
+# - changed provided shlibs	# effectively by CHECK_CHANGED_DEPS
+# - changed required shlibs	# effectively by CHECK_CHANGED_DEPS
+```
+
+Further it is possible that this package requires a shared library that no
+dependency provides for. This can happen due to a missed `PORTREVISION` chase
+or simply switching to a new quarterly branch. Due to the lack of ports
+metadata advertising what libraries are provided we must search dependency
+packages _after they are built_ to determine if this package still has its
+shared library requirements met. That is, some of `_delete_old_pkg` (inspection
+of existing package) for shared library handling is deferred to the build.
+
+This changes Poudriere behavior in a few ways:
+
+- Dry-run mode can no longer predict everything that will be done.
+- A new "inspected" category is added. A port is "inspected" to see if its shared library dependencies are satisified. If they are then it is done. If they are not then it rebuilds that package.
+- `PORTREVISION` bumps are now critical. The old behavior of recursively deleting hid how important these are as it often would rebuild things anyway. Now we basically only rebuild if the version or a required shared library version changed.
+
+More details on shared library handling are in [shlib_tracking.md](./shlib_tracking.md).
+
+## `PKG_NO_VERSION_FOR_DEPS` safety
+
+Removing the versions from the dependencies is likely safe for a single
+consistent repository. For multi-repository support we likely need more work
+for binary-dependencies (like `RUN_DEPENDS+= /usr/local/bin/foo:devel/fooport`)
+or provides/requires.
+
+Missed `PORTREVISION` chases can lead to very confusing `pkg upgrade`
+conflicts/behavior and runtime problems.
+
+---
+
+# Shared library tracking
+
+Source: https://github.com/freebsd/poudriere/blob/master/docs/shlib_tracking.md
+
+# Shared library tracking
+
+## Purpose
+
+Poudriere has 2 incremental build modes.
+
+See [pkg_no_version_for_deps](./pkg_no_version_for_deps.md) for details.
+
+This document describes shared library handling for the new mode.
+
+[Commit 8a64dc67da](https://github.com/freebsd/poudriere/commit/8a64dc67da40864d15e1808a6fc9a32bfb9e46bf)
+added this for use when `PKG_NO_VERSION_FOR_DEPS` is set to `yes`.
+
+## Shared library missed PORTREVISION chase / Branch switch
+
+These cases are the target of this algorithm:
+- A committer updates a port providing a shared library, with a new shared library version, and forgets to bump its consumers (or assumes Poudriere will deal with rebuilding everything).
+  - In this case the packages will remain installed on user systems but new installs of the packages will not find a package providing for one of their needed libraries.
+  - This is the "missed PORTREVISION chase" case.
+- **Switching branch / quarterly switches** which a committer cannot deal with; we do not want to bump _everything_.
+- User has local custom ports using libraries that cannot be chased by upstream.
+
+### Notes
+
+- It is also possible that a port uses a shared library from a nested dependency and lacks a `LIB_DEPENDS` on it.
+- Ports like php/pecl pop up on this algorithm often.
+- This algorithm results in "Inspected" ports during the build.
+- This algorithm results in the "do we need to rebuild" decision for many packages being deferred to the build phase.
+- This may occur for every build and result in a NOP build still inspecting hundreds of packages.
+- This may need to be extended to _incremental-alg-1_ as well with `AUTO_LIB_DEPENDS`.
+- This may already be enabled for _incremental-alg-1_ by default somewhat by accident.
+
+### Algorithm
+
+**The primary goal here is to rebuild only if needed and not miss it when needed.**
+
+1. During build planning if a package uses shared libraries, and nothing else in `delete_old_pkg` triggers a rebuild, then it is scheduled to be "inspected" later after its own dependencies have been built/inspected.
+  - See `delete_old_pkg`.
+  - The "it" and "this package" and "_old/stale_ package" is the same one referred below.
+  - We stash the list of current shlibs required by this _old/stale_ package.
+  - Base libraries, ones provided in the jail's clean snapshot, are removed from the list. It is assumed that a jail version update will force rebuild all packages.
+2. Later during the build we run the inspection job for a particular port `libfooconsumer`.
+  - We find that this port still has an _old/stale_ package that was not deleted.
+  - We do not yet know if it will rebuild.
+  - The package version matches the port's version.
+3. The existing package is used to build a full recursive runtime dependency graph _from that package_.
+  - See `package_recursive_deps`.
+  - Ports metadata is not used as this package is _old/stale_ and does not match _current_ ports.
+  - _This package_ is the _old/stale_ one but its dependencies are _potentially newly built_ packages since this job runs after they are inspected/rebuilt.
+  - This is somewhat expensive and uses caching. It adds minutes to a NOP build (`bulk -a` has not been timed).
+  - Wishlist: ports providing metadata on what libraries they provide. This would allow more predictable build planning, but could still become stale.
+  - **This is no longer possible with `AUTO_LIB_DEPENDS`.**
+4. Then construct a full list of shared libraries provided by that graph.
+  - This involves looking at the shared libraries provided by each _current/new_ package.
+  - This creates a new _current effective_ graph that `pkg upgrade` / `pkg install` would see if we were to not rebuild this package.
+  - See `package_deps_provided_libs`.
+5. Then compare this _old/stale_ package's required shlibs to see if they are still satisfied or if a rebuild is needed.
+  - See `package_libdeps_satisfied`.
+  - Inspect each library provided for by its _current effective_ package-runtime dependency graph.
+  - If a package provides a needed shlib by exact name, success, we move on to the next library.
+  - If a package provides a library that "looks like" a shared lib we need then we rebuild. For example, we want libfoo.so.1 and libfoo.pkg now provides libfoo.so.2, close enough, rebuild.
+  - If we have a required library that _no dependency provides for_ a rebuild is done, but it may be a bug in the port.
+    - For example this was fixed in a `go` port in [freebsd/freebsd-ports@a4327166148114](https://github.com/freebsd/freebsd-ports/commit/a4327166148114c314ae5dd6f9c7e6776178e0ac).
+  - If all exact library names were satisfied then no rebuild is done.
+
+### Examples
+
+```
+Warning: couchdb3-3.4.2 will be rebuilt as it misses libcrypto.so.12
+Warning: couchdb3-3.4.2_1 will be rebuilt as it misses libcrypto.so.12
+Warning: couchdb3-3.4.3_1 will be rebuilt as it misses libcrypto.so.12
+Warning: emacs-nox-29.4_2,3 will be rebuilt as it misses libtree-sitter.so.0.24
+Warning: fusefs-bindfs-1.17.7_1 will be rebuilt as it misses libfuse3.so.3
+Warning: fusefs-sshfs-3.7.3_2 will be rebuilt as it misses libfuse3.so.3
+[false-positive+bug] Warning: go122-1.22.11 will be rebuilt as it misses libc.so.6:32
+[false-positive+bug] Warning: go123-1.23.5 will be rebuilt as it misses libc.so.6:32
+[false-positive+bug] Warning: go123-1.23.6 will be rebuilt as it misses libc.so.6:32
+Warning: mold-2.36.0 will be rebuilt as it misses libmimalloc.so.2
+Warning: mosh-1.4.0_8 will be rebuilt as it misses libabsl_bad_optional_access.so.2407.0.0
+Warning: node18-18.20.6 will be rebuilt as it misses libicudata.so.74
+Warning: protobuf-c-1.5.1 will be rebuilt as it misses libabsl_bad_optional_access.so.2407.0.0
+[These are custom ports that cannot be chased by upstream committers]
+Warning: znc16-1.6.6_4 will be rebuilt as it misses libicudata.so.74
+Warning: znc17-1.7.5_2 will be rebuilt as it misses libboost_locale.so.1.85.0
+Warning: znc17-1.7.5_2 will be rebuilt as it misses libboost_locale.so.1.86.0
+Warning: znc17-1.7.5_2 will be rebuilt as it misses libicudata.so.74
+Warning: znc18-1.8.2_12 will be rebuilt as it misses libboost_locale.so.1.85.0
+Warning: znc18-1.8.2_12 will be rebuilt as it misses libboost_locale.so.1.86.0
+Warning: znc18-1.8.2_12 will be rebuilt as it misses libicudata.so.74
+```
+
+Ignored ones:
+```
+apache24-2.4.62 misses libdb-18.1.so which no dependency provides. This will be ignored but should be fixed in the port.
+bootstrap-openjdk17-17.0.1.12.1 misses libX11.so.6 which no dependency provides. This will be ignored but should be fixed in the port.
+bootstrap-openjdk17-17.0.1.12.1 misses libXext.so.6 which no dependency provides. This will be ignored but should be fixed in the port.
+bootstrap-openjdk17-17.0.1.12.1 misses libXi.so.6 which no dependency provides. This will be ignored but should be fixed in the port.
+bootstrap-openjdk17-17.0.1.12.1 misses libXrender.so.1 which no dependency provides. This will be ignored but should be fixed in the port.
+bootstrap-openjdk17-17.0.1.12.1 misses libXtst.so.6 which no dependency provides. This will be ignored but should be fixed in the port.
+bootstrap-openjdk17-17.0.1.12.1 misses libasound.so.2 which no dependency provides. This will be ignored but should be fixed in the port.
+bootstrap-openjdk17-17.0.1.12.1 misses libfontconfig.so.1 which no dependency provides. This will be ignored but should be fixed in the port.
+bootstrap-openjdk17-17.0.1.12.1 misses libfreetype.so.6 which no dependency provides. This will be ignored but should be fixed in the port.
+bootstrap-openjdk17-17.0.1.12.1 misses libgif.so.7 which no dependency provides. This will be ignored but should be fixed in the port.
+bootstrap-openjdk17-17.0.1.12.1 misses libharfbuzz.so.0 which no dependency provides. This will be ignored but should be fixed in the port.
+bootstrap-openjdk17-17.0.1.12.1 misses libjpeg.so.8 which no dependency provides. This will be ignored but should be fixed in the port.
+bootstrap-openjdk17-17.0.1.12.1 misses liblcms2.so.2 which no dependency provides. This will be ignored but should be fixed in the port.
+bootstrap-openjdk17-17.0.1.12.1 misses libpng16.so.16 which no dependency provides. This will be ignored but should be fixed in the port.
+couchdb3-3.4.2 misses libcrypto.so.12 which no dependency provides. This will be ignored but should be fixed in the port.
+neovim-0.10.3_1 misses /usr/local/lib/lua/5.1/lpeg.so which no dependency provides. This will be ignored but should be fixed in the port.
+serf-1.3.10_1 misses libdb-18.1.so which no dependency provides. This will be ignored but should be fixed in the port.
+```
+
+## Pkg `AUTO_LIB_DEPENDS` discussion
+
+This discussion is not a suggesting that `AUTO_LIB_DEPENDS` is a problem or we need to continue tracking something, it is to ensure the right behavior is planned for.
+
+With Pkg 2.1 `AUTO_LIB_DEPENDS` it no longer will advertise packages in run depends that only provide a library. This causes problems for [Algorithm.3](./shlib_tracking.md#Algorithm) as we no longer know what the current package's _old_ graph is.
+
+What we can do instead is use the port's current `RUN_DEPENDS+LIB_DEPENDS` as a guide, assuming that the port is reproducible, that its libraries are still provided for. If nothing in its new graph provides the needed library then it may be reasonable to make it a hard error, or force a rebuild, rather than ignoring it in poudriere.
+
+`RUN_DEPENDS` are considered as well given they may provide a library that port picks up on despite the metadata/maintainer not realizing it.
+
+It seems wrong to use the current port's `RUN_DEPENDS+LIB_DEPENDS` when inspecting an existing _old/stale_ package. This may not be a real concern when considering the port claims it wants those and we are determining whether a rebuild is needed in a case where the port was _not_ bumped. **The package would match the port's version at this point.**
+
+However, when considering the behavior of `pkg upgrade` here the algorithm becomes less clear. This may be getting into the weeds and overcomplicating the ideas but it seems reasonable to keep in mind `pkg upgrade`'s behavior when building ports.
+
+Consider odd unpredictable cases like `gettext-*` refactoring that force manual intervention at ports or pkg. And keep in mind branch-switching and user custom ports. A `libfooconsumer.pkg` may want a `libfoo.so.1` which `libfoo.pkg` provided. Then for whatever reason `libfoo.pkg` no longer provides it but a `libfoo-compat.pkg` now provides it. And `libfooconsumer`'s port `RUN_DEPENDS+LIB_DEPENDS` were not updated. Assume we do not rebuild `libfooconsumer` here - `pkg upgrade` will gladly pull in `libfoo-compat.pkg` to satisfy `libfooconsumer`'s need of `libfoo.so.1`. Because `pkg upgrade` dealt with it fine and the `libconsumer` port did not _need a rebuild_ should we still delete it and attempt a rebuild? It may fail and result in a lost package for the user.
+
+In such a case it does not matter what the current port's `RUN_DEPENDS+LIB_DEPENDS` are. It matters what libraries are provided for _by the repository_. It is possible we do not need to rebuild. That the port's metadata is stale and rebuilding it will just break it when we could have kept the user happy with a working repository by not rebuilding it. In such a case we need to inspect _every package_ that built before this one. We do not have a pkg repository to inspect, it does not make sense to run `pkg repo` during every package build. We could cache each package's provided libraries as they are built and serialize access to it.
+
+There is a subtle problem too in that if we assume `libfoo-compat.pkg` will satisfy, it may not have built by the time `libfooconsumer` is scheduled if it was not in the graph. So we get to `libfooconsumer` and don't find anyone provides `libfoo.so.1` and rebuild anyway. This problem may be a deal breaker for this odd case discussion; we may just have to use current `RUN_DEPENDS+LIB_DEPENDS`.
+
+---
+
+# API documentation
+
+Source: https://github.com/freebsd/poudriere/blob/master/external/libucl/doc/api.md
+
+# API documentation
+
+**Table of Contents**  *generated with [DocToc](http://doctoc.herokuapp.com/)*
+
+- [Synopsis](#synopsis)
+- [Description](#description)
+	- [Parser functions](#parser-functions)
+	- [Emitting functions](#emitting-functions)
+	- [Conversion functions](#conversion-functions)
+	- [Generation functions](#generation-functions)
+	- [Iteration functions](#iteration-functions)
+	- [Validation functions](#validation-functions)
+	- [Utility functions](#utility-functions)
+- [Parser functions](#parser-functions-1)
+	- [ucl_parser_new](#ucl_parser_new)
+	- [ucl_parser_register_macro](#ucl_parser_register_macro)
+	- [ucl_parser_register_variable](#ucl_parser_register_variable)
+	- [ucl_parser_add_chunk](#ucl_parser_add_chunk)
+	- [ucl_parser_add_string](#ucl_parser_add_string)
+	- [ucl_parser_add_file](#ucl_parser_add_file)
+	- [ucl_parser_get_object](#ucl_parser_get_object)
+	- [ucl_parser_get_error](#ucl_parser_get_error)
+	- [ucl_parser_free](#ucl_parser_free)
+	- [ucl_pubkey_add](#ucl_pubkey_add)
+	- [ucl_parser_set_filevars](#ucl_parser_set_filevars)
+	- [Parser usage example](#parser-usage-example)
+- [Emitting functions](#emitting-functions-1)
+	- [ucl_object_emit](#ucl_object_emit)
+	- [ucl_object_emit_full](#ucl_object_emit_full)
+- [Conversion functions](#conversion-functions-1)
+- [Generation functions](#generation-functions-1)
+	- [ucl_object_new](#ucl_object_new)
+	- [ucl_object_typed_new](#ucl_object_typed_new)
+	- [Primitive objects generation](#primitive-objects-generation)
+	- [ucl_object_fromstring_common](#ucl_object_fromstring_common)
+- [Iteration functions](#iteration-functions-1)
+	- [ucl_iterate_object](#ucl_iterate_object)
+- [Validation functions](#validation-functions-1)
+	- [ucl_object_validate](#ucl_object_validate)
+
+# Synopsis
+
+`#include <ucl.h>`
+
+# Description
+
+Libucl is a parser and `C` API to parse and generate `ucl` objects. Libucl consist of several groups of functions:
+
+### Parser functions
+Used to parse `ucl` files and provide interface to extract `ucl` object. Currently, `libucl` can parse only full `ucl` documents, for instance, it is impossible to parse a part of document and therefore it is impossible to use `libucl` as a streaming parser. In future, this limitation can be removed.
+
+### Emitting functions
+Convert `ucl` objects to some textual or binary representation. Currently, libucl supports the following exports:
+
+- `JSON` - valid json format (can possibly lose some original data, such as implicit arrays)
+- `Config` - human-readable configuration format (lossless)
+- `YAML` - embedded yaml format (has the same limitations as `json` output)
+
+### Conversion functions
+Help to convert `ucl` objects to C types. These functions are used to convert `ucl_object_t` to C primitive types, such as numbers, strings or boolean values.
+
+### Generation functions
+Allow creation of `ucl` objects from C types and creating of complex `ucl` objects, such as hashes or arrays from primitive `ucl` objects, such as numbers or strings.
+
+### Iteration functions
+Iterate over `ucl` complex objects or over a chain of values, for example when a key in an object has multiple values (that can be treated as implicit array or implicit consolidation).
+
+### Validation functions
+Validation functions are used to validate some object `obj` using json-schema compatible object `schema`. Both input and schema must be UCL objects to perform validation.
+
+### Utility functions
+Provide basic utilities to manage `ucl` objects: creating, removing, retaining and releasing reference count and so on.
+
+# Parser functions
+
+Parser functions operates with `struct ucl_parser`.
+
+### ucl_parser_new
+
+~~~C
+struct ucl_parser* ucl_parser_new (int flags);
+~~~
+
+Creates new parser with the specified flags:
+
+- `UCL_PARSER_KEY_LOWERCASE` - lowercase keys parsed
+- `UCL_PARSER_ZEROCOPY` - try to use zero-copy mode when reading files (in zero-copy mode text chunk being parsed without copying strings so it should exist till any object parsed is used)
+- `UCL_PARSER_NO_TIME` - treat time values as strings without parsing them as floats
+
+### ucl_parser_register_macro
+
+~~~C
+void ucl_parser_register_macro (struct ucl_parser *parser,
+    const char *macro, ucl_macro_handler handler, void* ud);
+~~~
+
+Register new macro with name .`macro` parsed by handler `handler` that accepts opaque data pointer `ud`. Macro handler should be of the following type:
+
+~~~C
+bool (*ucl_macro_handler) (const unsigned char *data,
+    size_t len, void* ud);`
+~~~
+
+Handler function accepts macro text `data` of length `len` and the opaque pointer `ud`. If macro is parsed successfully the handler should return `true`. `false` indicates parsing failure and the parser can be terminated.
+
+### ucl_parser_register_variable
+
+~~~C
+void ucl_parser_register_variable (struct ucl_parser *parser,
+    const char *var, const char *value);
+~~~
+
+Register new variable $`var` that should be replaced by the parser to the `value` string.
+
+### ucl_parser_add_chunk
+
+~~~C
+bool ucl_parser_add_chunk (struct ucl_parser *parser, 
+    const unsigned char *data, size_t len);
+~~~
+
+Add new text chunk with `data` of length `len` to the parser. At the moment, `libucl` parser is not a streamlined parser and chunk *must* contain the *valid* ucl object. For example, this object should be valid:
+
+~~~json
+{ "var": "value" }
+~~~
+
+while this one won't be parsed correctly:
+
+~~~json
+{ "var": 
+~~~
+
+This limitation may possible be removed in future.
+
+### ucl_parser_add_string
+~~~C
+bool ucl_parser_add_string (struct ucl_parser *parser, 
+    const char *data, size_t len);
+~~~
+
+This function acts exactly like `ucl_parser_add_chunk` does but if `len` argument is zero, then the string `data` must be zero-terminated and the actual length is calculated up to `\0` character. 
+
+### ucl_parser_add_file
+
+~~~C
+bool ucl_parser_add_file (struct ucl_parser *parser, 
+    const char *filename);
+~~~
+
+Load file `filename` and parse it with the specified `parser`. This function uses `mmap` call to load file, therefore, it should not be `shrunk` during parsing. Otherwise, `libucl` can cause memory corruption and terminate the calling application. This function is also used by the internal handler of `include` macro, hence, this macro has the same limitation.
+
+### ucl_parser_get_object
+
+~~~C
+ucl_object_t* ucl_parser_get_object (struct ucl_parser *parser);
+~~~
+
+If the `ucl` data has been parsed correctly this function returns the top object for the parser. Otherwise, this function returns the `NULL` pointer. The reference count for `ucl` object returned is increased by one, therefore, a caller should decrease reference by using `ucl_object_unref` to free object after usage.
+
+### ucl_parser_get_error
+
+~~~C
+const char *ucl_parser_get_error(struct ucl_parser *parser);
+~~~
+
+Returns the constant error string for the parser object. If no error occurred during parsing a `NULL` object is returned. A caller should not try to free or modify this string.
+
+### ucl_parser_free
+
+~~~C
+void ucl_parser_free (struct ucl_parser *parser);
+~~~
+
+Frees memory occupied by the parser object. The reference count for top object is decreased as well, however if the function `ucl_parser_get_object` was called previously then the top object won't be freed.
+
+### ucl_pubkey_add
+
+~~~C
+bool ucl_pubkey_add (struct ucl_parser *parser, 
+    const unsigned char *key, size_t len);
+~~~
+
+This function adds a public key from text blob `key` of length `len` to the `parser` object. This public key should be in the `PEM` format and can be used by `.includes` macro for checking signatures of files included. `Openssl` support should be enabled to make this function working. If a key cannot be added (e.g. due to format error) or `openssl` was not linked to `libucl` then this function returns `false`.
+
+### ucl_parser_set_filevars
+
+~~~C
+bool ucl_parser_set_filevars (struct ucl_parser *parser, 
+    const char *filename, bool need_expand);
+~~~
+
+Add the standard file variables to the `parser` based on the `filename` specified:
+
+- `$FILENAME` - a filename of `ucl` input
+- `$CURDIR` - a current directory of the input
+
+For example, if a `filename` param is `../something.conf` then the variables will have the following values:
+
+- `$FILENAME` - "../something.conf"
+- `$CURDIR` - ".."
+
+if `need_expand` parameter is `true` then all relative paths are expanded using `realpath` call. In this example if `..` is `/etc/dir` then variables will have these values:
+
+- `$FILENAME` - "/etc/something.conf"
+- `$CURDIR` - "/etc"
+
+## Parser usage example
+
+The following example loads, parses and extracts `ucl` object from stdin using `libucl` parser functions (the length of input is limited to 8K):
+
+~~~C
+char inbuf[8192];
+struct ucl_parser *parser = NULL;
+int ret = 0, r = 0;
+ucl_object_t *obj = NULL;
+FILE *in;
+
+in = stdin;
+parser = ucl_parser_new (0);
+while (!feof (in) && r < (int)sizeof (inbuf)) {
+	r += fread (inbuf + r, 1, sizeof (inbuf) - r, in);
+}
+ucl_parser_add_chunk (parser, inbuf, r);
+fclose (in);
+
+if (ucl_parser_get_error (parser)) {
+	printf ("Error occurred: %s\n", ucl_parser_get_error (parser));
+	ret = 1;
+}
+else {
+    obj = ucl_parser_get_object (parser);
+}
+
+if (parser != NULL) {
+	ucl_parser_free (parser);
+}
+if (obj != NULL) {
+	ucl_object_unref (obj);
+}
+return ret;
+~~~
+
+# Emitting functions
+
+Libucl can transform UCL objects to a number of tectual formats:
+
+- configuration (`UCL_EMIT_CONFIG`) - nginx like human readable configuration file where implicit arrays are transformed to the duplicate keys
+- compact json: `UCL_EMIT_JSON_COMPACT` - single line valid json without spaces
+- formatted json: `UCL_EMIT_JSON` - pretty formatted JSON with newlines and spaces
+- compact yaml: `UCL_EMIT_YAML` - compact YAML output
+
+Moreover, libucl API allows to select a custom set of emitting functions allowing 
+efficient and zero-copy output of libucl objects. Libucl uses the following structure to support this feature:
+
+~~~C
+struct ucl_emitter_functions {
+	/** Append a single character */
+	int (*ucl_emitter_append_character) (unsigned char c, size_t nchars, void *ud);
+	/** Append a string of a specified length */
+	int (*ucl_emitter_append_len) (unsigned const char *str, size_t len, void *ud);
+	/** Append a 64 bit integer */
+	int (*ucl_emitter_append_int) (int64_t elt, void *ud);
+	/** Append floating point element */
+	int (*ucl_emitter_append_double) (double elt, void *ud);
+	/** Opaque userdata pointer */
+	void *ud;
+};
+~~~
+
+This structure defines the following callbacks:
+
+- `ucl_emitter_append_character` - a function that is called to append `nchars` characters equal to `c`
+- `ucl_emitter_append_len` - used to append a string of length `len` starting from pointer `str`
+- `ucl_emitter_append_int` - this function applies to integer numbers
+- `ucl_emitter_append_double` - this function is intended to output floating point variable
+
+The set of these functions could be used to output text formats of `UCL` objects to different structures or streams.
+
+Libucl provides the following functions for emitting UCL objects:
+
+### ucl_object_emit
+
+~~~C
+unsigned char *ucl_object_emit (const ucl_object_t *obj, enum ucl_emitter emit_type);
+~~~
+
+Allocate a string that is suitable to fit the underlying UCL object `obj` and fill it with the textual representation of the object `obj` according to style `emit_type`. The caller should free the returned string after using.
+
+### ucl_object_emit_full
+
+~~~C
+bool ucl_object_emit_full (const ucl_object_t *obj, enum ucl_emitter emit_type,
+		struct ucl_emitter_functions *emitter);
+~~~
+
+This function is similar to the previous with the exception that it accepts the additional argument `emitter` that defines the concrete set of output functions. This emit function could be useful for custom structures or streams emitters (including C++ ones, for example).
+
+# Conversion functions
+
+Conversion functions are used to convert UCL objects to primitive types, such as strings, numbers, or boolean values. There are two types of conversion functions:
+
+- safe: try to convert an ucl object to a primitive type and fail if such a conversion is not possible
+- unsafe: return primitive type without additional checks, if the object cannot be converted then some reasonable default is returned (NULL for strings and 0 for numbers)
+
+Also there is a single `ucl_object_tostring_forced` function that converts any UCL object (including compound types - arrays and objects) to a string representation. For objects, arrays, booleans and numeric types this function performs emitting to a compact json format actually.
+
+Here is a list of all conversion functions:
+
+- `ucl_object_toint` - returns `int64_t` of UCL object
+- `ucl_object_todouble` - returns `double` of UCL object
+- `ucl_object_toboolean` - returns `bool` of UCL object
+- `ucl_object_tostring` - returns `const char *` of UCL object (this string is NULL terminated)
+- `ucl_object_tolstring` - returns `const char *` and `size_t` len of UCL object (string does not need to be NULL terminated)
+- `ucl_object_tostring_forced` - returns string representation of any UCL object
+
+Strings returned by these pointers are associated with the UCL object and exist over its lifetime. A caller should not free this memory.
+
+# Generation functions
+
+It is possible to generate UCL objects from C primitive types. Moreover, libucl allows creation and modifying complex UCL objects, such as arrays or associative objects. 
+
+## ucl_object_new
+~~~C
+ucl_object_t * ucl_object_new (void)
+~~~
+
+Creates new object of type `UCL_NULL`. This object should be released by caller.
+
+## ucl_object_typed_new
+~~~C
+ucl_object_t * ucl_object_typed_new (unsigned int type)
+~~~
+
+Create an object of a specified type:
+- `UCL_OBJECT` - UCL object - key/value pairs
+- `UCL_ARRAY` - UCL array
+- `UCL_INT` - integer number
+- `UCL_FLOAT` - floating point number
+- `UCL_STRING` - NULL terminated string
+- `UCL_BOOLEAN` - boolean value
+- `UCL_TIME` - time value (floating point number of seconds)
+- `UCL_USERDATA` - opaque userdata pointer (may be used in macros)
+- `UCL_NULL` - null value
+
+This object should be released by caller.
+
+## Primitive objects generation
+Libucl provides the functions similar to inverse conversion functions called with the specific C type:
+- `ucl_object_fromint` - converts `int64_t` to UCL object
+- `ucl_object_fromdouble` - converts `double` to UCL object
+- `ucl_object_frombool` - converts `bool` to UCL object
+- `ucl_object_fromstring` - converts `const char *` to UCL object (this string should be NULL terminated)
+- `ucl_object_fromlstring` - converts `const char *` and `size_t` len to UCL object (string does not need to be NULL terminated)
+
+Also there is a function to generate UCL object from a string performing various parsing or conversion operations called `ucl_object_fromstring_common`.
+
+## ucl_object_fromstring_common
+~~~C
+ucl_object_t * ucl_object_fromstring_common (const char *str, 
+	size_t len, enum ucl_string_flags flags)
+~~~
+
+This function is used to convert a string `str` of size `len` to a UCL object applying `flags` conversions. If `len` is equal to zero then a `str` is assumed as NULL-terminated. This function supports the following flags (a set of flags can be specified using logical `OR` operation):
+
+- `UCL_STRING_ESCAPE` - perform JSON escape
+- `UCL_STRING_TRIM` - trim leading and trailing whitespaces
+- `UCL_STRING_PARSE_BOOLEAN` - parse passed string and detect boolean
+- `UCL_STRING_PARSE_INT` - parse passed string and detect integer number
+- `UCL_STRING_PARSE_DOUBLE` - parse passed string and detect integer or float number
+- `UCL_STRING_PARSE_TIME` - parse time values as floating point numbers
+- `UCL_STRING_PARSE_NUMBER` - parse passed string and detect number (both float, integer and time types)
+- `UCL_STRING_PARSE` - parse passed string (and detect booleans, numbers and time values)
+- `UCL_STRING_PARSE_BYTES` - assume that numeric multipliers are in bytes notation, for example `10k` means `10*1024` and not `10*1000` as assumed without this flag
+
+If parsing operations fail then the resulting UCL object will be a `UCL_STRING`. A caller should always check the type of the returned object and release it after using.
+
+# Iteration functions
+
+Iteration are used to iterate over UCL compound types: arrays and objects. Moreover, iterations could be performed over the keys with multiple values (implicit arrays).
+There are two types of iterators API: old and unsafe one via `ucl_iterate_object` and the proposed interface of safe iterators.
+
+
+## ucl_iterate_object
+~~~C
+const ucl_object_t* ucl_iterate_object (const ucl_object_t *obj, 
+	ucl_object_iter_t *iter, bool expand_values);
+~~~
+
+This function accepts opaque iterator pointer `iter`. In the first call this iterator *must* be initialized to `NULL`. Iterator is changed by this function call. `ucl_iterate_object` returns the next UCL object in the compound object `obj` or `NULL` if all objects have been iterated. The reference count of the object returned is not increased, so a caller should not unref the object or modify its content (e.g. by inserting to another compound object). The object `obj` should not be changed during the iteration process as well. `expand_values` flag speicifies whether `ucl_iterate_object` should expand keys with multiple values. The general rule is that if you need to iterate through the *object* or *explicit array*, then you always need to set this flag to `true`. However, if you get some key in the object and want to extract all its values then you should set `expand_values` to `false`. Mixing of iteration types is not permitted since the iterator is set according to the iteration type and cannot be reused. Here is an example of iteration over the objects using libucl API (assuming that `top` is `UCL_OBJECT` in this example):
+
+~~~C
+ucl_object_iter_t it = NULL, it_obj = NULL;
+const ucl_object_t *cur, *tmp;
+
+/* Iterate over the object */
+while ((obj = ucl_iterate_object (top, &it, true))) {
+	printf ("key: \"%s\"\n", ucl_object_key (obj));
+	/* Iterate over the values of a key */
+	while ((cur = ucl_iterate_object (obj, &it_obj, false))) {
+		printf ("value: \"%s\"\n", 
+			ucl_object_tostring_forced (cur));
+	}
+}
+~~~
+
+## Safe iterators API
+
+Safe iterators are defined to clarify iterating over UCL objects and simplify flattening of UCL objects in non-trivial cases.
+For example, if there is an implicit array that contains another array and a boolean value it is extremely unclear how to iterate over
+such an object. Safe iterators are desinged to define two sorts of iteration:
+
+1. Iteration over complex objects with expanding all values
+2. Iteration over complex objects without expanding of values
+
+The following example demonstrates the difference between these two types of iteration:
+
+~~~
+key = 1;
+key = [2, 3, 4];
+
+Iteration with expansion:
+
+1, 2, 3, 4
+
+Iteration without expansion:
+
+1, [2, 3, 4]
+~~~
+
+UCL defines the following functions to manage safe iterators:
+
+- `ucl_object_iterate_new` - creates new safe iterator
+- `ucl_object_iterate_reset` - resets iterator to a new object
+- `ucl_object_iterate_safe` - safely iterate the object inside iterator
+- `ucl_object_iterate_free` - free memory associated with the safe iterator
+
+Please note that unlike unsafe iterators, safe iterators *must* be explicitly initialized and freed.
+An assert is likely generated if you use uninitialized or `NULL` iterator in all safe iterators functions.
+
+~~~C
+ucl_object_iter_t it;
+const ucl_object_t *cur;
+
+it = ucl_object_iterate_new (obj);
+
+while ((cur = ucl_object_iterate_safe (it, true)) != NULL) {
+	/* Do something */
+}
+
+/* Switch to another object */
+it = ucl_object_iterate_reset (it, another_obj);
+
+while ((cur = ucl_object_iterate_safe (it, true)) != NULL) {
+	/* Do something else */
+}
+
+ucl_object_iterate_free (it);
+~~~
+
+# Validation functions
+
+Currently, there is only one validation function called `ucl_object_validate`. It performs validation of object using the specified schema. This function is defined as following:
+
+## ucl_object_validate
+~~~C
+bool ucl_object_validate (const ucl_object_t *schema,
+	const ucl_object_t *obj, struct ucl_schema_error *err);
+~~~
+
+This function uses ucl object `schema`, that must be valid in terms of `json-schema` draft v4, to validate input object `obj`. If this function returns `true` then validation procedure has been succeed. Otherwise, `false` is returned and `err` is set to a specific value. If a caller sets `err` to NULL then this function does not set any error just returning `false`. Error is the structure defined as following:
+
+~~~C
+struct ucl_schema_error {
+	enum ucl_schema_error_code code;	/* error code */
+	char msg[128];				/* error message */
+	ucl_object_t *obj;			/* object where error occurred */
+};
+~~~
+
+Caller may use `code` field to get a numeric error code:
+
+~~~C
+enum ucl_schema_error_code {
+	UCL_SCHEMA_OK = 0,          /* no error */
+	UCL_SCHEMA_TYPE_MISMATCH,   /* type of object is incorrect */
+	UCL_SCHEMA_INVALID_SCHEMA,  /* schema is invalid */
+	UCL_SCHEMA_MISSING_PROPERTY,/* missing properties */
+	UCL_SCHEMA_CONSTRAINT,      /* constraint found */
+	UCL_SCHEMA_MISSING_DEPENDENCY, /* missing dependency */
+	UCL_SCHEMA_UNKNOWN          /* generic error */
+};
+~~~
+
+`msg` is a string description of an error and `obj` is an object where error has occurred. Error object is not allocated by libucl, so there is no need to free it after validation (a static object should thus be used).
+
+---
+
+# lua_api.md
+
+Source: https://github.com/freebsd/poudriere/blob/master/external/libucl/doc/lua_api.md
+
+## Module `ucl`
+
+This lua module allows to parse objects from strings and to store data into
+ucl objects. It uses `libucl` C library to parse and manipulate with ucl objects.
+
+Example:
+
+~~~lua
+local ucl = require("ucl")
+
+local parser = ucl.parser()
+local res,err = parser:parse_string('{key=value}')
+
+if not res then
+	print('parser error: ' .. err)
+else
+	local obj = parser:get_object()
+	local got = ucl.to_format(obj, 'json')
+end
+
+local table = {
+  str = 'value',
+  num = 100500,
+  null = ucl.null,
+  func = function ()
+    return 'huh'
+  end
+}
+
+
+print(ucl.to_format(table, 'ucl'))
+-- Output:
+--[[
+num = 100500;
+str = "value";
+null = null;
+func = "huh";
+--]]
+~~~
+
+###Brief content:
+
+**Functions**:
+
+> [`ucl_object_push_lua(L, obj, allow_array)`](#function-ucl_object_push_lual-obj-allow_array)
+
+> [`ucl.to_format(var, format)`](#function-uclto_formatvar-format)
+
+
+
+**Methods**:
+
+> [`parser:parse_file(name)`](#method-parserparse_filename)
+
+> [`parser:parse_string(input)`](#method-parserparse_stringinput)
+
+> [`parser:get_object()`](#method-parserget_object)
+
+
+## Functions
+
+The module `ucl` defines the following functions.
+
+### Function `ucl_object_push_lua(L, obj, allow_array)`
+
+This is a `C` function to push `UCL` object as lua variable. This function
+converts `obj` to lua representation using the following conversions:
+
+- *scalar* values are directly presented by lua objects
+- *userdata* values are converted to lua function objects using `LUA_REGISTRYINDEX`,
+this can be used to pass functions from lua to c and vice-versa
+- *arrays* are converted to lua tables with numeric indices suitable for `ipairs` iterations
+- *objects* are converted to lua tables with string indices
+
+**Parameters:**
+
+- `L {lua_State}`: lua state pointer
+- `obj {ucl_object_t}`: object to push
+- `allow_array {bool}`: expand implicit arrays (should be true for all but partial arrays)
+
+**Returns:**
+
+- `{int}`: `1` if an object is pushed to lua
+
+Back to [module description](#module-ucl).
+
+### Function `ucl.to_format(var, format)`
+
+Converts lua variable `var` to the specified `format`. Formats supported are:
+
+- `json` - fine printed json
+- `json-compact` - compacted json
+- `config` - fine printed configuration
+- `ucl` - same as `config`
+- `yaml` - embedded yaml
+
+If `var` contains function, they are called during output formatting and if
+they return string value, then this value is used for ouptut.
+
+**Parameters:**
+
+- `var {variant}`: any sort of lua variable (if userdata then metafield `__to_ucl` is searched for output)
+- `format {string}`: any available format
+
+**Returns:**
+
+- `{string}`: string representation of `var` in the specific `format`.
+
+Example:
+
+~~~lua
+local table = {
+  str = 'value',
+  num = 100500,
+  null = ucl.null,
+  func = function ()
+    return 'huh'
+  end
+}
+
+
+print(ucl.to_format(table, 'ucl'))
+-- Output:
+--[[
+num = 100500;
+str = "value";
+null = null;
+func = "huh";
+--]]
+~~~
+
+Back to [module description](#module-ucl).
+
+
+## Methods
+
+The module `ucl` defines the following methods.
+
+### Method `parser:parse_file(name)`
+
+Parse UCL object from file.
+
+**Parameters:**
+
+- `name {string}`: filename to parse
+
+**Returns:**
+
+- `{bool[, string]}`: if res is `true` then file has been parsed successfully, otherwise an error string is also returned
+
+Example:
+
+~~~lua
+local parser = ucl.parser()
+local res,err = parser:parse_file('/some/file.conf')
+
+if not res then
+	print('parser error: ' .. err)
+else
+	-- Do something with object
+end
+~~~
+
+Back to [module description](#module-ucl).
+
+### Method `parser:parse_string(input)`
+
+Parse UCL object from file.
+
+**Parameters:**
+
+- `input {string}`: string to parse
+
+**Returns:**
+
+- `{bool[, string]}`: if res is `true` then file has been parsed successfully, otherwise an error string is also returned
+
+Back to [module description](#module-ucl).
+
+### Method `parser:get_object()`
+
+Get top object from parser and export it to lua representation.
+
+**Parameters:**
+
+	nothing
+
+**Returns:**
+
+- `{variant or nil}`: ucl object as lua native variable
+
+Back to [module description](#module-ucl).
+
+
+Back to [top](#).
+
+
+---
