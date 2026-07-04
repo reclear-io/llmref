@@ -1,0 +1,1007 @@
+# tilefeed
+
+Source: https://github.com/muimsd/tilefeed/blob/main/README.md
+
+# tilefeed
+
+![CI](https://github.com/muimsd/tilefeed/actions/workflows/ci.yml/badge.svg)
+![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
+
+A PostGIS vector tile pipeline for **MBTiles generation + incremental updates + HTTP serving + storage publish**.
+
+## Architecture
+
+```
+PostGIS ──┬── Tippecanoe ──┐
+          ├── GDAL ────────┤── MBTiles ──┬── Built-in HTTP server
+          └── Native Rust ─┘             ├── Local copy
+                                         ├── S3 upload
+LISTEN/NOTIFY ── Debounce ── MVT encode ─├── Mapbox Studio
+                                         ├── Custom command
+                                         ├── Webhooks (HTTP POST)
+                                         └── SSE (Server-Sent Events)
+```
+
+Full generation exports PostGIS layers through one of three backends (Tippecanoe, GDAL, or native Rust) to produce MBTiles. Incremental updates listen for PostgreSQL notifications, debounce and deduplicate affected tiles, re-encode them as MVT protobuf, and write them into the existing MBTiles file. The built-in HTTP server serves tiles directly from MBTiles with ETag caching and TileJSON metadata.
+
+## Why tilefeed?
+
+| Tool | Approach | How tilefeed differs |
+|------|----------|---------------------|
+| **pg_tileserv** | Serves tiles on-the-fly from PostGIS, no caching or pre-generation. | tilefeed pre-generates tiles into MBTiles for predictable latency and CDN-friendly serving. |
+| **Martin** | Full-featured tile server with many backends, but more complex to deploy. | tilefeed is a focused pipeline that generates, serves, and incrementally updates MBTiles. |
+| **t-rex** | Similar pre-generation approach but tightly coupled to its own built-in HTTP server. | tilefeed decouples generation from serving — use the built-in server or bring your own. |
+| **Tippecanoe cron** | Periodic full re-runs via cron or CI. Misses real-time updates and wastes work. | tilefeed adds incremental updates via PostgreSQL LISTEN/NOTIFY, regenerating only affected tiles. |
+
+## Features
+
+- Cross-platform: Linux, macOS, and Windows
+- Three generation backends: [Tippecanoe](docs/tippecanoe.md), GDAL (ogr2ogr), and native Rust MVT encoder
+- Multiple sources: separate MBTiles outputs with independent layers and zoom ranges
+- Incremental tile regeneration using PostgreSQL LISTEN/NOTIFY with debounced batching
+- Built-in HTTP tile server with ETag caching, CORS, and [TileJSON 3.0.0](docs/serving.md)
+- [Derived geometry layers](docs/derived-layers.md): auto-generated label points and boundary lines from polygons
+- Geometry simplification (Douglas-Peucker) with per-zoom scaling
+- Per-zoom property filtering to reduce tile sizes at low zooms
+- Storage backends: local copy, S3, [Mapbox Studio](https://docs.mapbox.com/api/maps/uploads/), custom command
+- [Webhook notifications](docs/serving.md#webhooks) with HMAC-SHA256 signing and configurable cooldown
+- [Server-Sent Events](docs/serving.md#server-sent-events-sse) (`GET /events`) for live tile refresh in frontends
+- CLI tools: `inspect`, `validate`, `diff` for MBTiles diagnostics
+- Docker support with multi-stage build
+- Auto-reconnect on PostgreSQL connection loss with exponential backoff
+- WAL mode for concurrent MBTiles reads during writes
+
+## Installation
+
+### Prerequisites
+
+- PostgreSQL with [PostGIS](https://postgis.net/) extension
+- [Tippecanoe](https://github.com/felt/tippecanoe) — only if using `generation_backend = "tippecanoe"` (default)
+- [GDAL](https://gdal.org/) — only if using `generation_backend = "gdal"`
+- Neither needed for `generation_backend = "native"`
+
+### Homebrew (macOS / Linux)
+
+```bash
+brew tap muimsd/tilefeed
+brew install tilefeed
+```
+
+### Scoop (Windows)
+
+```powershell
+scoop bucket add tilefeed https://github.com/muimsd/tilefeed
+scoop install tilefeed
+```
+
+### Debian / Ubuntu (.deb)
+
+```bash
+curl -LO https://github.com/muimsd/tilefeed/releases/latest/download/tilefeed_amd64.deb
+sudo dpkg -i tilefeed_amd64.deb
+```
+
+### Fedora / RHEL (.rpm)
+
+```bash
+curl -LO https://github.com/muimsd/tilefeed/releases/latest/download/tilefeed-x86_64.rpm
+sudo rpm -i tilefeed-x86_64.rpm
+```
+
+### Cargo
+
+```bash
+cargo install tilefeed
+```
+
+### Docker
+
+```bash
+docker build -t tilefeed .
+docker run -v ./config.toml:/data/config.toml tilefeed serve
+```
+
+### From source
+
+Requires [Rust 1.70+](https://rustup.rs/) and `protoc` (protobuf compiler).
+
+```bash
+# Install protoc
+# Linux: sudo apt-get install -y protobuf-compiler
+# macOS: brew install protobuf
+# Windows: choco install protoc
+
+git clone https://github.com/muimsd/tilefeed.git
+cd tilefeed
+cargo build --release
+# Binary: target/release/tilefeed
+```
+
+### Pre-built binaries
+
+Download from [GitHub Releases](https://github.com/muimsd/tilefeed/releases):
+
+| Platform | Binary |
+|----------|--------|
+| Linux x86_64 | `tilefeed-x86_64-unknown-linux-gnu` |
+| Linux ARM64 | `tilefeed-aarch64-unknown-linux-gnu` |
+| macOS Apple Silicon | `tilefeed-aarch64-apple-darwin` |
+| macOS Intel | `tilefeed-x86_64-apple-darwin` |
+| Windows x86_64 | `tilefeed-x86_64-pc-windows-msvc` |
+
+## Usage
+
+### Commands
+
+```bash
+tilefeed generate            # full tile generation from PostGIS
+tilefeed watch               # watch LISTEN/NOTIFY for incremental updates
+tilefeed run                 # generate then watch
+tilefeed serve               # generate, start HTTP server, and watch
+tilefeed inspect <file>      # inspect MBTiles metadata and statistics
+tilefeed validate            # validate config against the database
+tilefeed diff <a> <b>        # compare two MBTiles files
+tilefeed -c other.toml serve # use alternate config file
+```
+
+If running from source: `cargo run --release -- serve`
+
+## Quick Start
+
+### 1. Set up database + triggers
+
+```bash
+createdb geodata
+psql -d geodata -c "CREATE EXTENSION IF NOT EXISTS postgis"
+psql -d geodata < sql/setup_notify.sql
+```
+
+Attach the trigger to each source table:
+
+```sql
+CREATE TRIGGER tile_update_trigger
+    AFTER INSERT OR UPDATE OR DELETE ON your_table
+    FOR EACH ROW
+    EXECUTE FUNCTION notify_tile_update('your_layer_name');
+```
+
+The trigger layer name must match a `[[sources.layers]].name` in config.
+
+### 2. Configure
+
+```toml
+[database]
+host = "localhost"
+port = 5432
+user = "postgres"
+password = "postgres"
+dbname = "geodata"
+
+[serve]
+host = "0.0.0.0"
+port = 3000
+
+# [webhook]
+# urls = ["https://example.com/hooks/tilefeed"]
+# secret = "my-signing-secret"
+# cooldown_secs = 300
+
+[[sources]]
+name = "basemap"
+mbtiles_path = "./basemap.mbtiles"
+min_zoom = 0
+max_zoom = 14
+# generation_backend = "native"  # no external tools needed
+
+[[sources.layers]]
+name = "buildings"
+table = "buildings"
+geometry_column = "geom"
+id_column = "id"
+srid = 4326
+properties = ["name", "type", "height"]
+simplify_tolerance = 0.00001
+generate_label_points = true
+
+[[sources.layers.property_rules]]
+below_zoom = 8
+exclude = ["height"]
+```
+
+See [full configuration reference](docs/configuration.md) for all options.
+
+### 3. Run
+
+```bash
+# Full rebuild + serve + watch
+tilefeed serve
+
+# Or step by step:
+tilefeed generate   # build MBTiles
+tilefeed watch      # incremental updates only
+```
+
+## Documentation
+
+| Doc | Description |
+|-----|-------------|
+| [Configuration Reference](docs/configuration.md) | All config fields, sections, and generation backends |
+| [Tippecanoe Settings](docs/tippecanoe.md) | Fine-tuning Tippecanoe tile generation |
+| [Tile Serving](docs/serving.md) | Built-in HTTP server, SSE, webhooks, and external alternatives |
+| [Derived Layers](docs/derived-layers.md) | Auto-generated label points and boundary lines |
+| [OGR_FDW Integration](docs/ogr-fdw.md) | Using external data sources via PostgreSQL FDW |
+
+## Incremental Flow
+
+1. PostgreSQL trigger emits `pg_notify('tile_update', ...)`
+2. tilefeed debounces notifications into a batch
+3. Events are routed to the correct source based on layer name
+4. Affected tiles are derived from new/old feature bounds
+5. Tiles are regenerated and written into the source's MBTiles
+6. MBTiles artifact is published if `publish_on_update = true`
+7. Webhook and SSE consumers are notified with affected zooms, tile counts, and `max_zoom` for overzoom awareness
+
+## Support
+
+<a href="https://www.buymeacoffee.com/muimsd" target="_blank"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-green.png" alt="Buy Me A Coffee" style="height: 60px !important;width: 217px !important;" ></a>
+
+## License
+
+MIT
+
+---
+
+# AGENTS.md
+
+Source: https://github.com/muimsd/tilefeed/blob/main/AGENTS.md
+
+# AGENTS.md
+
+This file provides guidance to Codex (Codex.ai/code) when working with code in this repository.
+
+## Build & Test Commands
+
+```bash
+cargo build                  # dev build
+cargo build --release        # release build
+cargo test                   # run all tests
+cargo test tiles::tests      # run specific test module
+cargo check                  # fast type-check without codegen
+```
+
+The build step compiles `proto/vector_tile.proto` via `prost-build` (see `build.rs`).
+
+## Running
+
+```bash
+cargo run -- generate              # full tile generation from PostGIS via Tippecanoe
+cargo run -- watch                 # watch LISTEN/NOTIFY and apply incremental updates
+cargo run -- run                   # generate then watch
+cargo run -- serve                 # generate, watch, and serve tiles over HTTP
+cargo run -- inspect out.mbtiles   # dump MBTiles metadata and stats
+cargo run -- validate              # check config against database
+cargo run -- diff a.mbtiles b.mbtiles  # compare two MBTiles files
+cargo run -- -c other.toml watch   # use alternate config file
+```
+
+Requires PostgreSQL with PostGIS extension. Tippecanoe is needed for `generate`, `run`, and `serve`.
+
+## Docker
+
+```bash
+docker compose up              # PostGIS + tilefeed serve
+docker compose up --build      # rebuild after code changes
+```
+
+## Architecture
+
+**tilefeed** is a PostGIS vector tile pipeline that builds MBTiles, incrementally updates them via PostgreSQL LISTEN/NOTIFY, and optionally serves tiles over HTTP.
+
+### Multi-source model
+
+The config defines one or more `[[sources]]`, each producing an independent MBTiles file with its own layers and zoom range. Notifications are routed to the correct source by matching the layer name.
+
+### Data flow
+
+1. **Full generation** (`generator.rs`): For each source: PostGIS → GeoJSON export → Tippecanoe → MBTiles file
+2. **Incremental updates** (`updater.rs`): PostgreSQL NOTIFY → debounce window → route to source → query affected features → re-encode MVT → write source's MBTiles
+3. **Publishing** (`storage.rs`): copy/upload each source's MBTiles artifact to local path, S3, Mapbox, or custom command backend
+4. **HTTP serving** (`server.rs`): Serve tiles at `/{source}/{z}/{x}/{y}.pbf` with ETags and TileJSON
+5. **Notifications** (`events.rs`, `webhook.rs`, `server.rs`): Webhook HTTP POST and SSE push to notify frontends of tile changes
+
+### Key modules
+
+- **`main.rs`** — CLI (clap), wires up all components, graceful shutdown (SIGTERM/Ctrl+C)
+- **`postgis.rs`** — PostGIS reader using `deadpool-postgres` connection pool. Exports GeoJSON, queries features by bounds or ID. Supports filter expressions, multiple geometry columns, connection retry, and layer validation.
+- **`mbtiles.rs`** — SQLite MBTiles store with WAL mode. Auto-materializes Tippecanoe's `tiles` view into a writable table on open. Includes inspect/diff query methods.
+- **`mvt.rs`** — Native MVT/protobuf encoder with geometry simplification (Douglas-Peucker via `geo` crate) and per-zoom property filtering. Uses `prost` with generated code from `vector_tile.proto`.
+- **`updater.rs`** — LISTEN/NOTIFY consumer with debounced batching and auto-reconnect with exponential backoff. Groups events by source, deduplicates affected tiles, regenerates concurrently (semaphore-bounded).
+- **`server.rs`** — HTTP tile server (axum) with ETag support, TileJSON endpoints, CORS, health check, and SSE (`GET /events`) for live tile refresh.
+- **`events.rs`** — Shared event types (`TileEvent` enum) and broadcast channel for fan-out to webhook and SSE consumers. Supports event merging during cooldown windows.
+- **`webhook.rs`** — Webhook notifier with HMAC-SHA256 signing, retry with exponential backoff, and optional trailing-edge cooldown/throttle per source.
+- **`storage.rs`** — Publishing abstraction for MBTiles artifact sync to local filesystem, S3 (`aws s3 cp`), Mapbox Studio, or custom shell command.
+- **`tiles.rs`** — Tile math: XYZ coordinate ↔ lon/lat bounds conversion, tiles-for-bounds enumeration.
+- **`config.rs`** — Config deserialization from TOML + env vars (prefix `TILES_`).
+- **`inspect.rs`** — MBTiles inspection (metadata, tile counts per zoom, sizes).
+- **`validate.rs`** — Config validation against database (tables, columns, triggers).
+- **`diff.rs`** — MBTiles comparison (added/removed/changed tiles per zoom).
+
+### Important patterns
+
+- **MBTiles uses TMS y-coordinates** (flipped from XYZ). All `get_tile`/`put_tile` methods handle the conversion: `tms_y = (1 << z) - 1 - y`.
+- **WAL mode for SQLite**: Enabled on open for concurrent read/write support.
+- **No `.await` while holding MBTiles lock**: The updater pre-computes all tile data (PostGIS queries + MVT encoding) before acquiring the `Arc<Mutex<MbtilesStore>>` lock for batch writes.
+- **Tippecanoe creates views, not tables**: The MBTiles `open()` method detects and materializes the `tiles` view into a real table so incremental writes work.
+- **Layer→source routing**: `AppConfig::find_source_for_layer()` maps a notification's layer name to the owning source. Each source maintains its own MBTiles store.
+- **Auto-reconnect**: The LISTEN/NOTIFY listener reconnects with exponential backoff if the PostgreSQL connection drops.
+
+### Config (`config.toml`)
+
+Sources are defined under `[[sources]]` with: `name`, `mbtiles_path`, `min_zoom`, `max_zoom`.
+Layers within each source are defined under `[[sources.layers]]` with: `name`, `table`, `schema`, `geometry_column`, `geometry_columns`, `id_column`, `srid`, `properties`, `filter`, `simplify_tolerance`, `property_rules`. The `name` field must match the trigger argument in `sql/setup_notify.sql`.
+Incremental settings live under `[updates]` (`debounce_ms`, `worker_concurrency`).
+Publishing settings live under `[publish]` (`backend`, `destination`, `command`, `args`, `publish_on_generate`, `publish_on_update`).
+HTTP serve settings live under `[serve]` (`host`, `port`, `cors_origins`).
+Webhook settings live under `[webhook]` (`urls`, `secret`, `cooldown_secs`, `timeout_ms`, `retry_count`, `on_generate`, `on_update`).
+
+### Database setup
+
+`sql/setup_notify.sql` installs a PostgreSQL trigger function (`notify_tile_update`) that sends JSON payloads on INSERT/UPDATE/DELETE. Each table needs its own trigger with the layer name as argument.
+
+---
+
+# CLAUDE.md
+
+Source: https://github.com/muimsd/tilefeed/blob/main/CLAUDE.md
+
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Build & Test Commands
+
+```bash
+cargo build                  # dev build
+cargo build --release        # release build
+cargo test                   # run all tests
+cargo test tiles::tests      # run specific test module
+cargo check                  # fast type-check without codegen
+```
+
+The build step compiles `proto/vector_tile.proto` via `prost-build` (see `build.rs`).
+
+## Running
+
+```bash
+cargo run -- generate              # full tile generation from PostGIS via Tippecanoe
+cargo run -- watch                 # watch LISTEN/NOTIFY and apply incremental updates
+cargo run -- run                   # generate then watch
+cargo run -- serve                 # generate, watch, and serve tiles over HTTP
+cargo run -- inspect out.mbtiles   # dump MBTiles metadata and stats
+cargo run -- validate              # check config against database
+cargo run -- diff a.mbtiles b.mbtiles  # compare two MBTiles files
+cargo run -- -c other.toml watch   # use alternate config file
+```
+
+Requires PostgreSQL with PostGIS extension. Tippecanoe is needed for `generate`, `run`, and `serve`.
+
+## Docker
+
+```bash
+docker compose up              # PostGIS + tilefeed serve
+docker compose up --build      # rebuild after code changes
+```
+
+## Architecture
+
+**tilefeed** is a PostGIS vector tile pipeline that builds MBTiles, incrementally updates them via PostgreSQL LISTEN/NOTIFY, and optionally serves tiles over HTTP.
+
+### Multi-source model
+
+The config defines one or more `[[sources]]`, each producing an independent MBTiles file with its own layers and zoom range. Notifications are routed to the correct source by matching the layer name.
+
+### Data flow
+
+1. **Full generation** (`generator.rs`): For each source: PostGIS → GeoJSON export → Tippecanoe → MBTiles file
+2. **Incremental updates** (`updater.rs`): PostgreSQL NOTIFY → debounce window → route to source → query affected features → re-encode MVT → write source's MBTiles
+3. **Publishing** (`storage.rs`): copy/upload each source's MBTiles artifact to local path, S3, Mapbox, or custom command backend
+4. **HTTP serving** (`server.rs`): Serve tiles at `/{source}/{z}/{x}/{y}.pbf` with ETags and TileJSON
+
+### Key modules
+
+- **`main.rs`** — CLI (clap), wires up all components, graceful shutdown (SIGTERM/Ctrl+C)
+- **`postgis.rs`** — PostGIS reader using `deadpool-postgres` connection pool. Exports GeoJSON, queries features by bounds or ID. Supports filter expressions, multiple geometry columns, connection retry, and layer validation.
+- **`mbtiles.rs`** — SQLite MBTiles store with WAL mode. Auto-materializes Tippecanoe's `tiles` view into a writable table on open. Includes inspect/diff query methods.
+- **`mvt.rs`** — Native MVT/protobuf encoder with geometry simplification (Douglas-Peucker via `geo` crate) and per-zoom property filtering. Uses `prost` with generated code from `vector_tile.proto`.
+- **`updater.rs`** — LISTEN/NOTIFY consumer with debounced batching and auto-reconnect with exponential backoff. Groups events by source, deduplicates affected tiles, regenerates concurrently (semaphore-bounded).
+- **`server.rs`** — HTTP tile server (axum) with ETag support, TileJSON endpoints, CORS, health check, and SSE (`GET /events`) for live tile refresh.
+- **`events.rs`** — Shared event types (`TileEvent` enum) and broadcast channel for fan-out to webhook and SSE consumers. Supports event merging during cooldown windows.
+- **`webhook.rs`** — Webhook notifier with HMAC-SHA256 signing, retry with exponential backoff, and optional trailing-edge cooldown/throttle per source.
+- **`storage.rs`** — Publishing abstraction for MBTiles artifact sync to local filesystem, S3 (`aws s3 cp`), Mapbox Studio, or custom shell command.
+- **`tiles.rs`** — Tile math: XYZ coordinate ↔ lon/lat bounds conversion, tiles-for-bounds enumeration.
+- **`config.rs`** — Config deserialization from TOML + env vars (prefix `TILES_`).
+- **`inspect.rs`** — MBTiles inspection (metadata, tile counts per zoom, sizes).
+- **`validate.rs`** — Config validation against database (tables, columns, triggers).
+- **`diff.rs`** — MBTiles comparison (added/removed/changed tiles per zoom).
+
+### Important patterns
+
+- **MBTiles uses TMS y-coordinates** (flipped from XYZ). All `get_tile`/`put_tile` methods handle the conversion: `tms_y = (1 << z) - 1 - y`.
+- **WAL mode for SQLite**: Enabled on open for concurrent read/write support.
+- **No `.await` while holding MBTiles lock**: The updater pre-computes all tile data (PostGIS queries + MVT encoding) before acquiring the `Arc<Mutex<MbtilesStore>>` lock for batch writes.
+- **Tippecanoe creates views, not tables**: The MBTiles `open()` method detects and materializes the `tiles` view into a real table so incremental writes work.
+- **Layer→source routing**: `AppConfig::find_source_for_layer()` maps a notification's layer name to the owning source. Each source maintains its own MBTiles store.
+- **Auto-reconnect**: The LISTEN/NOTIFY listener reconnects with exponential backoff if the PostgreSQL connection drops.
+
+### Config (`config.toml`)
+
+Sources are defined under `[[sources]]` with: `name`, `mbtiles_path`, `min_zoom`, `max_zoom`.
+Layers within each source are defined under `[[sources.layers]]` with: `name`, `table`, `schema`, `geometry_column`, `geometry_columns`, `id_column`, `srid`, `properties`, `filter`, `simplify_tolerance`, `property_rules`. The `name` field must match the trigger argument in `sql/setup_notify.sql`.
+Incremental settings live under `[updates]` (`debounce_ms`, `worker_concurrency`).
+Publishing settings live under `[publish]` (`backend`, `destination`, `command`, `args`, `publish_on_generate`, `publish_on_update`).
+HTTP serve settings live under `[serve]` (`host`, `port`, `cors_origins`).
+Webhook settings live under `[webhook]` (`urls`, `secret`, `cooldown_secs`, `timeout_ms`, `retry_count`, `on_generate`, `on_update`).
+
+### Database setup
+
+`sql/setup_notify.sql` installs a PostgreSQL trigger function (`notify_tile_update`) that sends JSON payloads on INSERT/UPDATE/DELETE. Each table needs its own trigger with the layer name as argument.
+
+---
+
+# Configuration Reference
+
+Source: https://github.com/muimsd/tilefeed/blob/main/docs/configuration.md
+
+# Configuration Reference
+
+tilefeed reads a TOML configuration file (default: `config.toml`). All fields can be overridden with environment variables using the `TILES_` prefix and `__` as section separator.
+
+## Environment Variables
+
+```bash
+export TILES_DATABASE__HOST=db.example.com
+export TILES_DATABASE__PORT=5432
+export TILES_DATABASE__USER=myuser
+export TILES_DATABASE__PASSWORD=secret
+export TILES_DATABASE__DBNAME=geodata
+```
+
+You can also use a `.env` file in the project directory.
+
+## Full Config Example
+
+```toml
+# Path to Tippecanoe binary (default: "tippecanoe", resolved via PATH)
+# tippecanoe_bin = "/usr/local/bin/tippecanoe"
+
+# Path to ogr2ogr binary (default: "ogr2ogr", resolved via PATH)
+# ogr2ogr_bin = "/usr/local/bin/ogr2ogr"
+
+[database]
+host = "localhost"
+port = 5432
+user = "postgres"
+password = "postgres"
+dbname = "geodata"
+pool_size = 4
+
+[updates]
+debounce_ms = 200
+worker_concurrency = 8
+
+[serve]
+host = "0.0.0.0"
+port = 3000
+cors_origins = ["http://localhost:8080"]
+
+[publish]
+backend = "none" # none | local | s3 | mapbox | command
+publish_on_generate = true
+publish_on_update = true
+
+# Source with multiple layers
+[[sources]]
+name = "basemap"
+mbtiles_path = "./basemap.mbtiles"
+min_zoom = 0
+max_zoom = 14
+generation_backend = "tippecanoe" # tippecanoe | gdal | native
+
+[sources.tippecanoe]
+drop_densest_as_needed = true
+no_tile_size_limit = true
+
+[[sources.layers]]
+name = "buildings"
+schema = "public"
+table = "buildings"
+geometry_column = "geom"
+id_column = "id"
+srid = 4326
+properties = ["name", "type", "height"]
+filter = "type != 'demolished'"
+simplify_tolerance = 0.00001
+generate_label_points = true
+generate_boundary_lines = true
+
+# Exclude heavy properties at low zooms
+[[sources.layers.property_rules]]
+below_zoom = 8
+exclude = ["description", "metadata"]
+
+[[sources.layers.property_rules]]
+below_zoom = 5
+exclude = ["type", "height"]
+
+[[sources.layers]]
+name = "roads"
+table = "roads"
+geometry_column = "geom"
+id_column = "id"
+srid = 4326
+properties = ["name", "class"]
+simplify_tolerance = 0.00001
+```
+
+## Section Reference
+
+### `[database]`
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `host` | string | yes | PostgreSQL host |
+| `port` | int | yes | PostgreSQL port |
+| `user` | string | yes | Database user |
+| `password` | string | yes | Database password |
+| `dbname` | string | yes | Database name |
+| `pool_size` | int | no | Connection pool size |
+
+### `[updates]`
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `debounce_ms` | int | 200 | Debounce window for batching notifications |
+| `worker_concurrency` | int | 8 | Max concurrent tile regeneration workers |
+
+### `[serve]`
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `host` | string | `"127.0.0.1"` | HTTP server bind address |
+| `port` | int | 3000 | HTTP server port |
+| `cors_origins` | string[] | `["*"]` | Allowed CORS origins. Omit or empty for wildcard. |
+
+### `[publish]`
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `backend` | string | `"none"` | `none`, `local`, `s3`, `mapbox`, `command` |
+| `destination` | string | — | File path (local) or S3 URI (s3) |
+| `command` | string | — | Shell command (command backend) |
+| `args` | string[] | — | Extra args for command backend |
+| `mapbox_tileset_id` | string | — | `username.tileset` for Mapbox uploads |
+| `mapbox_token` | string | — | Mapbox secret token with `uploads:write` |
+| `publish_on_generate` | bool | true | Publish after full generation |
+| `publish_on_update` | bool | true | Publish after incremental updates |
+
+### `[[sources]]`
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `name` | string | yes | Source identifier |
+| `mbtiles_path` | string | yes | Output MBTiles file path |
+| `min_zoom` | int | yes | Minimum zoom level |
+| `max_zoom` | int | yes | Maximum zoom level |
+| `generation_backend` | string | no | `"tippecanoe"` (default), `"gdal"`, or `"native"` |
+
+### `[[sources.layers]]`
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `name` | string | yes | Layer name (must match trigger argument) |
+| `schema` | string | no | Database schema (default: `"public"`) |
+| `table` | string | yes | Source table name |
+| `geometry_column` | string | no | Geometry column (default: `"geom"`) |
+| `id_column` | string | no | Feature ID column |
+| `srid` | int | no | SRID (default: 4326) |
+| `properties` | string[] | no | Properties to include in tiles |
+| `filter` | string | no | SQL WHERE clause to filter features |
+| `simplify_tolerance` | float | no | Douglas-Peucker tolerance in degrees (scaled per zoom) |
+| `generate_label_points` | bool | no | Generate `{name}_labels` centroid layer |
+| `generate_boundary_lines` | bool | no | Generate `{name}_boundary` polyline layer |
+
+### `[[sources.layers.property_rules]]`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `below_zoom` | int | Zoom threshold |
+| `exclude` | string[] | Properties to exclude below this zoom |
+
+### `[webhook]`
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `urls` | string[] | `[]` | Webhook endpoint URLs to receive HTTP POST notifications |
+| `secret` | string | — | HMAC-SHA256 signing secret. When set, requests include `X-Tilefeed-Signature: sha256=...` header |
+| `cooldown_secs` | int | — | Trailing-edge throttle window in seconds. Events are accumulated per source and sent as one aggregated notification when the window expires. Also applies to SSE. |
+| `timeout_ms` | int | 5000 | HTTP request timeout per webhook call |
+| `retry_count` | int | 2 | Number of retries with exponential backoff on failure |
+| `on_generate` | bool | true | Send webhook after full generation completes |
+| `on_update` | bool | true | Send webhook after incremental tile updates |
+
+Example:
+
+```toml
+[webhook]
+urls = ["https://example.com/hooks/tilefeed"]
+secret = "my-signing-secret"
+cooldown_secs = 300  # aggregate events for 5 minutes
+on_generate = true
+on_update = true
+```
+
+The webhook payload is a JSON object with an `event` field (`"generate_complete"` or `"update_complete"`). The `update_complete` payload includes `max_zoom` so frontends can invalidate overzoomed tile views (tiles rendered beyond the source's max zoom level).
+
+### `[sources.tippecanoe]`
+
+See [Tippecanoe Settings](tippecanoe.md).
+
+## Generation Backends
+
+### Tippecanoe (default)
+
+Requires the [Tippecanoe](https://github.com/felt/tippecanoe) binary. Exports PostGIS layers as GeoJSON, pipes through Tippecanoe, and produces optimized MBTiles. Best for production with large datasets.
+
+### GDAL
+
+Requires `ogr2ogr` from [GDAL](https://gdal.org/). Exports via OGR and converts to MBTiles. Useful when Tippecanoe isn't available.
+
+### Native
+
+No external dependencies. Uses tilefeed's built-in Rust MVT encoder to generate tiles directly from PostGIS queries. Supports geometry simplification and derived layers. Best for development or environments where installing external tools is impractical.
+
+```toml
+[[sources]]
+name = "parks"
+mbtiles_path = "./parks.mbtiles"
+min_zoom = 0
+max_zoom = 8
+generation_backend = "native"
+```
+
+---
+
+# Derived Geometry Layers
+
+Source: https://github.com/muimsd/tilefeed/blob/main/docs/derived-layers.md
+
+# Derived Geometry Layers
+
+tilefeed can automatically generate companion layers from polygon geometries, useful for map labeling and styling.
+
+## Label Points
+
+Set `generate_label_points = true` on a polygon layer to create a companion point layer named `{name}_labels`. Each point is computed using PostGIS `ST_PointOnSurface`, which guarantees the point lies within the polygon (unlike centroids which can fall outside concave shapes).
+
+```toml
+[[sources.layers]]
+name = "parks"
+table = "parks"
+geometry_column = "geom"
+id_column = "id"
+srid = 4326
+properties = ["name", "type"]
+generate_label_points = true
+# Creates: parks (polygons) + parks_labels (points)
+```
+
+## Boundary Lines
+
+Set `generate_boundary_lines = true` to create a companion polyline layer named `{name}_boundary`. Each linestring is computed using PostGIS `ST_Boundary`, giving you the polygon outline as a separate layer for styling borders independently.
+
+```toml
+[[sources.layers]]
+name = "districts"
+table = "districts"
+geometry_column = "geom"
+id_column = "id"
+srid = 4326
+properties = ["name"]
+generate_boundary_lines = true
+# Creates: districts (polygons) + districts_boundary (linestrings)
+```
+
+## Both Together
+
+```toml
+[[sources.layers]]
+name = "parks"
+table = "parks"
+geometry_column = "geom"
+id_column = "id"
+srid = 4326
+properties = ["name", "type"]
+generate_label_points = true
+generate_boundary_lines = true
+# Creates: parks + parks_labels + parks_boundary
+```
+
+Derived layers inherit the same properties as the parent layer. They appear in TileJSON metadata and are included in both full generation and incremental updates.
+
+---
+
+# Using OGR_FDW for External Data Sources
+
+Source: https://github.com/muimsd/tilefeed/blob/main/docs/ogr-fdw.md
+
+# Using OGR_FDW for External Data Sources
+
+[OGR_FDW](https://github.com/pramsey/pgsql-ogr-fdw) is a PostgreSQL Foreign Data Wrapper that exposes any OGR-supported data source as a regular table. This lets tilefeed generate vector tiles from Esri FeatureServer, SQL Server, GeoPackage, shapefiles, WFS, and dozens of other formats -- without any code changes.
+
+## How it works
+
+```
+Esri FeatureServer ──┐
+SQL Server (via TDS) ─┤── OGR_FDW ── PostgreSQL foreign table ── tilefeed ── MBTiles
+GeoPackage / SHP ─────┘
+```
+
+OGR_FDW creates foreign tables that look and query like regular PostGIS tables. Since tilefeed reads from PostGIS, it works transparently against these tables.
+
+## Setup
+
+```sql
+-- Install the extension
+CREATE EXTENSION ogr_fdw;
+
+-- Example 1: Esri FeatureServer
+CREATE SERVER esri_server
+    FOREIGN DATA WRAPPER ogr_fdw
+    OPTIONS (
+        datasource 'https://services.arcgis.com/ORG_ID/arcgis/rest/services/MyService/FeatureServer/0',
+        format 'ESRIJSON'
+    );
+
+IMPORT FOREIGN SCHEMA ogr_all
+    FROM SERVER esri_server
+    INTO public;
+
+-- Example 2: SQL Server via ODBC
+CREATE SERVER mssql_server
+    FOREIGN DATA WRAPPER ogr_fdw
+    OPTIONS (
+        datasource 'MSSQL:server=db.example.com;database=geodata;uid=user;pwd=pass',
+        format 'MSSQLSpatial'
+    );
+
+IMPORT FOREIGN SCHEMA ogr_all
+    FROM SERVER mssql_server
+    INTO public;
+
+-- Example 3: GeoPackage file
+CREATE SERVER gpkg_server
+    FOREIGN DATA WRAPPER ogr_fdw
+    OPTIONS (
+        datasource '/data/parcels.gpkg',
+        format 'GPKG'
+    );
+
+IMPORT FOREIGN SCHEMA ogr_all
+    FROM SERVER gpkg_server
+    INTO public;
+```
+
+Use `ogr_fdw_info` to discover available layers and columns before importing:
+
+```bash
+ogr_fdw_info -s 'https://services.arcgis.com/.../FeatureServer/0'
+```
+
+## tilefeed config
+
+Point tilefeed layers at the foreign tables just like any other table:
+
+```toml
+[[sources]]
+name = "external"
+mbtiles_path = "./external.mbtiles"
+min_zoom = 0
+max_zoom = 14
+
+[[sources.layers]]
+name = "parcels"
+table = "parcels"          # the foreign table name
+geometry_column = "geom"
+id_column = "ogc_fid"
+srid = 4326
+properties = ["owner", "area_sqm", "land_use"]
+```
+
+## Considerations
+
+- **No LISTEN/NOTIFY for foreign tables.** Changes happen on the remote side, so PostgreSQL triggers won't fire. Use `tilefeed generate` on a schedule (cron) instead of `tilefeed watch` for these sources.
+- **Performance depends on the remote source.** OGR_FDW can push down simple filters, but complex spatial queries may pull entire datasets over the network. For large remote sources, consider materializing the foreign table periodically:
+  ```sql
+  CREATE MATERIALIZED VIEW parcels_local AS SELECT * FROM parcels;
+  REFRESH MATERIALIZED VIEW CONCURRENTLY parcels_local;
+  ```
+  Then point tilefeed at the materialized view and attach a trigger to refresh + notify.
+- **Mixed sources work well.** You can have some sources backed by local PostGIS tables (with LISTEN/NOTIFY for real-time updates) and others backed by OGR_FDW foreign tables (with scheduled `generate` runs). Each `[[sources]]` block operates independently.
+
+---
+
+# Tile Serving
+
+Source: https://github.com/muimsd/tilefeed/blob/main/docs/serving.md
+
+# Tile Serving
+
+tilefeed includes a built-in HTTP tile server for development and production use.
+
+## Built-in Server
+
+Start the server with the `serve` command, which generates tiles, starts an HTTP server, and watches for incremental updates:
+
+```bash
+tilefeed serve
+tilefeed -c myconfig.toml serve
+```
+
+### Endpoints
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /{source}/{z}/{x}/{y}.pbf` | Serve a vector tile (MVT protobuf) |
+| `GET /{source}.json` | TileJSON 3.0.0 metadata |
+| `GET /events` | Server-Sent Events stream for live tile updates |
+| `GET /health` | Health check (returns `ok`) |
+
+### Features
+
+- **ETags** — SHA-256 based content hashing with `If-None-Match` / 304 Not Modified support
+- **CORS** — Configurable origins or wildcard (default)
+- **Cache-Control** — `public, max-age=300` on tile responses
+- **TileJSON 3.0.0** — Auto-generated from source config, includes derived layers (`_labels`, `_boundary`)
+
+### Configuration
+
+```toml
+[serve]
+host = "0.0.0.0"     # bind address (default: 127.0.0.1)
+port = 3000           # port (default: 3000)
+cors_origins = ["http://localhost:8080"]  # omit for wildcard
+```
+
+## Server-Sent Events (SSE)
+
+The `GET /events` endpoint provides a live stream of tile update events using [Server-Sent Events](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events). Frontends can subscribe to this stream to refresh tiles automatically when data changes.
+
+### Event Types
+
+**`update_complete`** — Sent after incremental tile updates:
+
+```json
+{
+  "event": "update_complete",
+  "source": "basemap",
+  "tiles_updated": 42,
+  "affected_zooms": [10, 11, 12, 13, 14],
+  "max_zoom": 14,
+  "layers_affected": ["buildings", "roads"]
+}
+```
+
+**`generate_complete`** — Sent after a full tile generation:
+
+```json
+{
+  "event": "generate_complete",
+  "source": "basemap",
+  "duration_ms": 5000
+}
+```
+
+The `max_zoom` field helps frontends handle overzooming — tiles at zoom levels beyond `max_zoom` are rendered by upscaling tiles from `max_zoom`, so those views should also be invalidated.
+
+### MapLibre Example
+
+```javascript
+const es = new EventSource('http://localhost:3000/events');
+es.addEventListener('update_complete', (e) => {
+    const data = JSON.parse(e.data);
+    const source = map.getSource(data.source);
+    if (source) {
+        source.setTiles([`http://localhost:3000/${data.source}/{z}/{x}/{y}.pbf?_t=${Date.now()}`]);
+    }
+});
+```
+
+A full MapLibre integration example is available at `examples/webhook-sse/map.html`.
+
+### Cooldown / Throttle
+
+If `cooldown_secs` is set in `[webhook]` config, SSE events are also throttled — events are accumulated per source during the cooldown window and sent as one aggregated notification when the window expires. This prevents flooding frontends during rapid database changes.
+
+## Webhooks
+
+tilefeed can send HTTP POST notifications to external URLs when tiles are updated. Configure under `[webhook]` in your config file (see [Configuration Reference](configuration.md#webhook)).
+
+### Payload
+
+The request body is the same JSON as SSE events (see above). The `Content-Type` header is `application/json`.
+
+### HMAC Signing
+
+When `secret` is configured, each request includes an `X-Tilefeed-Signature` header:
+
+```
+X-Tilefeed-Signature: sha256=<hex-encoded HMAC-SHA256 of request body>
+```
+
+Verify this server-side to authenticate that the webhook came from tilefeed.
+
+### Cooldown
+
+Set `cooldown_secs` to aggregate rapid-fire events. For example, `cooldown_secs = 300` batches all events per source over 5 minutes into a single webhook call with accumulated tile counts and zoom levels.
+
+## External Tile Servers
+
+You can also serve MBTiles files produced by tilefeed with external tools:
+
+- **CDN (CloudFront, Cloudflare R2)** — upload via S3 or command backend and serve through CDN
+- **Martin** — point [Martin](https://github.com/maplibre/martin) at the MBTiles file for hot-reload
+- **tileserver-gl** — use [tileserver-gl](https://github.com/maptiler/tileserver-gl) for raster + vector serving
+- **nginx** — use an nginx module or lightweight proxy to read tiles from SQLite directly
+
+---
+
+# Tippecanoe Settings
+
+Source: https://github.com/muimsd/tilefeed/blob/main/docs/tippecanoe.md
+
+# Tippecanoe Settings
+
+Each source can include a `[sources.tippecanoe]` section to fine-tune how Tippecanoe generates tiles. All settings are optional.
+
+```toml
+[[sources]]
+name = "basemap"
+mbtiles_path = "./basemap.mbtiles"
+min_zoom = 0
+max_zoom = 14
+
+[sources.tippecanoe]
+drop_densest_as_needed = true
+no_tile_size_limit = true
+no_feature_limit = true
+buffer = 5
+full_detail = 12
+extra_args = ["--cluster-distance=10"]
+```
+
+## Settings Reference
+
+| Setting | Tippecanoe flag | Description |
+|---------|----------------|-------------|
+| `drop_densest_as_needed` | `--drop-densest-as-needed` | Drop features in the densest areas to stay under tile size limits |
+| `drop_fraction_as_needed` | `--drop-fraction-as-needed` | Drop a fraction of features at random |
+| `drop_smallest_as_needed` | `--drop-smallest-as-needed` | Drop the smallest features first |
+| `coalesce_densest_as_needed` | `--coalesce-densest-as-needed` | Merge nearby features in dense areas |
+| `extend_zooms_if_still_dropping` | `--extend-zooms-if-still-dropping` | Continue to higher zooms if features are still being dropped |
+| `drop_rate` | `--drop-rate` | Rate at which features are dropped at lower zooms (default: 2.5) |
+| `base_zoom` | `--base-zoom` | Base zoom level for drop rate calculation |
+| `simplification` | `--simplification` | Simplification factor in tile coordinate units |
+| `detect_shared_borders` | `--detect-shared-borders` | Detect and simplify shared polygon borders identically |
+| `no_tiny_polygon_reduction` | `--no-tiny-polygon-reduction` | Don't collapse very small polygons into single pixels |
+| `no_feature_limit` | `--no-feature-limit` | Remove the default 200,000 feature-per-tile limit |
+| `no_tile_size_limit` | `--no-tile-size-limit` | Remove the default 500KB tile size limit (default: true) |
+| `no_tile_compression` | `--no-tile-compression` | Don't gzip-compress PBF tile data |
+| `buffer` | `--buffer` | Pixel buffer around each tile edge |
+| `full_detail` | `--full-detail` | Detail level at max zoom (2^n coordinate units) |
+| `low_detail` | `--low-detail` | Detail level at lower zoom levels |
+| `minimum_detail` | `--minimum-detail` | Minimum detail level below which features are dropped |
+| `extra_args` | *(any)* | Array of additional raw Tippecanoe arguments |
+
+The `extra_args` field is an escape hatch for any Tippecanoe option not explicitly modeled. Each array element is passed as a separate argument.
+
+---

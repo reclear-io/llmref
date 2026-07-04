@@ -1,0 +1,448 @@
+# traefik-kop
+
+Source: https://github.com/jittering/traefik-kop/blob/main/README.md
+
+# traefik-kop
+
+A dynamic docker->redis->traefik discovery agent.
+
+Solves the problem of running a non-Swarm/Kubernetes multi-host cluster with a
+single public-facing traefik instance.
+
+```text
+                        +---------------------+          +---------------------+
+                        |                     |          |                     |
++---------+     :443    |  +---------+        |   :8088  |  +------------+     |
+|   WAN   |--------------->| traefik |<-------------------->| svc-nginx  |     |
++---------+             |  +---------+        |          |  +------------+     |
+                        |       |             |          |                     |
+                        |  +---------+        |          |  +-------------+    |
+                        |  |  redis  |<-------------------->| traefik-kop |    |
+                        |  +---------+        |          |  +-------------+    |
+                        |             docker1 |          |             docker2 |
+                        +---------------------+          +---------------------+
+```
+
+`traefik-kop` solves this problem by using the same `traefik` docker-provider
+logic. It reads the container labels from the local docker node and publishes
+them to a given `redis` instance. Simply configure your `traefik` node with a
+`redis` provider and point it to the same instance, as in the diagram above.
+
+## Contents
+
+- [traefik-kop](#traefik-kop)
+  - [Contents](#contents)
+  - [Usage](#usage)
+  - [Configuration](#configuration)
+  - [IP Binding](#ip-binding)
+    - [bind-ip](#bind-ip)
+    - [bind-interface](#bind-interface)
+    - [traefik-kop service labels](#traefik-kop-service-labels)
+    - [Container Networking](#container-networking)
+    - [Disable IP Replacement (auto-detection)](#disable-ip-replacement-auto-detection)
+  - [Load Balancer Merging](#load-balancer-merging)
+  - [Service port binding](#service-port-binding)
+  - [Namespaces](#namespaces)
+    - [Namespace via label prefix](#namespace-via-label-prefix)
+  - [Docker API](#docker-api)
+    - [Traefik Docker Provider Config](#traefik-docker-provider-config)
+  - [Redis Sentinel](#redis-sentinel)
+  - [Releasing](#releasing)
+  - [License](#license)
+
+## Usage
+
+Configure `traefik` to use the redis provider, for example via `traefik.yml`:
+
+```yaml
+providers:
+  providersThrottleDuration: 2s
+  docker:
+    watch: true
+    endpoint: unix:///var/run/docker.sock
+    swarmModeRefreshSeconds: 15s
+    exposedByDefault: false
+  redis:
+    endpoints:
+      # assumes a redis link with this service name running on the same
+      # docker host as traefik
+      - "redis:6379"
+```
+
+Run `traefik-kop` on your other nodes via docker-compose:
+
+```yaml
+services:
+  traefik-kop:
+    image: "ghcr.io/jittering/traefik-kop:latest"
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - "REDIS_ADDR=192.168.1.50:6379"
+      - "BIND_IP=192.168.1.75"
+      # Alternatively, derive from an interface (requires network_mode: host)
+      # - "BIND_INTERFACE=eth0"
+```
+
+Then add the usual labels to your target service:
+
+```yml
+services:
+  nginx:
+    image: "nginx:alpine"
+    restart: unless-stopped
+    ports:
+      # The host port binding will automatically be picked up for use as the
+      # service endpoint. See 'service port binding' in the configuration
+      # section for more.
+      - 8088:80
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.nginx.rule=Host(`nginx-on-docker2.example.com`)"
+      - "traefik.http.routers.nginx.tls=true"
+      - "traefik.http.routers.nginx.tls.certresolver=default"
+      # [opptional] explicitly set the port binding for this service.
+      # See 'service port binding' in the configuration section for more.
+      - "traefik.http.services.nginx.loadbalancer.server.scheme=http"
+      - "traefik.http.services.nginx.loadbalancer.server.port=8088"
+```
+
+See also the [IP Binding](#ip-binding) section below.
+
+## Configuration
+
+traefik-kop can be configured via either CLI flags or environment variables.
+
+```text
+USAGE:
+   traefik-kop [global options] command [command options] [arguments...]
+
+GLOBAL OPTIONS:
+   --hostname value       Hostname to identify this node in redis (default: "server.local") [$KOP_HOSTNAME]
+   --bind-ip value        IP address to bind services to [$BIND_IP]
+   --bind-interface value Network interface to derive bind IP (overrides auto-detect) [$BIND_INTERFACE]
+   --skip-replace         Disable custom IP replacement (default: false) [$SKIP_REPLACE]
+   --redis-addr value     Redis address (default: "127.0.0.1:6379") [$REDIS_ADDR]
+   --redis-user value     Redis username (default: "default") [$REDIS_USER]
+   --redis-pass value     Redis password (if needed) [$REDIS_PASS]
+   --redis-db value       Redis DB number (default: 0) [$REDIS_DB]
+   --redis-ttl value              Redis TTL (in seconds) (default: 0) [$REDIS_TTL]
+   --redis-sentinel-addrs value   Comma-separated list of Redis Sentinel addresses (e.g., host1:26379,host2:26379) [$REDIS_SENTINEL_ADDRS]
+   --redis-sentinel-master value  Redis Sentinel master name [$REDIS_SENTINEL_MASTER]
+   --docker-host value            Docker endpoint (default: "unix:///var/run/docker.sock") [$DOCKER_ADDR]
+   --docker-config value  Docker provider config (file must end in .yaml) [$DOCKER_CONFIG]
+   --docker-prefix value  Docker label prefix [$DOCKER_PREFIX]
+   --poll-interval value  Poll interval for refreshing container list (default: 60) [$KOP_POLL_INTERVAL]
+   --namespace value      Namespace to process containers for [$NAMESPACE]
+   --verbose              Enable debug logging (default: false) [$VERBOSE, $DEBUG]
+   --help, -h             show help
+   --version, -V          Print the version (default: false)
+```
+
+Most important are the `bind-ip`/`bind-interface` and `redis-addr` flags.
+
+## IP Binding
+
+There are a number of ways to set the IP published to traefik. Below is the
+order of precedence (highest first) and detailed descriptions of each setting.
+
+1. `kop.<service name>.bind.ip` label
+2. `kop.bind.ip` label
+3. Container networking IP
+4. `--bind-ip` CLI flag (or `BIND_IP` env var)
+5. `--bind-interface` CLI flag (or `BIND_INTERFACE` env var), requires network_mode: host
+6. Auto-detected host IP
+
+### bind-ip
+
+Since your upstream docker nodes are external to your primary traefik server,
+traefik needs to connect to these services via the server's public IP rather
+than the usual method of using the internal docker-network IPs (by default
+172.20.0.x or similar).
+
+When using host networking this can be auto-detected, however it is advisable in
+the majority of cases to manually set this to the desired IP address. This can
+be done using the docker image by exporting the `BIND_IP` environment variable.
+
+### bind-interface
+
+If you prefer to bind using the primary IPv4 address of a specific network
+interface, you can specify it via `--bind-interface` or the `BIND_INTERFACE`
+environment variable, for example `--bind-interface eth0`. This is used when
+`--bind-ip` is not provided. If the interface has multiple addresses, the first
+non-loopback IPv4 address is selected.
+
+This option requires that the container be run with  `network_mode: host` so that the interface is visible to the container.
+
+### traefik-kop service labels
+
+The bind IP can be set via label for each service/container.
+
+Labels can be one of two keys:
+
+- `kop.<service name>.bind.ip=2.2.2.2`
+- `kop.bind.ip=2.2.2.2`
+
+For a container with a single exposed service, or where all services use
+the same IP, the latter is sufficient.
+
+### Container Networking
+
+If your container is configured to use a network-routable IP address via an
+overlay network or CNI plugin, that address will override the `bind-ip`
+configuration above when the `traefik.docker.network` label is present on the
+service.
+
+If using a global overlay `network` in your [Traefik Docker Provider
+Config](#traefik-docker-provider-config), it is recommended that you [disable IP
+replacement](#disable-ip-replacement-auto-detection) entirely (see below).
+
+### Disable IP Replacement (auto-detection)
+
+traefik-kop's custom IP and port auto-detection can be disabled by passing the `--skip-replace` flag
+or setting the `SKIP_REPLACE=1` environment variable. When set, `traefik-kop` will rely solely on
+traefik's native IP and port detection. Other relevant flags such as `--bind-ip` or `--bind-interface`
+will have no effect.
+
+This works best when your services are using an overlay network, as described in
+[Container Networking](#container-networking) above.
+
+## Load Balancer Merging
+
+If your service is running on multiple nodes and load balanced by traefik, you can enable
+merging of load balancers by adding the following label to your container:
+
+- `kop.merge-lbs=true`
+
+When set, kop will check in redis for an existing definition and, if found, append it's service
+address to the ones already present.
+
+This setting is off by default as there are some cases where it could cause an issue, such as if
+your node's IP changes. In this case, the dead IP would be left in place and the new IP would get
+added to the list, causing some of your traffic to fail.
+
+## Service port binding
+
+By default, the service port will be picked up from the container port bindings
+if only a single port is bound. For example:
+
+```yml
+services:
+  nginx:
+    image: "nginx:alpine"
+    restart: unless-stopped
+    ports:
+      - 8088:80
+```
+
+`8088` would automatically be used as the service endpoint's port in traefik. If
+you have more than one port or are using *host networking*, you will need to
+explicitly set the port binding via service label, like so:
+
+```yaml
+services:
+  nginx:
+    image: "nginx:alpine"
+    network_mode: host
+    ports:
+      - 8088:80
+      - 8888:81
+    labels:
+      # (note: other labels snipped for brevity)
+      - "traefik.http.services.nginx.loadbalancer.server.port=8088"
+```
+
+__NOTE:__ unlike the standard traefik-docker usage, we need to expose the
+service port on the host and tell traefik to bind to *that* port (8088 in the
+example above) in the load balancer config, not the internal port (80). This is
+so that traefik can reach it over the network.
+
+## Namespaces
+
+traefik-kop has the ability to target containers via namespaces(s). Simply
+configure `kop` with a namespace:
+
+```yaml
+services:
+  traefik-kop:
+    image: "ghcr.io/jittering/traefik-kop:latest"
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - "REDIS_ADDR=192.168.1.50:6379"
+      - "BIND_IP=192.168.1.75"
+      - "NAMESPACE=staging"
+```
+
+Then add the `kop.namespace` label to your target services, along with the usual traefik labels:
+
+```yaml
+services:
+  nginx:
+    image: "nginx:alpine"
+    restart: unless-stopped
+    ports:
+      - 8088:80
+    labels:
+      - "kop.namespace=staging"
+      - "traefik.enable=true"
+      - "traefik..."
+```
+
+Multiple namespaces can be used by comma-delimiting your values. Traefik-kop will include a container as long as one of its namespaces is found.
+
+```yaml
+services:
+  traefik-kop:
+    # ...
+    environment:
+      # will expose any service with either 'dev' or 'staging'
+      - "NAMESPACE=dev,staging"
+```
+
+```yaml
+services:
+  nginx:
+    # ...
+    labels:
+      # will be exposed because it has namespace 'staging'
+      - "kop.namespace=staging,experimental"
+```
+
+### Namespace via label prefix
+
+An alternative method of namespacing is to add a custom prefix for your traefik-related labels. This
+works as an *inclusion* filter for `traefik-kop` and an *exclusion* filter for `traefik`. This can
+be useful in a scenario here you are running both `traefik` and `traefik-kop` side-by-side on the
+same host.
+
+```yaml
+services:
+  nginx:
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers..."
+      - "traefik..."
+```
+
+becomes
+
+```yaml
+services:
+  traefik-kop:
+    image: "ghcr.io/jittering/traefik-kop:latest"
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - "REDIS_ADDR=192.168.1.50:6379"
+      - "BIND_IP=192.168.1.75"
+      - "DOCKER_PREFIX=kop.public"
+
+  nginx:
+    labels:
+      - "kop.public.traefik.enable=true"
+      - "kop.public.traefik.http.routers..."
+      - "kop.public.traefik..."
+```
+
+## Docker API
+
+traefik-kop expects to connect to the Docker host API via a unix socket, by
+default at `/var/run/docker.sock`. The location can be overridden via the
+`DOCKER_ADDR` env var or `--docker-host` flag.
+
+Other connection methods (like ssh, http/s) are not supported.
+
+By default, `traefik-kop` will listen for push events via the Docker API in
+order to detect configuration changes. In some circumstances, a change may not
+be pushed correctly. For example, when using healthchecks in certain
+configurations, the `start -> healthy` change may not be detected via push
+event. As a failsafe, there is an additional polling mechanism to detect those
+missed changes.
+
+The default interval of 60 seconds should be light so as not to cause any
+issues, however it can be adjusted as needed via the `KOP_POLL_INTERVAL` env var
+or set to 0 to disable it completely.
+
+### Traefik Docker Provider Config
+
+In addition to the simple `--docker-host` setting above, all [Docker Provider
+configuration
+options](https://doc.traefik.io/traefik/providers/docker/#provider-configuration)
+are available via the `--docker-config <filename.yaml>` flag which expects
+either a filename to read configuration from or an inline YAML document.
+
+For example:
+
+```yaml
+services:
+  traefik-kop:
+    image: "ghcr.io/jittering/traefik-kop:latest"
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      REDIS_ADDR: "172.28.183.97:6380"
+      BIND_IP: "172.28.183.97"
+      DOCKER_CONFIG: |
+        ---
+        docker:
+          defaultRule: Host(`{{.Name}}.foo.example.com`)
+```
+
+## Redis Sentinel
+
+If your Redis setup uses [Sentinel](https://redis.io/docs/management/sentinel/)
+for high availability, you can configure `traefik-kop` to connect through
+Sentinel instead of directly to a Redis instance. This ensures `traefik-kop`
+always writes to the current master, even after a failover.
+
+```yaml
+services:
+  traefik-kop:
+    image: "ghcr.io/jittering/traefik-kop:latest"
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - "REDIS_SENTINEL_ADDRS=sentinel1:26379,sentinel2:26379,sentinel3:26379"
+      - "REDIS_SENTINEL_MASTER=mymaster"
+      - "BIND_IP=192.168.1.75"
+```
+
+When Sentinel is configured, the `--redis-addr` flag is ignored.
+Both `--redis-sentinel-addrs` and `--redis-sentinel-master` must be provided
+together. The `--redis-user`, `--redis-pass`, and `--redis-db` flags still apply
+and are used for authenticating with the Redis master discovered by Sentinel.
+
+## Releasing
+
+To release a new version, simply push a new tag to github.
+
+```sh
+git push
+git tag -a v0.11.0
+git push --tags
+```
+
+To update the changelog:
+
+```sh
+make update-changelog
+# or (replace tag below)
+docker run -it --rm -v "$(pwd)":/usr/local/src/your-app \
+  githubchangeloggenerator/github-changelog-generator \
+  -u jittering -p traefik-kop --output "" \
+  --since-tag v0.10.1
+```
+
+## License
+
+traefik-kop: MIT, (c) 2015, Pixelcop Research, Inc.
+
+traefik: MIT, (c) 2016-2025 Containous SAS; 2020-2022 Traefik Labs
+
+---
