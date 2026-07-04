@@ -1,0 +1,2478 @@
+# Stargz Snapshotter
+
+Source: https://github.com/containerd/stargz-snapshotter/blob/main/README.md
+
+[[⬇️ **Download**]](https://github.com/containerd/stargz-snapshotter/releases)
+[[📔**Browse images**]](./docs/pre-converted-images.md)
+[[☸**Quick Start (Kubernetes)**]](#quick-start-with-kubernetes)
+[[🤓**Quick Start (nerdctl)**]](https://github.com/containerd/nerdctl/blob/master/docs/stargz.md)
+[[🔆**Install**]](./docs/INSTALL.md)
+
+# Stargz Snapshotter
+
+
+Read also introductory blog: [Startup Containers in Lightning Speed with Lazy Image Distribution on Containerd](https://medium.com/nttlabs/startup-containers-in-lightning-speed-with-lazy-image-distribution-on-containerd-243d94522361)
+
+Pulling image is one of the time-consuming steps in the container lifecycle.
+Research shows that time to take for pull operation accounts for 76% of container startup time[[FAST '16]](https://www.usenix.org/node/194431).
+*Stargz Snapshotter* is an implementation of snapshotter which aims to solve this problem by *lazy pulling*.
+*Lazy pulling* here means a container can run without waiting for the pull completion of the image and necessary chunks of the image are fetched *on-demand*.
+
+[*eStargz*](/docs/stargz-estargz.md) is a lazily-pullable image format proposed by this project.
+This is compatible to [OCI](https://github.com/opencontainers/image-spec/)/[Docker](https://github.com/moby/moby/blob/master/image/spec/v1.2.md) images so this can be pushed to standard container registries (e.g. ghcr.io) as well as this is *still runnable* even on eStargz-agnostic runtimes including Docker.
+eStargz format is based on [stargz image format by CRFS](https://github.com/google/crfs) but comes with additional features like runtime optimization and content verification.
+
+The following histogram is the benchmarking result for startup time of several containers measured on Github Actions, using GitHub Container Registry.
+
+<img src="docs/images/benchmarking-result-ecdb227.png" width="600" alt="The benchmarking result on ecdb227">
+
+`legacy` shows the startup performance when we use containerd's default snapshotter (`overlayfs`) with images copied from `docker.io/library` without optimization.
+For this configuration, containerd pulls entire image contents and `pull` operation takes accordingly.
+When we use stargz snapshotter with eStargz-converted images but without any optimization (`estargz-noopt`) we are seeing performance improvement on the `pull` operation because containerd can start the container without waiting for the `pull` completion and fetch necessary chunks of the image on-demand.
+But at the same time, we see the performance drawback for `run` operation because each access to files takes extra time for fetching them from the registry.
+When we use [eStargz with optimization](/docs/ctr-remote.md) (`estargz`), we can mitigate the performance drawback observed in `estargz-noopt` images.
+This is because [stargz snapshotter prefetches and caches *likely accessed files* during running the container](/docs/stargz-estargz.md).
+On the first container creation, stargz snapshotter waits for the prefetch completion so `create` sometimes takes longer than other types of image.
+But it's still shorter than waiting for downloading all files of all layers.
+
+The above histogram is [the benchmarking result on the commit `ecdb227`](https://github.com/containerd/stargz-snapshotter/actions/runs/398606060).
+We are constantly measuring the performance of this snapshotter so you can get the latest one through the badge shown top of this doc.
+Please note that we sometimes see dispersion among the results because of the NW condition on the internet and the location of the instance in the Github Actions, etc.
+Our benchmarking method is based on [HelloBench](https://github.com/Tintri/hello-bench).
+
+:nerd_face: You can also run containers on IPFS with lazy pulling. This is an experimental feature. See [`./docs/ipfs.md`](./docs/ipfs.md) for more details.
+
+Stargz Snapshotter is a **non-core** sub-project of containerd.
+
+## Quick Start with Kubernetes
+
+- For more details about stargz snapshotter plugin and its configuration, refer to [Containerd Stargz Snapshotter Plugin Overview](/docs/overview.md).
+- For more details about setup lazy pulling of eStargz with containerd, CRI-O, Podman, systemd, etc., refer to [Install Stargz Snapshotter and Stargz Store](./docs/INSTALL.md).
+- For more details about integration status of eStargz with tools in community, refer to [Integration of eStargz with other tools](./docs/integration.md)
+
+For using stargz snapshotter on kubernetes nodes, you need the following configuration to containerd as well as run stargz snapshotter daemon on the node.
+We assume that you are using containerd (> v1.4.2) as a CRI runtime.
+
+```toml
+version = 2
+
+# Plug stargz snapshotter into containerd
+# Containerd recognizes stargz snapshotter through specified socket address.
+# The specified address below is the default which stargz snapshotter listen to.
+[proxy_plugins]
+  [proxy_plugins.stargz]
+    type = "snapshot"
+    address = "/run/containerd-stargz-grpc/containerd-stargz-grpc.sock"
+  [proxy_plugins.stargz.exports]
+    root = "/var/lib/containerd-stargz-grpc/"
+
+# Use stargz snapshotter through CRI
+[plugins."io.containerd.grpc.v1.cri".containerd]
+  snapshotter = "stargz"
+  disable_snapshot_annotations = false
+```
+
+You can try our [prebuilt](/Dockerfile) [KinD](https://github.com/kubernetes-sigs/kind) node image that contains the above configuration.
+
+```console
+$ kind create cluster --name stargz-demo --image ghcr.io/containerd/stargz-snapshotter:0.12.1-kind
+```
+
+:information_source: kind binary v0.16.x or newer is recommended for `ghcr.io/containerd/stargz-snapshotter:0.12.1-kind`.
+
+:information_source: You can get latest node images from [`ghcr.io/containerd/stargz-snapshotter:${VERSION}-kind`](https://github.com/orgs/containerd/packages/container/package/stargz-snapshotter) namespace.
+
+Then you can create eStargz pods on the cluster.
+In this example, we create a stargz-converted Node.js pod (`ghcr.io/stargz-containers/node:17.8.0-esgz`) as a demo.
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nodejs
+spec:
+  containers:
+  - name: nodejs-stargz
+    image: ghcr.io/stargz-containers/node:17.8.0-esgz
+    command: ["node"]
+    args:
+    - -e
+    - var http = require('http');
+      http.createServer(function(req, res) {
+        res.writeHead(200);
+        res.end('Hello World!\n');
+      }).listen(80);
+    ports:
+    - containerPort: 80
+```
+
+The following command lazily pulls `ghcr.io/stargz-containers/node:17.8.0-esgz` from Github Container Registry and creates the pod so the time to take for it is shorter than the original image `library/node:13.13`.
+
+```console
+$ kubectl --context kind-stargz-demo apply -f stargz-pod.yaml && kubectl --context kind-stargz-demo get po nodejs -w
+$ kubectl --context kind-stargz-demo port-forward nodejs 8080:80 &
+$ curl 127.0.0.1:8080
+Hello World!
+```
+
+Stargz snapshotter also supports [further configuration](/docs/overview.md) including private registry authentication, mirror registries, etc.
+
+## Getting eStargz images
+
+- For more examples and details about the image converter `ctr-remote`, refer to [Optimize Images with `ctr-remote image optimize`](/docs/ctr-remote.md).
+- For more details about eStargz format, refer to [eStargz: Standard-Compatible Extensions to Tar.gz Layers for Lazy Pulling Container Images](/docs/stargz-estargz.md)
+
+For lazy pulling images, you need to prepare eStargz images first.
+There are several ways to achieve that.
+This section describes some of them.
+
+### Trying pre-built eStargz images
+
+You can try our pre-converted eStargz images on ghcr.io listed in [Trying pre-converted images](/docs/pre-converted-images.md).
+
+### Building eStargz images using BuildKit
+
+BuildKit supports building eStargz image since v0.10.
+
+You can try it using [Docker Buildx](https://docs.docker.com/buildx/working-with-buildx/).
+The following command builds an eStargz image and push it to `ghcr.io/ktock/hello:esgz`.
+Flags `oci-mediatypes=true,compression=estargz` enable to build eStargz.
+
+```
+$ docker buildx build -t ghcr.io/ktock/hello:esgz \
+    -o type=registry,oci-mediatypes=true,compression=estargz,force-compression=true \
+    /tmp/buildctx/
+```
+
+> NOTE1: `force-compression=true` isn't needed if the base image is already eStargz.
+
+> NOTE2: Docker still does not support lazy pulling of eStargz.
+
+eStargz-enabled BuildKit (v0.10) will be [included to Docker v22.XX](https://github.com/moby/moby/blob/v22.06.0-beta.0/vendor.mod#L51) however you can build eStargz images with the prior version using Buildx [driver](https://github.com/docker/buildx/blob/master/docs/reference/buildx_create.md#-set-the-builder-driver-to-use---driver) feature.
+You can enable the specific version of BuildKit using [`docker buildx create`](https://docs.docker.com/engine/reference/commandline/buildx_create/) (this example specifies `v0.10.3`).
+
+```
+$ docker buildx create --use --name v0.10.3 --driver docker-container --driver-opt image=moby/buildkit:v0.10.3
+$ docker buildx inspect --bootstrap v0.10.3
+```
+
+### Building eStargz images using Kaniko
+
+[Kaniko](https://github.com/GoogleContainerTools/kaniko) is an image builder runnable in containers and Kubernetes.
+Since v1.5.0, it experimentally supports building eStargz.
+`GGCR_EXPERIMENT_ESTARGZ=1` is needed.
+
+```console
+$ docker run --rm -e GGCR_EXPERIMENT_ESTARGZ=1 \
+    -v /tmp/buildctx:/workspace -v ~/.docker/config.json:/kaniko/.docker/config.json:ro \
+    gcr.io/kaniko-project/executor:v1.8.1 --destination ghcr.io/ktock/hello:esgz
+```
+
+### Building eStargz images using nerdctl
+
+[nerdctl](https://github.com/containerd/nerdctl), Docker-compatible CLI of containerd, supports building eStargz images.
+
+```console
+$ nerdctl build -t ghcr.io/ktock/hello:1 /tmp/buildctx
+$ nerdctl image convert --estargz --oci ghcr.io/ktock/hello:1 ghcr.io/ktock/hello:esgz
+$ nerdctl push ghcr.io/ktock/hello:esgz
+```
+
+> NOTE: `--estargz` should be specified in conjunction with `--oci`
+
+Please refer to nerdctl document for details for further information (e.g. lazy pulling): https://github.com/containerd/nerdctl/blob/master/docs/stargz.md
+
+### Creating eStargz images using `ctr-remote`
+
+[`ctr-remote`](/docs/ctr-remote.md) allows converting an image into eStargz with optimizing it.
+As shown in the above benchmarking result, on-demand lazy pulling improves the performance of pull but causes runtime performance penalty because reading files induce remotely downloading contents.
+For solving this, `ctr-remote` has *workload-based* optimization for images.
+
+For trying the examples described in this section, you can also use the docker-compose-based demo environment.
+You can setup this environment as the following commands (put this repo on `${GOPATH}/src/github.com/containerd/stargz-snapshotter`).
+*Note that this runs privileged containers on your host.*
+
+```console
+$ cd ${GOPATH}/src/github.com/containerd/stargz-snapshotter/script/demo
+$ docker-compose build containerd_demo
+$ docker-compose up -d
+$ docker exec -it containerd_demo /bin/bash
+(inside container) # ./script/demo/run.sh
+```
+
+Generally, container images are built with purpose and the *workloads* are defined in the Dockerfile with some parameters (e.g. entrypoint, envvars and user).
+By default, `ctr-remote` optimizes the performance of reading files that are most likely accessed in the workload defined in the Dockerfile.
+[You can also specify the custom workload using options if needed](/docs/ctr-remote.md).
+
+The following example converts the legacy `library/ubuntu:20.04` image into eStargz.
+The command also optimizes the image for the workload of executing `ls` on `/bin/bash`.
+The thing actually done is it runs the specified workload in a temporary container and profiles all file accesses with marking them as *likely accessed* also during runtime.
+The converted image is still **docker-compatible** so you can run it with eStargz-agnostic runtimes (e.g. Docker).
+
+```console
+# ctr-remote image pull docker.io/library/ubuntu:20.04
+# ctr-remote image optimize --oci --entrypoint='[ "/bin/bash", "-c" ]' --args='[ "ls" ]' docker.io/library/ubuntu:20.04 registry2:5000/ubuntu:20.04
+# ctr-remote image push --plain-http registry2:5000/ubuntu:20.04
+```
+
+Finally, the following commands clear the local cache then pull the eStargz image lazily.
+Stargz snapshotter prefetches files that are most likely accessed in the optimized workload, which hopefully increases the cache hit rate for that workload and mitigates runtime overheads as shown in the benchmarking result shown top of this doc.
+
+```console
+# ctr-remote image rm --sync registry2:5000/ubuntu:20.04
+# ctr-remote images rpull --plain-http registry2:5000/ubuntu:20.04
+fetching sha256:610399d1... application/vnd.oci.image.index.v1+json
+fetching sha256:0b4a26b4... application/vnd.oci.image.manifest.v1+json
+fetching sha256:8d8d9dbe... application/vnd.oci.image.config.v1+json
+# ctr-remote run --rm -t --snapshotter=stargz registry2:5000/ubuntu:20.04 test /bin/bash
+root@8eabb871a9bd:/# ls
+bin  boot  dev  etc  home  lib  lib32  lib64  libx32  media  mnt  opt  proc  root  run  sbin  srv  sys  tmp  usr  var
+```
+
+> NOTE: You can perform lazy pulling from any OCI-compatible registries (e.g. docker.io, ghcr.io, etc) as long as the image is formatted as eStargz.
+
+## Importing Stargz Snapshotter as go module
+
+Currently, Stargz Snapshotter repository contains two Go modules as the following and both of them need to be imported.
+
+- `github.com/containerd/stargz-snapshotter`
+- `github.com/containerd/stargz-snapshotter/estargz`
+
+Please make sure you import the both of them and they point to *the same commit version*.
+
+## Project details
+
+Stargz Snapshotter is a containerd **non-core** sub-project, licensed under the [Apache 2.0 license](./LICENSE).
+As a containerd non-core sub-project, you will find the:
+ * [Project governance](https://github.com/containerd/project/blob/main/GOVERNANCE.md),
+ * [Maintainers](./MAINTAINERS),
+ * and [Contributing guidelines](https://github.com/containerd/project/blob/main/CONTRIBUTING.md)
+
+information in our [`containerd/project`](https://github.com/containerd/project) repository.
+
+---
+
+# Optimize Images with `ctr-remote image optimize`
+
+Source: https://github.com/containerd/stargz-snapshotter/blob/main/docs/ctr-remote.md
+
+# Optimize Images with `ctr-remote image optimize`
+
+This doc describes example usages of `ctr-remote image optimize` command for converting images into eStargz.
+
+`ctr-remote images optimize` command (call `ctr-remote` in this doc) enables users to convert an image into eStargz.
+This command works on containerd so containerd needs to run on your environment.
+So this converts an image stored in containerd and stores the resulting image to containerd.
+
+Because the resulting image is stored to containerd, you can use `ctr-remote image pull` and `ctr-remote image push` commands for pulling/pushing images from/to regstries.
+[nerdctl](https://github.com/containerd/nerdctl), Docker-compatible CLI for containerd, allows you to pull/push images using `~/.docker/config.json`.
+Various other containerd-based commands like `ctr-remote content get`, `ctr-remote images export` and other `ctr-remote` and `nerdctl` commands can also be used for debugging and inspecting the resulting eStargz image.
+
+The converted eStargz image can be lazily pulled by Stargz Snapshotter which can speed up the container startup.
+Because this image is backward compatible to OCI/Docker image, this can be also run by other runtimes that don't support lazy pull (e.g. Docker).
+
+Though lazy pull speeds up the container's startup, it's possible, especially with slow network, that the runtime performance becomes lower because reading files can induce remotely downloading file contents.
+For mitigating this, `ctr-remote` also allows to *optimize* the image against the *workload* the image runs.
+Here, workload means the configuration of the container that runs from that image, including the entrypoint program, environment variables, user etc.
+This optimization is done by baking the information about files that are likely accessed during runtime (called *prioritized files*), to the image.
+On runtime, Stargz Snapshotter prefetches these prioritized files before mounting the layer for making sure these files are locally accessible.
+This can avoid downloading chunks on every file read and mitigate the runtime performance drawbacks.
+
+:information_source: For more details about eStargz and its optimization, refer also to [eStargz: Standard-Compatible Extensions to Tar.gz Layers for Lazy Pulling Container Images](/docs/stargz-estargz.md).
+
+:information_source: Please see also [Creating smaller eStargz images](/docs/smaller-estargz.md) if you're interested in creating a smaller size of eStargz images.
+
+## Requirements
+
+- containerd: Release binaries are available on https://github.com/containerd/containerd/releases.
+- CNI plugins (if network connection is needed during optimization): Release binaries are available on https://github.com/containernetworking/plugins.
+
+`ctr-remote` requires CAP_SYS_ADMIN.
+Rootless execution of this command is still WIP.
+
+For trying the examples described in this doc, you can also use the docker-compose-based demo environment.
+You can setup this environment as the following commands.
+*Note that this runs privileged containers on your host.*
+
+```
+$ cd ${GOPATH}/src/github.com/containerd/stargz-snapshotter/script/demo
+$ docker-compose build containerd_demo
+$ docker-compose up -d
+$ docker exec -it containerd_demo /bin/bash
+(inside container) # ./script/demo/run.sh
+```
+
+## Optimizing an image
+
+The following command optimizes an (non-eStargz) image `ghcr.io/stargz-containers/golang:1.15.3-buster-org` (this is a copy of `golang:1.15.3-buster`) and pushes the result eStargz image into `registry2:5000/golang:1.15.3-esgz`.
+This doesn't append workload-related configuration options (e.g. `--entrypoint`) so this optimizes the image against the default configurations baked to the image e.g. through Dockefile instructions (`ENTRYPOINT`, etc) when building the original image.
+
+```
+ctr-remote image pull ghcr.io/stargz-containers/golang:1.15.3-buster-org
+ctr-remote image optimize --oci ghcr.io/stargz-containers/golang:1.15.3-buster-org registry2:5000/golang:1.15.3-esgz
+ctr-remote image push --plain-http registry2:5000/golang:1.15.3-esgz
+```
+
+When you run `ctr-remote image optimize`, this runs the source image (`ghcr.io/stargz-containers/golang:1.15.3-buster-org`) as a container and profiles all file accesses during the execution.
+Then these accessed files are marked as "prioritized" files and will be prefetched on runtime.
+
+You can specify the `--estargz-gzip-helper` flag to specify a command-line helper tool for gzip decompression during optimization. Using command-line tools can speed up the decompression of the original image, thereby accelerating the overall optimization process. Even using the gzip command corresponding to the Go gzip library can achieve approximately 32% speed improvement. For more details, see: [Using decompression commands to improve the layer decompression speed of gzip-formatted images](https://github.com/containerd/stargz-snapshotter/pull/2117). Currently, `--estargz-gzip-helper` only supports `pigz`, `igzip`, and `gzip`.
+
+The following example uses the `pigz` command to accelerate the optimization process:
+
+```console
+# ctr-remote image optimize --oci --estargz-gzip-helper pigz ghcr.io/stargz-containers/golang:1.15.3-buster-org registry2:5000/golang:1.15.3-esgz
+```
+
+You can specify the GZIP compression level the converter should use using the `--estargz-compression-level` flag. The values range from 1-9. If the flag isn't provided, the compression level will default to 9.
+
+A value of 9 indicates the archive will be gzipped with max compression. This will reduce the bytes transferred over the network but increase the CPU cycles required to decompress the payload. Whereas gzip compression value 1 indicates archive will be gzipped with least compression. This will increase the bytes transferred over the network but decreases the CPU cycles required to decompress the payload. This value should be chosen based on the workload and host characteristics.
+
+The following example optimizes an image with a compression level of 1.
+
+```console
+# ctr-remote image optimize --oci --estargz-compression-level 1 ghcr.io/stargz-containers/golang:1.15.3-buster-org registry2:5000/golang:1.15.3-esgz
+```
+
+You can enable host networking for the container using the `net-host` flag.
+
+```console
+# ctr-remote i optimize -t -i --oci --entrypoint='[ "/bin/bash", "-c" ]' --net-host --args='[ "ip a && curl example.com" ]' ghcr.io/stargz-containers/centos:8-test registry2:5000/centos:8-test-esgz
+```
+
+You can optimize GPU-based images using the `gpu` flag. The flag expects a comma separated list of integers or 'all'.
+
+- Prerequisites
+  - NVIDIA GPU Drivers and Contaienr Toolkit: For details, refer to the [docs](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
+  - CDI Specification: For details, refer to the [docs](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/cdi-support.html)
+
+```console
+# ctr-remote i optimize --oci --gpus "0" <src> <target>
+# ctr-remote i optimize --oci --gpus "all" <src> <target>
+```
+
+`--oci` option is highly recommended to add when you create eStargz image.
+If the source image is [Docker image](https://github.com/moby/moby/blob/master/image/spec/v1.2.md) that doesn't allow us [content verification of eStargz](/docs/verification.md), `ctr-remote` converts this image into the [OCI starndard compliant image](https://github.com/opencontainers/image-spec/).
+OCI image also can run on most of modern container runtimes.
+
+You can lazy-pull this image into other hosts with Stargz Snapshotter.
+The following example lazily pulls this image to containerd, using `ctr-remote image rpull` command.
+
+```console
+# ctr-remote image rpull --plain-http registry2:5000/golang:1.15.3-esgz
+fetching sha256:9f9b5a43... application/vnd.oci.image.index.v1+json
+fetching sha256:16debc17... application/vnd.oci.image.manifest.v1+json
+fetching sha256:a610ec55... application/vnd.oci.image.config.v1+json
+# ctr-remote run --rm -t --snapshotter=stargz registry2:5000/golang:1.15.3-esgz test echo hello
+hello
+```
+
+In the following examples, we omit `ctr-remote image pull` and `ctr-remote image push` from the example.
+
+## Optimizing an image with custom configuration
+
+You can also specify the custom workload configuration that the image is optimized against.
+The following example optimizes the image against the workload running `go version` on `/bin/bash`.
+
+```
+ctr-remote image optimize --oci \
+           --entrypoint='[ "/bin/bash", "-c" ]' --args='[ "go version" ]' \
+           ghcr.io/stargz-containers/golang:1.15.3-buster-org \
+           registry2:5000/golang:1.15.3-esgz-go-version
+```
+
+Other options are also available for configuring the workload.
+
+|Option|Description|
+---|---
+|`--entrypoint`|Entrypoint of the container (in JSON array)|
+|`--args`|Arguments for the entrypoint (in JSON array)|
+|`--env`|Environment variables in the container|
+|`--user`|User name to run the process in the container|
+|`--cwd`|Working directory|
+|`--period`|The time seconds during profiling the file accesses|
+|`-t`or`--terminal`|Attach terminal to the container. This flag must be specified with `-i`|
+|`-i`|Attach stdin to the container|
+
+### Prefetch list glob patterns
+
+`ctr-remote image optimize` supports specifying a prefetch list file via `--prefetch-list`. Each line can be a path or a glob pattern. Supported patterns:
+
+- `*` matches any sequence except `/` (single directory level)
+- `?` matches a single character except `/`
+- `[]` character class, e.g. `[ab]`, `[a-z]`
+- `**` recursive wildcard that can match across `/` (multiple directory levels)
+
+Examples:
+
+```
+/usr/bin/*
+/usr/lib/**/*.so
+/var/log/**/app.*.log
+/opt/data/img_[ab].png
+```
+
+Notes:
+- Empty lines and lines starting with `#` are ignored.
+- Paths are normalized internally; both `/foo/bar` and `foo/bar` are accepted.
+
+## Mounting files from the host
+
+There are several cases where sharing files from host to the container during optimization is useful.
+This includes when we want to optimize an image against building a binary using compilers.
+
+For these use-cases, you can mount files on the hosts to the container using `--mount` option.
+The following example optimizes the image against the workload where Go compiler compiles "hello world" program.
+
+First, create the following Go source file at `/tmp/hello.go`.
+
+```golang
+package main
+
+import "fmt"
+
+func main() {
+     fmt.Println("hello world")
+}
+```
+
+Then you can build it inside the container by bind-mounting the file `/tmp/hello.go` on the host to this container.
+
+```
+ctr-remote image optimize --oci \
+           --mount=type=bind,source=/tmp/hello.go,destination=/hello.go,options=bind:ro \
+           --entrypoint='[ "/bin/bash", "-c" ]' --args='[ "go build -o /hello /hello.go && /hello" ]' \
+           ghcr.io/stargz-containers/golang:1.15.3-buster-org \
+           registry2:5000/golang:1.15.3-esgz-hello-world
+```
+
+The syntax of the `--mount` option is compatible to containerd's `ctr` tool and [corresponds to the OCI Runtime Spec](https://github.com/opencontainers/runtime-spec/blob/v1.0.2/config.md#mounts).
+You need to specify the following key-value pairs with comma separators.
+
+|Field|Description|
+---|---
+|`type`|The type of the filesystem to be mounted|
+|`destination`|The absolute path to the destination mount point in the container|
+|`source`|The source of the mount|
+|`options`|Mount options (separated by `:`) of the filesystem|
+
+## Enabling CNI-based Networking
+
+You can also gain network connection in the container during optimization, using CNI plugins.
+Once you configure CNI plugins on the host, CNI-based networking can be enabled using `--cni` option.
+
+The following example accesses to https://example.com from the container, using `bridge` CNI plugin installed in the demo environment.
+```
+ctr-remote image optimize --oci \
+           --cni \
+           --entrypoint='[ "/bin/bash", "-c" ]' \
+           --args='[ "curl example.com" ]' \
+           ghcr.io/stargz-containers/golang:1.15.3-buster-org \
+           registry2:5000/golang:1.15.3-esgz-curl
+```
+
+If CNI plugins and configurations are installed to locations other than well-known paths (/opt/cni/bin and /etc/cni/net.d), you can tell it to `ctr-remote` using the following options.
+
+|Option|Description|
+---|---
+|`--cni-plugin-config-dir`|Path to the directory where CNI plugins configurations are stored|
+|`--cni-plugin-dir`|Path to the directory where CNI plugins binaries are installed|
+
+By default, `/etc/hosts` and `/etc/resolv.conf` are configured as the following.
+
+/etc/hosts
+
+```
+127.0.0.1	localhost
+::1		localhost ip6-localhost ip6-loopback
+fe00::0		ip6-localnet
+ff00::0		ip6-mcastprefix
+ff02::1		ip6-allnodes
+ff02::2		ip6-allrouters
+```
+
+/etc/resolv.conf
+
+```
+nameserver 8.8.8.8
+```
+
+If you want to customize the configuration, the following options are useful.
+
+|Option|Description|
+---|---
+|`--add-hosts`|Commma-separated list of hosts configuration (formatted as `hostname:IP`) for `/etc/hosts`|
+|`--dns-nameservers`|Comma-separated `nameserver` configs added to the container's `/etc/resolv.conf`|
+|`--dns-search-domains`|Comma-separated `search` configs added to the container's `/etc/resolv.conf`|
+|`--dns-options`|Comma-separated `options` configs added to the container's `/etc/resolv.conf`|
+
+## Other useful features
+
+### Reusing already-converted layers
+
+If the source image is large, its conversion takes accordingly long time.
+But you can skip conversion for layers that are already converted to eStargz.
+For enabling this feature, add `--reuse` option to `ctr-remote`.
+
+The following example re-converts already converted eStargz image (`ghcr.io/stargz-containers/golang:1.15.3-buster-esgz`) with `--reuse` feature.
+
+```
+ctr-remote image optimize --oci \
+           --reuse \
+           ghcr.io/stargz-containers/golang:1.15.3-buster-esgz \
+           registry2:5000/golang:1.15.3-esgz
+```
+
+You will see `ctr-remote` skips converting some layers with printing `copying without conversion` log messages as the following.
+
+```
+(... omit ...)
+WARN[0036] reusing "sha256:4416ecf7e2787af750fe3b1988f36a2c47edc2d3162739c6eedd739d6d5a14d1" without conversion
+WARN[0036] reusing "sha256:976cc0da952505fede3abe08c0ff0c5277416828c4dff8bd01b306c5b4e5c6f5" without conversion
+WARN[0036] reusing "sha256:59cf7266511a915072804370a3083a1007c4fb757d800ceef848032ac4a5b605" without conversion
+WARN[0036] reusing "sha256:ca2a1da2dee341a3b87a14d56603e9c29c66721056a47bec156f9b04ee0b1e5e" without conversion
+WARN[0036] reusing "sha256:79d28aed10b15d548b63eea4cc59e518c4939f9c8fb8498100ec658fc7e0baca" without conversion
+WARN[0036] reusing "sha256:6aedf0c74720e30b9093dc0d2b39c2dd88f35ead14e2087bb49c1608bb151e61" without conversion
+(... omit ...)
+```
+
+When optimizing an image, `ctr-remote` tries to avoid layer conversion as much as possible.
+The layers that meet the following conditions are skipped to converting.
+
+- layers that are already formatted as eStargz
+- layers that no file access occurred during optimization
+
+### Converting multi-platform images
+
+You can also convert multi-platform images.
+If you want to convert all images contained in a multi-platform image, use `--all-platform` option.
+If you want to convert an image corresponding to a specific platform, tell it using `--platform` option.
+The format of the `--platform` option is `<os>|<arch>|<os>/<arch>[/<variant>]`, please refer to containerd's [godoc](https://godoc.org/github.com/containerd/containerd/platforms#hdr-Platform_Specifiers) for more details.
+
+The following example converts all images contained in `ghcr.io/stargz-containers/golang:1.15.3-buster-org`.
+
+```
+ctr-remote image optimize --oci \
+           --all-platforms \
+           ghcr.io/stargz-containers/golang:1.15.3-buster-org \
+           registry2:5000/golang:1.15.3-esgz-fat
+```
+
+By default, when the source image is a multi-platform image, `ctr-remote` converts the image corresponding to the platform where `ctr-remote` runs.
+
+Note that though the images specified by `--all-platform` and `--platform` are converted to eStargz, images that don't correspond to the current platform aren't *optimized*. That is, these images are lazily pulled but without prefetch.
+
+### Dump log of accessed files during optimization (`--record-out`)
+
+You can dump the information of which files are accesssed during optimization, using `--record-out` flag.
+
+For example, the following dumps logs of files accessed during running `ls` in `ubuntu:24.04`.
+
+```
+ctr-remote image pull docker.io/library/ubuntu:24.04
+ctr-remote image optimize --record-out=/tmp/log.json \
+  --entrypoint='[ "/bin/bash", "-c" ]' --args='[ "ls" ]' \
+  docker.io/library/ubuntu:24.04 registry2:5000/ubuntu:24.04
+```
+
+The following is the contents of the log (`/tmp/log.json`):
+
+```
+{"path":"usr/bin/bash","manifestDigest":"sha256:5d070ad5f7fe63623cbb99b4fc0fd997f5591303d4b03ccce50f403957d0ddc4","layerIndex":0}
+{"path":"usr/bin/bash","manifestDigest":"sha256:5d070ad5f7fe63623cbb99b4fc0fd997f5591303d4b03ccce50f403957d0ddc4","layerIndex":0}
+{"path":"usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2","manifestDigest":"sha256:5d070ad5f7fe63623cbb99b4fc0fd997f5591303d4b03ccce50f403957d0ddc4","layerIndex":0}
+{"path":"etc/ld.so.cache","manifestDigest":"sha256:5d070ad5f7fe63623cbb99b4fc0fd997f5591303d4b03ccce50f403957d0ddc4","layerIndex":0}
+{"path":"usr/lib/x86_64-linux-gnu/libtinfo.so.6.4","manifestDigest":"sha256:5d070ad5f7fe63623cbb99b4fc0fd997f5591303d4b03ccce50f403957d0ddc4","layerIndex":0}
+{"path":"usr/lib/x86_64-linux-gnu/libc.so.6","manifestDigest":"sha256:5d070ad5f7fe63623cbb99b4fc0fd997f5591303d4b03ccce50f403957d0ddc4","layerIndex":0}
+{"path":"etc/nsswitch.conf","manifestDigest":"sha256:5d070ad5f7fe63623cbb99b4fc0fd997f5591303d4b03ccce50f403957d0ddc4","layerIndex":0}
+{"path":"etc/nsswitch.conf","manifestDigest":"sha256:5d070ad5f7fe63623cbb99b4fc0fd997f5591303d4b03ccce50f403957d0ddc4","layerIndex":0}
+{"path":"etc/passwd","manifestDigest":"sha256:5d070ad5f7fe63623cbb99b4fc0fd997f5591303d4b03ccce50f403957d0ddc4","layerIndex":0}
+{"path":"usr/bin/ls","manifestDigest":"sha256:5d070ad5f7fe63623cbb99b4fc0fd997f5591303d4b03ccce50f403957d0ddc4","layerIndex":0}
+{"path":"usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2","manifestDigest":"sha256:5d070ad5f7fe63623cbb99b4fc0fd997f5591303d4b03ccce50f403957d0ddc4","layerIndex":0}
+{"path":"etc/ld.so.cache","manifestDigest":"sha256:5d070ad5f7fe63623cbb99b4fc0fd997f5591303d4b03ccce50f403957d0ddc4","layerIndex":0}
+{"path":"usr/lib/x86_64-linux-gnu/libselinux.so.1","manifestDigest":"sha256:5d070ad5f7fe63623cbb99b4fc0fd997f5591303d4b03ccce50f403957d0ddc4","layerIndex":0}
+{"path":"usr/lib/x86_64-linux-gnu/libc.so.6","manifestDigest":"sha256:5d070ad5f7fe63623cbb99b4fc0fd997f5591303d4b03ccce50f403957d0ddc4","layerIndex":0}
+{"path":"usr/lib/x86_64-linux-gnu/libpcre2-8.so.0.11.2","manifestDigest":"sha256:5d070ad5f7fe63623cbb99b4fc0fd997f5591303d4b03ccce50f403957d0ddc4","layerIndex":0}
+```
+
+For creating an optimized eStargz using this log, you can input this log into [`--estargz-record-in` or `--zstdchunked-record-in` of `nerdctl image convert`](https://github.com/containerd/nerdctl/blob/8b814ca7fe29cb505a02a3d85ba22860e63d15bf/docs/command-reference.md#nerd_face-nerdctl-image-convert) or the same flags for `ctr-remote image convert` .
+
+---
+
+# eStargz: Standard-Compatible Extension to Container Image Layers for Lazy Pulling
+
+Source: https://github.com/containerd/stargz-snapshotter/blob/main/docs/estargz.md
+
+# eStargz: Standard-Compatible Extension to Container Image Layers for Lazy Pulling
+
+This doc describes the extension to gzip layers of container images (`application/vnd.oci.image.layer.v1.tar+gzip` of [OCI Image Specification](https://github.com/opencontainers/image-spec/) and `application/vnd.docker.image.rootfs.diff.tar.gzip` of [Docker Image Specification](https://github.com/moby/moby/blob/master/image/spec/v1.2.md)) for *lazy pulling*.
+The extension is called *eStargz*.
+
+eStargz is a *backward-compatible extension* which means that images can be pushed to the extension-agnostic registry and can run on extension-agnostic runtimes.
+
+This extension is based on stargz (stands for *seekable tar.gz*) proposed by [Google CRFS](https://github.com/google/crfs) project (initially [discussed in Go community](https://github.com/golang/go/issues/30829)).
+eStargz extends stargz for chunk-level verification and runtime performance optimization.
+
+Notational convention follows [OCI Image Specification](https://github.com/opencontainers/image-spec/blob/v1.0.1/spec.md#notational-conventions).
+
+## Overview
+
+Lazy pulling is a technique of pulling container images aiming at the faster cold start.
+This allows a container to startup without waiting for the entire image layer contents to be locally available.
+Instead, necessary files (or chunks for large files) in the layer are fetched *on-demand* during running the container.
+
+For achieving this, runtimes need to fetch and extract each file in a layer independently.
+However, layer without eStargz extension doesn't allow this because of the following reasons,
+
+1. The entire layer blob needs to be extracted even for getting a single file entry.
+2. Digests aren't provided for each file so it cannot be verified independently.
+
+eStargz solves these issues and enables lazy pulling.
+
+Additionally, it supports prefetching of files.
+This can be used to mitigate runtime performance drawbacks caused by the on-demand fetching of each file.
+
+This extension is a backward-compatible so the eStargz-formatted image can be pushed to the registry and can run even on eStargz-agnostic runtimes.
+
+## The structure
+
+![The structure of eStargz](/docs/images/estargz-structure.png)
+
+eStargz is a gzip-compressed tar archive of files and a metadata component called *TOC* (described in the later section).
+In an eStargz-formatted blob, each non-empty regular file and each metadata component MUST be separately compressed as gzip.
+This structure is inherited from [stargz](https://github.com/google/crfs).
+
+Therefore, the gzip headers MUST locate at the following locations.
+
+- The top of the blob
+- The top of the payload of each non-empty regular file tar entry except *TOC*
+- The top of *TOC* tar header
+- The top of *footer* (described in the later section)
+
+Large regular files in an eStargz blob MAY be chunked into several smaller gzip members.
+Each chunked member is called *chunk* in this doc.
+
+Therefore, gzip headers MAY locate at the following locations.
+
+- Arbitrary location within the payload of non-empty regular file entry
+
+An eStargz-formatted blob is the concatenation of these gzip members, which is a still valid gzip blob.
+
+## TOC, TOCEntries and Footer
+
+### TOC and TOCEntries
+
+eStargz contains a regular file called *TOC* which records metadata (e.g. name, file type, owners, offset etc) of all file entries in eStargz, except TOC itself.
+Container runtimes MAY use TOC to mount the container's filesystem without downloading the entire layer contents.
+
+TOC MUST be a JSON file contained as the last tar entry and MUST be named `stargz.index.json`.
+
+The following fields contain the primary properties that constitute a TOC.
+
+- **`version`** *int*
+
+   This REQUIRED property contains the version of the TOC. This value MUST be `1`.
+
+- **`entries`** *array of objects*
+
+   This property MUST contain an array of *TOCEntry* of all tar entries and chunks in the blob, except `stargz.index.json`.
+
+*TOCEntry* consists of metadata of a file or chunk in eStargz.
+If metadata in a TOCEntry of a file differs from the corresponding tar entry, TOCEntry SHOULD be respected.
+
+The following fields contain the primary properties that constitute a TOCEntry.
+Properties other than `chunkDigest` are inherited from [stargz](https://github.com/google/crfs).
+
+- **`name`** *string*
+
+  This REQUIRED property contains the name of the tar entry.
+  This MUST be the complete path stored in the tar file.
+
+- **`type`** *string*
+
+  This REQUIRED property contains the type of tar entry.
+  This MUST be either of the following.
+  - `dir`: directory
+  - `reg`: regular file
+  - `symlink`: symbolic link
+  - `hardlink`: hard link
+  - `char`: character device
+  - `block`: block device
+  - `fifo`: fifo
+  - `chunk`: a chunk of regular file data
+  As described in the above section, a regular file can be divided into several chunks.
+  TOCEntry MUST be created for each chunk.
+  TOCEntry of the first chunk of that file MUST be typed as `reg`.
+  TOCEntry of each chunk after 2nd MUST be typed as `chunk`.
+  `chunk` TOCEntry MUST set *offset*, *chunkOffset* and *chunkSize* properties.
+
+- **`size`** *uint64*
+
+  This OPTIONAL property contains the uncompressed size of the regular file.
+  Non-empty `reg` file MUST set this property.
+
+- **`modtime`** *string*
+
+  This OPTIONAL property contains the modification time of the tar entry.
+  Empty means zero or unknown.
+  Otherwise, the value is in UTC RFC3339 format.
+
+- **`linkName`** *string*
+
+  This OPTIONAL property contains the link target.
+  `symlink` and `hardlink` MUST set this property.
+
+- **`mode`** *int64*
+
+  This REQUIRED property contains the permission and mode bits.
+
+- **`uid`** *uint*
+
+  This REQUIRED property contains the user ID of the owner of this file.
+
+- **`gid`** *uint*
+
+  This REQUIRED property contains the group ID of the owner of this file.
+
+- **`userName`** *string*
+
+  This OPTIONAL property contains the username of the owner.
+
+- **`groupName`** *string*
+
+  This OPTIONAL property contains the groupname of the owner.
+
+- **`devMajor`** *int*
+
+  This OPTIONAL property contains the major device number of device files.
+  `char` and `block` files MUST set this property.
+
+- **`devMinor`** *int*
+
+  This OPTIONAL property contains the minor device number of device files.
+  `char` and `block` files MUST set this property.
+
+- **`xattrs`** *string-bytes map*
+
+  This OPTIONAL property contains the extended attribute for the tar entry.
+
+- **`digest`** *string*
+
+  This OPTIONAL property contains the digest of the regular file contents.
+
+- **`offset`** *int64*
+
+  This OPTIONAL property contains the offset of the gzip header of the regular file or chunk in the blob.
+  TOCEntries of non-empty `reg` and `chunk` MUST set this property.
+
+- **`chunkOffset`** *int64*
+
+  This OPTIONAL property contains the offset of this chunk in the decompressed regular file payload.
+  TOCEntries of `chunk` type MUST set this property.
+
+- **`chunkSize`** *int64*
+
+  This OPTIONAL property contains the decompressed size of this chunk.
+  The last `chunk` in a `reg` file or `reg` file that isn't chunked MUST set this property to zero.
+  Other `reg` and `chunk` MUST set this property.
+
+- **`chunkDigest`** *string*
+
+  This OPTIONAL property contains a digest of this chunk.
+  TOCEntries of non-empty `reg` and `chunk` MUST set this property.
+  This MAY be used for verifying the data of the chunk.
+
+- **`innerOffset`** *int64*
+
+  This OPTIONAL property indicates the uncompressed offset of the "reg" or "chunk" entry payload in a stream starts from `offset` field.
+
+#### Details about `innerOffset`
+
+`innerOffset` enables to put multiple "reg" or "chunk" payloads in one gzip stream starts from `offset`.
+This field allows the following structure.
+
+![The structure of eStargz with innerOffset](/docs/images/estargz-inneroffset.png)
+
+Use case of this field is `--estargz-min-chunk-size` flag of `ctr-remote`.
+The value of this flag is the minimal number of bytes of data must be written in one gzip stream.
+If it's > 0, multiple files and chunks can be written into one gzip stream.
+Smaller number of gzip header and smaller size of the result blob can be expected.
+
+### Footer
+
+At the end of the blob, a *footer* MUST be appended.
+This MUST be an empty gzip member whose [Extra field](https://tools.ietf.org/html/rfc1952#section-2.3.1.1) contains the offset of TOC in the blob.
+The footer MUST be the following 51 bytes (1 byte = 8 bits in gzip).
+
+```
+- 10 bytes  gzip header
+- 2  bytes  XLEN (length of Extra field) = 26 (4 bytes header + 16 hex digits + len("STARGZ"))
+- 2  bytes  Extra: SI1 = 'S', SI2 = 'G'
+- 2  bytes  Extra: LEN = 22 (16 hex digits + len("STARGZ"))
+- 22 bytes  Extra: subfield = fmt.Sprintf("%016xSTARGZ", offsetOfTOC)
+- 5  bytes  flate header: BFINAL = 1(last block), BTYPE = 0(non-compressed block), LEN = 0
+- 8  bytes  gzip footer
+(End of eStargz)
+```
+
+Runtimes MAY first read and parse the footer to get the offset of TOC.
+
+Each file's metadata is recorded in the TOC so runtimes don't need to extract other parts of the archive as long as it only uses file metadata.
+If runtime needs to get a regular file's content, it can get the size and offset of that content from the TOC and extract that range without scanning the entire blob.
+By combining this with HTTP Range Request supported by [OCI Distribution Spec](https://github.com/opencontainers/distribution-spec/blob/ef28f81727c3b5e98ab941ae050098ea664c0960/detail.md#fetch-blob-part), runtimes can selectively download file entries from the registry.
+
+### Notes on compatibility with stargz
+
+eStargz is designed aiming to compatibility with gzip layers.
+For achieving this, eStargz's footer structure is incompatible with [stargz's one](https://github.com/google/crfs/blob/71d77da419c90be7b05d12e59945ac7a8c94a543/stargz/stargz.go#L36-L49).
+eStargz adds SI1, SI2 and LEN fields to the footer to make it compliant to [Extra field definition in RFC1952](https://tools.ietf.org/html/rfc1952#section-2.3.1.1).
+TOC, TOCEntry and the position of gzip headers are still compatible with stargz.
+
+## Prioritized Files and Landmark Files
+
+![Prioritized files and landmark files](/docs/images/estargz-landmark.png)
+
+Lazy pulling can cause runtime performance overhead by on-demand fetching of each file.
+eStargz mitigates this by supporting prefetching of important files called *prioritized files*.
+
+eStargz encodes the information about prioritized files to the *order* of file entries with some *landmark* file entries.
+
+File entries in eStargz are grouped into the following groups,
+
+- A. *prioritized files*
+- B. non *prioritized files*
+
+If no files are belonging to A, a landmark file *no-prefetch landmark* MUST be contained in the archive.
+
+If one or more files are belonging to A, eStargz MUST consist of two separated areas corresponding to these groups and a landmark file *prefetch landmark* MUST be contained at the boundary between these two areas.
+
+The Landmark file MUST be a regular file entry with 4 bits contents 0xf in eStargz.
+It MUST be recorded to TOC as a TOCEntry. Prefetch landmark MUST be named `.prefetch.landmark`. No-prefetch landmark MUST be named `.no.prefetch.landmark`.
+
+### Example use-case of prioritized files: workload-based image optimization in Stargz Snapshotter
+
+Stargz Snapshotter makes use of eStargz's prioritized files for *workload-based* optimization to mitigate the overhead of reading files.
+The *workload* of the image is the runtime configuration defined in the Dockerfile, including entrypoint command, environment variables and user.
+
+Stargz snapshotter provides an image converter command `ctr-remote images optimize` to create optimized eStargz images.
+When converting the image, this command runs the specified workload in a sandboxed environment and profiles all file accesses.
+This command treats all accessed files as prioritized files.
+Then it constructs eStargz by
+
+- putting prioritized files from the top of the archive, sorting them by the accessed order,
+- putting *prefetch landmark* file entry at the end of this range, and
+- putting all other files (non-prioritized files) after the prefetch landmark.
+
+Before running the container, stargz snapshotter prefetches and pre-caches the range where prioritized files are contained, by a single HTTP Range Request supported by the registry.
+This can increase the cache hit rate for the specified workload and can mitigate runtime overheads.
+
+## Content Verification in eStargz
+
+The goal of the content verification in eStargz is to ensure the downloaded metadata and contents of all files are the expected ones, based on the calculated digests.
+The verification of other components in the image including image manifests is out-of-scope of eStargz.
+On the verification step of an eStargz layer, we assume that the manifest that references this eStargz layer is already verified (using digest tag, etc).
+
+![the overview of the verification](/docs/images/estargz-verification.png)
+
+A non-eStargz layer can be verified by recalculating the digest and comparing it with the one written in the layer descriptor referencing that layer in the verified manifest.
+However, an eStargz layer is *lazily* pulled from the registry in file (or chunk if that file is large) granularity so each one needs to be independently verified every time fetched.
+
+The following describes how the verification of eStargz is done using the verified manifest.
+
+eStargz consists of the following components to be verified:
+
+- TOC (a set of metadata of all files contained in the layer)
+- chunks of contents of each regular file
+
+TOC contains metadata (name, type, mode, etc.) of all files and chunks in the blob.
+On mounting eStargz, filesystem fetches the TOC from the registry.
+For making the TOC verifiable using the verified manifest, we define an annotation `containerd.io/snapshot/stargz/toc.digest`.
+The value of this annotation is the digest of the TOC and this MUST be contained in the descriptor that references this eStargz layer.
+Using this annotation, filesystem can verify the TOC by recalculating the digest and comparing it to the annotation value.
+
+Each file's metadata is encoded to a TOCEntry in the TOC.
+TOCEntry is created also for each chunk of regular files.
+For making the contents of each file and chunk verifiable using the verified manifest, TOCEntry has a property *chunkDigest*.
+*chunkDigest* contains the digest of the content of the `reg` or `chunk` entry.
+As mentioned above, the TOC is verifiable using the special annotation.
+Using *chunkDigest* fields written in the verified TOC, each file and chunk can be independently verified by recalculating the digest and comparing it to the property.
+
+As the conclusion, eStargz MUST contain the following metadata:
+
+- `containerd.io/snapshot/stargz/toc.digest` annotation in the descriptor that references eStargz layer: The value is the digest of the TOC.
+- *chunkDigest* properties of non-empty `reg` or `chunk` TOCEntry: The value is the digest of the contents of the file or chunk.
+
+### Example usecase: Content verification in Stargz Snapshotter
+
+Stargz Snapshotter verifies eStargz layers leveraging the above metadata.
+As mentioned above, the verification of other image components including the manifests is out-of-scope of the snapshotter.
+When this snapshotter mounts an eStargz layer, the manifest that references this layer must be verified in advance and the TOC digest annotation written in the verified manifest must be passed down to this snapshotter.
+
+On mounting a layer, stargz snapshotter fetches the TOC from the registry.
+Then it verifies the TOC by recalculating the digest and comparing it with the one written in the manifest.
+After the TOC is verified, the snapshotter mounts this layer using the metadata recorded in the TOC.
+
+During runtime of the container, this snapshotter fetches chunks of regular file contents lazily.
+Before providing a chunk to the filesystem user, snapshotter recalculates the digest and checks it matches the one recorded in the corresponding TOCEntry.
+
+## eStargz image with an external TOC (OPTIONAL)
+
+This OPTIONAL feature allows separating TOC into another image called *TOC image*.
+This type of eStargz is the same as the normal eStargz but doesn't contain TOC JSON file (`stargz.index.json`) in the layer blob and has a special footer.
+This feature enables creating a smaller eStargz blob by avoiding including TOC JSON file in that blob.
+
+Footer has the following structure:
+
+```
+// The footer is an empty gzip stream with no compression and an Extra header.
+//
+// 46 comes from:
+//
+// 10 bytes  gzip header
+// 2  bytes  XLEN (length of Extra field) = 21 (4 bytes header + len("STARGZEXTERNALTOC"))
+// 2  bytes  Extra: SI1 = 'S', SI2 = 'G'
+// 2  bytes  Extra: LEN = 17 (len("STARGZEXTERNALTOC"))
+// 17 bytes  Extra: subfield = "STARGZEXTERNALTOC"
+// 5  bytes  flate header
+// 8  bytes  gzip footer
+// (End of the eStargz blob)
+```
+
+TOC image is an OCI image containing TOC.
+Each layer contains a TOC JSON file (`stargz.index.json`) in the root directory.
+
+Layer descriptors in the manifest must contain an annotation `containerd.io/snapshot/stargz/layer.digest`.
+The value of this annotation is the digest of the eStargz layer blob corresponding to that TOC.
+
+The following is an example layer descriptor in the TOC image.
+This layer (`sha256:64dedefd539280a5578c8b94bae6f7b4ebdbd12cb7a7df0770c4887a53d9af70`) contains the TOC JSON file (`stargz.index.json`) in the root directory and can be used for eStargz layer blob that has the digest `sha256:5da5601c1f2024c07f580c11b2eccf490cd499473883a113c376d64b9b10558f`.
+
+```json
+{
+  "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+  "digest": "sha256:64dedefd539280a5578c8b94bae6f7b4ebdbd12cb7a7df0770c4887a53d9af70",
+  "size": 154425,
+  "annotations": {
+    "containerd.io/snapshot/stargz/layer.digest": "sha256:5da5601c1f2024c07f580c11b2eccf490cd499473883a113c376d64b9b10558f"
+  }
+}
+```
+
+### Example usecase: lazy pulling with Stargz Snapshotter
+
+Stargz Snapshotter supports eStargz with external TOC.
+If an eStargz blob's footer indicates that it requires the TOC image, stargz snapshotter also pulls it from the registry.
+
+Stargz snapshotter assumes the TOC image has the reference name same as the eStargz with `-esgztoc` suffix.
+For example, if an eStargz image is named `ghcr.io/stargz-containers/ubuntu:22.04-esgz`, stargz snapshotter acquires the TOC image from `ghcr.io/stargz-containers/ubuntu:22.04-esgz-esgztoc`.
+Note that future versions of stargz snapshotter will support more ways to search the TOC image (e.g. allowing custom suffix, using OCI Reference Type, etc.)
+
+Once stargz snapshotter acquires TOC image, it tries to find the TOC corresponding to the mounting eStargz blob, by looking `containerd.io/snapshot/stargz/layer.digest` annotations.
+As describe in the above, the acquired TOC JSON is validated using `containerd.io/snapshot/stargz/toc.digest` annotation.
+
+## Example of TOC
+
+Here is an example TOC JSON:
+
+```json
+{
+  "version": 1,
+  "entries": [
+    {
+      "name": "bin/",
+      "type": "dir",
+      "modtime": "2019-08-20T10:30:43Z",
+      "mode": 16877,
+      "NumLink": 0
+    },
+    {
+      "name": "bin/busybox",
+      "type": "reg",
+      "size": 833104,
+      "modtime": "2019-06-12T17:52:45Z",
+      "mode": 33261,
+      "offset": 126,
+      "NumLink": 0,
+      "digest": "sha256:8b7c559b8cccca0d30d01bc4b5dc944766208a53d18a03aa8afe97252207521f",
+      "chunkDigest": "sha256:8b7c559b8cccca0d30d01bc4b5dc944766208a53d18a03aa8afe97252207521f"
+    },
+    {
+      "name": "lib/",
+      "type": "dir",
+      "modtime": "2019-08-20T10:30:43Z",
+      "mode": 16877,
+      "NumLink": 0
+    },
+    {
+      "name": "lib/ld-musl-x86_64.so.1",
+      "type": "reg",
+      "size": 580144,
+      "modtime": "2019-08-07T07:15:30Z",
+      "mode": 33261,
+      "offset": 512427,
+      "NumLink": 0,
+      "digest": "sha256:45c6ee3bd1862697eab8058ec0e462f5a760927331c709d7d233da8ffee40e9e",
+      "chunkDigest": "sha256:45c6ee3bd1862697eab8058ec0e462f5a760927331c709d7d233da8ffee40e9e"
+    },
+    {
+      "name": ".prefetch.landmark",
+      "type": "reg",
+      "size": 1,
+      "offset": 886633,
+      "NumLink": 0,
+      "digest": "sha256:dc0e9c3658a1a3ed1ec94274d8b19925c93e1abb7ddba294923ad9bde30f8cb8",
+      "chunkDigest": "sha256:dc0e9c3658a1a3ed1ec94274d8b19925c93e1abb7ddba294923ad9bde30f8cb8"
+    },
+... (omit) ...
+```
+
+---
+
+# Install Stargz Snapshotter and Stargz Store
+
+Source: https://github.com/containerd/stargz-snapshotter/blob/main/docs/INSTALL.md
+
+# Install Stargz Snapshotter and Stargz Store
+
+## What's Stargz Snapshotter and Stargz Store?
+
+*Stargz Snapshotter* is a plugin for containerd, which enables it to perform lazy pulling of eStargz.
+This is an implementation of *remote snapshotter* plugin and provides remotely-mounted eStargz layers to containerd.
+Communication between containerd and Stargz Snapshotter is done with gRPC over unix socket.
+For more details about Stargz Snapshotter and the relationship with containerd, [please refer to the doc](./overview.md).
+
+If you are using CRI-O/Podman, you can't use Stargz Snapshotter for enabling lazy pulling of eStargz.
+Instead, use *Stargz Store* plugin.
+This is an implementation of *additional layer store* plugin of CRI-O/Podman.
+Stargz Store provides remotely-mounted eStargz layers to CRI-O/Podman.
+
+Stargz Store exposes mounted filesystem structured like the following.
+CRI-O/Podman access to this filesystem to acquire eStargz layers.
+
+```
+<mountpoint>/base64(imageref)/<layerdigest>/
+- diff  : exposes the extracted eStargz layer
+- info  : contains JSON-formatted metadata of this layer
+- use   : files to notify the use of this layer (used for GC)
+```
+
+## Install Stargz Snapshotter for containerd with Systemd
+
+To enable lazy pulling of eStargz on containerd, you need to install *Stargz Snapshotter* plugin.
+This section shows the step to install Stargz Snapshotter with systemd.
+We assume that you are using containerd (> v1.4.2) as a CRI runtime.
+
+- Download release tarball from [the release page](https://github.com/containerd/stargz-snapshotter/releases).
+
+- Add the following configuration to containerd's configuration file (typically: /etc/containerd/config.toml). Please see also [an example configuration file](../script/config/etc/containerd/config.toml).
+  ```toml
+  version = 2
+
+  # Enable stargz snapshotter for CRI
+  [plugins."io.containerd.grpc.v1.cri".containerd]
+    snapshotter = "stargz"
+    disable_snapshot_annotations = false
+
+  # Plug stargz snapshotter into containerd
+  [proxy_plugins]
+    [proxy_plugins.stargz]
+      type = "snapshot"
+      address = "/run/containerd-stargz-grpc/containerd-stargz-grpc.sock"
+    [proxy_plugins.stargz.exports]
+      root = "/var/lib/containerd-stargz-grpc/"
+
+  ```
+
+- Install fuse
+
+  ###### centos
+  ```
+  # centos 7
+  yum install fuse
+  # centos 8
+  dnf install fuse
+
+  modprobe fuse
+  ```
+
+  ###### ubuntu
+
+  ```
+  apt-get install fuse
+  modprobe fuse
+  ```
+
+- Start stargz-snapshotter and restart containerd
+  ```
+  tar -C /usr/local/bin -xvf stargz-snapshotter-${version}-linux-${arch}.tar.gz containerd-stargz-grpc ctr-remote
+  wget -O /etc/systemd/system/stargz-snapshotter.service https://raw.githubusercontent.com/containerd/stargz-snapshotter/main/script/config/etc/systemd/system/stargz-snapshotter.service
+  systemctl enable --now stargz-snapshotter
+  systemctl restart containerd
+  ```
+
+## Install Stargz Store for CRI-O/Podman with Systemd
+
+To enable lazy pulling of eStargz on CRI-O/Podman, you need to install *Stargz Store* plugin.
+This section shows the step to install Stargz Store with systemd.
+We assume that you are using CRI-O newer than https://github.com/cri-o/cri-o/pull/4850 or Podman newer than https://github.com/containers/podman/pull/10214 .
+
+- Download release tarball from [the release page](https://github.com/containerd/stargz-snapshotter/releases).
+
+- Add the following configuration to the storage configuration file of CRI-O/Podman (typically: /etc/containers/storage.conf). Please see also [an example configuration file](../script/config-cri-o/etc/containers/storage.conf).
+  ```toml
+  [storage]
+  driver = "overlay"
+  graphroot = "/var/lib/containers/storage"
+  runroot = "/run/containers/storage"
+
+  [storage.options]
+  additionallayerstores = ["/var/lib/stargz-store/store:ref"]
+  ```
+
+- Install fuse
+
+  ###### centos
+  ```
+  # centos 7
+  yum install fuse
+  # centos 8
+  dnf install fuse
+
+  modprobe fuse
+  ```
+
+  ###### ubuntu
+
+  ```
+  apt-get install fuse
+  modprobe fuse
+  ```
+
+- Start stargz-store (CRI-O also needs to be restarted if you are using)
+  ```
+  tar -C /usr/local/bin -xvf stargz-snapshotter-${version}-linux-${arch}.tar.gz stargz-store
+  wget -O /etc/systemd/system/stargz-store.service https://raw.githubusercontent.com/containerd/stargz-snapshotter/main/script/config-cri-o/etc/systemd/system/stargz-store.service
+  systemctl enable --now stargz-store
+  systemctl restart cri-o # if you are using CRI-O
+  ```
+
+## Install Stargz Snapshotter for Docker(Moby) with Systemd
+
+- Docker(Moby) newer than [`5c1d6c957b97321c8577e10ddbffe6e01981617a`](https://github.com/moby/moby/commit/5c1d6c957b97321c8577e10ddbffe6e01981617a) is needed on your host. The commit is expected to be included in Docker v24.
+
+- Download stargz-snapshotter release tarball from [the release page](https://github.com/containerd/stargz-snapshotter/releases).
+
+- Enable `containerd-snapshotter` feature and `stargz` snapshotter in Docker. Add the following to docker's configuration file (typically: /etc/docker/daemon.json).
+  ```json
+  {
+    "features": {
+      "containerd-snapshotter": true
+    },
+    "storage-driver": "stargz"
+  }
+  ```
+
+- Enable stargz snapshotter in containerd. Add the following configuration to containerd's configuration file (typically: /etc/containerd/config.toml).
+  ```toml
+  version = 2
+
+  # Plug stargz snapshotter into containerd
+  [proxy_plugins]
+    [proxy_plugins.stargz]
+      type = "snapshot"
+      address = "/run/containerd-stargz-grpc/containerd-stargz-grpc.sock"
+    [proxy_plugins.stargz.exports]
+      root = "/var/lib/containerd-stargz-grpc/"
+  ```
+
+- Install fuse
+
+  ###### centos
+  ```
+  # centos 7
+  yum install fuse
+  # centos 8
+  dnf install fuse
+
+  modprobe fuse
+  ```
+
+  ###### ubuntu
+
+  ```
+  apt-get install fuse
+  modprobe fuse
+  ```
+
+- Start stargz-snapshotter and restart containerd and docker
+  ```
+  tar -C /usr/local/bin -xvf stargz-snapshotter-${version}-linux-${arch}.tar.gz containerd-stargz-grpc ctr-remote
+  wget -O /etc/systemd/system/stargz-snapshotter.service https://raw.githubusercontent.com/containerd/stargz-snapshotter/${version}/script/config/etc/systemd/system/stargz-snapshotter.service
+  systemctl enable --now stargz-snapshotter
+  systemctl restart containerd
+  systemctl restart docker
+  ```
+
+## Using stargz-snapshotter on Lima
+
+See [`./lima.md`](./lima.md)
+
+---
+
+# Integration of eStargz with other tools
+
+Source: https://github.com/containerd/stargz-snapshotter/blob/main/docs/integration.md
+
+# Integration of eStargz with other tools
+
+This document lists links and information about integrations of stargz-snapshotter with tools in commuinty.
+
+You can refer to [issue #258 "Tracker issue for adoption status"](https://github.com/containerd/stargz-snapshotter/issues/258) for the list of the latest status of these integrations.
+
+## Kubernetes
+
+To use stargz snapshotter on Kubernetes nodes, you need to use containerd as the CRI runtime.
+You also need to run stargz snapshotter on the node.
+
+### Kind
+
+See [`/README.md#quick-start-with-kubernetes`](/README.md#quick-start-with-kubernetes).
+
+### k3s
+
+k3s >= v1.22 supports stagz-snapshotter as an experimental feature.
+`--snapshotter=stargz` for k3s server and agent enables this feature.
+
+```
+k3s server --snapshotter=stargz
+```
+
+Refer to [k3s docs](https://docs.k3s.io/advanced#enabling-lazy-pulling-of-estargz-experimental) for more details.
+
+The following is a quick demo using [k3d](https://github.com/k3d-io/k3d) (k3s in Docker).
+
+```console
+$ k3d cluster create mycluster --k3s-arg='--snapshotter=stargz@server:*;agent:*'
+$ cat <<'EOF' | kubectl --context=k3d-mycluster apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nodejs
+spec:
+  containers:
+  - name: nodejs-stargz
+    image: ghcr.io/stargz-containers/node:17.8.0-esgz
+    command: ["node"]
+    args:
+    - -e
+    - var http = require('http');
+      http.createServer(function(req, res) {
+        res.writeHead(200);
+        res.end('Hello World!\n');
+      }).listen(80);
+    ports:
+    - containerPort: 80
+EOF
+$ kubectl --context=k3d-mycluster get po nodejs -w
+$ kubectl --context=k3d-mycluster port-forward nodejs 8080:80 &
+$ curl 127.0.0.1:8080
+Hello World!
+$ k3d cluster delete mycluster
+```
+
+### Google Kubernetes Engine
+
+There is no node image includes stargz snapshotter by default as of now so you need to manually customize the nodes.
+
+A brief instrcution of enabling stargz snapshotter is the following:
+
+- Create a Kubernetes cluster using containerd-supported Linux node images like `ubuntu_containerd`. containerd must be >= v1.4.2.
+- SSH into each node and install stargz snapshotter following [`./INSTALL.md`](./INSTALL.md#install-stargz-snapshotter-for-containerd-with-systemd). You need this installation on all worker nodes.
+- Optionally apply configuration to allow stargz-snapshotter to access private registries following [`./overview.md`](./overview.md#authentication).
+
+### Amazon Elastic Kubernetes Service
+
+There is no AMI includes stargz snapshotter by default as of now so you need to manually customize the nodes.
+
+A brief instrcution of enabling stargz snapshotter is the following:
+
+- Create a Kubernetes cluster using containerd-supported Linux AMIs. containerd must be >= v1.4.2. e.g. Amazon EKS optimized Amazon Linux AMIs with [containerd runtime bootstrap flag](https://docs.aws.amazon.com/eks/latest/userguide/eks-optimized-ami.html).
+- SSH into each node and install stargz snapshotter following [`./INSTALL.md`](./INSTALL.md#install-stargz-snapshotter-for-containerd-with-systemd). You need this installation on all worker nodes.
+- Optionally apply configuration to allow stargz-snapshotter to access private registries following [`./overview.md`](./overview.md#authentication).
+
+## CRI runtimes
+
+### containerd
+
+See [`./INSTALL.md`](./INSTALL.md#install-stargz-snapshotter-for-containerd-with-systemd)
+
+> :information_source: There is also a doc for [integration with firecracker-containerd](https://github.com/firecracker-microvm/firecracker-containerd/blob/24f1fcf99ebf6edcb94edd71a2affbcdae6b08e7/docs/remote-snapshotter-getting-started.md).
+
+### CRI-O
+
+See [`./INSTALL.md`](./INSTALL.md#install-stargz-store-for-cri-opodman-with-systemd).
+
+## High-level container engines
+
+### Docker
+
+#### Moby
+
+Moby supports lazy pulling of eStargz since [`5c1d6c957b97321c8577e10ddbffe6e01981617a`](https://github.com/moby/moby/commit/5c1d6c957b97321c8577e10ddbffe6e01981617a) .
+See [`./INSTALL.md`](./INSTALL.md#install-stargz-snapshotter-for-dockermoby-with-systemd) for details.
+
+#### Docker Desktop
+
+Docker Desktop 4.12.0 "Containerd Image Store (Beta)" uses stargz-snapshotter.
+Refer to [Docker documentation](https://docs.docker.com/desktop/containerd/).
+
+### nerdctl
+
+See the [docs in nerdctl](https://github.com/containerd/nerdctl/blob/main/docs/stargz.md).
+
+### Podman
+
+See [`./INSTALL.md`](./INSTALL.md#install-stargz-store-for-cri-opodman-with-systemd).
+
+## Image builders
+
+### BuildKit
+
+#### Building eStargz
+
+BuildKit >= v0.10 supports creating eStargz images.
+See [`README.md`](/README.md#building-estargz-images-using-buildkit) for details.
+
+#### Lazy pulling of eStargz
+
+BuildKit >= v0.8 supports stargz-snapshotter and can perform lazy pulling of eStargz-formatted base images during build.
+`--oci-worker-snapshotter=stargz` flag enables this feature.
+
+You can try this feature using Docker Buildx as the following.
+
+```
+$ docker buildx create --use --name lazy-builder --buildkitd-flags '--oci-worker-snapshotter=stargz'
+$ docker buildx inspect --bootstrap lazy-builder
+```
+
+The following is a sample Dockerfile that uses eStargz-formatted golang image (`ghcr.io/stargz-containers/golang:1.18-esgz`) as the base image.
+
+```Dockerfile
+FROM ghcr.io/stargz-containers/golang:1.18-esgz AS dev
+COPY ./hello.go /hello.go
+RUN go build -o /hello /hello.go
+
+FROM scratch
+COPY --from=dev /hello /
+ENTRYPOINT [ "/hello" ]
+```
+
+Put the following Go source code in the context directory with naming it `hello.go`.
+
+```golang
+package main
+
+import "fmt"
+
+func main() {
+	fmt.Println("Hello, world!")
+}
+```
+
+The following build performs lazy pulling of the eStargz-formatted golang base image.
+
+```console
+$ docker buildx build --load -t hello /tmp/ctx/
+$ docker run --rm hello
+Hello, world!
+```
+
+### Kaniko
+
+#### Building eStargz
+
+Kaniko >= v1.5.0 creates eStargz images when `GGCR_EXPERIMENT_ESTARGZ=1` is specified.
+See [`README.md`](/README.md#building-estargz-images-using-kaniko) for details.
+
+### ko
+
+ko >= v0.7.0 creates eStargz images when `GGCR_EXPERIMENT_ESTARGZ=1` is specified.
+Please see also [the docs in ko](https://github.com/ko-build/ko/blob/f70e3cad38c3bbd232f51604d922b8baff31144e/docs/advanced/faq.md#can-i-optimize-images-for-estargz-support).
+
+## P2P image distribution
+
+### IPFS
+
+See [`./ipfs.md`](./ipfs.md)
+
+### Dragonfly
+
+Change the `/etc/containerd-stargz-grpc/config.toml` configuration to make dragonfly as registry mirror.
+`127.0.0.1:65001` is the proxy address of dragonfly peer,
+and the `X-Dragonfly-Registry` header is the address of origin registry,
+which is provided for dragonfly to download the images.
+
+```toml
+[[resolver.host."docker.io".mirrors]]
+  host = "127.0.0.1:65001"
+  insecure = true
+  [resolver.host."docker.io".mirrors.header]
+    X-Dragonfly-Registry = ["https://index.docker.io"]
+```
+
+For more details about dragonfly as registry mirror,
+refer to [How to use Dragonfly With eStargz](https://d7y.io/docs/setup/integration/stargz/).
+
+## Registry-side conversion of eStargz
+
+### Harbor
+
+See the docs in Harbor: https://github.com/goharbor/acceleration-service
+
+---
+
+# Running containers on IPFS (experimental)
+
+Source: https://github.com/containerd/stargz-snapshotter/blob/main/docs/ipfs.md
+
+# Running containers on IPFS (experimental)
+
+:information_source: This document isn't for Kubernetes environemnt. For information about node-to-node image sharing on Kubernetes, please refer to [the docs in nerdctl project](https://github.com/containerd/nerdctl/tree/main/examples/nerdctl-ipfs-registry-kubernetes).
+
+You can run OCI-compatible container images on IPFS with lazy pulling.
+
+To enable this feature, add the following configuration to `config.toml` of Stargz Snapsohtter (typically located at `/etc/containerd-stargz-grpc/config.toml`).
+
+```toml
+ipfs = true
+```
+
+> NOTE: containerd-stargz-grpc tries to connect to IPFS API written in `~/.ipfs/api` (or the file under `$IPFS_PATH` if configured) via HTTP (not HTTPS).
+
+## IPFS-enabled OCI Image
+
+For obtaining IPFS-enabled OCI Image, each descriptor in an OCI image must contain the following [IPFS URL](https://docs.ipfs.io/how-to/address-ipfs-on-web/#native-urls) in `urls` field.
+
+```
+ipfs://<CID>
+```
+
+`<CID>` is the Base32 case-insensitive CIDv1 of the blob that the descriptor points to.
+
+An image is represented as a CID pointing to the OCI descriptor of the top-level blob of the image (i.e. image index).
+
+The following is an example OCI descriptor pointing to the image index of an IPFS-enabled image:
+
+```console
+# ipfs cat bafkreie7754qk7fl56ebauawdgfuqqa3kdd7sotvuhsm6wbz3qin6ssw3a | jq
+{
+  "mediaType": "application/vnd.oci.image.index.v1+json",
+  "digest": "sha256:80d6aec48c0a74635a5f3dc106328c1673afaa21ed6e1270a9a44de66e8ffa55",
+  "size": 314,
+  "urls": [
+    "ipfs://bafkreiea22xmjdakorrvuxz5yeddfdawoox2uipnnyjhbknejxtg5d72ku"
+  ]
+}
+```
+
+## Lazy pulling with Stargz Snapshotter
+
+If layer descriptors of an image contain the URLs described above and these blobs are formatted as eStargz, Stargz Snapshotter mounts them from IPFS to the container's rootfs using FUSE with lazy pulling support.
+Thus container can startup without waiting for the entire image contents being locally available.
+Necessary chunks of contents (e.g. each file in the rootfs) are fetched from IPFS on-demand.
+
+If the container image isn't eStargz or the snapshotter isn't Stargz Snapshotter (e.g. overlayfs snapshotter), containerd fetches the entire image contents from IPFS and unpacks it to the local directory before starting the container.
+Thus possibly you'll see slow container cold-start.
+
+## Examples
+
+This section describes some examples of storing images to IPFS and running them as containers.
+Make sure IPFS daemon runs on your node.
+For example, you can run an IPFS daemon using the following command.
+
+```
+ipfs daemon
+```
+
+:information_source: If you don't want IPFS to communicate with nodes on the internet, you can run IPFS daemon in offline mode using `--offline` flag or you can create a private IPFS network as described in Appendix 1.
+
+### Running a container with lazy pulling
+
+`ctr-remote image ipfs-push` command converts an image to IPFS-enabled eStargz and stores it to IPFS.
+
+```console
+# ctr-remote i pull ghcr.io/stargz-containers/python:3.9-org
+# ctr-remote i ipfs-push ghcr.io/stargz-containers/python:3.9-org
+bafkreie7754qk7fl56ebauawdgfuqqa3kdd7sotvuhsm6wbz3qin6ssw3a
+```
+
+The printed IPFS CID (`bafkreie7754qk7fl56ebauawdgfuqqa3kdd7sotvuhsm6wbz3qin6ssw3a`) points to an OCI descriptor which points to the image index of the added image.
+
+```console
+# ipfs cat bafkreie7754qk7fl56ebauawdgfuqqa3kdd7sotvuhsm6wbz3qin6ssw3a | jq
+{
+  "mediaType": "application/vnd.oci.image.index.v1+json",
+  "digest": "sha256:80d6aec48c0a74635a5f3dc106328c1673afaa21ed6e1270a9a44de66e8ffa55",
+  "size": 314,
+  "urls": [
+    "ipfs://bafkreiea22xmjdakorrvuxz5yeddfdawoox2uipnnyjhbknejxtg5d72ku"
+  ]
+}
+```
+
+You can run this image from IPFS using that CID as an image reference for `ctr-remote image rpull`.
+`--ipfs` option is needed for enabling this.
+
+Note that `ctr-remote` accepts an IPFS CID as the image reference but doesn't support `/ipfs`-prefixed path as of now.
+We're working on eliminating this limitation.
+
+```console
+# time ( ctr-remote i rpull --ipfs bafkreie7754qk7fl56ebauawdgfuqqa3kdd7sotvuhsm6wbz3qin6ssw3a && \
+         ctr-remote run --snapshotter=stargz --rm -t bafkreie7754qk7fl56ebauawdgfuqqa3kdd7sotvuhsm6wbz3qin6ssw3a foo python -c 'print("Hello, World!")' )
+fetching sha256:80d6aec4... application/vnd.oci.image.index.v1+json
+fetching sha256:16d36f86... application/vnd.oci.image.manifest.v1+json
+fetching sha256:236b4bd7... application/vnd.oci.image.config.v1+json
+Hello, World!
+
+real	0m1.099s
+user	0m0.047s
+sys	0m0.037s
+```
+
+### Running a container without lazy pulling
+
+Though eStargz-based lazy pulling is highly recommended for speeding up the container startup time, you can store and run non-eStargz images with IPFS as well.
+In this case, containerd fetches the entire image contents from IPFS and unpacks it to the local directory before starting the container.
+
+You can add a non-eStargz image to IPFS using `--estargz=false` option.
+
+```console
+# ctr-remote i pull ghcr.io/stargz-containers/python:3.9-org
+# ctr-remote i ipfs-push --estargz=false ghcr.io/stargz-containers/python:3.9-org
+bafkreienbir4knaofs3o5f57kqw2the2v7zdhdlzpkq346mipuopwvqhty
+```
+
+You don't need FUSE nor stargz snapshotter for running this image but will see slow container cold-start.
+This example uses overlayfs snapshotter of containerd.
+
+```console
+# time ( ctr-remote i rpull --snapshotter=overlayfs --ipfs bafkreienbir4knaofs3o5f57kqw2the2v7zdhdlzpkq346mipuopwvqhty && \
+         ctr-remote run --snapshotter=overlayfs --rm -t bafkreienbir4knaofs3o5f57kqw2the2v7zdhdlzpkq346mipuopwvqhty foo python -c 'print("Hello, World!")' )
+fetching sha256:7240ac9f... application/vnd.oci.image.index.v1+json
+fetching sha256:17dc54f4... application/vnd.oci.image.manifest.v1+json
+fetching sha256:6f1289b1... application/vnd.oci.image.config.v1+json
+fetching sha256:9476e460... application/vnd.oci.image.layer.v1.tar+gzip
+fetching sha256:64c0f10e... application/vnd.oci.image.layer.v1.tar+gzip
+fetching sha256:4c25b309... application/vnd.oci.image.layer.v1.tar+gzip
+fetching sha256:942374d5... application/vnd.oci.image.layer.v1.tar+gzip
+fetching sha256:3fff52a3... application/vnd.oci.image.layer.v1.tar+gzip
+fetching sha256:5cf06daf... application/vnd.oci.image.layer.v1.tar+gzip
+fetching sha256:419e258e... application/vnd.oci.image.layer.v1.tar+gzip
+fetching sha256:1acf5650... application/vnd.oci.image.layer.v1.tar+gzip
+fetching sha256:b95c0dd0... application/vnd.oci.image.layer.v1.tar+gzip
+Hello, World!
+
+real	0m11.320s
+user	0m0.556s
+sys	0m0.280s
+```
+
+## Appendix 1: Creating IPFS private network
+
+You can create a private IPFS network as described in the official docs.
+
+- https://github.com/ipfs/go-ipfs/blob/v0.10.0/docs/experimental-features.md#private-networks
+
+The following is the summary.
+
+First, generate a key and save it to `~/.ipfs/swarm.key` (or under `$IPFS_PATH` if configured) of nodes you want to have in the network.
+IPFS only connects to peers having this key.
+
+```
+go install github.com/Kubuxu/go-ipfs-swarm-key-gen/ipfs-swarm-key-gen@latest
+~/go/bin/ipfs-swarm-key-gen > ~/.ipfs/swarm.key
+```
+
+Select nodes as a bootstrap nodes.
+IPFS daemons learn about the peers on the private network from them.
+Configure all non-bootstrap nodes to recognize only our bootstrap nodes instead of public ones like the following example.
+
+```
+ipfs bootstrap rm --all
+ipfs bootstrap add /ip4/<ip address of bootstrap node>/tcp/4001/ipfs/<Peer ID of the bootstrap node>
+```
+
+:information_source: You can get Peer ID of a node by `ipfs config show | grep "PeerID"`.
+
+Finally, start all nodes in the private network.
+
+```
+export LIBP2P_FORCE_PNET=1
+ipfs daemon
+```
+
+`LIBP2P_FORCE_PNET=1` makes sure that the daemon uses the private network and fails if the private network isn't configured.
+
+---
+
+# Getting started with Stargz Snapshotter on Lima
+
+Source: https://github.com/containerd/stargz-snapshotter/blob/main/docs/lima.md
+
+# Getting started with Stargz Snapshotter on Lima
+
+[Lima](https://github.com/lima-vm/lima) is a tool to manage Linux virtual machines on various hosts, including MacOS and Linux.
+Lima can be used as an easy way to get started with Stargz Snapshotter as Lima provides a default VM image bundling [containerd](https://github.com/containerd/containerd), [nerdctl](https://github.com/containerd/nerdctl)(Docker-compatible CLI of containerd) and Stargz Snapshotter.
+
+This document describes how to get started with Stargz Snapshotter on Lima.
+
+## Enable Stargz Snapshotter using `--snapshotter=stargz` flag
+
+nerdctl's `--snapshotter=stargz` flag enables stargz-snapshotter.
+
+```
+$ nerdctl.lima --snapshotter=stargz system info | grep stargz
+ Storage Driver: stargz
+```
+
+Using this flag, you can perform lazy pulling of a python eStargz image and run it.
+
+```
+$ nerdctl.lima --snapshotter=stargz run --rm -it --name python ghcr.io/stargz-containers/python:3.13-esgz
+Python 3.13.2 (main, Feb  6 2025, 22:37:13) [GCC 12.2.0] on linux
+Type "help", "copyright", "credits" or "license" for more information.
+>>>
+```
+
+## Use Stargz Snapshotter as the default snapshotter
+
+nerdctl recognizes an environment variable `CONTAINERD_SNAPSHOTTER` for the snapshotter to use.
+You can add this environment variable to the VM by configuring Lima config as shown in the following:
+
+```
+$ cat <<EOF >> ~/.lima/_config/override.yaml
+env:
+  CONTAINERD_SNAPSHOTTER: stargz
+EOF
+$ limactl stop
+$ limactl start
+$ nerdctl.lima system info | grep Storage
+Storage Driver: stargz
+```
+
+> NOTE: `override.yaml` applies to all the instances of Lima
+
+
+You can perform lazy pulling of eStargz using nerdctl, without any extra flags.
+
+```
+$ nerdctl.lima run --rm -it --name python ghcr.io/stargz-containers/python:3.13-esgz
+Python 3.13.2 (main, Feb  6 2025, 22:37:13) [GCC 12.2.0] on linux
+Type "help", "copyright", "credits" or "license" for more information.
+>>>
+```
+
+---
+
+# Containerd Stargz Snapshotter Plugin Overview
+
+Source: https://github.com/containerd/stargz-snapshotter/blob/main/docs/overview.md
+
+# Containerd Stargz Snapshotter Plugin Overview
+
+__Before reading this overview document, we recommend you read [README](../README.md).__
+
+Pulling images is one of the most time-consuming steps in the container startup process.
+In the containerd community, we have had a lot of discussions to address this issue at the following:
+
+- [#3731 Support remote snapshotter to speed up image pulling](https://github.com/containerd/containerd/issues/3731)
+- [#2968 Support `Prepare` for existing snapshots in Snapshotter interface](https://github.com/containerd/containerd/issues/2968)
+- [#2943 remote filesystem snapshotter](https://github.com/containerd/containerd/issues/2943)
+
+The solution for fast image distribution is called *Remote Snapshotter* plugin.
+This prepares the container's rootfs layers by directly mounting from remote stores instead of downloading and unpacking the entire image contents.
+The actual image contents can be fetched *lazily* so runtimes can start containers before the entire image contents are locally available.
+We call these remotely mounted layers *remote snapshots*.
+
+*Stargz Snapshotter* is a remote snapshotter plugin implementation which supports standard compatible remote snapshots functionality.
+This snapshotter leverages [eStargz](/docs/stargz-estargz.md) image, which is lazily-pullable and still standard-compatible.
+Because of this compatibility, eStargz images can be pushed to and lazily pulled from [OCI](https://github.com/opencontainers/distribution-spec)/[Docker](https://docs.docker.com/registry/spec/api/) registries (e.g. ghcr.io).
+Furthermore, images can run even on eStargz-agnostic runtimes (e.g. Docker).
+When you run a container image and it is formatted by eStargz, stargz snapshotter prepares container's rootfs layers as remote snapshots by mounting layers from the registry to the node, instead of pulling the entire image contents.
+
+This document gives you a high-level overview of stargz snapshotter.
+
+![overview](/docs/images/overview01.png)
+
+## Stargz Snapshotter proxy plugin
+
+Stargz snapshotter is implemented as a [proxy plugin](https://github.com/containerd/containerd/blob/04985039cede6aafbb7dfb3206c9c4d04e2f924d/PLUGINS.md#proxy-plugins) daemon (`containerd-stargz-grpc`) for containerd.
+When containerd starts a container, it queries the rootfs snapshots to stargz snapshotter daemon through a unix socket.
+This snapshotter remotely mounts queried eStargz layers from registries to the node and provides these mount points as remote snapshots to containerd.
+
+Containerd recognizes this plugin through a unix socket specified in the configuration file (e.g. `/etc/containerd/config.toml`).
+Stargz snapshotter can also be used through Kubernetes CRI by specifying the snapshotter name in the CRI plugin configuration.
+We assume that you are using containerd (> v1.4.2).
+
+```toml
+version = 2
+
+# Plug stargz snapshotter into containerd
+# Containerd recognizes stargz snapshotter through specified socket address.
+# The specified address below is the default which stargz snapshotter listen to.
+[proxy_plugins]
+  [proxy_plugins.stargz]
+    type = "snapshot"
+    address = "/run/containerd-stargz-grpc/containerd-stargz-grpc.sock"
+  [proxy_plugins.stargz.exports]
+    root = "/var/lib/containerd-stargz-grpc/"
+
+# Use stargz snapshotter through CRI
+[plugins."io.containerd.grpc.v1.cri".containerd]
+  snapshotter = "stargz"
+  disable_snapshot_annotations = false
+```
+
+> NOTE: `root` field of `proxy_plugins` is needed for the CRI plugin to recognize stargz snapshotter's root directory.
+
+This repo contains [a Dockerfile as a KinD node image](/Dockerfile) which includes the above configuration.
+
+## State directory
+
+Stargz snapshotter mounts eStargz layers from registries to the node using FUSE.
+Metadata for all files in the image are preserved on the container filesystem and the file contents are fetched from registries on demand.
+
+At the root of the container filesystem, there is a *state directory* (`/.stargz-snapshotter`) for status monitoring for the filesystem.
+This directory is hidden from `getdents(2)` so you can't see this with `ls -a /`.
+Instead, you can directly access the directory by specifying the path (`/.stargz-snapshotter`).
+
+The state directory contains JSON-formatted metadata files for each layer.
+In the following example, metadata JSON files for overlayed 7 layers are visible.
+In each metadata JSON file, the following fields are contained:
+
+- `digest` contains the layer digest. This is the same value as that in the image's manifest.
+- `size` is the size bytes of the layer.
+- `fetchedSize` and `fetchedPercent` indicate how many bytes have been fetched for this layer. Stargz snapshotter aggressively downloads this layer in the background - unless configured otherwise - so these values gradually increase. When `fetchedPercent` reaches `100` percent, this layer has been fully downloaded on the node and no further access will occur for reading files.
+
+Note that the state directory layout and the metadata JSON structure are subject to change.
+
+```console
+# ctr-remote run --rm -t --snapshotter=stargz docker.io/stargz/golang:1.12.9-esgz test /bin/bash
+root@1d43741b8d29:/go# ls -a /
+.   bin   dev  go    lib    media  opt     root  sbin  sys  usr
+..  boot  etc  home  lib64  mnt    proc  run   srv   tmp  var
+root@1d43741b8d29:/go# ls /.stargz-snapshotter/*
+/.stargz-snapshotter/sha256:2b1fc65cafe05b65acc9e9f186df4dd81ae74c58ef73d89ecfc15e7286b3e960.json
+/.stargz-snapshotter/sha256:42d56485c1f672e394a02855048774621731c8fd44a54dc816a421a3a52b8482.json
+/.stargz-snapshotter/sha256:6a5826d877de5c93fb4a9e1d0369cfdef6d43df2610562501ebf42e4bcb2ef73.json
+/.stargz-snapshotter/sha256:a4d35801573274df19d9c2ae2aed80eba96d5aa69a38c464e1f01f9abf81e34e.json
+/.stargz-snapshotter/sha256:ab13100112faac6e04d2da2281db3df942efc8cef2532ab2cac688c6232944d8.json
+/.stargz-snapshotter/sha256:e8cc31024eb09fe216ad906392aec139038330c6d29dfd3fe5c81c4b2dd21430.json
+/.stargz-snapshotter/sha256:f077511be7d385c17ba88980379c5cd0aab7068844dffa7a1cefbf68cc3daea3.json
+root@1d43741b8d29:/go# cat /.stargz-snapshotter/*
+{"digest":"sha256:2b1fc65cafe05b65acc9e9f186df4dd81ae74c58ef73d89ecfc15e7286b3e960","size":131339690,"fetchedSize":7939690,"fetchedPercent":6.045156646859757}
+{"digest":"sha256:42d56485c1f672e394a02855048774621731c8fd44a54dc816a421a3a52b8482","size":10047608,"fetchedSize":2047608,"fetchedPercent":20.379059374131632}
+{"digest":"sha256:6a5826d877de5c93fb4a9e1d0369cfdef6d43df2610562501ebf42e4bcb2ef73","size":54352828,"fetchedSize":2302828,"fetchedPercent":4.236813584014432}
+{"digest":"sha256:a4d35801573274df19d9c2ae2aed80eba96d5aa69a38c464e1f01f9abf81e34e","size":70359295,"fetchedSize":2259295,"fetchedPercent":3.211082487395588}
+{"digest":"sha256:ab13100112faac6e04d2da2281db3df942efc8cef2532ab2cac688c6232944d8","size":7890588,"fetchedSize":2140588,"fetchedPercent":27.12837116828302}
+{"digest":"sha256:e8cc31024eb09fe216ad906392aec139038330c6d29dfd3fe5c81c4b2dd21430","size":52934435,"fetchedSize":2634435,"fetchedPercent":4.976788738748227}
+{"digest":"sha256:f077511be7d385c17ba88980379c5cd0aab7068844dffa7a1cefbf68cc3daea3","size":580,"fetchedSize":580,"fetchedPercent":100}
+```
+
+## Fuse Manager
+
+The fuse manager is designed to maintain the availability of running containers by managing the lifecycle of FUSE mountpoints independently from the stargz snapshotter.
+
+### Fuse Manager Overview
+Remote snapshots are mounted using FUSE, and its filesystem processes are attached to the stargz snapshotter. If the stargz snapshotter restarts (due to configuration changes or crashes), all filesystem processes will be killed and restarted, which causes the remount of FUSE mountpoints, making running containers unavailable.
+
+To avoid this, we use a fuse daemon called the fuse manager to handle filesystem processes. The fuse manager is responsible for mounting and unmounting remote snapshotters. Its process is detached from the stargz snapshotter main process to an independent one in a shim-like way during the snapshotter's startup. This design ensures that the restart of the snapshotter won't affect the filesystem processes it manages, keeping mountpoints and running containers available during the restart. However, it is important to note that the restart of the fuse manager itself triggers a remount, so it is recommended to keep the fuse manager running in a good state.
+
+You can enable the fuse manager by adding the following configuration.
+
+```toml
+[fuse_manager]
+enable = true
+# address must be an absolute path; default is "/run/containerd-stargz-grpc/fuse-manager.sock"
+address = "/run/containerd-stargz-grpc/fuse-manager.sock"
+# set a custom binary path if the executable is not in PATH
+path = "/usr/local/bin/stargz-fuse-manager"
+```
+
+## Killing and restarting Stargz Snapshotter
+
+Stargz Snapshotter works as a FUSE server for the snapshots.
+When you stop Stargz Sanpshotter on the node, it takes the following behaviour depending on the configuration.
+
+### FUSE manager mode is disabled
+
+killing containerd-stargz-grpc will result in unmounting all snapshot mounts managed by Stargz Snapshotter.
+When containerd-stargz-grpc is restarted, all those snapshots are mounted again by lazy pulling all layers.
+If the snapshotter fails to mount one of the snapshots (e.g. because of lazy pulling failure) during this step, the behaviour differs depending on `allow_invalid_mounts_on_restart` flag in the config TOML.
+
+- `allow_invalid_mounts_on_restart = true`: containerd-stargz-grpc leaves the failed snapshots as empty directories. The user needs to manually remove those snapshot via containerd (e.g. using `ctr snapshot rm` command). The name of those snapshots can be seen in the log with `failed to restore remote snapshot` message.
+
+- `allow_invalid_mounts_on_restart = false`: containerd-stargz-grpc doesn't start. The user needs to manually recover this (e.g. by wiping snapshotter and containerd state).
+
+### FUSE manager mode is enabled
+
+Killing containerd-stargz-grpc using non-SIGINT signal (e.g. using SIGTERM) doesn't affect the snapshot mounts because the FUSE manager process detached from containerd-stargz-grpc keeps on serving FUSE mounts to the kernel.
+This is useful when you reload the updated config TOML to Stargz Snapshotter without unmounting existing snapshots.
+
+FUSE manager serves FUSE mounts of the snapshots so if you kill this process, all snapshot mounts will be unavailable.
+When stopping FUSE manager for upgrading the binary or restarting the node, you can use SIGINT signal to trigger the graceful exit as shown in the following steps.
+
+1. Stop containers that use Stargz Snapshotter. Stopping FUSE manager makes all snapshot mounts unavailable so containers can't keep working.
+2. Stop containerd-stargz-grpc process using SIGINT. This signal triggers unmounting of all snapshots and cleaning up of the associated resources.
+3. Kill the FUSE manager process (`stargz-fuse-manager`)
+4. Restart the containerd-stargz-grpc process. This restores all snapshot mounts by lazy pulling them. `allow_invalid_mounts_on_restart` (described in the above) can still be used for controlling the behaviour of the error cases.
+5. Restart the containers.
+
+### Unexpected restart handling
+
+When Stargz Snapshotter is killed unexpectedly (e.g., by OOM killer or system crash), the process doesn't get a chance to perform graceful cleanup. In such cases, the snapshotter can successfully restart and restore remote snapshots, but this may lead to the temporary cache directories having duplicating cached data.
+
+**Recommended handling:**
+
+Since this scenario is caused by abnormal exit, users are expected to manually clean up the cache directories (`/var/lib/containerd-stargz-grpc/stargz/fscache` and `/var/lib/containerd-stargz-grpc/stargz/httpcache`) after an unexpected restart to avoid cache duplication issues. The cache cleanup should be performed before restarting the snapshotter service.
+
+## Registry-related configuration
+
+You can configure stargz snapshotter for accessing registries with custom configurations.
+The config file must be formatted with TOML and can be passed to stargz snapshotter with `--config` option.
+
+### Authentication
+
+Stargz snapshotter doesn't share private registries creds with containerd.
+Instead, this supports authentication in the following methods,
+
+- Using `$DOCKER_CONFIG` or `~/.docker/config.json`
+- Proxying and scanning CRI Image Service API
+- Using Kubernetes secrets (type = `kubernetes.io/dockerconfigjson`)
+
+#### dockerconfig-based authentication
+
+By default, This snapshotter tries to get creds from `$DOCKER_CONFIG` or `~/.docker/config.json`.
+Following example enables stargz snapshotter to access to private registries using `docker login` command. [`nerdctl login`](https://github.com/containerd/nerdctl) can also be used for this.
+Stargz snapshotter doesn't share credentials with containerd so credentials specified by `ctr-remote`'s `--user` option in the example is just for containerd.
+
+```console
+# docker login
+(Enter username and password)
+# ctr-remote image rpull --user <username>:<password> docker.io/<your-repository>/ubuntu:18.04
+```
+
+#### CRI-based authentication
+
+Following configuration (typically located at `/etc/containerd-stargz-grpc/config.toml`) enables stargz snapshotter to pull private images on Kubernetes.
+The snapshotter works as a proxy of CRI Image Service and exposes CRI Image Service API on the snapshotter's unix socket (i.e. `/run/containerd-stargz-grpc/containerd-stargz-grpc.sock`).
+The snapshotter acquires registry creds by scanning requests.
+
+You must specify `--image-service-endpoint=unix:///run/containerd-stargz-grpc/containerd-stargz-grpc.sock` option to kubelet.
+
+You can specify the backing image service's socket using `image_service_path`.
+The default is the containerd's socket (`/run/containerd/containerd.sock`).
+
+```toml
+# Stargz Snapshotter proxies CRI Image Service into containerd socket.
+[cri_keychain]
+enable_keychain = true
+image_service_path = "/run/containerd/containerd.sock"
+```
+
+The default path where containerd-stargz-grpc serves the CRI Image Service API is `unix:///run/containerd-stargz-grpc/containerd-stargz-grpc.sock`.
+You can also change this path using `listen_path` field.
+
+> Note that if you enabled the FUSE manager and CRI-based authentication together, `listen_path` is a mandatory field with some caveats:
+> - This path must be different from the FUSE manager's socket path (`/run/containerd-stargz-grpc/fuse-manager.sock`) because they have different lifecycle. Specifically, the CRI socket is recreted on each reload of the configuration to the FUSE manager.
+> - containerd-stargz-grpc's socket path (`/run/containerd-stargz-grpc/containerd-stargz-grpc.sock`) can't be used as `listen_path` because the CRI socket is served by the FUSE manager process (not containerd-stargz-grpc process).
+
+#### kubeconfig-based authentication
+
+This is another way to enable lazy pulling of private images on Kubernetes.
+
+Following configuration (typically located at `/etc/containerd-stargz-grpc/config.toml`) enables stargz snapshotter to access to private registries using kubernetes secrets (type = `kubernetes.io/dockerconfigjson`) in the cluster using kubeconfig files.
+You can specify the path of kubeconfig file using `kubeconfig_path` option.
+It's no problem that the specified file doesn't exist when this snapshotter starts.
+In this case, snapsohtter polls the file until actually provided.
+This is useful for some environments (e.g. single node cluster with containerized apiserver) where stargz snapshotter needs to start before everything, including booting containerd/kubelet/apiserver and configuring users/roles.
+If no `kubeconfig_path` is specified, snapshotter searches kubeconfig files from `$KUBECONFIG` or `~/.kube/config`.
+
+```toml
+# Use Kubernetes secrets accessible by the kubeconfig `/etc/kubernetes/snapshotter/config.conf`.
+[kubeconfig_keychain]
+enable_keychain = true
+kubeconfig_path = "/etc/kubernetes/snapshotter/config.conf"
+```
+
+Please note that kubeconfig-based authentication requires additional privilege (i.e. kubeconfig to list/watch secrets) to the node.
+And this doesn't work if kubelet retrieve creds from somewhere not API server (e.g. [credential provider](https://kubernetes.io/docs/tasks/kubelet-credential-provider/kubelet-credential-provider/)).
+
+### Registry mirrors and insecure connection
+
+The hostname used as a mirror host can be specified using `host` option.
+If an optional field `insecure` is `true`, snapshotter tries to connect to the registry using plain HTTP instead of HTTPS.
+`request_timeout_sec` can also be specified for each mirror to override the global setting.
+
+```toml
+# Use `mirrorhost.io` as a mirrored host of `exampleregistry.io` and
+# use plain HTTP for connecting to the mirror host.
+[[resolver.host."exampleregistry.io".mirrors]]
+host = "mirrorhost.io"
+insecure = true
+request_timeout_sec = 60
+
+# Use plain HTTP for connecting to `exampleregistry.io`.
+[[resolver.host."exampleregistry.io".mirrors]]
+host = "exampleregistry.io"
+insecure = true
+```
+
+`header` field allows to set headers to send to the server.
+
+```toml
+[[resolver.host."registry2:5000".mirrors]]
+  host = "registry2:5000"
+  [resolver.host."registry2:5000".mirrors.header]
+    x-custom-2 = ["value3", "value4"]
+```
+
+> NOTE: Headers aren't passed to the redirected location.
+
+### Request timeout
+
+You can configure the default timeout for each request to the registry.
+The global `request_timeout_sec` field under `[resolver]` sets the default timeout (in seconds). If not specified, the default value is 30 seconds.
+
+```toml
+[resolver]
+request_timeout_sec = 300
+```
+
+The config file can be passed to stargz snapshotter using `containerd-stargz-grpc`'s `--config` option.
+
+## Metadata store
+
+Stargz Snapshotter supports 2 ways to store the filesystem's metadata (e.g. each file's type, size, mode, etc.).
+
+- `memory` (default): The metadata is stored in memory. The memory consumption increases as the number of images managed by Stargz Snapshotter increases. It has lower latency on container creation and metadata lookup.
+- `db`: The metadata is stored on disk. Lower memory consumption can be expected at the expence of disk overhead on storing and looking up of each file's metadata.
+
+If stargz-snapshotter's memory consumption is too large because of the `memory` mode of the metadata store, consider enabling the `db` mode. For example, the following conifguration enables the `db` mode.
+
+```toml
+metadata_store = "db"
+```
+
+## Make your remote snapshotter
+
+It isn't difficult for you to implement your remote snapshotter using [our general snapshotter package](/snapshot) without considering the protocol between that and containerd.
+You can configure the remote snapshotter with your `FileSystem` structure which you want to use as a backend filesystem.
+[Our snapshotter command](/cmd/containerd-stargz-grpc/main.go) is a good example for the integration.
+
+---
+
+# Introduction
+
+Source: https://github.com/containerd/stargz-snapshotter/blob/main/docs/passthrough.md
+
+# Introduction
+
+FUSE Passthrough has been introduced in the Linux kernel version 6.9 ([Linux Kernel Commit](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=6ce8b2ce0d7e3a621cdc9eb66d74436ca7d0e66e)). This feature has shown significant performance improvements, as detailed in the following articles:
+
+[Phoronix Article on FUSE Passthrough](https://www.phoronix.com/news/FUSE-Passthrough-In-6.9-Next)<br>
+
+FUSE Passthrough allows performing read and write (also via memory maps) on a backing file without incurring the overhead of roundtrips to userspace.
+
+![passhthrough feature](/docs/images/passthrough01.png)
+
+Additionally, the `go-fuse` package, which Stargz-Snapshotter depends on, has also added support for this passthrough feature:
+
+[go-fuse Commit 1](https://github.com/hanwen/go-fuse/commit/e0641a46c6cca7e5370fc135f78caf7cb7fc3aa8#diff-f830ac3db25844bf71102b09e4e02f7213e9cdb577b32745979d61d775462bd3R157)<br>
+[go-fuse Commit 2](https://github.com/hanwen/go-fuse/commit/e0a0b09ae8287249c38033a27fd69a3593c7e235#diff-1521152f1fc3600273bda897c669523dc1e9fc9cbe24046838f043a8040f0d67R749)<br>
+[go-fuse Commit 3](https://github.com/hanwen/go-fuse/commit/1a7d98b0360f945fca50ac79905332b7106c049f)
+
+When a user-defined file implements the `FilePassthroughFder` interface, `go-fuse` will attempt to register the file `fd` from the file with the kernel.
+
+# Configuration
+
+## Basic Configuration
+
+To enable FUSE passthrough mode, first verify that your host's kernel supports this feature. You can check this by running the following command:
+
+```bash
+$ cat /boot/config-$(uname -r) | grep "CONFIG_FUSE_PASSTHROUGH=y"
+CONFIG_FUSE_PASSTHROUGH=y
+```
+
+Once you have confirmed kernel support, you need to enable passthrough mode in your `config.toml` file with the following configuration:
+
+```toml
+[fuse]
+passthrough = true
+```
+
+After updating the configuration, specify the `config.toml` file when starting `containerd-stargz-grpc` and restart the service:
+
+```bash
+$ containerd-stargz-grpc -config config.toml
+```
+
+## Advanced Configuration
+
+In passthrough mode, the initial pull of an image requires merging chunks into a file. This process can be time-consuming, especially for large files.
+
+To optimize the time taken for the initial image pull, you can use the `merge_buffer_size` and `merge_worker_count` configuration options. The `merge_buffer_size` specifies the size of the buffer used for reading the image, with a default value of 400MB. The `merge_worker_count` determines the level of concurrency for reading the image, with a default value of 10.
+
+By concurrently reading chunks and caching them for batch writing, you can significantly enhance the performance of the initial image pull in passthrough mode.
+
+# Important Considerations
+
+When passthrough mode is enabled, the following configuration is applied by default, even if it is set to false in the configuration file:
+
+```toml
+[directory_cache]
+direct = true
+```
+
+This is because, in passthrough mode, read operations after opening a file are handled directly by the kernel.
+
+---
+
+# Trying pre-converted images
+
+Source: https://github.com/containerd/stargz-snapshotter/blob/main/docs/pre-converted-images.md
+
+# Trying pre-converted images
+
+We have several pre-converted stargz images on Github Container Registry (`ghcr.io/stargz-containers`), mainly for benchmarking purpose.
+This document lists them.
+
+:information_source: You can build eStargz from Dockerfile using BuildKit, [using Docker Buildx](../README.md#building-estargz-images-using-buildkit) or [Kaniko](../README.md#building-estargz-images-using-kaniko).
+
+:information_source: You can convert arbitrary images into eStargz optimized for your workload, using [`ctr-remote` command](/docs/ctr-remote.md).
+
+:information_source: You can convert arbitrary images into eStargz on the registry-side, using [`estargz.kontain.me`](https://estargz.kontain.me).
+
+## Pre-converted images
+
+:information_source: You can request new pre-converted images from our CI repository ([`github.com/stargz-containers/image-ci`](https://github.com/stargz-containers/image-ci)).
+
+In the following table, image names listed in `Image Name` contain the following suffixes based on the type of the image.
+
+- `org`: Legacy image copied from `docker.io/library` without optimization. Layers are normal tarballs.
+- `esgz`: eStargz-formatted version of the `org` images. `ctr-remote images optimize` command is used for the optimization.
+
+`Optimized Workload` column describes workloads used for building `esgz` images. We optimized these images for benchmarking which is based on [HelloBench](https://github.com/Tintri/hello-bench) so we specified "hello-world"-like workloads for the command. See [benchmarking script](/script/benchmark/hello-bench/src/hello.py) for the exact command option specified for `ctr-remote images optimize`. 
+
+|Image Name|Optimized Workload|
+---|---
+|`ghcr.io/stargz-containers/alpine:3.15.3-org`|Executing `echo hello` on the shell|
+|`ghcr.io/stargz-containers/alpine:3.15.3-esgz`|Executing `echo hello` on the shell|
+|`ghcr.io/stargz-containers/drupal:9.3.9-org`|Code execution until up and ready message (`apache2 -D FOREGROUND`) is printed|
+|`ghcr.io/stargz-containers/drupal:9.3.9-esgz`|Code execution until up and ready message (`apache2 -D FOREGROUND`) is printed|
+|`ghcr.io/stargz-containers/fedora:35-org`|Executing `echo hello` on the shell|
+|`ghcr.io/stargz-containers/fedora:35-esgz`|Executing `echo hello` on the shell|
+|`ghcr.io/stargz-containers/gcc:11.2.0-org`|Compiling and executing a program which prints `hello`|
+|`ghcr.io/stargz-containers/gcc:11.2.0-esgz`|Compiling and executing a program which prints `hello`|
+|`ghcr.io/stargz-containers/golang:1.18-org`|Compiling and executing a program which prints `hello`|
+|`ghcr.io/stargz-containers/golang:1.18-esgz`|Compiling and executing a program which prints `hello`|
+|`ghcr.io/stargz-containers/jenkins:2.60.3-org`|Code execution until up and ready message (`Jenkins is fully up and running`) is printed|
+|`ghcr.io/stargz-containers/jenkins:2.60.3-esgz`|Code execution until up and ready message (`Jenkins is fully up and running`) is printed|
+|`ghcr.io/stargz-containers/jruby:9.3.4-org`|Printing `hello`|
+|`ghcr.io/stargz-containers/jruby:9.3.4-esgz`|Printing `hello`|
+|`ghcr.io/stargz-containers/node:17.8.0-org`|Printing `hello`|
+|`ghcr.io/stargz-containers/node:17.8.0-esgz`|Printing `hello`|
+|`ghcr.io/stargz-containers/perl:5.34.1-org`|Printing `hello`|
+|`ghcr.io/stargz-containers/perl:5.34.1-esgz`|Printing `hello`|
+|`ghcr.io/stargz-containers/php:8.1.4-org`|Printing `hello`|
+|`ghcr.io/stargz-containers/php:8.1.4-esgz`|Printing `hello`|
+|`ghcr.io/stargz-containers/pypy:3.9-org`|Printing `hello`|
+|`ghcr.io/stargz-containers/pypy:3.9-esgz`|Printing `hello`|
+|`ghcr.io/stargz-containers/python:3.10-org`|Printing `hello`|
+|`ghcr.io/stargz-containers/python:3.10-esgz`|Printing `hello`|
+|`ghcr.io/stargz-containers/r-base:4.1.3-org`|Printing `hello`|
+|`ghcr.io/stargz-containers/r-base:4.1.3-esgz`|Printing `hello`|
+|`ghcr.io/stargz-containers/redis:6.2.6-org`|Code execution until up and ready message (`Ready to accept connections`) is printed|
+|`ghcr.io/stargz-containers/redis:6.2.6-esgz`|Code execution until up and ready message (`Ready to accept connections`) is printed|
+|`ghcr.io/stargz-containers/rethinkdb:2.4.1-org`|Code execution until up and ready message (`Server ready`) is printed|
+|`ghcr.io/stargz-containers/rethinkdb:2.4.1-esgz`|Code execution until up and ready message (`Server ready`) is printed|
+|`ghcr.io/stargz-containers/tomcat:10.1.0-jdk17-openjdk-bullseye-org`|Code execution until up and ready message (`Server startup`) is printed|
+|`ghcr.io/stargz-containers/tomcat:10.1.0-jdk17-openjdk-bullseye-esgz`|Code execution until up and ready message (`Server startup`) is printed|
+|`ghcr.io/stargz-containers/postgres:14.2-org`|Code execution until up and ready message (`database system is ready to accept connections`) is printed|
+|`ghcr.io/stargz-containers/postgres:14.2-esgz`|Code execution until up and ready message (`database system is ready to accept connections`) is printed|
+|`ghcr.io/stargz-containers/wordpress:5.9.2-org`|Code execution until up and ready message (`apache2 -D FOREGROUND`) is printed|
+|`ghcr.io/stargz-containers/wordpress:5.9.2-esgz`|Code execution until up and ready message (`apache2 -D FOREGROUND`) is printed|
+|`ghcr.io/stargz-containers/mariadb:10.7.3-org`|Code execution until up and ready message (`mysqld: ready for connections`) is printed|
+|`ghcr.io/stargz-containers/mariadb:10.7.3-esgz`|Code execution until up and ready message (`mysqld: ready for connections`) is printed|
+|`ghcr.io/stargz-containers/php:8.1.4-apache-bullseye-org`|Code execution until up and ready message (`apache2 -D FOREGROUND`) is printed|
+|`ghcr.io/stargz-containers/php:8.1.4-apache-bullseye-esgz`|Code execution until up and ready message (`apache2 -D FOREGROUND`) is printed|
+|`ghcr.io/stargz-containers/rabbitmq:3.9.14-org`|Code execution until up and ready message (`Server startup complete`) is printed|
+|`ghcr.io/stargz-containers/rabbitmq:3.9.14-esgz`|Code execution until up and ready message (`Server startup complete`) is printed|
+|`ghcr.io/stargz-containers/elasticsearch:8.1.1-org`|Code execution until up and ready message (`started`) is printed|
+|`ghcr.io/stargz-containers/elasticsearch:8.1.1-esgz`|Code execution until up and ready message (`started`) is printed|
+|`ghcr.io/stargz-containers/nixos/nix:2.3.12-org`|Executing `echo hello` on the shell|
+|`ghcr.io/stargz-containers/nixos/nix:2.3.12-esgz`|Executing `echo hello` on the shell|
+
+## lazy-pulling-enabled KinD node image
+
+You can enable lazy pulling of eStargz on [KinD](https://github.com/kubernetes-sigs/kind) using our prebuilt node image [`ghcr.io/containerd/stargz-snapshotter:${VERSION}-kind`](https://github.com/orgs/containerd/packages/container/package/stargz-snapshotter) namespace.
+
+Example:
+
+```console
+$ kind create cluster --name stargz-demo --image ghcr.io/containerd/stargz-snapshotter:0.12.1-kind
+```
+
+Please refer to README for more details.
+
+---
+
+# Rootless execution of stargz snapshotter
+
+Source: https://github.com/containerd/stargz-snapshotter/blob/main/docs/rootless.md
+
+# Rootless execution of stargz snapshotter
+
+This document lists links and information about how to run Stargz Snapshotter and Stargz Store from the non-root user.
+
+## nerdctl (Stargz Snapshotter)
+
+Rootless Stargz Snapshotter for nerdctl can be installed via `containerd-rootless-setuptool.sh install-stargz` command.
+Please see [the doc in nerdctl repo](https://github.com/containerd/nerdctl/blob/v1.1.0/docs/rootless.md#stargz-snapshotter) for details.
+
+## Podman (Stargz Store)
+
+> NOTE: This is an experimental configuration leveraging [`podman unshare`](https://docs.podman.io/en/latest/markdown/podman-unshare.1.html). Limitation: `--uidmap` of `podman run` doesn't work.
+
+First, allow podman using Stargz Store by adding the following store configuration.
+Put the configuration file to [`/etc/containers/storage.conf` or `$HOME/.config/containers/storage.conf`](https://github.com/containers/podman/blob/v4.3.1/docs/tutorials/rootless_tutorial.md#storageconf).
+
+> NOTE: Replace `/path/to/home` to the actual home directory.
+
+```
+[storage]
+driver = "overlay"
+
+[storage.options]
+additionallayerstores = ["/path/to/homedir/.local/share/stargz-store/store:ref"]
+```
+
+Start Stargz Store in the namespace managed by podman via [`podman unshare`](https://docs.podman.io/en/latest/markdown/podman-unshare.1.html) command.
+
+```
+$ podman unshare stargz-store --root $HOME/.local/share/stargz-store/data $HOME/.local/share/stargz-store/store &
+```
+
+Podman performs lazy pulling when it pulls eStargz images.
+
+```
+$ podman pull ghcr.io/stargz-containers/python:3.9-esgz
+```
+
+<details>
+<summary>Creating systemd unit file for Stargz Store</summary>
+
+It's possible to create systemd unit file of Stargz Store for easily managing it.
+An example systemd unit file can be found [here](../script/podman/config/podman-rootless-stargz-store.service)
+
+After installing that file (e.g. to `$HOME/.config/systemd/user/`), start the service using `systemctl`.
+
+```
+$ systemctl --user start podman-rootless-stargz-store
+```
+
+</details>
+
+## BuildKit (Stargz Snapshotter)
+
+BuildKit supports running Stargz Snapshotter from the non-root user.
+Please see [the doc in BuildKit repo](https://github.com/moby/buildkit/blob/8b132188aa7af944c813d02da63c93308d83cf75/docs/stargz-estargz.md) (unmerged 2023/1/18) for details.
+
+---
+
+# Creating smaller eStargz images
+
+Source: https://github.com/containerd/stargz-snapshotter/blob/main/docs/smaller-estargz.md
+
+# Creating smaller eStargz images
+
+The following flags of `ctr-remote i convert` and `ctr-remote i optimize` allow users optionally creating smaller eStargz images.
+
+- `--estargz-external-toc`: Separate TOC JSON into another image (called "TOC image"). The result eStargz doesn't contain TOC so we can expect a smaller size than normal eStargz.
+
+- `--estargz-min-chunk-size`: The minimal number of bytes of data must be written in one gzip stream. If it's > 0, multiple files and chunks can be written into one gzip stream. Smaller number of gzip header and smaller size of the result blob can be expected. `--estargz-min-chunk-size=0` produces normal eStargz.
+
+## `--estargz-external-toc` usage
+
+convert:
+
+```console
+# ctr-remote i pull ghcr.io/stargz-containers/ubuntu:22.04
+# ctr-remote i convert --oci --estargz --estargz-external-toc ghcr.io/stargz-containers/ubuntu:22.04 registry2:5000/ubuntu:22.04-ex
+```
+
+Layers in eStargz (`registry2:5000/ubuntu:22.04-ex`) don't contain TOC JSON.
+TOC image (`registry2:5000/ubuntu:22.04-ex-esgztoc`) contains TOC of all layers of the eStargz image.
+Suffix `-esgztoc` is automatically added to the image name by `ctr-remote`.
+
+Then push eStargz(`registry2:5000/ubuntu:22.04-ex`) and TOC image(`registry2:5000/ubuntu:22.04-ex-esgztoc`) to the same registry:
+
+```console
+# ctr-remote i push --plain-http registry2:5000/ubuntu:22.04-ex
+# ctr-remote i push --plain-http registry2:5000/ubuntu:22.04-ex-esgztoc
+```
+
+Pull it lazily:
+
+```console
+# ctr-remote i rpull --plain-http registry2:5000/ubuntu:22.04-ex
+fetching sha256:14fb0ea2... application/vnd.oci.image.index.v1+json
+fetching sha256:24471b45... application/vnd.oci.image.manifest.v1+json
+fetching sha256:d2e4737e... application/vnd.oci.image.config.v1+json
+# mount | grep "stargz on"
+stargz on /var/lib/containerd-stargz-grpc/snapshotter/snapshots/1/fs type fuse.rawBridge (rw,nodev,relatime,user_id=0,group_id=0,allow_other)
+```
+
+Stargz Snapshotter automatically refers to the TOC image on the same registry.
+
+### optional `--estargz-keep-diff-id` flag for conversion without changing layer diffID
+
+`ctr-remote i convert` supports optional flag `--estargz-keep-diff-id` specified with `--estargz-external-toc`.
+This converts an image to eStargz without changing the diffID (uncompressed digest) so even eStargz-agnostic gzip decompressor (e.g. gunzip) can restore the original tar blob.
+
+```console
+# ctr-remote i pull ghcr.io/stargz-containers/ubuntu:22.04
+# ctr-remote i convert --oci --estargz --estargz-external-toc --estargz-keep-diff-id ghcr.io/stargz-containers/ubuntu:22.04 registry2:5000/ubuntu:22.04-ex-keepdiff
+# ctr-remote i push --plain-http registry2:5000/ubuntu:22.04-ex-keepdiff
+# ctr-remote i push --plain-http registry2:5000/ubuntu:22.04-ex-keepdiff-esgztoc
+# crane --insecure blob registry2:5000/ubuntu:22.04-ex-keepdiff@sha256:2dc39ba059dcd42ade30aae30147b5692777ba9ff0779a62ad93a74de02e3e1f | jq -r '.rootfs.diff_ids[]'
+sha256:7f5cbd8cc787c8d628630756bcc7240e6c96b876c2882e6fc980a8b60cdfa274
+# crane blob ghcr.io/stargz-containers/ubuntu:22.04@sha256:2dc39ba059dcd42ade30aae30147b5692777ba9ff0779a62ad93a74de02e3e1f | jq -r '.rootfs.diff_ids[]'
+sha256:7f5cbd8cc787c8d628630756bcc7240e6c96b876c2882e6fc980a8b60cdfa274
+```
+
+## `--estargz-min-chunk-size` usage
+
+conversion:
+
+```console
+# ctr-remote i pull ghcr.io/stargz-containers/ubuntu:22.04
+# ctr-remote i convert --oci --estargz --estargz-min-chunk-size=50000 ghcr.io/stargz-containers/ubuntu:22.04 registry2:5000/ubuntu:22.04-chunk50000
+# ctr-remote i push --plain-http registry2:5000/ubuntu:22.04-chunk50000
+```
+
+Pull it lazily:
+
+```console
+# ctr-remote i rpull --plain-http registry2:5000/ubuntu:22.04-chunk50000
+fetching sha256:5d1409a2... application/vnd.oci.image.index.v1+json
+fetching sha256:859e2b50... application/vnd.oci.image.manifest.v1+json
+fetching sha256:c07a44b9... application/vnd.oci.image.config.v1+json
+# mount | grep "stargz on"
+stargz on /var/lib/containerd-stargz-grpc/snapshotter/snapshots/1/fs type fuse.rawBridge (rw,nodev,relatime,user_id=0,group_id=0,allow_other)
+```
+
+> NOTE: This flag creates an eStargz image with newly-added `innerOffset` funtionality of eStargz. Stargz Snapshotter < v0.13.0 cannot perform lazy pulling for the images created with this flag.
+
+---
+
+# eStargz: Standard-Compatible Extensions to Tar.gz Layers for Lazy Pulling Container Images
+
+Source: https://github.com/containerd/stargz-snapshotter/blob/main/docs/stargz-estargz.md
+
+# eStargz: Standard-Compatible Extensions to Tar.gz Layers for Lazy Pulling Container Images
+
+Moved to [`/docs/estargz.md`](/docs/estargz.md).
+
+---
+
+# Enabling Stargz Snapshotter With Transfer Service
+
+Source: https://github.com/containerd/stargz-snapshotter/blob/main/docs/transfer.md
+
+# Enabling Stargz Snapshotter With Transfer Service
+
+Transfer Service is a containerd component which is used for image management in contianerd (e.g. pulling and pushing images).
+For details about Transfer Service, refer to [the official document in the containerd repo](https://github.com/containerd/containerd/blob/6af7c07905a317d4c343a49255e2392f4c8569f9/docs/transfer.md).
+
+To use Stargz Snapshotter on containerd with enabling Transfer Service, additional configurations is needed.
+
+## Availability of Transfer Service
+
+Transfer Service is available since v1.7.
+And this is enabled in different settings depending on the containerd version.
+
+|containerd version|`ctr`|CRI|
+---|---|---
+|containerd >= v1.7 and < v2.0|Disabled by default. Enabled by `--local=false`|Disabled|
+|containerd >= v2.0 and < v2.1|Enabled by default. Disabled by `--local`|Disabled|
+|containerd >= v2.1|Enabled by default. Disabled by `--local`|Enabled by default. Disabled when conditions described in [containerd's CRI document](https://github.com/containerd/containerd/blob/v2.1.0/docs/cri/config.md#image-pull-configuration-since-containerd-v21) are met|
+
+### Note about containerd v2.1
+
+Before containerd v2.1, `disable_snapshot_annotations = false` in containerd's config TOML was a mandatory field to enable Stargz Snapshotter in CRI.
+In containerd v2.1, `disable_snapshot_annotations = false` field can still be used to enable Stargz Snapshotter and containerd disables Transfer Service when this field is detected.
+If you want to enable Transfer Service, you need to remove `disable_snapshot_annotations = false` field and apply the configuration explaind in this document.
+
+## How to enable Stargz Snapshotter when Transfer Service is enabled?
+
+In containerd v2.1, Transfer Service added support for remote snapshotters like Stargz Snapshotter.
+
+### For ctr and other non-CRI clients
+
+To enable Stargz Snapshotter with Transfer Service, you need to start containerd-stargz-grpc on the node and add the following configuration to contianerd's config TOML file.
+Note that you need to add a field `enable_remote_snapshot_annotations = "true"` in `proxy_plugins.stargz.exports` so that containerd can correctly pass image-related information to Stargz Snapshotter.
+
+```toml
+version = 2
+
+# Enable Stargz Snapshotter in Transfer Service
+[[plugins."io.containerd.transfer.v1.local".unpack_config]]
+  platform = "linux"
+  snapshotter = "stargz"
+
+# Plugin Stargz Snapshotter
+[proxy_plugins]
+  [proxy_plugins.stargz]
+    type = "snapshot"
+    address = "/run/containerd-stargz-grpc/containerd-stargz-grpc.sock"
+  [proxy_plugins.stargz.exports]
+    root = "/var/lib/containerd-stargz-grpc/"
+    enable_remote_snapshot_annotations = "true"
+```
+
+#### Example client command
+
+When you enable Transfer Service with Stargz Snapshotter, you can perform lazy pulling using the normal `ctr` command. (of course, `ctr-remote` can still be used)
+
+```
+# ctr image pull --snapshotter=stargz ghcr.io/stargz-containers/ubuntu:24.04-esgz
+```
+
+Then `mount | grep stargz` prints stargz mounts on the node.
+
+### For CRI
+
+To enable Stargz Snapshotter with Transfer Service, you need to start containerd-stargz-grpc on the node and add the following configuration to contianerd's config TOML file.
+
+```toml
+version = 2
+
+# Basic CRI configuration with enabling Stargz Snapshotter
+[plugins."io.containerd.grpc.v1.cri".containerd]
+  default_runtime_name = "runc"
+  snapshotter = "stargz"
+[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
+  runtime_type = "io.containerd.runc.v2"
+
+# Enable Stargz Snapshotter in Transfer Service
+[[plugins."io.containerd.transfer.v1.local".unpack_config]]
+  platform = "linux"
+  snapshotter = "stargz"
+
+# Plugin Stargz Snapshotter
+[proxy_plugins]
+  [proxy_plugins.stargz]
+    type = "snapshot"
+    address = "/run/containerd-stargz-grpc/containerd-stargz-grpc.sock"
+  [proxy_plugins.stargz.exports]
+    root = "/var/lib/containerd-stargz-grpc/"
+    enable_remote_snapshot_annotations = "true"
+```
+
+#### Example client command
+
+You can quickly check the behaviour using `crictl` command.
+
+```
+# crictl image pull ghcr.io/stargz-containers/ubuntu:24.04-esgz
+```
+
+Then `mount | grep stargz` prints stargz mounts on the node.
+
+---
+
+# Content Verification in eStargz
+
+Source: https://github.com/containerd/stargz-snapshotter/blob/main/docs/verification.md
+
+# Content Verification in eStargz
+
+Moved to [`/docs/estargz.md`](/docs/estargz.md).
+
+---
+
+# NOTICE.md
+
+Source: https://github.com/containerd/stargz-snapshotter/blob/main/NOTICE.md
+
+The source code developed under the Stargz Snapshotter Project is licensed under Apache License 2.0. 
+
+However, the Stargz Snapshotter project contains modified subcomponents from Container Registry Filesystem Project with separate copyright notices and license terms. Your use of the source code for the subcomponent is subject to the terms and conditions as defined by the source project. Files in these subcomponents contain following file header.
+
+```
+Copyright 2019 The Go Authors. All rights reserved.
+Use of this source code is governed by a BSD-style
+license that can be found in the NOTICE.md file.
+```
+
+These source code is governed by a 3-Clause BSD license. The copyright notice, list of conditions and disclaimer are the following.
+
+```
+Copyright (c) 2019 Google LLC. All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are
+met:
+
+   * Redistributions of source code must retain the above copyright
+notice, this list of conditions and the following disclaimer.
+   * Redistributions in binary form must reproduce the above
+copyright notice, this list of conditions and the following disclaimer
+in the documentation and/or other materials provided with the
+distribution.
+   * Neither the name of Google Inc. nor the names of its
+contributors may be used to endorse or promote products derived from
+this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+"AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```
+
+The Stargz Snapshotter project also contains modified benchmarking code from HelloBench Project with separate copyright notices and license terms. Your use of the source code for the benchmarking code is subject to the terms and conditions as defined by the source project. These source code is governed by a MIT license. The copyright notice, condition and disclaimer are the following. The file in the benchmarking code contains it as the file header.
+
+```
+The MIT License (MIT)
+
+Copyright (c) 2015 Tintri
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+---
