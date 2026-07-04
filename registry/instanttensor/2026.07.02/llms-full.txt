@@ -1,0 +1,337 @@
+# InstantTensor
+
+Source: https://github.com/scitix/instanttensor/blob/main/README.md
+
+# InstantTensor
+
+
+InstantTensor is an **ultra-fast, distributed Safetensors loader** designed to maximize I/O throughput when moving model weights from Safetensors files to GPU memory.
+
+### Model loading benchmark on inference engines
+
+| Model | GPU | Backend | Load Time (s) | Throughput (GB/s) | Speedup |
+|---|---|---|---|---|---|
+| Qwen3-30B-A3B | 1*H200 | Safetensors   | 57.4  | 1.1 | 1x |
+| Qwen3-30B-A3B | 1*H200 | InstantTensor | 1.77 | 35  | <span style="color: green">**32.4x**</span> |
+| DeepSeek-R1   | 8*H200 | Safetensors   | 160  | 4.3 | 1x |
+| DeepSeek-R1   | 8*H200 | InstantTensor | 15.3 | 45  | <span style="color: green">**10.5x**</span> |
+
+See [Benchmark](./docs/benchmark.md) for full benchmarks.
+
+### Quickstart
+
+```python
+from instanttensor import safe_open
+
+tensors = {}
+with safe_open("model.safetensors", framework="pt", device=0) as f:
+    for name, tensor in f.tensors():
+        tensors[name] = tensor
+```
+
+Yielded tensors own their memory by default (`copy=True`). For zero-copy
+streaming into preallocated storage, see [Zero-copy mode](#zero-copy-mode).
+
+See [Usage](#usage) for multi-file and distributed usage.
+
+### Used by
+
+- **[vLLM](https://github.com/vllm-project/vllm)**: [Loading Model Weights with InstantTensor](https://docs.vllm.ai/en/latest/models/extensions/instanttensor/)
+<!-- - **[SGLang](https://github.com/sgl-project/sglang)**:  -->
+
+## Why InstantTensor?
+
+- **Fast weight loading**
+  - Direct I/O: Avoid the slow page cache allocation on cold start. Friendly for large models and tight memory budgets.
+  - Tuned I/O size and concurrency: Maximize hardware throughput.
+  - Pipelining and prefetching: Parallelize and overlap the various stages of transmission.
+- **Distributed loading**
+  - Use `torch.distributed` (NCCL) to speed up loading under any parallelism policy (TP/PP/EP/CP/DP).
+- **Multiple I/O backends**
+  - Supports multiple backends: GPUDirect Storage, Legacy Storage, and Memory-based Storage.
+
+## When to Use InstantTensor
+
+InstantTensor is recommended if **any** of the following conditions are met:
+- High storage bandwidth (>= 5 GB/s).
+- Unable to keep the model cached in host memory, for example:
+  - Limited free memory for model caching (for example, when most memory is used for KV cache offloading in LLM serving).
+  - Infrequent model loading, where Linux page cache is less effective.
+  - Model switching, where multiple models cannot be cached in memory simultaneously.
+- The model is heavily sharded (for example, TP=8), resulting in small, non-contiguous I/O per GPU.
+- Loading from `tmpfs`.
+
+
+## Installation
+
+### Requirements
+
+- GPU platforms: CUDA, ROCm
+- Framework: PyTorch
+
+
+### Method 1: Install from pip
+  ```bash
+  pip install instanttensor
+  ```
+
+### Method 2: Build from source
+  ```bash
+  git clone https://github.com/scitix/InstantTensor.git
+  cd InstantTensor
+  ./checkout_submodules.sh
+  pip install .
+  # For a debug build, set "DEBUG=1" before "pip"
+  ```
+
+## Usage
+
+### Multi-file loading
+
+Passing a list of files allows the backend to plan reads and provides higher throughput than making multiple calls to load single files:
+
+```python
+from instanttensor import safe_open
+
+files = ["model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"]
+tensors = {}
+with safe_open(files, framework="pt", device=0) as f:
+    for name, tensor in f.tensors():
+        tensors[name] = tensor
+```
+
+### Distributed loading
+
+InstantTensor can use a `torch.distributed` NCCL process group to coordinate loading and achieve higher throughput compared to running `safe_open` independently on each GPU.
+
+```python
+import torch
+import torch.distributed as dist
+from instanttensor import safe_open
+
+dist.init_process_group(backend="nccl")
+process_group = dist.GroupMember.WORLD
+
+files = ["model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"]
+tensors = {}
+with safe_open(files, framework="pt", device=torch.cuda.current_device(), process_group=process_group) as f:
+    for name, tensor in f.tensors():
+        tensors[name] = tensor
+```
+
+> **NOTE:** You can also load weights using a subgroup created via `dist.new_group`, which allows multiple subgroups to load weights independently. For example, if you have TP=8 and PP=2 (i.e., two TP groups), you can create two subgroups and load weights independently on each TP group. In cross-node (multi-machine) scenarios, loading using per-node subgroups can sometimes be faster than loading on the world group. However, for most cases, the world group is a good default choice.
+
+### Buffered I/O
+
+For regular disk files, InstantTensor defaults to Direct I/O to prioritize cold
+load performance. This is usually the right choice when a model is loaded once
+for a long-running workload.
+
+If the same model is loaded repeatedly within a short period, Buffered I/O can
+be faster because later reads may benefit from the page cache. Enable it with
+the `backend=BackendPolicy.BUFFERED` argument to `safe_open`, or, when
+`backend=None`, by setting the `INSTANTTENSOR_BACKEND=BUFFERED` environment
+variable.
+
+### Zero-copy mode
+
+Pass `copy=False` to skip the per-tensor clone and yield views into the
+internal ring buffer:
+
+```python
+with safe_open(files, framework="pt", device=0, copy=False) as f:
+    for name, tensor in f.tensors():
+        model_param[name].copy_(tensor)
+```
+
+Two rules:
+
+1. Consume each tensor before the next is yielded — `list(f.tensors())` and
+   similar patterns silently corrupt data when `buffer_size < total_tensor_size`.
+2. Do not keep references past the `with` block — the buffer is freed on exit.
+
+A `UserWarning` fires when `copy=False` and `buffer_size < total_tensor_size`.
+Both attributes are public on the `safe_open` object.
+
+See `tests/test.py` for a full benchmark harness (TP/PP grouping, checksums, etc.).
+
+<!-- ## Performance tuning
+
+Users can specify three key parameters in `safe_open` for performance tuning:
+
+- **`buffer_size`**: The size of the GPU buffer used for tensors in bytes.
+
+- **`chunk_size`**: The size of each file I/O operation in bytes.
+
+- **`concurrency`**: The number of concurrent I/O operations. 
+
+When set to None (the default), InstantTensor will automatically select a value based on the storage type for high performance. Otherwise, the user-supplied value is used.  -->
+
+### Backend selection
+
+InstantTensor selects an I/O backend automatically by default. You can provide
+one or more backend candidates with the `backend` argument to `safe_open`, or
+with the `INSTANTTENSOR_BACKEND` environment variable when `backend=None`.
+InstantTensor tries the candidates in order and uses the first backend that is
+supported by the file system and available on the current system.
+
+Supported backend values are `Backend.AIO`, `Backend.AIO_BUFFERED`,
+`Backend.URING`, `Backend.URING_BUFFERED`, `Backend.CUFILE`, and
+`Backend.MMAP`. The `backend` argument accepts a single `Backend` or a list of
+`Backend`/`BackendPolicy` values:
+
+```python
+from instanttensor import Backend, BackendPolicy, safe_open
+
+safe_open("model.safetensors", framework="pt", device=0, backend=Backend.URING)
+safe_open("model.safetensors", framework="pt", device=0, backend=[Backend.URING, Backend.AIO])
+safe_open("model.safetensors", framework="pt", device=0, backend=BackendPolicy.BUFFERED)
+```
+
+`BackendPolicy.BUFFERED` expands to `[Backend.URING_BUFFERED,
+Backend.AIO_BUFFERED, Backend.MMAP]`. This is a good choice when you want Buffered I/O.
+
+`INSTANTTENSOR_BACKEND` accepts comma-separated backend or policy names:
+
+```bash
+INSTANTTENSOR_BACKEND=URING,AIO
+INSTANTTENSOR_BACKEND=BUFFERED
+```
+
+Backends are used in different file-system and I/O scenarios:
+
+- **In-memory file systems** (available backends: `MMAP`, `URING_BUFFERED`,
+  `AIO_BUFFERED`): when model files are
+  stored on tmpfs or ramfs, `MMAP` provides the best compatibility and
+  performance for this case. The other backends are usually slower for
+  in-memory files.
+- **Regular file systems**: InstantTensor can use either Direct I/O or Buffered
+  I/O.
+  - **Direct I/O** (available backends: `AIO`, `URING`, `CUFILE`) is best when
+    a model is loaded once for a long-running
+    workload. It avoids page-cache cold-start effects and reduces page-cache
+    pollution. When choosing manually, `URING` may be faster on newer platforms.
+    `AIO` has the broadest platform compatibility. `CUFILE` requires GPUDirect
+    Storage support, and its higher throughput can be offset by cuFile
+    initialization overhead.
+  - **Buffered I/O** (available backends: `AIO_BUFFERED`, `URING_BUFFERED`,
+    `MMAP`) is best when the same model is
+    loaded repeatedly within a short period. Later reads can benefit from the
+    page cache, though the first read is usually slower than Direct I/O.
+    `URING_BUFFERED` is preferred on platforms with io_uring support;
+    `AIO_BUFFERED` provides a more compatible option, while `MMAP` is available
+    but usually not preferred.
+
+If no backend is specified, InstantTensor tries `[URING, AIO]` for regular disk
+files. For tmpfs/ramfs files, it uses `MMAP`. If none of the requested
+candidates can be used, InstantTensor raises an error listing why each candidate
+was rejected.
+
+<!--
+- **`INSTANTTENSOR_USE_INTERNAL_MEMORY_REGISTER`**:
+  - `1`: For tmpfs/ramfs files, register the mmapped memory and copy directly to GPU
+  - `0` (default): Use an external pinned host buffer + CPU memcpy + async H2D copy -->
+
+## API reference
+
+See [Build API reference](./docs/build_doc.md)
+
+<!-- ## Benchmark -->
+
+<!-- ## Roadmap
+
+- **Supporting loading to CPU**: E.g., CPU inference.
+- **Improving scalability**: E.g., Collective loading on 32+ GPUs. -->
+
+## Thanks
+
+Thanks to the AI Systems and Optimization team at ScitiX AI and the Wenfei Wu Lab at Peking University.
+
+---
+
+# Full benchmarks
+
+Source: https://github.com/scitix/instanttensor/blob/main/docs/benchmark.md
+
+# Full benchmarks
+
+## Test setting
+
+Versions:
++ safetensors 0.7.0
++ fastsafetensors 0.2.2
++ runai_model_streamer 0.15.6 
++ instanttensor 0.1.4
+<!-- vllm 0.13.0 -->
+
+<!-- enable distributed mode of runai_model_streamer in vllm through --model-loader-extra-config '{ "distributed": true }' -->
+
+## Test on 50GB/s storage
+
+| Model         | GPU    | Backend                | Load Time (s) | Throughput (GB/s) | Speedup   |
+|---            |---     | ---                    |---            |---                |---        |
+| Qwen3-30B-A3B | 1*H200 | Safetensors            | 57.4          | 1.07              | 1x        |
+|               |        | fastsafetensors        | 22.2          | 2.75              | 2.59x     |
+|               |        | RMS                    | 9.29          | 6.57              | 6.18x     |
+|               |        | InstantTensor          | 1.77          | 34.5              | **32.4x** |
+| DeepSeek-R1   | 8*H200 | Safetensors            | 160           | 4.30              | 1x        |
+|               |        | fastsafetensors        | 75.8          | 9.08              | 2.11x     |
+|               |        | RMS                    | 101           | 6.82              | 1.58x     |
+|               |        | RMS (distributed mode) | 192           | 3.59              | 0.83x    |
+|               |        | InstantTensor          | 15.3          | 45.0              | **10.5x** |
+
+<!-- Qwen3-30B-A3B: 61.07GB -->
+<!-- DeepSeek-R1: 688.6GB -->
+
+*RMS: Run:ai Model Streamer
+
+*Run DeepSeek-R1 with TP=8 and EP=8
+<!-- -tp 8 -ep -->
+
+*In multi-GPU loading, the load time is defined as the time until the last (slowest) GPU finishes loading.
+
+## Test on in-memory file system (tmpfs)
+
+Testbed: 2 numa nodes * 8 channels DDR5 per numa node
+
+| Model         | GPU    | Backend                | Load Time (s) | Throughput (GB/s) | Speedup   |
+|---            |---     | ---                    |---            |---                |---        |
+| Qwen3-30B-A3B | 1*H200 | Safetensors            | 12.7          | 4.81              | 1x        |
+|               |        | fastsafetensors        | 16.7          | 3.66              | 0.76x     |
+|               |        | RMS                    | 8.21          | 7.44              | 1.55x     |
+|               |        | InstantTensor          | 1.26          | 48.5              | **10.1x** |
+| DeepSeek-R1   | 8*H200 | Safetensors            | 22.6          | 30.5              | 1x        |
+|               |        | fastsafetensors        | 63.4          | 10.9              | 0.36x     |
+|               |        | RMS                    | 79.8          | 8.63              | 0.28x     |
+|               |        | RMS (distributed mode) | 156           | 4.41              | 0.14x     |
+|               |        | InstantTensor          | 12.1          | 56.9              | **1.87x** |
+
+---
+
+# Build API Reference
+
+Source: https://github.com/scitix/instanttensor/blob/main/docs/build_doc.md
+
+# Build API Reference
+
+## Quick Start
+
+```bash
+cd docs
+make html
+```
+
+The generated HTML documentation is in `build/html/` directory.
+
+## Commands
+
+- `make html` - Generate HTML documentation
+- `make clean` - Clean build cache
+
+## Requirements
+
+```bash
+pip install sphinx sphinx-autodoc-typehints
+```
+
+---
