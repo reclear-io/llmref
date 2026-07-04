@@ -1,0 +1,2854 @@
+# README.md
+
+Source: https://github.com/corsix/amx/blob/main/README.md
+
+Contemporary M1 / M2 / M3 / M4 machines from Apple have (at least) four different ways for low-level programmers to perform heavy computations:
+1. Standard ARMv8 SIMD/NEON vector instructions on CPU cores (128 bits wide, issue [up to four per cycle on Firestorm](https://dougallj.github.io/applecpu/firestorm-simd.html))
+2. Apple's undocumented AMX instructions, issued from CPU, executed on a special accelerator execution unit
+3. The Neural Engine (called ANE or NPU)
+4. The GPU (e.g. [Metal Compute Shaders](https://developer.apple.com/documentation/metal/performing_calculations_on_a_gpu))
+
+This repository is all about the 2<sup>nd</sup> of those: Apple's AMX instructions. Note that these instructions are neither documented nor supported by Apple. As a source of potential great confusion, Apple's AMX instructions are completely distinct from [Intel's AMX instructions](https://en.wikipedia.org/wiki/Advanced_Matrix_Extensions), though both are intended for issuing matrix multiply operations from a CPU.
+
+The research was done on an Apple M1 Max (2021), with follow-up work on an M2 (2023), and additional follow-up work on an M3 (2023) and M4 Max (2024). Older or newer chips might have different AMX instructions. [Some sources](https://nod.ai/comparing-apple-m1-with-amx2-m1-with-neon/) report that the M1 contains version 2 of the AMX instructions, which seems plausible (possibly everything using 7-bit writemasks comes from version 1, and everything using 9-bit writemasks is new in version 2). The M1 to M2 transition [adds bf16 support, along with a few other tweaks](https://github.com/corsix/amx/issues/5#issuecomment-1464639729). The M2 to M3 transition [adds one extra mode to each of `ldx` and `ldy` and `matint`](https://github.com/corsix/amx/issues/10). The M3 to M4 transition [causes some modes of `extrh`, `extrv`, `vecfp`, and `vecint` to ignore low bits of X/Y offset](https://github.com/corsix/amx/issues/13).
+
+A good one-image summary of AMX is the following figure from [abandoned patent US20180074824A1](https://patents.google.com/patent/US20180074824A1/en). Consider a 32x32 grid of compute units, where each unit can perform 16-bit multiply-accumulate, or a 2x2 subgrid of units can perform 32-bit multiply-accumulate, or a 4x4 subgrid can perform 64-bit multiply-accumulate. To feed this grid, there is a pool of X registers each containing 32 16-bit elements (or 16 32-bit elements, or 8 64-bit elements) and a pool of Y registers similarly containing 32 16-bit elements (or 16 32-bit elements, or 8 64-bit elements). A single instruction can perform a full outer product: multiply every element of an X register with every element of a Y register, and accumulate with the Z element in the corresponding position.
+
+![US20180074824A1 Figure 2](fig2.png)
+
+A single row of the 32x32 grid can also be used to perform vector operations (rather than matrix operations) between X and Y<sup>T</sup>.
+
+In terms of available data types, the general pattern is:
+- IEEE754 f16 or f32 or f64 (same width for all three fused-multiply-add operands)
+- IEEE754 f16 multiplicands, accumulating onto f32
+- On M2 hardware, bf16 multiplicands, accumulating onto bf16 or IEEE754 f32
+- Integer 8-bit or 16-bit multiplicands, accumulating onto 16 or 32 bits (in various signednesses)
+
+This repository provides:
+- [A tiny header for accessing AMX instructions](aarch64.h) (use at your own risk)
+- [A description of the register file](RegisterFile.md)
+- [A full description of every instruction](Instructions.md)
+- [C code matching the behaviour of every instruction](test.md) (using inline ARMv8 assembly to express certain things)
+- [References for further reading](References.md)
+
+---
+
+# aarch64.md
+
+Source: https://github.com/corsix/amx/blob/main/aarch64.md
+
+The A64 instruction set defines the following instruction bit patterns as reserved:
+
+|29|3|op0|Must be `0`
+|25|4||Must be `0`|
+|21|4|op1 (hi)|Must be `1`|
+|16|5|op1 (lo)||
+|0|16|
+
+AMX instructions fit into this space like so:
+
+|29|3|op0|Must be `0`
+|25|4||Must be `0`|
+|21|4|op1 (hi)|Must be `1`|
+|16|5|op1 (lo)|Must be `0`|
+|12|4||Must be `1`|
+|10|2||Must be `0`|
+|5|5|Instruction|`0` through `22` used|
+|0|5|Operand|Either 5-bit immediate or 5-bit GPR index, depending on instruction. GPR 31 denotes xzr.|
+
+Inline assembly syntax can be used to emit AMX instructions from C code. The easy case is when the operand is a 5-bit immediate:
+```c
+#define AMX_OP_IMM5(op, imm5) \
+    __asm(".word (0x201000 + (%0 << 5) + %1)" : : "i"(op), "i"(imm5) : "memory")
+```
+
+The harder case is the operand being a 5-bit GPR index. The C compiler will choose the particular GPR however it sees fit, which will be one of `x0` through `x31`, but inline assembly syntax receives this choice as a string rather than an integer. However, _prepending_ the _string_ `0` to the choice gives the _strings_ `0x0` through `0x31`, which just happen to be parsable as hexadecimal numbers. They can be used as such, with some math to convert from base 16 back to base 10:
+```c
+#define AMX_OP_GPR(op, gpr) \
+    __asm(".word (0x201000 + (%0 << 5) + 0%1 - ((0%1 >> 4) * 6))" : : "i"(op), "r"((uint64_t)(gpr)) : "memory")
+```
+
+Instruction `17` is used for setup and clearing, and is the sole instruction which uses a 5-bit immediate; all other instructions use a 5-bit GPR index. In Apple's [Accelerate](https://developer.apple.com/documentation/accelerate?language=objc), instruction `17` is apparently always prefixed by three nops. The same can be done in inline assembly:
+```c
+#define AMX_NOP_OP_IMM5(op, imm5) \
+    __asm("nop\nnop\nnop\n.word (0x201000 + (%0 << 5) + %1)" : : "i"(op), "i"(imm5) : "memory")
+```
+
+With these macros, the full AMX instruction set can be accessed:
+```c
+#define AMX_LDX(gpr)    AMX_OP_GPR( 0, gpr)
+#define AMX_LDY(gpr)    AMX_OP_GPR( 1, gpr)
+#define AMX_STX(gpr)    AMX_OP_GPR( 2, gpr)
+#define AMX_STY(gpr)    AMX_OP_GPR( 3, gpr)
+#define AMX_LDZ(gpr)    AMX_OP_GPR( 4, gpr)
+#define AMX_STZ(gpr)    AMX_OP_GPR( 5, gpr)
+#define AMX_LDZI(gpr)   AMX_OP_GPR( 6, gpr)
+#define AMX_STZI(gpr)   AMX_OP_GPR( 7, gpr)
+#define AMX_EXTRX(gpr)  AMX_OP_GPR( 8, gpr)
+#define AMX_EXTRY(gpr)  AMX_OP_GPR( 9, gpr)
+#define AMX_FMA64(gpr)  AMX_OP_GPR(10, gpr)
+#define AMX_FMS64(gpr)  AMX_OP_GPR(11, gpr)
+#define AMX_FMA32(gpr)  AMX_OP_GPR(12, gpr)
+#define AMX_FMS32(gpr)  AMX_OP_GPR(13, gpr)
+#define AMX_MAC16(gpr)  AMX_OP_GPR(14, gpr)
+#define AMX_FMA16(gpr)  AMX_OP_GPR(15, gpr)
+#define AMX_FMS16(gpr)  AMX_OP_GPR(16, gpr)
+#define AMX_SET()       AMX_NOP_OP_IMM5(17, 0)
+#define AMX_CLR()       AMX_NOP_OP_IMM5(17, 1)
+#define AMX_VECINT(gpr) AMX_OP_GPR(18, gpr)
+#define AMX_VECFP(gpr)  AMX_OP_GPR(19, gpr)
+#define AMX_MATINT(gpr) AMX_OP_GPR(20, gpr)
+#define AMX_MATFP(gpr)  AMX_OP_GPR(21, gpr)
+#define AMX_GENLUT(gpr) AMX_OP_GPR(22, gpr)
+```
+
+---
+
+# extr_h.md
+
+Source: https://github.com/corsix/amx/blob/main/extr_h.md
+
+## Quick summary
+
+|`extrh`&nbsp;(26=0)|<code>x[i] =&nbsp;&nbsp;&nbsp;z[_][i]&nbsp;</code>|7 bit|
+|`extrh`&nbsp;(26=1,10=0)|`x[i] = f(z[_][i])`|9 bit|Integer right shift, integer saturation|
+|`extrh`&nbsp;(26=1,10=1)|`y[i] = f(z[_][i])`|9 bit|Integer right shift, integer saturation|
+
+## Instruction encoding
+
+|5|5|Instruction|Must be `8`|
+
+## Operand bitfields when 26=1
+
+|63|1|Lane width mode (hi)|See bit 11|
+|(63=1)&nbsp;62|1|Destination is bf16 (`1`) or f16 (`0`)|Only applies in mixed lane-width modes, ignored otherwise|
+|(63=1)&nbsp;54|8|Ignored|Only applies in mixed lane-width modes, ignored otherwise|
+|(63=0)&nbsp;58|5|Right shift amount|Only applies in mixed lane-width modes, ignored otherwise|
+|(63=0)&nbsp;57|1|Z is signed (`1`) or unsigned (`0`)|Only applies in mixed lane-width modes, ignored otherwise|
+|(63=0)&nbsp;56|1|Z saturation is signed (`1`) or unsigned (`0`)|Only applies in mixed lane-width modes, ignored otherwise|
+|(63=0)&nbsp;55|1|Saturate Z (`1`) or truncate Z (`0`)|Only applies in mixed lane-width modes, ignored otherwise|
+|(63=0)&nbsp;54|1|Right shift is rounding (`1`) or truncating (`0`)|Only applies in mixed lane-width modes, ignored otherwise|
+|41|13|Ignored|
+|(31=0)&nbsp;38|3|Write enable mode|
+|(31=0)&nbsp;32|6|Write enable value|Meaning dependent upon associated mode|
+|31|1|Perform operation for multiple vectors (`1`)<br/>or just one vector (`0`)|M2 only (always reads as `0` on M1)|
+|27|4|Ignored|
+|26|1|Must be `1` for this decode variant|
+|(31=1)&nbsp;25|1|"Multiple" means four vectors (`1`)<br/>or two vectors (`0`)|Top two bits of Z row ignored if operating on four vectors|
+|20|6|Z row|When 31=1, top bit or top two bits ignored|
+|15|5|Ignored|
+|11|4|Lane width mode (lo)|See bit 63|
+|10|1|Destination is Y (`1`) or is X (`0`)|
+|9|1|Ignored|
+|0|9|Destination offset (in bytes)|On M4, when 31=1, low four bits ignored|
+
+Lane widths:
+|X (or Y)|Z|63|11|Notes|
+|---|---|---|---|---|
+|i8 or u8|i8 or u8|`0`|`0`|
+|i32 or u32|i32 or u32|`0`|`8`|
+|i16 or u16|i32 or u32 (two rows, interleaved pair)|`0`|`9`|Shift and saturation supported|
+|i16 or u16|i32 or u32 (four rows, interleaved pair from those)|`0`|`10`|Shift and saturation supported|
+|i8 or u8|i32 or u32 (four rows, interleaved quartet)|`0`|`11`|Shift and saturation supported|
+|i8 or u8|i16 or u16 (two rows, interleaved pair)|`0`|`13`|Shift and saturation supported|
+|i16 or u16|i16 or u16|`0`|anything else|
+|f64|f64|`1`|`1`|
+|f32|f32|`1`|`8`|
+|f16 or bf16|f32 (two rows, interleaved pair)|`1`|`9`|M2 only. Bit 62 determines X (or Y) format|
+|f16 or bf16|f32 (four rows, interleaved pair from those)|`1`|`10`|M2 only. Bit 62 determines X (or Y) format|
+|f16|f16|`1`|anything else|
+
+Write enable modes (with regard to X or Y):
+|Mode|Meaning of value (N)|
+|---:|---|
+|`0`|Enable all lanes (`0` or `4` or `5`), or odd lanes only (`1`), or even lanes only (`2`), or enable all lanes but write `0` to them regardless of Z (`3`), or no lanes enabled (anything else)|
+|`1`|Only enable lane #N|
+|`2`|Only enable the first N lanes, or all lanes when N is zero|
+|`3`|Only enable the last N lanes, or all lanes when N is zero|
+|`4`|Only enable the first N lanes (no lanes when N is zero)|
+|`5`|Only enable the last N lanes (no lanes when N is zero)|
+|`6`|No lanes enabled|
+|`7`|No lanes enabled|
+
+## Operand bitfields when 26=0
+
+|48|16|Ignored|
+|46|2|Write enable mode||
+|41|5|Write enable value|Meaning dependent upon associated mode|
+|30|11|Ignored|
+|28|2|Lane width mode|
+|27|1|Must be `0`|Otherwise decodes as [`extrx`](extr_x.md)|
+|26|1|Must be `0` for this decode variant|
+|20|6|Z row|
+|19|1|Ignored|
+|10|9|Destination offset (in bytes)|Destination is always X for this decode variant|
+|0|10|Ignored|
+
+Lane width modes:
+|X,Z|28|
+|---|---|
+|any 64-bit|`0`|
+|any 32-bit|`1`|
+|any 16-bit|`2`|
+|any 16-bit, but with high 8 bits of each lane disabled|`3`|
+
+Write enable modes (with regard to X):
+|Mode|Meaning of value (N)|
+|---:|---|
+|`0`|Enable all lanes (`0`), or odd lanes only (`1`), or even lanes only (`2`), or no lanes (anything else)|
+|`1`|Only enable lane #N|
+|`2`|Only enable the first N lanes, or all lanes when N is zero|
+|`3`|Only enable the last N lanes, or all lanes when N is zero|
+
+## Description
+
+When X/Y/Z all have the same lane width (which is always the case when 26=0), this operation is simple: the field at bit 20 identifies a Z row, and that row is copied to X (or transposed and copied to Y). The lane width only affects the write-enable logic.
+
+When Z is wider than X/Y, this operation is more complex, as it needs to perform narrowing. The four mixed-width modes are `9`, `10`, `11`, `13`. For integer operands, all of these modes support right-shift and optional saturation of the Z values, and then take the low bits. For floating-point operands, these modes canonicalise NaNs and perform rounding (round to nearest, ties to even).
+
+Mode 9 (32-bit Z elements, 16-bit X or Y elements), correspondance between X/Y lanes and pair of Z registers:
+<table><tr><th>Z0</th><td>0</td><td>2</td><td>4</td><td>6</td><td>8</td><td>10</td><td>12</td><td>14</td><td>16</td><td>18</td><td>20</td><td>22</td><td>24</td><td>26</td><td>28</td><td>30</td></tr>
+<tr><th>Z1</th><td>1</td><td>3</td><td>5</td><td>7</td><td>9</td><td>11</td><td>13</td><td>15</td><td>17</td><td>19</td><td>21</td><td>23</td><td>25</td><td>27</td><td>29</td><td>31</td></tr></table>
+
+Mode 10 (32-bit Z elements, 16-bit X/Y elements), correspondance between X/Y lanes and quartet of Z registers:
+<table><tr><th>Z0</th><td>0</td><td>2</td><td>4</td><td>6</td><td>8</td><td>10</td><td>12</td><td>14</td><td>16</td><td>18</td><td>20</td><td>22</td><td>24</td><td>26</td><td>28</td><td>30</td></tr>
+<tr><th>Z1</th><td/><td/><td/><td/><td/><td/><td/><td/><td/><td/><td/><td/><td/><td/><td/><td/></tr>
+<tr><th>Z2</th><td>1</td><td>3</td><td>5</td><td>7</td><td>9</td><td>11</td><td>13</td><td>15</td><td>17</td><td>19</td><td>21</td><td>23</td><td>25</td><td>27</td><td>29</td><td>31</td></tr>
+<tr><th>Z3</th><td/><td/><td/><td/><td/><td/><td/><td/><td/><td/><td/><td/><td/><td/><td/><td/></tr></table>
+
+Mode 11 (32-bit Z elements, 8-bit X/Y elements), correspondance between X/Y lanes and quartet of Z registers:
+<table><tr><th>Z0</th><td>0</td><td>4</td><td>8</td><td>12</td><td>16</td><td>20</td><td>24</td><td>28</td><td>32</td><td>36</td><td>40</td><td>44</td><td>48</td><td>52</td><td>56</td><td>60</td></tr>
+<tr><th>Z1</th><td>1</td><td>5</td><td>9</td><td>13</td><td>17</td><td>21</td><td>25</td><td>29</td><td>33</td><td>37</td><td>41</td><td>45</td><td>49</td><td>53</td><td>57</td><td>61</td></tr>
+<tr><th>Z2</th><td>2</td><td>6</td><td>10</td><td>14</td><td>18</td><td>22</td><td>26</td><td>30</td><td>34</td><td>38</td><td>42</td><td>46</td><td>50</td><td>54</td><td>58</td><td>62</td></tr>
+<tr><th>Z3</th><td>3</td><td>7</td><td>11</td><td>15</td><td>19</td><td>23</td><td>27</td><td>31</td><td>35</td><td>39</td><td>43</td><td>47</td><td>51</td><td>55</td><td>59</td><td>63</td></tr></table>
+
+Mode 13 (16-bit Z elements, 8-bit X/Y elements), correspondance between X/Y lanes and pair of Z registers:
+<table><tr><th>Z0</th><td>0</td><td>2</td><td>4</td><td>6</td><td>8</td><td>10</td><td>12</td><td>14</td><td>16</td><td>18</td><td>20</td><td>22</td><td>24</td><td>26</td><td>28</td><td>30</td><td>32</td><td>34</td><td>36</td><td>38</td><td>40</td><td>42</td><td>44</td><td>46</td><td>48</td><td>50</td><td>52</td><td>54</td><td>56</td><td>58</td><td>60</td><td>62</td></tr>
+<tr><th>Z1</th><td>1</td><td>3</td><td>5</td><td>7</td><td>9</td><td>11</td><td>13</td><td>15</td><td>17</td><td>19</td><td>21</td><td>23</td><td>25</td><td>27</td><td>29</td><td>31</td><td>33</td><td>35</td><td>37</td><td>39</td><td>41</td><td>43</td><td>45</td><td>47</td><td>49</td><td>51</td><td>53</td><td>55</td><td>57</td><td>59</td><td>61</td><td>63</td></tr></table>
+
+On M2, when 26=1, the whole operation can optionally be repeated multiple times, by setting bit 31. Bit 25 controls the repetition count; either two times or four times. Consecutive X or Y registers are used as the destination. If repeated twice, the top bit of Z row is ignored, and Z row is incremented by 32 for the 2<sup>nd</sup> iteration. If repeated four times, the top two bits of Z row are ignored, and Z row is incremented by 16 on each iteration.
+
+## Emulation code
+
+See [extr.c](extr.c).
+
+```c
+void emulate_AMX_EXTRX(amx_state* state, uint64_t operand) {
+    void* dst;
+    uint64_t dst_offset;
+    uint64_t z_row = operand >> 20;
+    uint64_t z_step = 64;
+    uint64_t store_enable = ~(uint64_t)0;
+    uint8_t buffer[64];
+    uint32_t stride = 0;
+    uint32_t zbytes, xybytes;
+
+    if (operand & EXTR_HV) {
+        dst = (operand & EXTR_HV_TO_Y) ? state->y : state->x;
+        dst_offset = operand;
+        switch (((operand >> 63) << 4) | ((operand >> 11) & 0xF)) {
+        case  0: xybytes = 1; zbytes = 1; break;
+        case  8: xybytes = 4; zbytes = 4; break;
+        case  9: xybytes = 2; zbytes = 4; stride = 1; break;
+        case 10: xybytes = 2; zbytes = 4; stride = 2; break;
+        case 11: xybytes = 1; zbytes = 4; stride = 1; break;
+        case 13: xybytes = 1; zbytes = 2; stride = 1; break;
+        case 17: xybytes = 8; zbytes = 8; break;
+        case 24: xybytes = 4; zbytes = 4; break;
+        case 25: xybytes = 2; if (AMX_VER >= AMX_VER_M2) { zbytes = 4; stride = 1; } else { zbytes = 2; } break;
+        case 26: xybytes = 2; if (AMX_VER >= AMX_VER_M2) { zbytes = 4; stride = 2; } else { zbytes = 2; } break;
+        default: xybytes = 2; zbytes = 2; break;
+        }
+        if ((AMX_VER >= AMX_VER_M2) && (operand & (1ull << 31))) {
+            operand &=~ (0x1ffull << 32);
+            z_step = z_row & 32 ? 16 : 32;
+            if (AMX_VER >= AMX_VER_M4) {
+                dst_offset &= -64u;
+            }
+        }
+        store_enable &= parse_writemask(operand >> 32, xybytes, 9);
+    } else if (operand & EXTR_BETWEEN_XY) {
+        ...
+    } else {
+        dst = state->x;
+        dst_offset = operand >> 10;
+        xybytes = 8 >> ((operand >> 28) & 3);
+        if (xybytes == 1) {
+            xybytes = 2;
+            store_enable &= 0x5555555555555555ull;
+        }
+        store_enable &= parse_writemask(operand >> 41, xybytes, 7);
+        zbytes = xybytes;
+    }
+
+    uint32_t signext = (operand & EXTR_SIGNED_INPUT) ? 64 - zbytes*8 : 0;
+    for (z_row &= z_step - 1; z_row <= 63; z_row += z_step) {
+        for (uint32_t i = 0; i < 64; i += xybytes) {
+            uint64_t zoff = (i & (zbytes - 1)) / xybytes * stride;
+            int64_t val = load_int(&state->z[bit_select(z_row, z_row + zoff, zbytes - 1)].u8[i & -zbytes],
+                                   zbytes, signext);
+            if (stride) val = extr_alu(val, operand, xybytes*8);
+            store_int(buffer + i, xybytes, val);
+        }
+        if ((operand & EXTR_HV) && (((operand >> 32) & 0x1ff) == 3)) {
+            memset(buffer, 0, sizeof(buffer));
+        }
+        store_xy_row(dst, dst_offset & 0x1FF, buffer, store_enable);
+        dst_offset += 64;
+    }
+}
+
+int64_t extr_alu(int64_t val, uint64_t operand, uint32_t outbits) {
+    uint32_t shift = (operand >> 58) & 0x1f;
+    if (operand & (1ull << 63)) {
+        if (shift >= 16) {
+            val = bf16_from_f32((uint32_t)val);
+        } else {
+            __asm("fcvt %h0, %s0" : "=w"(val) : "0"(val));
+        }
+        return val;
+    }
+    if (shift && (operand & EXTR_ROUNDING_SHIFT)) {
+        val += 1 << (shift - 1);
+    }
+    val >>= shift;
+    if (operand & EXTR_SATURATE) {
+        if (operand & EXTR_SIGNED_OUTPUT) outbits -= 1;
+        int64_t hi = 1ull << outbits;
+        if (operand & EXTR_SIGNED_INPUT) {
+            int64_t lo = (operand & EXTR_SIGNED_OUTPUT) ? -hi : 0;
+            if (val < lo) val = lo;
+            if (val >= hi) val = hi - 1;
+        } else {
+            if ((uint64_t)val >= (uint64_t)hi) val = hi - 1;
+        }
+    }
+    return val;
+}
+```
+
+---
+
+# extr_v.md
+
+Source: https://github.com/corsix/amx/blob/main/extr_v.md
+
+## Quick summary
+
+|`extrv`&nbsp;(26=0)|<code>y[j] =&nbsp;&nbsp;&nbsp;z[j][_]&nbsp;</code>|7 bit|
+|`extrv`&nbsp;(26=1,10=1)|`y[j] = f(z[j][_])`|9 bit|Integer right shift, integer saturation|
+|`extrv`&nbsp;(26=1,10=0)|`x[j] = f(z[j][_])`|9 bit|Integer right shift, integer saturation|
+
+## Instruction encoding
+
+|5|5|Instruction|Must be `9`|
+
+## Operand bitfields when 26=1
+
+|63|1|Lane width mode (hi)|See bit 11|
+|(63=1)&nbsp;62|1|Destination is bf16 (`1`) or f16 (`0`)|Only applies in mixed lane-width modes, ignored otherwise|
+|(63=1)&nbsp;54|8|Ignored|Only applies in mixed lane-width modes, ignored otherwise|
+|(63=0)&nbsp;58|5|Right shift amount|Only applies in mixed lane-width modes, ignored otherwise|
+|(63=0)&nbsp;57|1|Z is signed (`1`) or unsigned (`0`)|Only applies in mixed lane-width modes, ignored otherwise|
+|(63=0)&nbsp;56|1|Z saturation is signed (`1`) or unsigned (`0`)|Only applies in mixed lane-width modes, ignored otherwise|
+|(63=0)&nbsp;55|1|Saturate Z (`1`) or truncate Z (`0`)|Only applies in mixed lane-width modes, ignored otherwise|
+|(63=0)&nbsp;54|1|Right shift is rounding (`1`) or truncating (`0`)|Only applies in mixed lane-width modes, ignored otherwise|
+|41|13|Ignored|
+|(31=0)&nbsp;38|3|Write enable mode|
+|(31=0)&nbsp;32|6|Write enable value|Meaning dependent upon associated mode|
+|31|1|Perform operation for multiple vectors (`1`)<br/>or just one vector (`0`)|M2 only (always reads as `0` on M1)|
+|27|4|Ignored|
+|26|1|Must be `1` for this decode variant|
+|(31=1)&nbsp;25|1|"Multiple" means four vectors (`1`)<br/>or two vectors (`0`)|Top two bits of Z column ignored if operating on four vectors|
+|20|6|Z column|The low bits can instead select the row within each cell<br/>When 31=1, top bit or top two bits ignored|
+|15|5|Ignored|
+|11|4|Lane width mode (lo)|See bit 63|
+|10|1|Destination is Y (`1`) or is X (`0`)|
+|9|1|Ignored|
+|0|9|Destination offset (in bytes)|On M4, when 31=1, low four bits ignored|
+
+Lane widths:
+|Y (or X)|Z|63|11|Notes|
+|---|---|---|---|---|
+|i8 or u8|i8 or u8 (all rows)|`0`|`0`|
+|i32 or u32|i32 or u32 (one row from each cell of four)|`0`|`8`|
+|i16 or u16|i32 or u32 (two consecutive rows from each cell of four)|`0`|`9`|Shift and saturation supported|
+|i16 or u16|i32 or u32 (two non-consecutive rows from each cell of four)|`0`|`10`|Shift and saturation supported|
+|i8 or u8|i32 or u32 (four rows from each cell of four)|`0`|`11`|Shift and saturation supported|
+|i8 or u8|i16 or u16 (two rows from each cell of two)|`0`|`13`|Shift and saturation supported|
+|i16 or u16|i16 or u16 (one row from each cell of two)|`0`|anything else|
+|f64|f64 (one row from each cell of eight)|`1`|`1`|
+|f32|f32 (one row from each cell of four)|`1`|`8`|
+|f16 or bf16|f32 (two consecutive rows from each cell of four)|`1`|`9`|M2 only<br/>Bit 62 determines Y (or X) format|
+|f16 or bf16|f32 (two non-consecutive rows from each cell of four)|`1`|`10`|M2 only<br/>Bit 62 determines Y (or X) format|
+|f16|f16 (one row from each cell of two)|`1`|anything else|
+
+Write enable modes (with regard to X or Y):
+|Mode|Meaning of value (N)|
+|---:|---|
+|`0`|Enable all lanes (`0` or `4` or `5`), or odd lanes only (`1`), or even lanes only (`2`), or enable all lanes but write `0` to them regardless of Z (`3`), or no lanes enabled (anything else)|
+|`1`|Only enable lane #N|
+|`2`|Only enable the first N lanes, or all lanes when N is zero|
+|`3`|Only enable the last N lanes, or all lanes when N is zero|
+|`4`|Only enable the first N lanes (no lanes when N is zero)|
+|`5`|Only enable the last N lanes (no lanes when N is zero)|
+|`6`|No lanes enabled|
+|`7`|No lanes enabled|
+
+## Operand bitfields when 26=0
+
+|39|25|Ignored|
+|37|2|Write enable mode||
+|32|5|Write enable value|Meaning dependent upon associated mode|
+|30|2|Ignored|
+|28|2|Lane width mode|
+|27|1|Must be `0`|Otherwise decodes as [`extry`](extr_y.md)|
+|26|1|Must be `0` for this decode variant|
+|20|6|Z column|The low bits can instead select the row within each cell|
+|9|11|Ignored|
+|0|9|Destination offset (in bytes)|Destination is always Y for this decode variant|
+
+Lane widths:
+|Y|Z|28|
+|---|---|---|
+|any 64-bit|any 64-bit (one row from each cell of eight)|`0`|
+|any 32-bit|any 32-bit (one row from each cell of four)|`1`|
+|any 16-bit|any 16-bit (one row from each cell of two)|`2`|
+|any 16-bit, but with high 8 bits of each lane disabled|any 16-bit (one row from each cell of two)|`3`|
+
+Write enable modes (with regard to Y):
+|Mode|Meaning of value (N)|
+|---:|---|
+|`0`|Enable all lanes (`0`), or odd lanes only (`1`), or even lanes only (`2`), or no lanes (anything else) |
+|`1`|Only enable lane #N|
+|`2`|Only enable the first N lanes, or all lanes when N is zero|
+|`3`|Only enable the last N lanes, or all lanes when N is zero|
+
+## Description
+
+When the lane width is 8 bits (i.e. 26=1, 11=0, 63=0), treats Z as a 64x64 grid of bytes, the field at bit 20 selects one column from that grid, and that column is copied to Y (or transposed and copied to X).
+
+When all of X/Y/Z are 16 bits, treats Z as a 32x32 grid of cells, where each cell contains two 16-bit scalars (stacked vertically). The high bits of "Z column" select one column of cells, and one scalar from each cell is copied to Y or X. The low bits of "Z column" select the row within each cell. This pattern extends to X/Y/Z being 32 bits (16x16 grid of cells, four 32-bit scalars in each cell, stacked vertically) and to X/Y/Z being 64 bits (8x8 grid of cells, eight 64-bit scalars in each cell, stacked vertically).
+
+When Z is wider than X/Y, the grid/cell arrangement of Z is determined solely by the lane width of Z, and multiple rows are selected from each cell. The high bits of "Z column" select one column of cells, and the low bits of "Z column" select the first scalar within each cell. For integer operands, these mixed-width modes support right-shift and optional saturation of the scalars from Z, and then take the low bits. For floating-point operands, these mied-width modes canonicalise NaNs and perform rounding (round to nearest, ties to even).
+
+On M2, when 26=1, the whole operation can optionally be repeated multiple times, by setting bit 31. Bit 25 controls the repetition count; either two times or four times. Consecutive X or Y registers are used as the destination. If repeated twice, the top bit of Z column is ignored, and Z column is incremented by 32 for the 2<sup>nd</sup> iteration. If repeated four times, the top two bits of Z column are ignored, and Z column is incremented by 16 on each iteration.
+
+## Emulation code
+
+See [extr.c](extr.c).
+
+```c
+void emulate_AMX_EXTRY(amx_state* state, uint64_t operand) {
+    void* dst;
+    uint64_t dst_offset = operand;
+    uint64_t z_col = operand >> 20;
+    uint64_t z_step = 64;
+    uint64_t store_enable = ~(uint64_t)0;
+    uint8_t buffer[64];
+    uint32_t stride = 0;
+    uint32_t zbytes, xybytes;
+
+    if (operand & EXTR_HV) {
+        dst = (operand & EXTR_HV_TO_Y) ? state->y : state->x;
+        switch (((operand >> 63) << 4) | ((operand >> 11) & 0xF)) {
+        case  0: xybytes = 1; zbytes = 1; break;
+        case  8: xybytes = 4; zbytes = 4; break;
+        case  9: xybytes = 2; zbytes = 4; stride = 1; break;
+        case 10: xybytes = 2; zbytes = 4; stride = 2; break;
+        case 11: xybytes = 1; zbytes = 4; stride = 1; break;
+        case 13: xybytes = 1; zbytes = 2; stride = 1; break;
+        case 17: xybytes = 8; zbytes = 8; break;
+        case 24: xybytes = 4; zbytes = 4; break;
+        case 25: xybytes = 2; if (AMX_VER >= AMX_VER_M2) { zbytes = 4; stride = 1; } else { zbytes = 2; } break;
+        case 26: xybytes = 2; if (AMX_VER >= AMX_VER_M2) { zbytes = 4; stride = 2; } else { zbytes = 2; } break;
+        default: xybytes = 2; zbytes = 2; break;
+        }
+        if ((AMX_VER >= AMX_VER_M2) && (operand & (1ull << 31))) {
+            operand &=~ (0x1ffull << 32);
+            z_step = z_col & 32 ? 16 : 32;
+            if (AMX_VER >= AMX_VER_M4) {
+                dst_offset &= -64u;
+            }
+        }
+        store_enable &= parse_writemask(operand >> 32, xybytes, 9);
+    } else if (operand & EXTR_BETWEEN_XY) {
+        ...
+    } else {
+        dst = state->y;
+        xybytes = 8 >> ((operand >> 28) & 3);
+        if (xybytes == 1) {
+            xybytes = 2;
+            store_enable &= 0x5555555555555555ull;
+        }
+        store_enable &= parse_writemask(operand >> 32, xybytes, 7);
+        zbytes = xybytes;
+    }
+
+    uint32_t signext = (operand & EXTR_SIGNED_INPUT) ? 64 - zbytes*8 : 0;
+    for (z_col &= z_step - 1; z_col <= 63; z_col += z_step) {
+        for (uint32_t j = 0; j < 64; j += xybytes) {
+            uint64_t zoff = (j & (zbytes - 1)) / xybytes * stride;
+            int64_t val = load_int(&state->z[bit_select(j, z_col + zoff, zbytes - 1)].u8[z_col & -zbytes], zbytes, signext);
+            if (stride) val = extr_alu(val, operand, xybytes*8);
+            store_int(buffer + j, xybytes, val);
+        }
+        if (((operand >> 32) & 0x1ff) == 3) {
+            memset(buffer, 0, sizeof(buffer));
+        }
+        store_xy_row(dst, dst_offset & 0x1FF, buffer, store_enable);
+        dst_offset += 64;
+    }
+}
+
+int64_t extr_alu(int64_t val, uint64_t operand, uint32_t outbits) {
+    uint32_t shift = (operand >> 58) & 0x1f;
+    if (operand & (1ull << 63)) {
+        if (shift >= 16) {
+            val = bf16_from_f32((uint32_t)val);
+        } else {
+            __asm("fcvt %h0, %s0" : "=w"(val) : "0"(val));
+        }
+        return val;
+    }
+    if (shift && (operand & EXTR_ROUNDING_SHIFT)) {
+        val += 1 << (shift - 1);
+    }
+    val >>= shift;
+    if (operand & EXTR_SATURATE) {
+        if (operand & EXTR_SIGNED_OUTPUT) outbits -= 1;
+        int64_t hi = 1ull << outbits;
+        if (operand & EXTR_SIGNED_INPUT) {
+            int64_t lo = (operand & EXTR_SIGNED_OUTPUT) ? -hi : 0;
+            if (val < lo) val = lo;
+            if (val >= hi) val = hi - 1;
+        } else {
+            if ((uint64_t)val >= (uint64_t)hi) val = hi - 1;
+        }
+    }
+    return val;
+}
+```
+
+---
+
+# extr_x.md
+
+Source: https://github.com/corsix/amx/blob/main/extr_x.md
+
+## Quick summary
+
+|`extrx`|`x[i] = y[i]`|None|
+
+## Instruction encoding
+
+|5|5|Instruction|Must be `8`|
+
+## Operand bitfields
+
+|28|36|Ignored|
+|27|1|Must be `1`|Otherwise decodes as [`extrh`](extr_h.md)|
+|26|1|Must be `0`|Otherwise decodes as [`extrh`](extr_h.md)|
+|23|3|Ignored|
+|20|3|Y register index|
+|19|1|Ignored|
+|16|3|X register index|
+|0|16|Ignored|
+
+## Description
+
+Copies an entire register from Y to X.
+
+## Emulation code
+
+See [extr.c](extr.c).
+
+```c
+void emulate_AMX_EXTRX(amx_state* state, uint64_t operand) {
+    if (operand & EXTR_HV) {
+        ...
+    } else if (operand & EXTR_BETWEEN_XY) {
+        memcpy(state->x + ((operand >> 16) & 7),
+               state->y + ((operand >> 20) & 7), 64);
+    } else {
+        ...
+    }
+}
+```
+
+---
+
+# extr_y.md
+
+Source: https://github.com/corsix/amx/blob/main/extr_y.md
+
+## Quick summary
+
+|`extry`|`y[i] = x[i]`|None|
+
+## Instruction encoding
+
+|5|5|Instruction|Must be `9`|
+
+## Operand bitfields
+
+|28|36|Ignored|
+|27|1|Must be `1`|Otherwise decodes as [`extrv`](extr_v.md)|
+|26|1|Must be `0`|Otherwise decodes as [`extrv`](extr_v.md)|
+|23|3|Ignored|
+|20|3|X register index|
+|9|11|Ignored|
+|6|3|Y register index|
+|0|6|Ignored|
+
+## Description
+
+Copies an entire register from X to Y.
+
+## Emulation code
+
+See [extr.c](extr.c).
+
+```c
+void emulate_AMX_EXTRY(amx_state* state, uint64_t operand) {
+    if (operand & EXTR_HV) {
+        ...
+    } else if (operand & EXTR_BETWEEN_XY) {
+        memcpy(state->y + ((operand >>  6) & 7),
+               state->x + ((operand >> 20) & 7), 64);
+    } else {
+        ...
+    }
+}
+```
+
+---
+
+# fma.md
+
+Source: https://github.com/corsix/amx/blob/main/fma.md
+
+## Quick summary
+
+|`fma64`&nbsp;(63=0)<br/>`fma32`&nbsp;(63=0)<br/>`fma16`&nbsp;(63=0)|`z[j][i] += x[i] * y[j]`|7 bit X, 7 bit Y|X/Y/Z input disable|
+|`fma64`&nbsp;(63=1)<br/>`fma32`&nbsp;(63=1)<br/>`fma16`&nbsp;(63=1)|`z[_][i] += x[i] * y[i]`|7 bit|X/Y/Z input disable|
+
+## Instruction encoding
+
+|5|5|Instruction|`10` for `fma64`<br/>`12` for `fma32`<br/>`15` for `fma16`|
+
+## Operand bitfields
+
+|63|1|Vector mode (`1`) or matrix mode (`0`)|
+|62|1|Z is f32 (`1`) or Z is instruction width (`0`)|Only used by `fma16` in matrix mode, ignored otherwise|
+|61|1|X is f16 (`1`) or X is instruction width (`0`)|Only used by `fma32`, ignored otherwise|
+|60|1|Y is f16 (`1`) or Y is instruction width (`0`)|Only used by `fma32`, ignored otherwise|
+|48|12|Ignored|
+|46|2|X enable mode||
+|41|5|X enable value|Meaning dependent upon associated mode|
+|39|2|Ignored|
+|37|2|Y enable mode|Ignored in vector mode|
+|32|5|Y enable value|Ignored in vector mode<br/>Meaning dependent upon associated mode|
+|30|2|Ignored|
+|29|1|Skip X input (`1`) or use X input (`0`)|
+|28|1|Skip Y input (`1`) or use Y input (`0`)|
+|27|1|Skip Z input (`1`) or use Z input (`0`)|
+|26|1|Ignored|
+|20|6|Z row|High bits ignored in matrix mode|
+|19|1|Ignored|
+|10|9|X offset (in bytes)|
+|9|1|Ignored|
+|0|9|Y offset (in bytes)|
+
+Combinations of bits 27-29 result in various floating-point ALU operations:
+
+|Operation|29 (X)|28 (Y)|27 (Z)|
+|`x*y+z`|`0`|`0`|`0`|
+|<code>x*y&nbsp;&nbsp;</code>|`0`|`0`|`1`|
+|<code>x&nbsp;&nbsp;+z</code>|`0`|`1`|`0`|
+|<code>x&nbsp;&nbsp;&nbsp;&nbsp;</code>|`0`|`1`|`1`|
+|<code>&nbsp;&nbsp;y+z</code>|`1`|`0`|`0`|
+|<code>&nbsp;&nbsp;y&nbsp;&nbsp;</code>|`1`|`0`|`1`|
+|<code>&nbsp;&nbsp;&nbsp;&nbsp;z</code>|`1`|`1`|`0`|
+|`0`|`1`|`1`|`1`|
+
+Combinations of the instruction and bits 60-63 result in various widths for X / Y / Z:
+
+|Mode|X|Y|Z|63 (M)|62 (Z)|61 (X)|60 (Y)|Op|
+|---|---|---|---|---|---|---|---|---|
+|Matrix|f16|f16|f16 (one row from each two)|`0`|`0`|||`fma16`|
+|Matrix|f16|f16|f32 (all rows, interleaved pairs)|`0`|`1`|||`fma16`|
+|Matrix|f32|f32|f32 (one row from each four)|`0`||`0`|`0`|`fma32`|
+|Matrix|f32|f16 (even lanes)|f32 (one row from each four)|`0`||`0`|`1`|`fma32`|
+|Matrix|f16 (even lanes)|f32|f32 (one row from each four)|`0`||`1`|`0`|`fma32`|
+|Matrix|f16 (even lanes)|f16 (even lanes)|f32 (one row from each four)|`0`||`1`|`1`|`fma32`|
+|Matrix|f64|f64|f64 (one row from each eight)|`0`||||`fma64`|
+|Vector|f16|f16|f16 (one row)|`1`||||`fma16`|
+|Vector|f32|f32|f32 (one row)|`1`||`0`|`0`|`fma32`|
+|Vector|f32|f16 (even lanes)|f32 (one row)|`1`||`0`|`1`|`fma32`|
+|Vector|f16 (even lanes)|f32|f32 (one row)|`1`||`1`|`0`|`fma32`|
+|Vector|f16 (even lanes)|f16 (even lanes)|f32 (one row)|`1`||`1`|`1`|`fma32`|
+|Vector|f64|f64|f64 (one row)|`1`||||`fma64`|
+
+X/Y enable modes:
+|Mode|Meaning of value (N)|
+|---:|---|
+|`0`|Enable all lanes (`0`), or odd lanes only (`1`), or even lanes only (`2`), or no lanes (anything else) |
+|`1`|Only enable lane #N|
+|`2`|Only enable the first N lanes, or all lanes when N is zero|
+|`3`|Only enable the last N lanes, or all lanes when N is zero|
+
+## Description
+
+In vector mode, performs a pointwise fused-multiply-add (or simplification thereof) operation between an X vector, a Y vector, and a Z vector, accumulating onto the Z vector. All three vectors have the same element type, either f16 or f32 or f64. Alternatively, when Z has type f32, X or Y (or both) can have type f16, though only the even lanes are used.
+
+In matrix mode, performs a fused-multiply-add (or simplification thereof) outer-product between an X vector, a Y vector, and a 2D grid of Z values, accumulating onto Z. All three of X and Y and Z have the same element type, either f16 or f32 or f64. Alternatively, when Z has type f32, X or Y (or both) can have type f16, though only the even lanes are used. As a final alternative, when Z has type f32 and both X/Y have type f16, then all lanes of X and Y can be used in combination with the entire 64x64 byte grid of Z, with even lanes of X going into even Z registers and odd lanes of X going into odd Z registers (see [Mixed lane widths](RegisterFile.md#mixed-lane-widths)).
+
+## Emulation code
+
+See [fma.c](fma.c). Note the code in [test.c](test.c) to set the DN bit of `fpcr`.
+
+```c
+void emulate_AMX_FMA64(amx_state* state, uint64_t operand) {
+    uint64_t y_offset = operand & 0x1FF;
+    uint64_t x_offset = (operand >> 10) & 0x1FF;
+    uint64_t z_row = (operand >> 20) & 63;
+    uint64_t x_enable = parse_writemask(operand >> 41, 8, 7);
+    uint64_t y_enable = parse_writemask(operand >> 32, 8, 7);
+
+    double x[8];
+    double y[8];
+    load_xy_reg(x, state->x, x_offset);
+    load_xy_reg(y, state->y, y_offset);
+
+    for (int i = 0; i < 8; i++) {
+        if (!((x_enable >> (i * 8)) & 1)) continue;
+        if (operand & FMA_VECTOR_PRODUCT) {
+            double* z = &state->z[z_row].f64[i];
+            *z = fma64_alu(x[i], y[i], *z, operand);
+        } else {
+            for (int j = 0; j < 8; j++) {
+                if (!((y_enable >> (j * 8)) & 1)) continue;
+                double* z = &state->z[(j * 8) + (z_row & 7)].f64[i];
+                *z = fma64_alu(x[i], y[j], *z, operand);
+            }
+        }
+    }
+}
+
+double fma64_alu(double x, double y, double z, uint64_t operand) {
+    switch ((operand >> 27) & 7) {
+    case 1: return x * y;
+    case 2: return z + x;
+    case 3: return x;
+    case 4: return z + y;
+    case 5: return y;
+    case 6: return z;
+    case 7: return 0.;
+    }
+    double result;
+    __asm("fmadd %d0, %d1, %d2, %d3" : "=w"(result) : "w"(x), "w"(y), "w"(z));
+    return result;
+}
+```
+
+## Performance (M1 Max)
+
+Note that a fused-multiply-add counts as _two_ floating-point operations. A measurement of 1.0 GFLOPS would mean 10<sup>9</sup> floating-point operations per second. The measurements are done without any load or store instructions; real-world workloads will need loads and stores, and thus will achieve lower numbers.
+
+`fma16` in matrix mode, each Z accumulator being `f16[32][32]`:
+
+|Z Accumulators|1 Thread|2 Threads|3 Threads|4 Threads|5 Threads|6 Threads|
+|---:|---:|---:|---:|---:|---:|---:|
+|1 per thread|1453.0 GFLOPS|2958.4 GFLOPS|2705.5 GFLOPS|3553.5 GFLOPS|4609.2 GFLOPS|5268.5 GFLOPS|
+|2 per thread|2958.9 GFLOPS|5915.7 GFLOPS|4862.3 GFLOPS|5355.6 GFLOPS|5546.6 GFLOPS|6263.4 GFLOPS|
+
+`fma16` in matrix mode, each Z accumulator being `f32[32][32]`:
+
+|Z Accumulators|1 Thread|2 Threads|3 Threads|4 Threads|5 Threads|6 Threads|
+|---:|---:|---:|---:|---:|---:|---:|
+|1 per thread|1459.7 GFLOPS|2948.3 GFLOPS|2842.5 GFLOPS|2626.4 GFLOPS|2892.2 GFLOPS|2909.9 GFLOPS|
+
+`fma32` in matrix mode, each Z accumulator being `f32[16][16]`:
+
+|Z Accumulators|1 Thread|2 Threads|3 Threads|4 Threads|5 Threads|6 Threads|
+|---:|---:|---:|---:|---:|---:|---:|
+|1 per thread|367.6 GFLOPS|739.1 GFLOPS|866.1 GFLOPS|1108.5 GFLOPS|1388.4 GFLOPS|1512.4 GFLOPS|
+|2 per thread|736.4 GFLOPS|1478.1 GFLOPS|1335.4 GFLOPS|1796.2 GFLOPS|2606.3 GFLOPS|2470.7 GFLOPS|
+|3 per thread|1108.4 GFLOPS|2217.9 GFLOPS|1878.5 GFLOPS|2507.2 GFLOPS|2564.2 GFLOPS|2798.4 GFLOPS|
+|4 per thread|1475.0 GFLOPS|2956.7 GFLOPS|2429.8 GFLOPS|3077.4 GFLOPS|2894.6 GFLOPS|3118.7 GFLOPS|
+
+`fma64` in matrix mode, each Z accumulator being `f64[8][8]`:
+
+|Z Accumulators|1 Thread|2 Threads|3 Threads|4 Threads|5 Threads|6 Threads|
+|---:|---:|---:|---:|---:|---:|---:|
+|1 per thread|92.1 GFLOPS|184.3 GFLOPS|214.9 GFLOPS|311.7 GFLOPS|416.9 GFLOPS|381.8 GFLOPS|
+|2 per thread|183.6 GFLOPS|366.6 GFLOPS|369.3 GFLOPS|516.6 GFLOPS|697.7 GFLOPS|641.6 GFLOPS|
+|3 per thread|275.6 GFLOPS|553.5 GFLOPS|548.2 GFLOPS|650.5 GFLOPS|768.4 GFLOPS|758.4 GFLOPS|
+|4 per thread|369.1 GFLOPS|738.1 GFLOPS|603.6 GFLOPS|706.5 GFLOPS|780.0 GFLOPS|756.3 GFLOPS|
+|5 per thread|368.4 GFLOPS|736.8 GFLOPS|604.6 GFLOPS|725.2 GFLOPS|777.6 GFLOPS|797.7 GFLOPS|
+|6 per thread|368.6 GFLOPS|738.5 GFLOPS|603.6 GFLOPS|689.8 GFLOPS|775.0 GFLOPS|776.6 GFLOPS|
+|7 per thread|368.4 GFLOPS|738.0 GFLOPS|604.5 GFLOPS|713.3 GFLOPS|792.6 GFLOPS|739.2 GFLOPS|
+|8 per thread|369.2 GFLOPS|739.5 GFLOPS|602.7 GFLOPS|733.3 GFLOPS|742.5 GFLOPS|768.9 GFLOPS|
+
+`fma16` in vector mode, each Z accumulator being `f16[32]`:
+
+|Z Accumulators|1 Thread|2 Threads|3 Threads|4 Threads|5 Threads|6 Threads|
+|---:|---:|---:|---:|---:|---:|---:|
+|1 per thread|45.8 GFLOPS|92.6 GFLOPS|105.2 GFLOPS|141.2 GFLOPS|173.0 GFLOPS|226.9 GFLOPS|
+|2 per thread|90.6 GFLOPS|181.0 GFLOPS|199.6 GFLOPS|276.9 GFLOPS|335.5 GFLOPS|352.0 GFLOPS|
+|3 per thread|138.8 GFLOPS|276.9 GFLOPS|330.9 GFLOPS|381.4 GFLOPS|463.1 GFLOPS|453.1 GFLOPS|
+|4 per thread|184.7 GFLOPS|366.0 GFLOPS|428.0 GFLOPS|514.6 GFLOPS|649.0 GFLOPS|574.5 GFLOPS|
+|5 per thread|230.9 GFLOPS|462.5 GFLOPS|469.5 GFLOPS|629.4 GFLOPS|671.7 GFLOPS|683.1 GFLOPS|
+|6 per thread|271.3 GFLOPS|553.7 GFLOPS|536.7 GFLOPS|713.7 GFLOPS|765.5 GFLOPS|768.7 GFLOPS|
+|7 per thread|322.7 GFLOPS|647.3 GFLOPS|597.3 GFLOPS|762.7 GFLOPS|768.0 GFLOPS|738.8 GFLOPS|
+|8 per thread|366.7 GFLOPS|729.0 GFLOPS|655.7 GFLOPS|760.8 GFLOPS|742.7 GFLOPS|806.2 GFLOPS|
+|9 per thread|342.6 GFLOPS|688.9 GFLOPS|622.8 GFLOPS|742.7 GFLOPS|750.7 GFLOPS|802.1 GFLOPS|
+|10 per thread|362.7 GFLOPS|716.3 GFLOPS|642.6 GFLOPS|785.9 GFLOPS|768.7 GFLOPS|793.7 GFLOPS|
+|11 per thread|358.3 GFLOPS|716.1 GFLOPS|660.6 GFLOPS|798.9 GFLOPS|798.8 GFLOPS|822.2 GFLOPS|
+|12 per thread|361.7 GFLOPS|730.8 GFLOPS|662.4 GFLOPS|783.0 GFLOPS|752.6 GFLOPS|823.2 GFLOPS|
+|13 per thread|368.3 GFLOPS|735.9 GFLOPS|669.9 GFLOPS|804.4 GFLOPS|794.5 GFLOPS|778.2 GFLOPS|
+|14 per thread|367.6 GFLOPS|733.3 GFLOPS|653.3 GFLOPS|802.9 GFLOPS|781.6 GFLOPS|790.2 GFLOPS|
+|15 per thread|360.2 GFLOPS|725.4 GFLOPS|661.7 GFLOPS|785.4 GFLOPS|759.2 GFLOPS|822.9 GFLOPS|
+|16 per thread|370.6 GFLOPS|733.4 GFLOPS|674.5 GFLOPS|797.6 GFLOPS|805.8 GFLOPS|818.7 GFLOPS|
+
+`fma32` in vector mode, each Z accumulator being `f32[16]`:
+
+|Z Accumulators|1 Thread|2 Threads|3 Threads|4 Threads|5 Threads|6 Threads|
+|---:|---:|---:|---:|---:|---:|---:|
+|1 per thread|23.0 GFLOPS|46.3 GFLOPS|53.2 GFLOPS|70.8 GFLOPS|88.1 GFLOPS|104.5 GFLOPS|
+|2 per thread|46.3 GFLOPS|92.4 GFLOPS|106.1 GFLOPS|134.2 GFLOPS|188.9 GFLOPS|178.0 GFLOPS|
+|3 per thread|68.7 GFLOPS|137.5 GFLOPS|153.6 GFLOPS|199.1 GFLOPS|239.1 GFLOPS|255.8 GFLOPS|
+|4 per thread|92.5 GFLOPS|184.4 GFLOPS|196.8 GFLOPS|264.6 GFLOPS|285.1 GFLOPS|282.8 GFLOPS|
+|5 per thread|114.9 GFLOPS|230.0 GFLOPS|225.3 GFLOPS|299.6 GFLOPS|354.0 GFLOPS|367.2 GFLOPS|
+|6 per thread|134.3 GFLOPS|276.0 GFLOPS|257.3 GFLOPS|344.1 GFLOPS|399.2 GFLOPS|380.9 GFLOPS|
+|7 per thread|161.3 GFLOPS|322.7 GFLOPS|297.6 GFLOPS|372.5 GFLOPS|389.1 GFLOPS|401.8 GFLOPS|
+|8 per thread|183.1 GFLOPS|370.2 GFLOPS|331.2 GFLOPS|381.4 GFLOPS|393.3 GFLOPS|389.6 GFLOPS|
+|9 per thread|170.6 GFLOPS|351.8 GFLOPS|323.3 GFLOPS|390.9 GFLOPS|395.6 GFLOPS|410.6 GFLOPS|
+|10 per thread|180.7 GFLOPS|357.5 GFLOPS|328.3 GFLOPS|395.6 GFLOPS|397.2 GFLOPS|399.6 GFLOPS|
+|11 per thread|185.0 GFLOPS|366.8 GFLOPS|330.3 GFLOPS|400.0 GFLOPS|399.6 GFLOPS|385.4 GFLOPS|
+|12 per thread|183.2 GFLOPS|369.7 GFLOPS|332.3 GFLOPS|399.2 GFLOPS|379.9 GFLOPS|403.0 GFLOPS|
+|13 per thread|184.1 GFLOPS|370.0 GFLOPS|401.0 GFLOPS|389.6 GFLOPS|383.9 GFLOPS|408.4 GFLOPS|
+|14 per thread|184.3 GFLOPS|368.2 GFLOPS|326.5 GFLOPS|400.6 GFLOPS|394.8 GFLOPS|406.5 GFLOPS|
+|15 per thread|181.8 GFLOPS|369.4 GFLOPS|335.7 GFLOPS|404.6 GFLOPS|404.5 GFLOPS|397.5 GFLOPS|
+|16 per thread|183.0 GFLOPS|368.0 GFLOPS|334.9 GFLOPS|402.2 GFLOPS|399.4 GFLOPS|393.5 GFLOPS|
+
+`fma64` in vector mode, each Z accumulator being `f64[8]`:
+
+|Z Accumulators|1 Thread|2 Threads|3 Threads|4 Threads|5 Threads|6 Threads|
+|---:|---:|---:|---:|---:|---:|---:|
+|1 per thread|11.5 GFLOPS|23.1 GFLOPS|26.7 GFLOPS|35.9 GFLOPS|44.2 GFLOPS|48.7 GFLOPS|
+|2 per thread|23.2 GFLOPS|46.3 GFLOPS|53.4 GFLOPS|70.5 GFLOPS|89.5 GFLOPS|102.6 GFLOPS|
+|3 per thread|34.7 GFLOPS|69.5 GFLOPS|79.9 GFLOPS|104.6 GFLOPS|120.6 GFLOPS|108.4 GFLOPS|
+|4 per thread|45.8 GFLOPS|92.4 GFLOPS|104.3 GFLOPS|127.4 GFLOPS|156.8 GFLOPS|146.7 GFLOPS|
+|5 per thread|57.5 GFLOPS|114.7 GFLOPS|119.6 GFLOPS|159.0 GFLOPS|180.2 GFLOPS|172.7 GFLOPS|
+|6 per thread|69.2 GFLOPS|138.7 GFLOPS|135.7 GFLOPS|179.9 GFLOPS|188.9 GFLOPS|200.9 GFLOPS|
+|7 per thread|80.9 GFLOPS|159.8 GFLOPS|151.4 GFLOPS|181.4 GFLOPS|197.2 GFLOPS|199.8 GFLOPS|
+|8 per thread|91.7 GFLOPS|183.5 GFLOPS|170.0 GFLOPS|199.0 GFLOPS|209.2 GFLOPS|196.0 GFLOPS|
+|9 per thread|85.3 GFLOPS|169.9 GFLOPS|159.9 GFLOPS|198.0 GFLOPS|199.3 GFLOPS|202.9 GFLOPS|
+|10 per thread|91.2 GFLOPS|180.4 GFLOPS|165.2 GFLOPS|199.5 GFLOPS|198.6 GFLOPS|206.1 GFLOPS|
+|11 per thread|92.1 GFLOPS|184.1 GFLOPS|167.1 GFLOPS|200.7 GFLOPS|200.7 GFLOPS|198.6 GFLOPS|
+|12 per thread|92.5 GFLOPS|185.1 GFLOPS|168.8 GFLOPS|198.5 GFLOPS|201.3 GFLOPS|203.1 GFLOPS|
+|13 per thread|92.3 GFLOPS|183.2 GFLOPS|168.5 GFLOPS|200.6 GFLOPS|201.4 GFLOPS|208.8 GFLOPS|
+|14 per thread|92.7 GFLOPS|185.1 GFLOPS|199.0 GFLOPS|201.3 GFLOPS|200.4 GFLOPS|209.8 GFLOPS|
+|15 per thread|92.6 GFLOPS|184.8 GFLOPS|168.2 GFLOPS|201.7 GFLOPS|200.1 GFLOPS|208.0 GFLOPS|
+|16 per thread|92.2 GFLOPS|185.1 GFLOPS|168.1 GFLOPS|202.2 GFLOPS|201.3 GFLOPS|205.3 GFLOPS|
+
+---
+
+# fms.md
+
+Source: https://github.com/corsix/amx/blob/main/fms.md
+
+## Quick summary
+
+|`fms64`&nbsp;(63=0)<br/>`fms32`&nbsp;(63=0)<br/>`fms16`&nbsp;(63=0)|`z[j][i] -= x[i] * y[j]`|7 bit X, 7 bit Y|X/Y/Z input disable|
+|`fms64`&nbsp;(63=1)<br/>`fms32`&nbsp;(63=1)<br/>`fms16`&nbsp;(63=1)|`z[_][i] -= x[i] * y[i]`|7 bit|X/Y/Z input disable|
+
+## Instruction encoding
+
+|5|5|Instruction|`11` for `fms64`<br/>`13` for `fms32`<br/>`16` for `fms16`|
+
+## Operand bitfields
+
+|63|1|Vector mode (`1`) or matrix mode (`0`)|
+|62|1|Z is f32 (`1`) or Z is instruction width (`0`)|Only used by `fms16` in matrix mode, ignored otherwise|
+|61|1|X is f16 (`1`) or X is instruction width (`0`)|Only used by `fms32`, ignored otherwise|
+|60|1|Y is f16 (`1`) or Y is instruction width (`0`)|Only used by `fms32`, ignored otherwise|
+|48|12|Ignored|
+|46|2|X enable mode||
+|41|5|X enable value|Meaning dependent upon associated mode|
+|39|2|Ignored|
+|37|2|Y enable mode|Ignored in vector mode|
+|32|5|Y enable value|Ignored in vector mode<br/>Meaning dependent upon associated mode|
+|30|2|Ignored|
+|29|1|Skip X input (`1`) or use X input (`0`)|
+|28|1|Skip Y input (`1`) or use Y input (`0`)|
+|27|1|Skip Z input (`1`) or use Z input (`0`)|
+|26|1|Ignored|
+|20|6|Z row|High bits ignored in matrix mode|
+|19|1|Ignored|
+|10|9|X offset (in bytes)|
+|9|1|Ignored|
+|0|9|Y offset (in bytes)|
+
+Combinations of bits 27-29 result in various floating-point ALU operations:
+
+|Operation|29 (X)|28 (Y)|27 (Z)|
+|`z-x*y`|`0`|`0`|`0`|
+|<code>&nbsp;-x*y</code>|`0`|`0`|`1`|
+|<code>z-x&nbsp;&nbsp;</code>|`0`|`1`|`0`|
+|<code>&nbsp;-x&nbsp;&nbsp;</code>|`0`|`1`|`1`|
+|<code>z-&nbsp;&nbsp;y</code>|`1`|`0`|`0`|
+|<code>&nbsp;-&nbsp;&nbsp;y</code>|`1`|`0`|`1`|
+|<code>z&nbsp;&nbsp;&nbsp;&nbsp;</code>|`1`|`1`|`0`|
+|<code>&nbsp;-0</code>|`1`|`1`|`1`|
+
+Combinations of the instruction and bits 60-63 result in various widths for X / Y / Z:
+
+|Mode|X|Y|Z|63 (M)|62 (Z)|61 (X)|60 (Y)|Op|
+|---|---|---|---|---|---|---|---|---|
+|Matrix|f16|f16|f16 (one row from each two)|`0`|`0`|||`fms16`|
+|Matrix|f16|f16|f32 (all rows, interleaved pairs)|`0`|`1`|||`fms16`|
+|Matrix|f32|f32|f32 (one row from each four)|`0`||`0`|`0`|`fms32`|
+|Matrix|f32|f16 (even lanes)|f32 (one row from each four)|`0`||`0`|`1`|`fms32`|
+|Matrix|f16 (even lanes)|f32|f32 (one row from each four)|`0`||`1`|`0`|`fms32`|
+|Matrix|f16 (even lanes)|f16 (even lanes)|f32 (one row from each four)|`0`||`1`|`1`|`fms32`|
+|Matrix|f64|f64|f64 (one row from each eight)|`0`||||`fms64`|
+|Vector|f16|f16|f16 (one row)|`1`||||`fms16`|
+|Vector|f32|f32|f32 (one row)|`1`||`0`|`0`|`fms32`|
+|Vector|f32|f16 (even lanes)|f32 (one row)|`1`||`0`|`1`|`fms32`|
+|Vector|f16 (even lanes)|f32|f32 (one row)|`1`||`1`|`0`|`fms32`|
+|Vector|f16 (even lanes)|f16 (even lanes)|f32 (one row)|`1`||`1`|`1`|`fms32`|
+|Vector|f64|f64|f64 (one row)|`1`||||`fms64`|
+
+X/Y enable modes:
+|Mode|Meaning of value (N)|
+|---:|---|
+|`0`|Enable all lanes (`0`), or odd lanes only (`1`), or even lanes only (`2`), or no lanes (anything else) |
+|`1`|Only enable lane #N|
+|`2`|Only enable the first N lanes, or all lanes when N is zero|
+|`3`|Only enable the last N lanes, or all lanes when N is zero|
+
+## Description
+
+In vector mode, performs a pointwise fused-multiply-subtract (or simplification thereof) operation between an X vector, a Y vector, and a Z vector, accumulating onto the Z vector. All three vectors have the same element type, either f16 or f32 or f64. Alternatively, when Z has type f32, X or Y (or both) can have type f16, though only the even lanes are used.
+
+In matrix mode, performs a fused-multiply-subtract (or simplification thereof) outer-product between an X vector, a Y vector, and a 2D grid of Z values, accumulating onto Z. All three of X and Y and Z have the same element type, either f16 or f32 or f64. Alternatively, when Z has type f32, X or Y (or both) can have type f16, though only the even lanes are used. As a final alternative, when Z has type f32 and both X/Y have type f16, then all lanes of X and Y can be used in combination with the entire 64x64 byte grid of Z, with even lanes of X going into even Z registers and odd lanes of X going into odd Z registers (see [Mixed lane widths](RegisterFile.md#mixed-lane-widths)).
+
+## Emulation code
+
+See [fms.c](fms.c). Note the code in [test.c](test.c) to set the DN bit of `fpcr`.
+
+```c
+void emulate_AMX_FMS64(amx_state* state, uint64_t operand) {
+    uint64_t y_offset = operand & 0x1FF;
+    uint64_t x_offset = (operand >> 10) & 0x1FF;
+    uint64_t z_row = (operand >> 20) & 63;
+    uint64_t x_enable = parse_writemask(operand >> 41, 8, 7);
+    uint64_t y_enable = parse_writemask(operand >> 32, 8, 7);
+
+    double x[8];
+    double y[8];
+    load_xy_reg(x, state->x, x_offset);
+    load_xy_reg(y, state->y, y_offset);
+
+    for (int i = 0; i < 8; i++) {
+        if (!((x_enable >> (i * 8)) & 1)) continue;
+        if (operand & FMA_VECTOR_PRODUCT) {
+            double* z = &state->z[z_row].f64[i];
+            *z = fms64_alu(x[i], y[i], *z, operand);
+        } else {
+            for (int j = 0; j < 8; j++) {
+                if (!((y_enable >> (j * 8)) & 1)) continue;
+                double* z = &state->z[(j * 8) + (z_row & 7)].f64[i];
+                *z = fms64_alu(x[i], y[j], *z, operand);
+            }
+        }
+    }
+}
+
+double fms64_alu(double x, double y, double z, uint64_t operand) {
+    switch ((operand >> 27) & 7) {
+    case 1: z = -0.; break;
+    case 2: return z - x;
+    case 3: return -x;
+    case 4: return z - y;
+    case 5: return -y;
+    case 6: return z;
+    case 7: return -0.;
+    }
+    double out;
+    __asm("fmsub %d0, %d1, %d2, %d3" : "=w"(out) : "w"(x), "w"(y), "w"(z));
+    return out;
+}
+```
+
+## Performance
+
+Identical to corresponding [fma](fma.md#performance-m1-max) instruction.
+
+---
+
+# genlut.md
+
+Source: https://github.com/corsix/amx/blob/main/genlut.md
+
+## Quick summary
+
+|Instruction|General theme|Notes|
+|---|---|---|
+|`genlut`&nbsp;(53≤6)|Generate indices for indexed load|For use by `matfp` / `matint` / `vecfp` / `vecint` / `genlut`&nbsp;(53≥7)|
+|`genlut`&nbsp;(53≥7)|Perform indexed load|Can write to any of `x` or `y` or `z`|
+
+## Instruction encoding
+
+|5|5|Instruction|Must be `22`|
+
+## Operand bitfields
+
+|63|1|Ignored|
+|60|3|Table register index|
+|59|1|Table is from Y (`1`) or from X (`0`)|
+|57|2|Ignored|
+|53|4|Mode|Data type, lane width, index width, whether generating or looking up|
+|31|22|Ignored|
+|(53=1)&nbsp;30|1|Data type is bf16 (`1`) or f16 (`0`)|M2 only (always reads as `0` on M1)|
+|27|3|Ignored|
+|26|1|Destination is Z (`1`) or is X or Y (`0`)|Ignored in generate modes; they always write to X or Y| 
+|(26=0) 25|1|Destination is Y (`1`) or is X (`0`)|
+|(26=0) 23|2|Ignored|
+|(26=1) 23|3|Destination register index (hi)|
+|20|3|Destination register index (lo)|
+|11|9|Ignored|
+|10|1|Source is from Y (`1`) or from X (`0`)|
+|9|1|Ignored|
+|0|9|Source offset (in bytes)|
+
+Mode bits:
+|Data type (DT)|Index type (IT)|Lane count (LC)|Direction|53|Notes|
+|---:|---:|---:|---|---:|---|
+|f32|u4|16|Generate|`0`|
+|bf16 or f16|u5|32|Generate|`1`|M2 required for bf16. See bit 30|
+|f64|u4|8|Generate|`2`|High bit of index always generated as `0`|
+|i32|u4|16|Generate|`3`|
+|i16|u5|32|Generate|`4`|
+|u32|u4|16|Generate|`5`|
+|u16|u5|32|Generate|`6`|
+|any 32-bit|u2|16|Lookup|`7`|
+|any 16-bit|u2|32|Lookup|`8`|
+|any 8-bit|u2|64|Lookup|`9`|
+|any 64-bit|u4|8|Lookup|`10`|High bit of index ignored|
+|any 32-bit|u4|16|Lookup|`11`|
+|any 16-bit|u4|32|Lookup|`12`|
+|any 8-bit|u4|64|Lookup|`13`|
+|any 16-bit|u5|32|Lookup|`14`|
+|any 8-bit|u5|64|Lookup|`15`|
+
+Note that DT times LC is always 512 bits.
+
+## Description
+
+In _lookup_ modes, a densely-packed `IT[LC]` vector is read from the source (between 4 and 40 bytes, depending on `IT` and `LC`), each lane is expanded from `IT` to `DT` by treating it as a lane index into the table register (which has type `DT[LC]`), and then the resultant 64 bytes are written to an X or Y or Z register.
+
+In _generate_ modes, a `DT[LC]` vector is read from the source (64 bytes), and a densely-packed `IT[LC]` vector is written to the low (between 4 and 40) bytes of an X or Y register, with the remaining bytes of the X or Y register cleared to zero. The index values are obtained by searching the `DT[LC]` table register: for each lane of the source, the minimum `v` is found such that `table[v] > source_lane`, and then the index value is `v - 1`. If no such `v` is found, the index value is `-1` (just as if `v` was `0`). Note that `-1` is represented as an unsigned integer with all bits set (except in the f64 case, where the high bit of the index is forced to zero). If `table` happens to be sorted in ascending order, this results in `v` when `table[v] <= source_lane < table[v+1]` and `-1` when `source_lane` is either less than or greater than all of the table elements.
+
+By using _generate_ followed by _lookup_ (into a different table), unary functions can be approximated in a piecewise linear (or piecewise polynomial) fashion: the _generate_ determines which piece of the function we're in, and the _lookup_ fetches the relevant coefficients for that piece.
+
+## Emulation code
+
+See [genlut.c](genlut.c).
+
+```c
+void emulate_AMX_GENLUT(amx_state* state, uint64_t operand) {
+    uint64_t mode = (operand >> 53) & 0xf;
+    const amx_reg* source = (operand & GENLUT_SOURCE_Y) ? state->y : state->x;
+    const amx_reg* table = (operand & GENLUT_TABLE_Y) ? state->y : state->x;
+    table += (operand >> 60) & 7;
+    amx_reg xy;
+    load_xy_reg(&xy, source, operand & 0x1FF);
+    uint32_t ibits, ebits;
+    switch (mode) {
+    case  0: ibits = 4; ebits = 32; break; // generate from f32
+    case  1: ibits = 5; ebits = 16; break; // generate from f16 (or bf16 on M2)
+    case  2: ibits = 4; ebits = 64; break; // generate from f64
+    case  3: ibits = 4; ebits = 32; break; // generate from i32
+    case  4: ibits = 5; ebits = 16; break; // generate from i16
+    case  5: ibits = 4; ebits = 32; break; // generate from u32
+    case  6: ibits = 5; ebits = 16; break; // generate from u16
+    case  7: ibits = 2; ebits = 32; break; // lookup
+    case  8: ibits = 2; ebits = 16; break; // lookup
+    case  9: ibits = 2; ebits =  8; break; // lookup
+    case 10: ibits = 4; ebits = 64; break; // lookup
+    case 11: ibits = 4; ebits = 32; break; // lookup
+    case 12: ibits = 4; ebits = 16; break; // lookup
+    case 13: ibits = 4; ebits =  8; break; // lookup
+    case 14: ibits = 5; ebits = 16; break; // lookup
+    case 15: ibits = 5; ebits =  8; break; // lookup
+    }
+    if (mode <= 6) {
+        uint8_t vs[32]; // 8 bits per element, subsequently packed to ibits per element
+        find_first_greater_than(vs, mode, &xy, table, operand);
+        pack_bits(xy.u8, vs, ibits, ebits);
+        operand &=~ GENLUT_DEST_Z;
+    } else {
+        load_xy_reg_indexed(xy.u8, table->u8, ibits, ebits);
+    }
+    amx_reg* dest;
+    uint64_t doff = (operand >> 20);
+    if (operand & GENLUT_DEST_Z) {
+        dest = state->z;
+        doff &= 63;
+    } else {
+        dest = (operand & GENLUT_DEST_Y) ? state->y : state->x;
+        doff &= 7;
+    }
+    memcpy(dest + doff, &xy, 64);
+}
+
+void find_first_greater_than(uint8_t* vs, uint32_t mode, const amx_reg* xy, const amx_reg* table, uint64_t operand) {
+    switch (mode) {
+    case 0:
+        for (uint32_t i = 0; i < 16; ++i) {
+            uint32_t v = 0;
+            for (; v < 16; ++v) { if (table->f32[v] > xy->f32[i]) break; }
+            vs[i] = v - 1;
+        }
+        break;
+    ...
+    }
+}
+
+void pack_bits(uint8_t* dst, const uint8_t* bytes, uint32_t ibits, uint32_t ebits) {
+    uint8_t* end = dst + 64;
+    uint64_t imask = ebits == 64 ? 7 : (1ull << ibits) - 1;
+    for (uint32_t etotal = 0; etotal < 64; etotal += ebits) {
+        uint64_t packed = 0;
+        for (uint32_t i = 0; i < 8; ++i) {
+            packed |= (bytes[i] & imask) << (i * ibits);
+        }
+        memcpy(dst, &packed, 8);
+        dst += ibits;
+        bytes += 8;
+    }
+    memset(dst, 0, end - dst);
+}
+
+void load_xy_reg_indexed(uint8_t* dst, const uint8_t* table, uint32_t ibits, uint32_t ebits) {
+    uint8_t tmp[40];
+    memcpy(tmp, dst, 40); // As we modify dst in-place
+
+    uint32_t ebytes = ebits / 8;
+    uint32_t imask = (1u << ibits) - 1;
+    for (uint32_t doff = 0, soff = 0; doff < 64; ) {
+        uint64_t bits;
+        memcpy(&bits, tmp + soff, 8);
+        soff += ibits;
+        for (int i = 0; i < 8; ++i) {
+            uint32_t toff = ((bits & imask) * ebytes) & 0x3f; // NB: & 0x3f only comes into play when ibits==4 and ebits==64
+            memcpy(dst + doff, table + toff, ebytes);
+            bits >>= ibits;
+            doff += ebytes;
+        }
+    }
+}
+```
+
+---
+
+# Instructions.md
+
+Source: https://github.com/corsix/amx/blob/main/Instructions.md
+
+### Notation
+
+`x` denotes a 64-byte span from the X register pool, accessed as a vector of lanes. The lanes are indexed by `i`.
+
+`y` denotes a 64-byte span from the Y register pool, accessed as a vector of lanes. The lanes are indexed by `j` (or by `i` for vector operations).
+
+`z` denotes the entire set of 64x64-byte Z registers, with 2D indexing. When only one index variable is used, `[_]` denotes that the other index comes from the instruction operand (typically a bitfield called "Z row" or "Z column").
+
+`f` denotes _some_ function. `f(x, y) = x * y` is usually one option for binary functions. <code>f<sub>s</sub>(z) = z &gt;&gt; s</code> is usually one option for unary functions.
+
+Some instructions can operate in multiple distinct modes. In these cases, the instruction name is followed by the relevant mode bits. When the mode field is a single bit #N, this is denoted as "(N=0)" or "(N=1)". When the mode field is multiple bits starting at bit #N, this is denoted as "(N=M)" or "(N≠M)" or "(N≤M)" or "(N≥M)".
+
+## Setup and clear
+
+|Instruction|General theme|Notes|
+|---|---|---|
+|[`set`](setclr.md)|Setup AMX state|Raises invalid instruction exception if already setup. All registers set to zero.|
+|[`clr`](setclr.md)|Clear AMX state|All registers set to uninitialised, no longer need saving/restoring on context switch.|
+
+## Memory
+
+|Instruction|General theme|Optional special features|
+|---|---|---|
+|[`ldx`](ldst.md)|<code>&nbsp;&nbsp;&nbsp;x[i] = memory[i]</code>|Load pair|
+|[`ldy`](ldst.md)|<code>&nbsp;&nbsp;&nbsp;y[i] = memory[i]</code>|Load pair|
+|[`ldz`](ldst.md)<br/>[`ldzi`](ldst.md)|`z[_][i] = memory[i]`|Load pair, interleaved Z|
+|[`stx`](ldst.md)|<code>memory[i] =&nbsp;&nbsp;&nbsp;&nbsp;x[i]</code>|Store pair|
+|[`sty`](ldst.md)|<code>memory[i] =&nbsp;&nbsp;&nbsp;&nbsp;y[i]</code>|Store pair|
+|[`stz`](ldst.md)<br/>[`stzi`](ldst.md)|`memory[i] = z[_][i]`|Store pair, interleaved Z|
+
+## Floating-point matrix arithmetic (i.e. outer products), writing to `z`
+
+|[`fma64`&nbsp;(63=0)](fma.md)<br/>[`fma32`&nbsp;(63=0)](fma.md)<br/>[`fma16`&nbsp;(63=0)](fma.md)|`z[j][i] += x[i] * y[j]`|7 bit X, 7 bit Y|X/Y/Z input disable|
+|[`fms64`&nbsp;(63=0)](fms.md)<br/>[`fms32`&nbsp;(63=0)](fms.md)<br/>[`fms16`&nbsp;(63=0)](fms.md)|`z[j][i] -= x[i] * y[j]`|7 bit X, 7 bit Y|X/Y/Z input disable|
+|[`matfp`](matfp.md)|<code>z[j][i]&nbsp;±=&nbsp;f(x[i],&nbsp;y[j])</code>|9 bit X, 9 bit Y|Indexed X or Y, shuffle X, shuffle Y,<br/>positive selection|
+
+## Integer matrix arithmetic (i.e. outer products), writing to `z`
+
+|[`mac16`&nbsp;(63=0)](mac16.md)|`z[j][i] += x[i] * y[j]`|7 bit X, 7 bit Y|X/Y/Z input disable, right shift|
+|[`matint`&nbsp;(47≠4)](matint.md)|<code>z[j][i]&nbsp;±=&nbsp;f(x[i],&nbsp;y[j])</code>|9 bit X or Y|Indexed X or Y, shuffle X, shuffle Y,<br/>right shift, `sqrdmlah`, `popcnt`|
+|[`matint`&nbsp;(47=4)](matint.md)|<code>z[j][i]&nbsp;&nbsp;=&nbsp;f(z[j][i])</code>|9 bit X or Y|Right shift, saturation|
+
+## Floating-point vector arithmetic (i.e. pointwise products), writing to `z`
+
+|[`fma64`&nbsp;(63=1)](fma.md)<br/>[`fma32`&nbsp;(63=1)](fma.md)<br/>[`fma16`&nbsp;(63=1)](fma.md)|`z[_][i] += x[i] * y[i]`|7 bit|X/Y/Z input disable|
+|[`fms64`&nbsp;(63=1)](fms.md)<br/>[`fms32`&nbsp;(63=1)](fms.md)<br/>[`fms16`&nbsp;(63=1)](fms.md)|`z[_][i] -= x[i] * y[i]`|7 bit|X/Y/Z input disable|
+|[`vecfp`](vecfp.md)|<code>z[_][i]&nbsp;±=&nbsp;f(x[i],&nbsp;y[i])</code>|9 bit|Indexed X or Y, shuffle X, shuffle Y,<br/>broadcast Y element,<br/>positive selection, `min`, `max`|
+
+## Integer vector arithmetic (i.e. pointwise products), writing to `z`
+
+|[`mac16`&nbsp;(63=1)](mac16.md)|<code>z[_][i]&nbsp;+=&nbsp;x[i]&nbsp;*&nbsp;y[i]</code>|7 bit|X/Y/Z input disable, right shift|
+|[`vecint`&nbsp;(47≠4)](vecint.md)|<code>z[_][i]&nbsp;±=&nbsp;f(x[i],&nbsp;y[i])</code>|9 bit|Indexed X or Y, shuffle X, shuffle Y,<br/>broadcast Y element, right shift, `sqrdmlah`|
+|[`vecint`&nbsp;(47=4)](vecint.md)|<code>z[\_][i]&nbsp;=&nbsp;f(z[\_][i])</code>|9 bit|Right shift, saturation|
+
+## Vector data movement, writing to `x` or `y`
+
+|[`extrx`](extr_x.md)|`x[i] = y[i]`|None|
+|[`extry`](extr_y.md)|`y[i] = x[i]`|None|
+|[`extrh`&nbsp;(26=0)](extr_h.md)|<code>x[i] =&nbsp;&nbsp;&nbsp;z[_][i]&nbsp;</code>|7 bit|
+|[`extrh`&nbsp;(26=1,10=0)](extr_h.md)|`x[i] = f(z[_][i])`|9 bit|Integer right shift, integer saturation|
+|[`extrv`&nbsp;(26=1,10=0)](extr_v.md)|`x[j] = f(z[j][_])`|9 bit|Integer right shift, integer saturation|
+|[`extrv`&nbsp;(26=0)](extr_v.md)|<code>y[j] =&nbsp;&nbsp;&nbsp;z[j][_]&nbsp;</code>|7 bit|
+|[`extrv`&nbsp;(26=1,10=1)](extr_v.md)|`y[j] = f(z[j][_])`|9 bit|Integer right shift, integer saturation|
+|[`extrh`&nbsp;(26=1,10=1)](extr_h.md)|`y[i] = f(z[_][i])`|9 bit|Integer right shift, integer saturation|
+
+## Vector other
+
+|Instruction|General theme|Notes|
+|---|---|---|
+|[`genlut`&nbsp;(53≤6)](genlut.md)|Generate indices for indexed load|For use by `matfp` / `matint` / `vecfp` / `vecint` / `genlut`&nbsp;(53≥7)|
+|[`genlut`&nbsp;(53≥7)](genlut.md)|Perform indexed load|Can write to any of `x` or `y` or `z`|
+
+---
+
+# ldst.md
+
+Source: https://github.com/corsix/amx/blob/main/ldst.md
+
+## Quick summary
+
+|Instruction|General theme|Optional special features|
+|---|---|---|
+|`ldx`|<code>&nbsp;&nbsp;&nbsp;x[i] = memory[i]</code>|Load pair|
+|`ldy`|<code>&nbsp;&nbsp;&nbsp;y[i] = memory[i]</code>|Load pair|
+|`ldz`<br/>`ldzi`|`z[_][i] = memory[i]`|Load pair, interleaved Z|
+|`stx`|<code>memory[i] =&nbsp;&nbsp;&nbsp;&nbsp;x[i]</code>|Store pair|
+|`sty`|<code>memory[i] =&nbsp;&nbsp;&nbsp;&nbsp;y[i]</code>|Store pair|
+|`stz`<br/>`stzi`|`memory[i] = z[_][i]`|Store pair, interleaved Z|
+
+## Instruction encoding
+
+|5|5|Instruction|`0` for `ldx`<br/>`1` for `ldy`<br/>`2` for `stx`<br/>`3` for `sty`<br/>`4` for `ldz`<br/>`5` for `stz`<br/>`6` for `ldzi`<br/>`7` for `stzi`|
+
+## Operand bitfields
+
+For `ldx` / `ldy`:
+
+|Bit|Width|Meaning|
+|---:|---:|---|
+|63|1|Ignored|
+|62|1|Load multiple registers (`1`) or single register (`0`)|
+|61|1|On M1/M2: Ignored (loads are always to consecutive registers)<br/>On M3: Load to non-consecutive registers (`1`) or to consecutive registers (`0`)|
+|60|1|On M1: Ignored ("multiple" always means two registers)<br/>On M2/M3: "Multiple" means four registers (`1`) or two registers (`0`)|
+|59|1|Ignored|
+|56|3|X / Y register index|
+|0|56|Pointer|
+
+For `stx` / `sty`:
+
+|Bit|Width|Meaning|
+|---:|---:|---|
+|63|1|Ignored|
+|62|1|Store pair of registers (`1`) or single register (`0`)|
+|59|3|Ignored|
+|56|3|X / Y register index|
+|0|56|Pointer|
+
+For `ldz` / `stz`:
+
+|Bit|Width|Meaning|
+|---:|---:|---|
+|63|1|Ignored|
+|62|1|Load / store pair of registers (`1`) or single register (`0`)|
+|56|6|Z row|
+|0|56|Pointer|
+
+For `ldzi` / `stzi`:
+
+|Bit|Width|Meaning|
+|---:|---:|---|
+|62|2|Ignored|
+|57|5|Z row (high 5 bits thereof)|
+|56|1|Right hand half (`1`) or left hand half (`0`) of Z register pair|
+|0|56|Pointer|
+
+## Description
+
+Move 64 bytes of data between memory (does not have to be aligned) and an AMX register, or move 128 bytes of data between memory (must be aligned to 128 bytes) and an adjacent pair of AMX registers. On M2/M3, can also move 256 bytes of data from memory to four consecutive X or Y registers. On M3, can move 128 or 256 bytes of data from memory to non-consecutive X or Y registers: if bit 61 is set, 128 bytes are moved to registers `n` and `(n+4)%8`, or 256 bytes are moved to registers `n`, `(n+2)%8`, `(n+4)%8`, `(n+6)%8`.
+
+The `ldzi` and `stzi` instructions manipulate _half_ of a _pair_ of Z registers. Viewing the 64 bytes of memory and the 64 bytes of every Z register as vectors of i32 / u32 / f32, the mapping between memory and Z is:
+
+<table>
+<tr><th>Memory</th><td>0</td><td>1</td><td>2</td><td>3</td><td>4</td><td>5</td><td>6</td><td>7</td><td>8</td><td>9</td><td>10</td><td>11</td><td>12</td><td>13</td><td>14</td><td>15</td></tr>
+<tr><th>Z0</th><td>0 L</td><td>2 L</td><td>4 L</td><td>6 L</td><td>8 L</td><td>10 L</td><td>12 L</td><td>14 L</td><td>0 R</td><td>2 R</td><td>4 R</td><td>6 R</td><td>8 R</td><td>10 R</td><td>12 R</td><td>14 R</td></tr>
+<tr><th>Z1</th><td>1 L</td><td>3 L</td><td>5 L</td><td>7 L</td><td>9 L</td><td>11 L</td><td>13 L</td><td>15 L</td><td>1 R</td><td>3 R</td><td>5 R</td><td>7 R</td><td>9 R</td><td>11 R</td><td>13 R</td><td>15 R</td></tr>
+</table>
+
+In other words, the even Z register contains the even lanes from memory, and the odd Z register contains the odd lanes from memory. By a happy coincidence, this matches up with the "interleaved pair" lane arrangements of mixed-width [`mac16`](mac16.md) / [`fma16`](fma.md) / [`fms16`](fms.md) instructions, and with the "interleaved pair" lane arrangements of other instructions when in a (16, 16, 32) arrangement.
+
+## Emulation code
+
+See [ldst.c](ldst.c).
+
+```c
+void emulate_AMX_LDX(amx_state* state, uint64_t operand) {
+    ld_common(state->x, operand, 7);
+}
+
+void ld_common(amx_reg* regs, uint64_t operand, uint32_t regmask) {
+    uint32_t rn = (operand >> 56) & regmask;
+    const uint8_t* src = (uint8_t*)((operand << 8) >> 8);
+    memcpy(regs + rn, src, 64);
+    if (operand & LDST_MULTIPLE) {
+        uint32_t rs = 1;
+        if ((AMX_VER >= AMX_VER_M3) && (operand & LDST_NON_CONSECUTIVE) && (regmask <= 15)) {
+            rs = (operand & LDST_MULTIPLE_MEANS_FOUR) ? 2 : 4;
+        }
+        memcpy(regs + ((rn + rs) & regmask), src + 64, 64);
+        if ((AMX_VER >= AMX_VER_M2) && (operand & LDST_MULTIPLE_MEANS_FOUR) && (regmask <= 15)) {
+            memcpy(regs + ((rn + rs*2) & regmask), src + 128, 64);
+            memcpy(regs + ((rn + rs*3) & regmask), src + 192, 64);
+        }
+    }
+}
+```
+
+---
+
+# mac16.md
+
+Source: https://github.com/corsix/amx/blob/main/mac16.md
+
+## Quick summary
+
+|`mac16`&nbsp;(63=0)|`z[j][i] += x[i] * y[j]`|7 bit X, 7 bit Y|X/Y/Z input disable, right shift|
+|`mac16`&nbsp;(63=1)|<code>z[_][i]&nbsp;+=&nbsp;x[i]&nbsp;*&nbsp;y[i]</code>|7 bit|X/Y/Z input disable, right shift|
+
+## Instruction encoding
+
+|5|5|Instruction|Must be `14`|
+
+## Operand bitfields
+
+|63|1|Vector mode (`1`) or matrix mode (`0`)|
+|62|1|Z is i32 (`1`) or Z is i16 (`0`) |Ignored in vector mode; Z is always i16 there|
+|61|1|X is i8 (`1`) or X is i16 (`0`)|
+|60|1|Y is i8 (`1`) or Y is i16 (`0`)|
+|55|5|Right shift amount|Applied to `x*y`. When zero, sign of `x` and `y` inputs is less relevant.|
+|48|7|Ignored|
+|46|2|X enable mode|
+|41|5|X enable value|Meaning dependent upon associated mode|
+|39|2|Ignored|
+|37|2|Y enable mode|Ignored in vector mode|
+|32|5|Y enable value|Ignored in vector mode<br/>Meaning dependent upon associated mode|
+|30|2|Ignored|
+|29|1|Skip X input (`1`) or use X input (`0`)|
+|28|1|Skip Y input (`1`) or use Y input (`0`)|
+|27|1|Skip Z input (`1`) or use Z input (`0`)|
+|26|1|Ignored|
+|20|6|Z row|High bits ignored in matrix mode|
+|19|1|Ignored|
+|10|9|X offset (in bytes)|
+|9|1|Ignored|
+|0|9|Y offset (in bytes)|
+
+Combinations of bits 27-29 result in various integer ALU operations:
+
+|Operation|29 (X)|28 (Y)|27 (Z)|
+|`z+((x*y)>>s)`|`0`|`0`|`0`|
+|<code>&nbsp;&nbsp;&nbsp;(x*y)>>s&nbsp;</code>|`0`|`0`|`1`|
+|<code>z+(&nbsp;x&nbsp;&nbsp;&nbsp;>>s)</code>|`0`|`1`|`0`|
+|<code>&nbsp;&nbsp;&nbsp;&nbsp;x&nbsp;&nbsp;&nbsp;>>s&nbsp;</code>|`0`|`1`|`1`|
+|<code>z+(&nbsp;&nbsp;&nbsp;y&nbsp;>>s)</code>|`1`|`0`|`0`|
+|<code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;y&nbsp;>>s&nbsp;</code>|`1`|`0`|`1`|
+|<code>z&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;</code>|`1`|`1`|`0`|
+|`0`|`1`|`1`|`1`|
+
+Combinations of bits 60-63 result in various widths / signs for X / Y / Z:
+
+|Mode|X|Y|Z|63 (M)|62 (Z)|61 (X)|60 (Y)|
+|---|---|---|---|---|---|---|---|
+|Matrix|i16 <sup>[a]</sup>|i16 <sup>[a]</sup>|i16 or u16 (one row from each two)|`0`|`0`|`0`|`0`|
+|Matrix|i16 <sup>[a]</sup>|i8 (even lanes)|i16 or u16 (one row from each two)|`0`|`0`|`0`|`1`|
+|Matrix|i8 (even lanes)|i16 <sup>[a]</sup>|i16 or u16 (one row from each two)|`0`|`0`|`1`|`0`|
+|Matrix|i8 (even lanes)|i8 (even lanes)|i16 or u16 (one row from each two)|`0`|`0`|`1`|`1`|
+|Matrix|i16|i16|i32 or u32 (all rows, interleaved pairs)|`0`|`1`|`0`|`0`|
+|Matrix|i16|i8 (even lanes)|i32 or u32 (all rows, interleaved pairs)|`0`|`1`|`0`|`1`|
+|Matrix|i8 (even lanes)|i16|i32 or u32 (all rows, interleaved pairs)|`0`|`1`|`1`|`0`|
+|Matrix|i8 (even lanes)|i8 (even lanes)|i32 or u32 (all rows, interleaved pairs)|`0`|`1`|`1`|`1`|
+|Vector|i16 <sup>[a]</sup>|i16 <sup>[a]</sup>|i16 or u16 (one row)|`1`||`0`|`0`|
+|Vector|i16 <sup>[a]</sup>|i8 (even lanes)|i16 or u16 (one row)|`1`||`0`|`1`|
+|Vector|i8 (even lanes)|i16 <sup>[a]</sup>|i16 or u16 (one row)|`1`||`1`|`0`|
+|Vector|i8 (even lanes)|i8 (even lanes)|i16 or u16 (one row)|`1`||`1`|`1`|
+
+<sup>[a]</sup> Or u16 if shift amount is zero.
+
+X/Y enable modes:
+|Mode|Meaning of value (N)|
+|---:|---|
+|`0`|Enable all lanes (`0`), or odd lanes only (`1`), or even lanes only (`2`), or no lanes (anything else) |
+|`1`|Only enable lane #N|
+|`2`|Only enable the first N lanes, or all lanes when N is zero|
+|`3`|Only enable the last N lanes, or all lanes when N is zero|
+
+## Description
+
+In vector mode, takes an X vector of type i8 or i16, a Y vector of type i8 or i16, and a Z vector of type i16, and performs pointwise: multiply X by Y, right shift (truncating) by some amount, then add on to Z. Variants of this pointwise operation remove the X and/or Y and/or Z inputs. When X or Y have type i8, the 8 bits are taken from the low 8 bits of each 16-bit lane.
+
+In matrix mode, takes an X vector of type i8 or i16, a Y vector of type i8 or i16, and a 2D grid of Z values of type i16 or i32, and performs an outer product of X and Y followed by pointwise right shift (truncating) by some amount, and then pointwise addition onto Z. Variants of this remove the X and/or Y and/or Z inputs. When X or Y have type i8, the 8 bits are taken from the low 8 bits of each 16-bit lane. When Z has type i32, the entire 64x64 byte grid of Z is used, with even lanes of X going into even Z registers and odd lanes of X going into odd Z registers (see [Mixed lane widths](RegisterFile.md#mixed-lane-widths)).
+
+## Emulation code
+
+See [mac16.c](mac16.c).
+
+```c
+void emulate_AMX_MAC16(amx_state* state, uint64_t operand) {
+    uint64_t y_offset = operand & 0x1FF;
+    uint64_t x_offset = (operand >> 10) & 0x1FF;
+    uint64_t z_row = (operand >> 20) & 63;
+    uint64_t x_enable = parse_writemask(operand >> 41, 2, 7);
+    uint64_t y_enable = parse_writemask(operand >> 32, 2, 7);
+
+    int16_t x[32];
+    int16_t y[32];
+    load_xy_reg(x, state->x, x_offset);
+    load_xy_reg(y, state->y, y_offset);
+
+    for (int i = 0; i < 32; i++) {
+        if (!((x_enable >> (i * 2)) & 1)) continue;
+        if (operand & FMA_VECTOR_PRODUCT) {
+            int16_t* z = &state->z[z_row].i16[i];
+            *z = mac32_alu(x[i], y[i], *z, operand);
+        } else {
+            for (int j = 0; j < 32; j++) {
+                if (!((y_enable >> (j * 2)) & 1)) continue;
+                if (operand & FMA_WIDEN_16_32) {
+                    int32_t* z = &state->z[(j * 2) + (i & 1)].i32[i >> 1];
+                    *z = mac32_alu(x[i], y[j], *z, operand);
+                } else {
+                    int16_t* z = &state->z[(j * 2) + (z_row & 1)].i16[i];
+                    *z = mac32_alu(x[i], y[j], *z, operand);
+                }
+            }
+        }
+    }
+}
+
+int64_t mac32_alu(int64_t x, int64_t y, int64_t z, uint64_t operand) {
+    if (operand & MAC_X_INT8) x = (int8_t)x;
+    if (operand & MAC_Y_INT8) y = (int8_t)y;
+    int64_t val;
+    switch ((operand >> 28) & 3) {
+    default: val = x * y; break;
+    case  1: val = x; break;
+    case  2: val = y; break;
+    case  3: val = 0; break;
+    }
+    uint32_t shift = (operand >> 55) & 0x1f;
+    val >>= shift;
+    if (!(operand & MAC_SKIP_Z_INPUT)) {
+        val += z;
+    }
+    return val;
+}
+```
+
+## Performance (M1 Max)
+
+Note that multiply-and-add counts as _two_ operations. A measurement of 1.0 GOPS would mean 10<sup>9</sup> operations per second. The measurements are done without any load or store instructions; real-world workloads will need loads and stores, and thus will achieve lower numbers.
+
+`mac16` in matrix mode, with both of X and Y being i8, and each Z accumulator being `i16[32][32]`:
+
+|Z Accumulators|1 Thread|2 Threads|3 Threads|4 Threads|5 Threads|6 Threads|
+|---:|---:|---:|---:|---:|---:|---:|
+|1 per thread|1450.7 GOPS|2885.9 GOPS|2697.9 GOPS|3566.1 GOPS|4434.0 GOPS|5199.1 GOPS|
+|2 per thread|2964.4 GOPS|5821.3 GOPS|4866.4 GOPS|6196.0 GOPS|5601.5 GOPS|6286.5 GOPS|
+
+`mac16` in matrix mode, with X or Y or both being i16, and each Z accumulator being `i16[32][32]`:
+
+|Z Accumulators|1 Thread|2 Threads|3 Threads|4 Threads|5 Threads|6 Threads|
+|---:|---:|---:|---:|---:|---:|---:|
+|1 per thread|1459.3 GOPS|2290.9 GOPS|2634.3 GOPS|2370.3 GOPS|2863.8 GOPS|2875.9 GOPS|
+|2 per thread|1467.4 GOPS|2362.0 GOPS|2556.9 GOPS|2303.7 GOPS|2790.0 GOPS|2907.3 GOPS|
+
+`mac16` in matrix mode, with both of X and Y being i8, and each Z accumulator being `i32[32][32]`:
+
+|Z Accumulators|1 Thread|2 Threads|3 Threads|4 Threads|5 Threads|6 Threads|
+|---:|---:|---:|---:|---:|---:|---:|
+|1 per thread|1476.7 GOPS|2908.5 GOPS|2647.6 GOPS|2184.1 GOPS|2806.8 GOPS|2892.8 GOPS|
+
+`mac16` in matrix mode, with X or Y or both being i16, and each Z accumulator being `i32[32][32]`:
+
+|Z Accumulators|1 Thread|2 Threads|3 Threads|4 Threads|5 Threads|6 Threads|
+|---:|---:|---:|---:|---:|---:|---:|
+|1 per thread|1454.4 GOPS|2947.7 GOPS|2198.5 GOPS|2397.4 GOPS|2730.1 GOPS|2844.9 GOPS|
+
+`mac16` in vector mode, with both of X and Y being i8, and each Z accumulator being `i16[32]`:
+
+|Z Accumulators|1 Thread|2 Threads|3 Threads|4 Threads|5 Threads|6 Threads|
+|---:|---:|---:|---:|---:|---:|---:|
+|1 per thread|45.6 GOPS|92.6 GOPS|109.6 GOPS|129.3 GOPS|162.1 GOPS|195.4 GOPS|
+|2 per thread|91.4 GOPS|183.9 GOPS|204.6 GOPS|272.9 GOPS|385.3 GOPS|339.9 GOPS|
+|3 per thread|138.3 GOPS|277.3 GOPS|313.4 GOPS|413.1 GOPS|473.9 GOPS|477.8 GOPS|
+|4 per thread|180.4 GOPS|363.6 GOPS|416.9 GOPS|545.6 GOPS|635.5 GOPS|610.5 GOPS|
+|5 per thread|231.0 GOPS|461.2 GOPS|482.1 GOPS|642.7 GOPS|751.2 GOPS|648.2 GOPS|
+|6 per thread|278.0 GOPS|551.4 GOPS|543.4 GOPS|722.0 GOPS|771.1 GOPS|759.5 GOPS|
+|7 per thread|318.5 GOPS|644.5 GOPS|598.9 GOPS|754.3 GOPS|785.0 GOPS|792.5 GOPS|
+|8 per thread|369.8 GOPS|735.9 GOPS|669.0 GOPS|799.9 GOPS|789.6 GOPS|757.2 GOPS|
+
+`mac16` in vector mode, with X or Y or both being i16, and each Z accumulator being `i16[32]`:
+
+|Z Accumulators|1 Thread|2 Threads|3 Threads|4 Threads|5 Threads|6 Threads|
+|---:|---:|---:|---:|---:|---:|---:|
+|1 per thread|46.0 GOPS|92.6 GOPS|107.7 GOPS|142.1 GOPS|176.9 GOPS|199.9 GOPS|
+|2 per thread|92.5 GOPS|185.2 GOPS|211.4 GOPS|246.3 GOPS|281.9 GOPS|287.1 GOPS|
+|3 per thread|137.7 GOPS|277.0 GOPS|321.5 GOPS|388.3 GOPS|463.6 GOPS|415.3 GOPS|
+|4 per thread|185.5 GOPS|369.4 GOPS|425.8 GOPS|461.4 GOPS|486.6 GOPS|481.3 GOPS|
+|5 per thread|173.9 GOPS|346.1 GOPS|379.1 GOPS|426.7 GOPS|463.8 GOPS|449.3 GOPS|
+|6 per thread|185.2 GOPS|361.6 GOPS|427.5 GOPS|455.2 GOPS|476.7 GOPS|465.4 GOPS|
+|7 per thread|185.6 GOPS|368.7 GOPS|400.8 GOPS|444.5 GOPS|469.7 GOPS|455.6 GOPS|
+|8 per thread|185.1 GOPS|369.2 GOPS|413.8 GOPS|464.1 GOPS|477.5 GOPS|465.6 GOPS|
+
+---
+
+# matfp.md
+
+Source: https://github.com/corsix/amx/blob/main/matfp.md
+
+## Quick summary
+
+|`matfp`|<code>z[j][i]&nbsp;±=&nbsp;f(x[i],&nbsp;y[j])</code>|9 bit X, 9 bit Y|Indexed X or Y, shuffle X, shuffle Y,<br/>positive selection|
+
+## Instruction encoding
+
+|5|5|Instruction|Must be `21`|
+
+## Operand bitfields
+
+|63|1|Ignored|
+|57|6|Y enable value|Meaning dependent upon associated mode, see bit 23|
+|54|3|Must be zero|No-op otherwise|
+|53|1|[Indexed load](RegisterFile.md#indexed-loads) (`1`) or regular load (`0`)|
+|(53=1) 52|1|Ignored|
+|(53=1) 49|3|Register to index into|
+|(53=1) 48|1|Indices are 4 bits (`1`) or 2 bits (`0`)|
+|(53=1) 47|1|Indexed load of Y (`1`) or of X (`0`)|
+|(53=0) 47|6|ALU mode|
+|46|1|Ignored|
+|42|4|Lane width mode||
+|41|1|Ignored|
+|38|3|X enable mode|
+|37|1|Ignored|
+|32|5|X enable value|Meaning dependent upon associated mode|
+|31|1|Ignored|
+|29|2|[X shuffle](RegisterFile.md#shuffles)|
+|27|2|[Y shuffle](RegisterFile.md#shuffles)|
+|26|1|Ignored|
+|23|3|Y enable mode|Not high bits of Z row|
+|20|3|Z row|High bits ignored in some lane width modes|
+|19|1|Ignored|
+|10|9|X offset (in bytes)|
+|9|1|Ignored|
+|0|9|Y offset (in bytes)|
+
+ALU modes:
+|Floating-point operation|47|Notes|
+|---|---|---|
+|`z + x*y`|`0`|
+|`z - x*y`|`1`|
+|`x <= 0 ? 0 : y`|`4`|Z input not used|
+|no-op|anything else|
+
+Lane width modes:
+|X,Y|Z|42|Notes|
+|bf16|bf16 (one row from each two)|`0`|M2 only|
+|bf16|f32 (all rows, interleaved pairs)|`1`|M2 only|
+|f16|f32 (all rows, interleaved pairs)|`3`|
+|f32|f32 (one row from each four)|`4`|
+|f64|f64 (one row from each eight)|`7`|
+|f16|f16 (one row from each two)|anything else|
+
+X/Y enable modes:
+|Mode|Meaning of value (N)|
+|---:|---|
+|`0`|Enable all lanes (`0`), or odd lanes only (`1`), or even lanes only (`2`), or enable all lanes but override the ALU operation to `0.0` (`3`) or enable all lanes but override their value to `0.0` (`4` or `5`) or no lanes enabled (anything else) |
+|`1`|Only enable lane #N|
+|`2`|Only enable the first N lanes, or all lanes when N is zero|
+|`3`|Only enable the last N lanes, or all lanes when N is zero|
+|`4`|Only enable the first N lanes (no lanes when N is zero)|
+|`5`|Only enable the last N lanes (no lanes when N is zero)|
+|`6`|No lanes enabled|
+|`7`|No lanes enabled|
+
+## Description
+
+Performs a fused-multiply-add (or other ALU operation) outer-product between an X vector, a Y vector, and a 2D grid of Z values, accumulating onto Z. All three of X and Y and Z have the same element type, either f16 or f32 or f64 (or bf16 on M2). Alternatively, when X and Y are both f16 (or bf16 on M2), Z can have type f32, in which case the entire 64x64 byte grid of Z is used, with even lanes of X going into even Z registers and odd lanes of X going into odd Z registers (see [Mixed lane widths](RegisterFile.md#mixed-lane-widths)).
+
+## Emulation code
+
+See [matfp.c](matfp.c), and [vecfp.c](vecfp.c) for the shared ALU. Note the code in [test.c](test.c) to set the DN bit of `fpcr`.
+
+```c
+void emulate_AMX_MATFP(amx_state* state, uint64_t operand) {
+    if ((operand >> 54) & 7) {
+        return;
+    }
+    operand &=~ (1ull << 37);
+    operand &=~ (1ull << 63);
+
+    int alumode = (operand & MATFP_INDEXED_LOAD) ? 0 : (operand >> 47) & 0x3f;
+    if (alumode == 2 || alumode == 3 || alumode >= 5) {
+        return;
+    }
+
+    uint32_t xybits, zbits, bf16 = 0;
+    switch ((operand >> 42) & 0xf) {
+    case  0: xybits = 16; if (AMX_VER >= AMX_VER_M2) { zbits = 16; bf16 = 1; } else { zbits = 16; } break;
+    case  1: xybits = 16; if (AMX_VER >= AMX_VER_M2) { zbits = 32; bf16 = 1; } else { zbits = 16; } break;
+    case  3: xybits = 16; zbits = 32; break;
+    case  4: xybits = 32; zbits = 32; break;
+    case  7: xybits = 64; zbits = 64; break;
+    default: xybits = 16; zbits = 16; break;
+    }
+    uint32_t xybytes = xybits / 8;
+
+    amx_reg x;
+    amx_reg y;
+    load_xy_reg(&x, state->x, (operand >> 10) & 0x1FF);
+    load_xy_reg(&y, state->y, operand & 0x1FF);
+    if (operand & MATFP_INDEXED_LOAD) {
+        uint32_t src_reg = (operand >> 49) & 7;
+        uint32_t ibits = (operand & MATFP_INDEXED_LOAD_4BIT) ? 4 : 2;
+        if (operand & MATFP_INDEXED_LOAD_Y) {
+            load_xy_reg_indexed(y.u8, state->y[src_reg].u8, ibits, xybits);
+        } else {
+            load_xy_reg_indexed(x.u8, state->x[src_reg].u8, ibits, xybits);
+        }
+    }
+    xy_shuffle(x.u8, (operand >> 29) & 3, xybytes);
+    xy_shuffle(y.u8, (operand >> 27) & 3, xybytes);
+
+    uint64_t x_enable = parse_writemask(operand >> 32, xybytes, 9);
+    uint64_t y_enable = parse_writemask((((operand >> 23) & 7) << 6) | (operand >> 58), xybytes, 9);
+    int32_t omask = -1;
+    if (((operand >> (32+6)) & 7) == 0) {
+        uint32_t val = (operand >> 32) & 0x3F;
+        if (val == 3) {
+            omask = 0;
+        } else if (val == 4 || val == 5) {
+            memset(&x, 0, 64);
+        }
+    }
+    if (((operand >> 23) & 7) == 0) {
+        uint32_t val = (operand >> 58) & 0x3F;
+        if (val == 3) {
+            omask = 0;
+        } else if (val == 4 || val == 5) {
+            memset(&y, 0, 64);
+        }
+    }
+
+    uint64_t z_row = (operand >> 20) & 7;
+    if (zbits == 16) {
+        if (bf16) {
+            ...
+        } else {
+            for (uint32_t j = 0; j < 32; j += 1) {
+                if (!((y_enable >> (j*xybytes)) & 1)) continue;
+                for (uint32_t i = 0; i < 32; i += 1) {
+                    if (!((x_enable >> (i*xybytes)) & 1)) continue;
+                    _Float16* z = &state->z[bit_select(j*2, z_row, 1)].f16[i];
+                    *z = omask ? vecfp_alu16(x.f16[i], y.f16[j], *z, alumode) : 0;
+                }
+            }
+        }
+    } else {
+        ...
+    }
+}
+
+_Float16 vecfp_alu16(_Float16 x, _Float16 y, _Float16 z, int alumode) {
+    switch (alumode) {
+    case 0: __asm("fmadd %h0, %h1, %h2, %h3" : "=w"(z) : "w"(x), "w"(y), "w"(z)); break;
+    case 1: __asm("fmsub %h0, %h1, %h2, %h3" : "=w"(z) : "w"(x), "w"(y), "w"(z)); break;
+    case 4: z = (x <= (_Float16)0) ? (_Float16)0 : y; break;
+    }
+    return z;
+}
+```
+
+## Performance (M1 Max)
+
+Note that a fused-multiply-add counts as _two_ floating-point operations. A measurement of 1.0 GFLOPS would mean 10<sup>9</sup> floating-point operations per second. The measurements are done without any load or store instructions; real-world workloads will need loads and stores, and thus will achieve lower numbers.
+
+X and Y being `f16[32]`, each Z accumulator being `f16[32][32]`, ALU operation being `z + x*y` or `z - x*y`:
+
+|Z Accumulators|1 Thread|2 Threads|3 Threads|4 Threads|5 Threads|6 Threads|
+|---:|---:|---:|---:|---:|---:|---:|
+|1 per thread|1444.6 GFLOPS|2945.9 GFLOPS|2668.9 GFLOPS|4296.1 GFLOPS|4692.2 GFLOPS|5082.6 GFLOPS|
+|2 per thread|2944.7 GFLOPS|5856.6 GFLOPS|4857.7 GFLOPS|6150.3 GFLOPS|5565.6 GFLOPS|6186.8 GFLOPS|
+
+X and Y being `f16[32]`, each Z accumulator being `f32[32][32]`, ALU operation being `z + x*y` or `z - x*y`:
+
+|Z Accumulators|1 Thread|2 Threads|3 Threads|4 Threads|5 Threads|6 Threads|
+|---:|---:|---:|---:|---:|---:|---:|
+|1 per thread|1466.1 GFLOPS|2926.1 GFLOPS|2665.2 GFLOPS|2856.6 GFLOPS|2835.5 GFLOPS|2874.2 GFLOPS|
+
+X and Y being `f32[16]`, each Z accumulator being `f32[16][16]`, ALU operation being `z + x*y` or `z - x*y`:
+
+|Z Accumulators|1 Thread|2 Threads|3 Threads|4 Threads|5 Threads|6 Threads|
+|---:|---:|---:|---:|---:|---:|---:|
+|1 per thread|367.0 GFLOPS|725.8 GFLOPS|923.2 GFLOPS|1053.6 GFLOPS|1572.3 GFLOPS|1418.4 GFLOPS|
+|2 per thread|735.4 GFLOPS|1474.6 GFLOPS|1321.7 GFLOPS|1790.2 GFLOPS|2708.2 GFLOPS|2673.2 GFLOPS|
+|3 per thread|1095.0 GFLOPS|2215.9 GFLOPS|2010.7 GFLOPS|2469.2 GFLOPS|2865.7 GFLOPS|2861.8 GFLOPS|
+|4 per thread|1478.4 GFLOPS|2955.3 GFLOPS|2771.5 GFLOPS|2786.5 GFLOPS|2903.5 GFLOPS|2963.8 GFLOPS|
+
+X and Y being `f64[8]`, each Z accumulator being `f64[8][8]`, ALU operation being `z + x*y` or `z - x*y`:
+
+|Z Accumulators|1 Thread|2 Threads|3 Threads|4 Threads|5 Threads|6 Threads|
+|---:|---:|---:|---:|---:|---:|---:|
+|1 per thread|91.6 GFLOPS|184.9 GFLOPS|210.1 GFLOPS|329.7 GFLOPS|411.7 GFLOPS|408.6 GFLOPS|
+|2 per thread|184.7 GFLOPS|369.7 GFLOPS|334.1 GFLOPS|491.7 GFLOPS|720.2 GFLOPS|712.6 GFLOPS|
+|3 per thread|276.2 GFLOPS|553.2 GFLOPS|546.5 GFLOPS|652.4 GFLOPS|757.9 GFLOPS|685.1 GFLOPS|
+|4 per thread|364.6 GFLOPS|736.5 GFLOPS|702.4 GFLOPS|770.0 GFLOPS|767.5 GFLOPS|754.2 GFLOPS|
+|5 per thread|368.3 GFLOPS|731.0 GFLOPS|596.8 GFLOPS|763.6 GFLOPS|793.2 GFLOPS|710.5 GFLOPS|
+|6 per thread|369.5 GFLOPS|737.3 GFLOPS|776.0 GFLOPS|768.2 GFLOPS|794.7 GFLOPS|787.6 GFLOPS|
+|7 per thread|369.1 GFLOPS|738.6 GFLOPS|606.1 GFLOPS|708.7 GFLOPS|787.0 GFLOPS|792.2 GFLOPS|
+|8 per thread|369.6 GFLOPS|736.8 GFLOPS|686.6 GFLOPS|773.6 GFLOPS|779.9 GFLOPS|790.0 GFLOPS|
+
+---
+
+# matint.md
+
+Source: https://github.com/corsix/amx/blob/main/matint.md
+
+## Quick summary
+
+|`matint`&nbsp;(47≠4)|<code>z[j][i]&nbsp;±=&nbsp;f(x[i],&nbsp;y[j])</code>|9 bit X or Y|Indexed X or Y, shuffle X, shuffle Y,<br/>right shift, `sqrdmlah`, `popcnt`|
+|`matint`&nbsp;(47=4)|<code>z[j][i]&nbsp;&nbsp;=&nbsp;f(z[j][i])</code>|9 bit X or Y|Right shift, saturation|
+
+## Instruction encoding
+
+|5|5|Instruction|Must be `20`|
+
+## Operand bitfields
+
+|(47=4) 63|1|Z is signed (`1`) or unsigned (`0`)|
+|(47≠4) 63|1|X is signed (`1`) or unsigned (`0`)|
+|58|5|Right shift amount|Ignored when ALU mode in {5, 6, 9}|
+|57|1|Ignored|
+|55|2|Must be zero|No-op otherwise|
+|(53=1) 54|1|ALU mode 8 (`1`) or mode 0 (`0`)|
+|(53=0) 54|1|Must be zero|No-op otherwise|
+|53|1|[Indexed load](RegisterFile.md#indexed-loads) (`1`) or regular load (`0`)|
+|(53=1) 52|1|Ignored|
+|(53=1) 49|3|Register to index into|
+|(53=1) 48|1|Indices are 4 bits (`1`) or 2 bits (`0`)|
+|(53=1) 47|1|Indexed load of Y (`1`) or of X (`0`)|
+|(53=0) 47|6|ALU mode|
+|46|1|Ignored|
+|42|4|Lane width mode|Meaning dependent upon ALU mode|
+|41|1|Ignored|
+|38|3|X or Y enable mode|See bit 25|
+|32|6|X or Y enable value|Meaning dependent upon associated mode|
+|31|1|Ignored|
+|(47=4) 30|1|Saturate Z (`1`) or truncate Z (`0`)|
+|(47=4) 29|1|Right shift is rounding (`1`) or truncating (`0`)|
+|(47≠4) 29|2|[X shuffle](RegisterFile.md#shuffles)|
+|27|2|[Y shuffle](RegisterFile.md#shuffles)|
+|(47=4) 26|1|Z saturation is signed (`1`) or unsigned (`0`)|
+|(47≠4) 26|1|Y is signed (`1`) or unsigned (`0`)|
+|25|1|Enable mode is Y (`1`) or is X (`0`)|
+|22|3|Ignored|Would be middle bits of Z row|
+|20|2|Z row|High bits ignored in some lane width modes|
+|19|1|Ignored|
+|10|9|X offset (in bytes)|
+|9|1|Ignored|
+|0|9|Y offset (in bytes)|
+
+ALU modes:
+|Integer operation|47|Notes|
+|---|---|---|
+|`z+((x*y)>>s)`|`0`|
+|`z-((x*y)>>s)`|`1`|
+|`z+((x+y)>>s)`|`2`|Particular write enable mode can skip `x` or `y`|
+|`z-((x+y)>>s)`|`3`|Particular write enable mode can skip `x` or `y`|
+|`z>>s` or `sat(z>>s)`|`4`|Shift can be rounding, saturation is optional|
+|`sat(z+((x*y*2)>>16))`|`5`|Shift is rounding, saturation is signed|
+|`sat(z-((x*y*2)>>16))`|`6`|Shift is rounding, saturation is signed|
+|no-op|`7`|
+|`z+((x*y)>>s)`|`8`|Same as `0`, but different lane width modes|
+|`z+popcnt(~(x^y))`|`9`|See [XNOR-Net](https://arxiv.org/abs/1603.05279)|
+|no-op|anything else|
+
+When ALU mode < 4, lane width modes:
+|X,Y|Z|42|
+|---|---|---|
+|i16 or u16|i32 or u32 (all rows, interleaved pairs)|`3`|
+|i16 or u16|i16 or u16 (one row from each two)|anything else|
+
+When ALU mode = 4, lane width modes:
+|Z |Z saturation|42|
+|---|---|---|
+|i32 or u32 (one row from each four)|i16 or u16|`3`|
+|i32 or u32 (one row from each four)|i32 or u32|`4`|
+|i32 or u32 (one row from each four)|i8 or u8|`10`|
+|i16 or u16 (one row from each two)|i8 or u8|`11`|
+|i16 or u16 (one row from each two)|i16 or u16|anything else|
+
+When ALU mode in {5, 6}, lane width modes:
+
+|X,Y|Z|42|
+|---|---|---|
+|i16 or u16|i16 or u16 (one row from each two)|anything|
+
+When ALU mode = 8, lane width modes:
+|X|Y|Z|42|
+|i8 or u8|i8 or u8 (only every fourth lane is used, said lanes are used four times each)|i32 or u32 (all rows)|`10`|
+|i8 or u8|i16 or u16 (only even lanes used, said lanes are used four times each)|i32 or u32 (all rows)|`12` (M3 only)|
+|i8 or u8|i8 or u8 (only even lanes used, said lanes are used twice each)|i16 or u16 (all rows)|anything else|
+
+When ALU mode = 9, lane width modes:
+
+|X,Y|Z|42|
+|---|---|---|
+|i16 or u16|i32 or u32 (all rows, interleaved pairs)|`3`|
+|i32 or u32|i32 or u32 (one row from each four)|`4`|
+|i16 or u16|i16 or u16 (one row from each two)|anything else|
+
+X or Y enable modes:
+|Mode|Meaning of value (N)|
+|---:|---|
+|`0`|Enable all lanes (`0`), or odd lanes only (`1`), or even lanes only (`2`), or enable all lanes but override the ALU operation to `0` (`3`) or enable all lanes but override their value to `0` (`4` or `5`) or no lanes enabled (anything else) |
+|`1`|Only enable lane #N|
+|`2`|Only enable the first N lanes, or all lanes when N is zero|
+|`3`|Only enable the last N lanes, or all lanes when N is zero|
+|`4`|Only enable the first N lanes (no lanes when N is zero)|
+|`5`|Only enable the last N lanes (no lanes when N is zero)|
+|`6`|No lanes enabled|
+|`7`|No lanes enabled|
+
+## Description
+
+When 47=4, performs an in-place reduction of a 2D grid of Z values, where reduction means right shift (either rounding or truncating), optionally followed by saturation (to i8/u8/i16/u16/i32/u32). Z values are 16 bit or 32 bit integers.
+
+When 47≠4, performs some ALU operation in an outer-product manner between an X vector, a Y vector, and a 2D grid of Z values, accumulating onto Z. Various combinations of line widths are permitted.
+
+When 47=8, FMA is performed with 8-bit multiplicands, accumlating onto 16-bit or 32-bit Z, using a slightly unusual (for AMX) data layout. For 32-bit Z, each 4 by 4 block of bytes ends up looking like:
+
+<table><tr><td/><td>X<sub>0</sub></td><td>X<sub>1</sub></td><td>X<sub>2</sub></td><td>X<sub>3</sub></td></tr>
+<tr><td>Y<sub>0</sub></td><td colspan="4">Z<sub>0,0:3</sub> += X<sub>0</sub> × Y<sub>0</sub></tr>
+<tr><td>Y<sub>1</sub></td><td colspan="4">Z<sub>1,0:3</sub> += X<sub>1</sub> × Y<sub>0</sub></td>
+<tr><td>Y<sub>2</sub></td><td colspan="4">Z<sub>2,0:3</sub> += X<sub>2</sub> × Y<sub>0</sub></tr>
+<tr><td>Y<sub>3</sub></td><td colspan="4">Z<sub>3,0:3</sub> += X<sub>3</sub> × Y<sub>0</sub></td>
+</table>
+
+For 16-bit Z, each 2 by 2 block of bytes ends up looking like:
+
+<table><tr><td/><td>X<sub>0</sub></td><td>X<sub>1</sub></td></tr>
+<tr><td>Y<sub>0</sub></td><td colspan="2">Z<sub>0,0:1</sub> += X<sub>0</sub> × Y<sub>0</sub></tr>
+<tr><td>Y<sub>1</sub></td><td colspan="2">Z<sub>1,0:1</sub> += X<sub>1</sub> × Y<sub>0</sub></td>
+</table>
+
+When 47=8, M3 also supports 8-bit X, 16-bit Y, 32-bit Z, with each 4 by 4 block of bytes looking like:
+
+<table><tr><td/><td>X<sub>0</sub></td><td>X<sub>1</sub></td><td>X<sub>2</sub></td><td>X<sub>3</sub></td></tr>
+<tr><td>Y<sub>0</sub></td><td colspan="4">Z<sub>0,0:3</sub> += X<sub>0</sub> × Y<sub>0:1</sub></tr>
+<tr><td>Y<sub>1</sub></td><td colspan="4">Z<sub>1,0:3</sub> += X<sub>1</sub> × Y<sub>0:1</sub></td>
+<tr><td>Y<sub>2</sub></td><td colspan="4">Z<sub>2,0:3</sub> += X<sub>2</sub> × Y<sub>0:1</sub></tr>
+<tr><td>Y<sub>3</sub></td><td colspan="4">Z<sub>3,0:3</sub> += X<sub>3</sub> × Y<sub>0:1</sub></td>
+</table>
+
+## Emulation code
+
+See [matint.c](matint.c), and [vecint.c](vecint.c) for the shared ALU.
+
+```c
+void emulate_AMX_MATINT(amx_state* state, uint64_t operand) {
+    if ((operand >> 55) & 3) {
+        return;
+    }
+    if ((operand & (1ull << 54)) && !(operand & MATINT_INDEXED_LOAD)) {
+        return;
+    }
+
+    uint64_t z_row = (operand >> 20) & 3;
+    int32_t omask = (((operand >> 32) & 0x1ff) == 3) ? 0 : -1;
+    int alumode = (operand & MATINT_INDEXED_LOAD) ? (operand & (1ull << 54)) >> 51 : (operand >> 47) & 0x3f;
+    uint32_t shift = (operand >> 58) & 0x1f;
+
+    uint32_t xbits = 0, ybits = 0, zbits, satbits;
+    if (alumode == 4) {
+        switch ((operand >> 42) & 0xf) {
+        case  3: zbits = 32; satbits = 16; break;
+        case  4: zbits = 32; satbits = 32; break;
+        case 10: zbits = 32; satbits =  8; break;
+        case 11: zbits = 16; satbits =  8; break;
+        default: zbits = 16; satbits = 16; break;
+        }
+    } else if (alumode == 5 || alumode == 6) {
+        xbits = ybits = 16; zbits = 16;
+        shift = 15;
+    } else if (alumode == 8) {
+        switch ((operand >> 42) & 0xf) {
+        case 10: xbits = ybits = 8; zbits = 32; break;
+        case 12: xbits = 8; if (AMX_VER >= AMX_VER_M3) { ybits = 16; zbits = 32; } else { ybits = 8; zbits = 16; } break;
+        default: xbits = ybits = 8; zbits = 16; break;
+        }
+    } else if (alumode == 9) {
+        switch ((operand >> 42) & 0xf) {
+        case  3: xbits = ybits = 16; zbits = 32; break;
+        case  4: xbits = ybits = 32; zbits = 32; break;
+        default: xbits = ybits = 16; zbits = 16; break;
+        }
+        shift = 64 - xbits; // Not actually used as a shift
+    } else {
+        switch ((operand >> 42) & 0xf) {
+        case  3: xbits = ybits = 16; zbits = 32; break;
+        default: xbits = ybits = 16; zbits = 16; break;
+        }
+    }
+    uint32_t xbytes = xbits / 8;
+    uint32_t ybytes = ybits / 8;
+    uint32_t zbytes = zbits / 8;
+    
+    if (alumode == 4) {
+        ...
+        return;
+    } else if (alumode == 7 || alumode >= 10) {
+        return;
+    }
+
+    uint8_t x[64];
+    uint8_t y[64];
+    load_xy_reg(x, state->x, (operand >> 10) & 0x1FF);
+    load_xy_reg(y, state->y, operand & 0x1FF);
+    if (operand & MATINT_INDEXED_LOAD) {
+        uint32_t src_reg = (operand >> 49) & 7;
+        uint32_t ibits = (operand & MATINT_INDEXED_LOAD_4BIT) ? 4 : 2;
+        if (operand & MATINT_INDEXED_LOAD_Y) {
+            load_xy_reg_indexed(y, state->y[src_reg].u8, ibits, ybits);
+        } else {
+            load_xy_reg_indexed(x, state->x[src_reg].u8, ibits, xbits);
+        }
+    }
+    xy_shuffle(x, (operand >> 29) & 3, xbytes);
+    xy_shuffle(y, (operand >> 27) & 3, ybytes);
+
+    uint64_t x_enable, y_enable;
+    if (operand & MATINT_ENABLE_MASK_IS_Y) {
+        x_enable = ~(uint64_t)0;
+        y_enable = parse_writemask(operand >> 32, ybytes, 9);
+    } else {
+        x_enable = parse_writemask(operand >> 32, xbytes, 9);
+        y_enable = ~(uint64_t)0;
+    }
+    if (((operand >> (32+6)) & 7) == 0) {
+        uint32_t val = (operand >> 32) & 0x3F;
+        if (val == 4 || val == 5) {
+            memset((operand & MATINT_ENABLE_MASK_IS_Y) ? y : x, 0, 64);
+        }
+    }
+
+    uint32_t xsignext = (operand & MATINT_SIGNED_X) ? (64 - xbits) : 0;
+    uint32_t ysignext = (operand & MATINT_SIGNED_Y) ? (64 - ybits) : 0;
+    uint32_t zsignext = 64 - zbits;
+    uint32_t zmask = (zbytes / xbytes) - 1;
+    uint32_t step = xbytes == 1 ? zbytes : xbytes;
+    for (uint32_t j = 0; j < 64; j += step) {
+        if (!((y_enable >> j) & 1)) continue;
+        for (uint32_t i = 0; i < 64; i += xbytes) {
+            if (!((x_enable >> i) & 1)) continue;
+            int64_t xv = load_int(x + i, xbytes, xsignext);
+            int64_t yv = load_int(y + j, ybytes, ysignext);
+            void* z = &state->z[bit_select(bit_select(j, z_row, xbytes - 1), i / xbytes, zmask)].u8[i & -zbytes];
+            int64_t zv = load_int(z, zbytes, zsignext);
+            int64_t result = vecint_alu(xv, yv, zv, alumode, shift) & omask;
+            store_int(z, zbytes, result);
+        }
+    }
+}
+
+int64_t vecint_alu(int64_t x, int64_t y, int64_t z, int alumode, uint32_t shift) {
+    int64_t val = x * y;
+    if (alumode == 5 || alumode == 6) {
+        val += 1ull << (shift - 1);
+    } else if (alumode == 2 || alumode == 3) {
+        val = x + y;
+    } else if (alumode == 9) {
+        return z + __builtin_popcountll((~(x ^ y)) << shift);
+    }
+    val >>= shift;
+    if (alumode == 1 || alumode == 3 || alumode == 6) {
+        val = -val;
+    }
+    val += z;
+    if (alumode == 5 || alumode == 6) {
+        if (val > 32767) val = 32767;
+        if (val < -32768) val = -32768;
+    }
+    return val;
+}
+```
+
+---
+
+# References.md
+
+Source: https://github.com/corsix/amx/blob/main/References.md
+
+Assorted internet references:
+* [dougallj/aarch64_amx.py](https://gist.github.com/dougallj/7a75a3be1ec69ca550e7c36dc75e0d6f) - IDA (disassembler) and Hex-Rays (decompiler) plugin for Apple AMX
+* [dougallj/amx.h](https://gist.github.com/dougallj/7cba721da1a94da725ee37c1e9cd1f21) - amx simulator and hardware tests
+* [amx-rs](https://github.com/yvt/amx-rs) - Rust bindings and simulator, includes ASM trick and genlut framework
+* https://www.realworldtech.com/forum/?threadid=187087&curpostid=187120 - Instruction names
+* https://news.ycombinator.com/item?id=24464807#24472004 - Instruction names
+* [include/mach/arm/_structs.h](https://github.com/xybp888/iOS-SDKs/blob/a110a31ce82e42621b3e7ba31bd6563c02d2631a/iPhoneOS13.0.sdk/usr/include/mach/arm/_structs.h#L482) - Register file
+* https://nod.ai/comparing-apple-m1-with-amx2-m1-with-neon/ - "AMX2"
+* Google for `AMX_STATE_T_EL1`
+
+Patents:
+|Number|Title|Expires
+|---|---|---|
+|[US20180074824A1](https://patents.google.com/patent/US20180074824A1/en)|Outer Product Engine|Abandoned|
+|[US10831488B1](https://patents.google.com/patent/US10831488B1/en)|Computation engine with extract instructions to minimize memory access|2038-10-31|
+|[US20190129719A1](https://patents.google.com/patent/US20190129719A1/en)|Matrix Computation Engine (2017)|2038-01-14|
+|[US10592239B2](https://patents.google.com/patent/US10592239B2/en)|Matrix computation engine (2019)|2037-11-01 (anticipated)|
+|[US10877754B2](https://patents.google.com/patent/US10877754B2/en)|Matrix computation engine (2020)|2037-11-01 (anticipated)|
+|[US10754649B2](https://patents.google.com/patent/US10754649B2/en)|Computation engine that operates in matrix and vector modes (2018)|2038-10-19|
+|[US11042373B2](https://patents.google.com/patent/US11042373B2/en)|Computation engine that operates in matrix and vector modes (2020)|2038-07-24 (anticipated)|
+|[US10970078B2](https://patents.google.com/patent/US10970078B2/en)|Computation engine with upsize/interleave and downsize/deinterleave options|2038-05-25|
+|[US10642620B2](https://patents.google.com/patent/US10642620B2/en)|Computation engine with strided dot product (2018)|2038-07-24|
+|[US10990401B2](https://patents.google.com/patent/US10990401B2/en)|Computation engine with strided dot product (2020)|2038-04-05 (anticipated)|
+
+Academic papers:
+* [Fast polynomial multiplication using matrix multiplication accelerators with applications to NTRU on Apple M1/M3 SoCs](https://cic.iacr.org/p/1/1/9) - "Our work repurposes AMX to implement polynomial multiplication and applies it to the NTRU cryptosystem, setting new speed records on the Apple M1 and M3 systems-on-chip (SoCs)."
+* [PQC-AMX: Accelerating Saber and FrodoKEM on the Apple M1 and M3 SoCs](https://eprint.iacr.org/2024/195) - "In this paper, we leverage AMX to accelerate the post-quantum lattice-based cryptosystems Saber and FrodoKEM, and benchmark their performance on Apple M1 and M3 SoCs."
+
+---
+
+# RegisterFile.md
+
+Source: https://github.com/corsix/amx/blob/main/RegisterFile.md
+
+## Synopsis
+
+```c
+union amx_reg { // 64 byte vector...
+    // ...of unsigned integers:
+    uint8_t  u8 [64];
+    uint16_t u16[32];
+    uint32_t u32[16];
+    // ...of signed integers:
+    int8_t   i8 [64];
+    int16_t  i16[32];
+    int32_t  i32[16];
+    // ...of IEEE 754 floating point:
+    _Float16 f16[32]; // NB: IEEE half-precision, _not_ BF16
+    float    f32[16];
+    double   f64[ 8];
+};
+
+struct amx_state {
+    amx_reg x[ 8]; // 512 bytes, of which 64 bytes extracted / inserted by operations
+    amx_reg y[ 8]; // 512 bytes, of which 64 bytes extracted / inserted by operations
+    amx_reg z[64]; // 64 by 64 matrix of bytes
+}; // 5KB total
+```
+
+## Description
+
+Each register is 64 bytes, viewed as vector of u8/u16/u32/i8/i16/i32/f16/f32/f64 elements. The architectural state contains 80 such registers: 8 of which in the X pool, 8 of which in the Y pool, and the remaining 64 forming a 64x64 grid called Z.
+
+The entire X register pool can be concatenated to form a circular buffer of 512 bytes. Most instructions can operate on _any_ contiguous 64 byte range from this circular buffer. The same is true for Y: the entire Y pool can be concatenated to form a circular buffer of 512 bytes, and most instructions can operate on _any_ contiguous 64 byte range from this circular buffer.
+
+Once 64 bytes of X and 64 bytes of Y have been selected, operations between X and Y and Z can be performed. Said operations fall into two main categories:
+- Vector: Select one register from Z, and combine X/Y/Z in a standard SIMD manner: `Z[i] += X[i] * Y[i]`
+- Matrix: Select a number of registers from Z equal to the number of lanes in X and Y, and combine X/Y/Z in an outer-product manner: `Z[j][i] += X[i] * Y[j]`
+
+## Getting data in to and out of the AMX registers
+
+Load/store instructions move data between memory and AMX registers.
+
+Computation instructions can be used to synthesise various constants in the AMX registers: `0` is easy, as is floating-point `-0`. The latter can be used with integer shift instructions to synthesise (positive or negative) integer powers of two.
+
+There is no direct movement between AMX registers and A64 general purpose registers or SIMD registers; data has to go via memory.
+
+## Indexed loads
+
+By default, instructions operate on a 64-byte span from X or Y. Some operations support _indexed loads_ rather than 64-byte span loads. Said loads are parameterised by two things: the element size and the index size. The element size (`ES`) is 8/16/32/64 bits, and the index size (`IS`) is 2/4/5 bits. The element _count_ (`EC`) is then 512 divided by the element size. A regular load would load an `ES * EC` (i.e. 512) bit span from X or Y. An indexed load instead loads an `IS * EC` bit span from X or Y, and then treats every group of `IS` bits as a lane index into a _different_ register with element size `ES`. For example, taking `ES` of 16 for f16 data and `IS` of 2, a 64-bit span is loaded from X or Y, which can be viewed as `u2[32]` vector, and is expanded to form an `f16[32]` vector by looking up into lanes 0/1/2/3 of some other `f16[32]` vector.
+
+## Shuffles
+
+Once a 64 byte X (or Y) vector has been obtained (either by a regular load or an indexed load), some instructions support shuffling the 64 bytes before use.
+
+For vectors of 8 elements (i.e. `f64[8]`), the four (albeit only three distinct) available shuffles are:
+<table>
+<tr><th/><th>0</th><th>1</th><th>2</th><th>3</th><th>4</th><th>5</th><th>6</th><th>7</th></tr>
+<tr><th>S0</th><td>0</td><td>1</td><td>2</td><td>3</td><td>4</td><td>5</td><td>6</td><td>7</td></tr>
+<tr><th>S1</th><td>0</td><td>4</td><td>1</td><td>5</td><td>2</td><td>6</td><td>3</td><td>7</td></tr>
+<tr><th>S2</th><td>0</td><td>2</td><td>4</td><td>6</td><td>1</td><td>3</td><td>5</td><td>7</td></tr>
+<tr><th>S3</th><td>0</td><td>1</td><td>2</td><td>3</td><td>4</td><td>5</td><td>6</td><td>7</td></tr>
+</table>
+
+For vectors of 16 elements (i.e. `f32[16]` or `i32[16]` or `u32[16]`), the four available shuffles are:
+<table>
+<tr><th/><th>0</th><th>1</th><th>2</th><th>3</th><th>4</th><th>5</th><th>6</th><th>7</th><th>8</th><th>9</th><th>10</th><th>11</th><th>12</th><th>13</th><th>14</th><th>15</th></tr>
+<tr><th>S0</th><td>0</td><td>1</td><td>2</td><td>3</td><td>4</td><td>5</td><td>6</td><td>7</td><td>8</td><td>9</td><td>10</td><td>11</td><td>12</td><td>13</td><td>14</td><td>15</td></tr>
+<tr><th>S1</th><td>0</td><td>8</td><td>1</td><td>9</td><td>2</td><td>10</td><td>3</td><td>11</td><td>4</td><td>12</td><td>5</td><td>13</td><td>6</td><td>14</td><td>7</td><td>15</td></tr>
+<tr><th>S2</th><td>0</td><td>4</td><td>8</td><td>12</td><td>1</td><td>5</td><td>9</td><td>13</td><td>2</td><td>6</td><td>10</td><td>14</td><td>3</td><td>7</td><td>11</td><td>15</td></tr>
+<tr><th>S3</th><td>0</td><td>2</td><td>4</td><td>6</td><td>8</td><td>10</td><td>12</td><td>14</td><td>1</td><td>3</td><td>5</td><td>7</td><td>9</td><td>11</td><td>13</td><td>15</td></tr>
+</table>
+
+For vectors of 32 elements (i.e. `f16[32]` or `i16[32]` or `u16[32]`), the four available shuffles are:
+<table>
+<tr><th/><th>0</th><th>1</th><th>2</th><th>3</th><th>4</th><th>5</th><th>6</th><th>7</th><th>8</th><th>9</th><th>10</th><th>11</th><th>12</th><th>13</th><th>14</th><th>15</th><th>16</th><th>17</th><th>18</th><th>19</th><th>20</th><th>21</th><th>22</th><th>23</th><th>24</th><th>25</th><th>26</th><th>27</th><th>28</th><th>29</th><th>30</th><th>31</th></tr>
+<tr><th>S0</th><td>0</td><td>1</td><td>2</td><td>3</td><td>4</td><td>5</td><td>6</td><td>7</td><td>8</td><td>9</td><td>10</td><td>11</td><td>12</td><td>13</td><td>14</td><td>15</td><td>16</td><td>17</td><td>18</td><td>19</td><td>20</td><td>21</td><td>22</td><td>23</td><td>24</td><td>25</td><td>26</td><td>27</td><td>28</td><td>29</td><td>30</td><td>31</td></tr>
+<tr><th>S1</th><td>0</td><td>16</td><td>1</td><td>17</td><td>2</td><td>18</td><td>3</td><td>19</td><td>4</td><td>20</td><td>5</td><td>21</td><td>6</td><td>22</td><td>7</td><td>23</td><td>8</td><td>24</td><td>9</td><td>25</td><td>10</td><td>26</td><td>11</td><td>27</td><td>12</td><td>28</td><td>13</td><td>29</td><td>14</td><td>30</td><td>15</td><td>31</td></tr>
+<tr><th>S2</th><td>0</td><td>8</td><td>16</td><td>24</td><td>1</td><td>9</td><td>17</td><td>25</td><td>2</td><td>10</td><td>18</td><td>26</td><td>3</td><td>11</td><td>19</td><td>27</td><td>4</td><td>12</td><td>20</td><td>28</td><td>5</td><td>13</td><td>21</td><td>29</td><td>6</td><td>14</td><td>22</td><td>30</td><td>7</td><td>15</td><td>23</td><td>31</td></tr>
+<tr><th>S3</th><td>0</td><td>4</td><td>8</td><td>12</td><td>16</td><td>20</td><td>24</td><td>28</td><td>1</td><td>5</td><td>9</td><td>13</td><td>17</td><td>21</td><td>25</td><td>29</td><td>2</td><td>6</td><td>10</td><td>14</td><td>18</td><td>22</td><td>26</td><td>30</td><td>3</td><td>7</td><td>11</td><td>15</td><td>19</td><td>23</td><td>27</td><td>31</td></tr>
+</table>
+
+For vectors of 64 elements (i.e. `i8[64]` or `u8[64]`), the four available shuffles are:
+<table>
+<tr><th/><th>0</th><th>1</th><th>2</th><th>3</th><th>4</th><th>5</th><th>6</th><th>7</th><th>8</th><th>9</th><th>10</th><th>11</th><th>12</th><th>13</th><th>14</th><th>15</th><th>16</th><th>17</th><th>18</th><th>19</th><th>20</th><th>21</th><th>22</th><th>23</th><th>24</th><th>25</th><th>26</th><th>27</th><th>28</th><th>29</th><th>30</th><th>31</th><th>32</th><th>33</th><th>34</th><th>35</th><th>36</th><th>37</th><th>38</th><th>39</th><th>40</th><th>41</th><th>42</th><th>43</th><th>44</th><th>45</th><th>46</th><th>47</th><th>48</th><th>49</th><th>50</th><th>51</th><th>52</th><th>53</th><th>54</th><th>55</th><th>56</th><th>57</th><th>58</th><th>59</th><th>60</th><th>61</th><th>62</th><th>63</th></tr>
+<tr><th>S0</th><td>0</td><td>1</td><td>2</td><td>3</td><td>4</td><td>5</td><td>6</td><td>7</td><td>8</td><td>9</td><td>10</td><td>11</td><td>12</td><td>13</td><td>14</td><td>15</td><td>16</td><td>17</td><td>18</td><td>19</td><td>20</td><td>21</td><td>22</td><td>23</td><td>24</td><td>25</td><td>26</td><td>27</td><td>28</td><td>29</td><td>30</td><td>31</td><td>32</td><td>33</td><td>34</td><td>35</td><td>36</td><td>37</td><td>38</td><td>39</td><td>40</td><td>41</td><td>42</td><td>43</td><td>44</td><td>45</td><td>46</td><td>47</td><td>48</td><td>49</td><td>50</td><td>51</td><td>52</td><td>53</td><td>54</td><td>55</td><td>56</td><td>57</td><td>58</td><td>59</td><td>60</td><td>61</td><td>62</td><td>63</td></tr>
+<tr><th>S1</th><td>0</td><td>32</td><td>1</td><td>33</td><td>2</td><td>34</td><td>3</td><td>35</td><td>4</td><td>36</td><td>5</td><td>37</td><td>6</td><td>38</td><td>7</td><td>39</td><td>8</td><td>40</td><td>9</td><td>41</td><td>10</td><td>42</td><td>11</td><td>43</td><td>12</td><td>44</td><td>13</td><td>45</td><td>14</td><td>46</td><td>15</td><td>47</td><td>16</td><td>48</td><td>17</td><td>49</td><td>18</td><td>50</td><td>19</td><td>51</td><td>20</td><td>52</td><td>21</td><td>53</td><td>22</td><td>54</td><td>23</td><td>55</td><td>24</td><td>56</td><td>25</td><td>57</td><td>26</td><td>58</td><td>27</td><td>59</td><td>28</td><td>60</td><td>29</td><td>61</td><td>30</td><td>62</td><td>31</td><td>63</td></tr>
+<tr><th>S2</th><td>0</td><td>16</td><td>32</td><td>48</td><td>1</td><td>17</td><td>33</td><td>49</td><td>2</td><td>18</td><td>34</td><td>50</td><td>3</td><td>19</td><td>35</td><td>51</td><td>4</td><td>20</td><td>36</td><td>52</td><td>5</td><td>21</td><td>37</td><td>53</td><td>6</td><td>22</td><td>38</td><td>54</td><td>7</td><td>23</td><td>39</td><td>55</td><td>8</td><td>24</td><td>40</td><td>56</td><td>9</td><td>25</td><td>41</td><td>57</td><td>10</td><td>26</td><td>42</td><td>58</td><td>11</td><td>27</td><td>43</td><td>59</td><td>12</td><td>28</td><td>44</td><td>60</td><td>13</td><td>29</td><td>45</td><td>61</td><td>14</td><td>30</td><td>46</td><td>62</td><td>15</td><td>31</td><td>47</td><td>63</td></tr>
+<tr><th>S3</th><td>0</td><td>8</td><td>16</td><td>24</td><td>32</td><td>40</td><td>48</td><td>56</td><td>1</td><td>9</td><td>17</td><td>25</td><td>33</td><td>41</td><td>49</td><td>57</td><td>2</td><td>10</td><td>18</td><td>26</td><td>34</td><td>42</td><td>50</td><td>58</td><td>3</td><td>11</td><td>19</td><td>27</td><td>35</td><td>43</td><td>51</td><td>59</td><td>4</td><td>12</td><td>20</td><td>28</td><td>36</td><td>44</td><td>52</td><td>60</td><td>5</td><td>13</td><td>21</td><td>29</td><td>37</td><td>45</td><td>53</td><td>61</td><td>6</td><td>14</td><td>22</td><td>30</td><td>38</td><td>46</td><td>54</td><td>62</td><td>7</td><td>15</td><td>23</td><td>31</td><td>39</td><td>47</td><td>55</td><td>63</td></tr>
+</table>
+
+In all cases, S0 is the identity, S1 moves lane 1 to lane 2, S2 moves lane 1 to lane 4, and S3 moves lane 1 to lane 8.
+
+## Per-byte write-enable
+
+Most instructions support writing to only a subset of the output lanes, leaving the other lanes unchanged. This is controlled by a combination of a mode field and a value field. Said fields typically combine along the lines of:
+
+|Mode|Meaning of value (N)|
+|---:|---|
+|`0`|Write to all lanes (`0`), or to odd lanes only (`1`), or to even lanes only (`2`), or to no lanes |
+|`1`|Only write lane #N (or for certain vector operations, write all lanes, but broadcast Y lane #N to all lanes of Y)|
+|`2`|Only write first N lanes, or to all lanes when N is zero|
+|`3`|Only write last N lanes, or to all lanes when N is zero|
+|`4`|Only write first N lanes (no lanes when N is zero)|
+|`5`|Only write last N lanes (no lanes when N is zero)|
+|`6`|Write to no lanes|
+|`7`|Write to no lanes|
+
+Matrix operations have separate write-enable for the X axis and the Y axis, with the enabled Z elements being the outer product of the two write-enables.
+
+## Mixed lane widths
+
+When the element size is identical between X and Y and Z, indexing is simple. Assume an element size in bits (ES) of 8, 16, 32, or 64 for all three, then X and Y have N elements, where N = 512 / ES. In vector mode, a single Z register also has N elements. In matrix mode, a 2D grid of N<sup>2</sup> values is used from Z: N distinct registers from Z, each containing N elements. The N distinct registers are equally spaced in the Y dimension, with spacing 64 / N (the user can choose the starting row, subject to 0 ≤ starting row < 64 / N).
+
+When the element sizes are mixed (for example f16 × f16 ↦ f32 or i8 × i16 ↦ i32), then things are more complex. Either more Z registers need to be used (to make space for all the outputs), or some lanes from X and/or Y need to be dropped (because otherwise there is not space for all the outputs), or a combination of both. When lanes are dropped, it is typical to keep just the even lanes, or keep just one lane from every four (i.e. keep lanes 0, 4, 8, etc). Shuffles can be used to select different lanes; for example after applying shuffle S1 and then keeping just the even lanes, the result is lanes 0, 1, 2, etc; and after applying shuffle S2 and then keeping just one lane from every four then the result is lanes 0, 1, 2, etc. Alternatively, byte offsets on the input operands can be used to select different lanes: adding a byte offset equal to one lane turns even lanes into odd lanes, and turns lanes 0, 4, 8, etc into 1, 5, 9, etc.
+
+One particularly common mixed-width combination is X and Y having element size of 16 bits (i.e. i16 or u32 or f16) and Z having element size 32 bits (i.e. i32 or u32 or f32). In this case, both X and Y have 32 elements, and every Z register has 16 elements. The complete outer product of X and Y would need 32<sup>2</sup> Z values, which there is _just_ space for: use all 64 Z registers, with 16 elements in each. Each 4 by 4 block of bytes ends up looking like:
+
+<table><tr><td/><td colspan="2">X<sub>0:1</sub></td><td colspan="2">X<sub>2:3</sub></td></tr>
+<tr><td rowspan="2">Y<sub>0:1</sub></td><td colspan="4">Z<sub>0,0:3</sub> += X<sub>0:1</sub> × Y<sub>0:1</sub></tr>
+<tr><td colspan="4">Z<sub>1,0:3</sub> += X<sub>2:3</sub> × Y<sub>0:1</sub></td>
+<tr><td rowspan="2">Y<sub>2:3</sub></td><td colspan="4">Z<sub>2,0:3</sub> += X<sub>0:1</sub> × Y<sub>2:3</sub></tr>
+<tr><td colspan="4">Z<sub>3,0:3</sub> += X<sub>2:3</sub> × Y<sub>2:3</sub></td>
+</table>
+
+An alternative way of viewing this combination is that every _pair_ of Z registers contains 32 lanes (corresponding to the lanes of X), and there are 32 such _pairs_ (corresponding to the lanes of Y), with each pair arranged as:
+<table><tr><th>Z0</th><td>0</td><td>2</td><td>4</td><td>6</td><td>8</td><td>10</td><td>12</td><td>14</td><td>16</td><td>18</td><td>20</td><td>22</td><td>24</td><td>26</td><td>28</td><td>30</td></tr>
+<tr><th>Z1</th><td>1</td><td>3</td><td>5</td><td>7</td><td>9</td><td>11</td><td>13</td><td>15</td><td>17</td><td>19</td><td>21</td><td>23</td><td>25</td><td>27</td><td>29</td><td>31</td></tr></table>
+
+This arrangement is called an interleaved pair of Z registers, and for (16,16,32) has support instructions in the form of [`ldzi` and `stzi`](ldst.md#description).
+
+---
+
+# setclr.md
+
+Source: https://github.com/corsix/amx/blob/main/setclr.md
+
+## Quick summary
+
+|Instruction|General theme|Notes|
+|---|---|---|
+|`set`|Setup AMX state|Raises invalid instruction exception if already setup. All registers set to zero.|
+|`clr`|Clear AMX state|All registers set to uninitialised, no longer need saving/restoring on context switch.|
+
+## Instruction encoding
+
+|5|5|Instruction|Must be `17`|
+|0|5|5-bit immediate|`0` for `set`<br/>`1` for `clr`|
+
+## Description
+
+Before any other AMX instructions can be used, `set` must be issued. At some point later, `clr` must be issued. The pair of instructions are _not_ re-entrant: `set` will raise an invalid instruction exception if AMX is already enabled for the issuing thread. The implied ABI for public functions is therefore: AMX will be disabled on entry, and if enabled within the function, must be disabled again before returning.
+
+As a side-effect of `set`, all X and Y and Z registers are set to zero. If the goal is merely setting Z to zero, then various computational instructions can be used instead, for example [`fma16`](fma.md) with bits 27=1, 28=1, 29=1, 62=1. Alternatively, some computational instructions that accumulate onto Z can be configured to read Z as zero (bit 27 to [`fma16`](fma.md) / [`fma32`](fma.md) / [`fma64`](fma.md) / [`fms16`](fms.md) / [`fms32`](fms.md) / [`fms64`](fms.md) / [`mac16`](mac16.md)).
+
+## Emulation code
+
+Do not require emulation
+
+---
+
+# test.md
+
+Source: https://github.com/corsix/amx/blob/main/test.md
+
+The following files contain C code (hopefully) equivalent to the AMX instructions:
+
+|File|Contents|
+|---|---|
+|[emulate.h](emulate.h)|Common definitions and routines
+|[ldst.c](ldst.c)|`ldx`, `ldy`, `ldz`, `ldzi`, `stx`, `sty`, `stz`, `stzi`|
+|[extr.c](extr.c)|`extrx`, `extry`, `extrh`, `extrv`|
+|[fma.c](fma.c)|`fma16`, `fma32`, `fma64`|
+|[fms.c](fms.c)|`fms16`, `fms32`, `fms64`|
+|[genlut.c](genlut.c)|`genlut`|
+|[mac16.c](mac16.c)|`mac16`|
+|[matfp.c](matfp.c)|`matfp`|
+|[matint.c](matint.c)|`matint`|
+|[vecfp.c](vecfp.c)|`vecfp`|
+|[vecint.c](vecint.c)|`vecint`|
+
+The file [`test.c`](test.c) contains a very simple test harness that generates a bunch of random operands, and asserts that the behaviour of the above files matches the behaviour of the AMX instructions. This test harness requires an Apple Silicon machine, as otherwise the AMX instructions are not available to test against.
+
+A _very_ simple [`Makefile`](Makefile) is provided to compile all of the above. Running `make test` should output:
+```
+Testing AMX_LDX... OK   
+Testing AMX_LDY... OK   
+Testing AMX_LDZ... OK   
+Testing AMX_LDZI... OK   
+Testing AMX_STX... OK   
+Testing AMX_STY... OK   
+Testing AMX_STZ... OK   
+Testing AMX_STZI... OK   
+Testing AMX_EXTRX... OK   
+Testing AMX_EXTRY... OK   
+Testing AMX_MAC16... OK   
+Testing AMX_FMA16... OK   
+Testing AMX_FMA32... OK   
+Testing AMX_FMA64... OK   
+Testing AMX_FMS16... OK   
+Testing AMX_FMS32... OK   
+Testing AMX_FMS64... OK   
+Testing AMX_VECINT... OK   
+Testing AMX_VECFP... OK   
+Testing AMX_MATINT... OK   
+Testing AMX_MATFP... OK   
+Testing AMX_GENLUT... OK
+```
+
+---
+
+# vecfp.md
+
+Source: https://github.com/corsix/amx/blob/main/vecfp.md
+
+## Quick summary
+
+|`vecfp`|<code>z[_][i]&nbsp;±=&nbsp;f(x[i],&nbsp;y[i])</code>|9 bit|Indexed X or Y, shuffle X, shuffle Y,<br/>broadcast Y element,<br/>positive selection, `min`, `max`|
+
+## Instruction encoding
+
+|5|5|Instruction|Must be `19`|
+
+## Operand bitfields
+
+|57|7|Ignored|
+|54|3|Must be zero|No-op otherwise|
+|53|1|[Indexed load](RegisterFile.md#indexed-loads) (`1`) or regular load (`0`)|
+|(53=1) 52|1|Ignored|
+|(53=1) 49|3|Register to index into|
+|(53=1) 48|1|Indices are 4 bits (`1`) or 2 bits (`0`)|
+|(53=1) 47|1|Indexed load of Y (`1`) or of X (`0`)|
+|(53=0) 47|6|ALU mode|
+|46|1|Ignored|
+|42|4|Lane width mode||
+|41|1|Ignored|
+|(31=1)&nbsp;35|6|Ignored|
+|(31=1)&nbsp;32|3|Broadcast mode|
+|(31=0)&nbsp;38|3|Write enable or broadcast mode|
+|(31=0)&nbsp;37|1|Ignored|
+|(31=0)&nbsp;32|5|Write enable value or broadcast lane index|Meaning dependent upon associated mode|
+|31|1|Perform operation for multiple vectors (`1`)<br/>or just one vector (`0`)|M2 only (always reads as `0` on M1)|
+|29|2|[X shuffle](RegisterFile.md#shuffles)|
+|27|2|[Y shuffle](RegisterFile.md#shuffles)|
+|26|1|Ignored|
+|(31=1)&nbsp;25|1|"Multiple" means four vectors (`1`)<br/>or two vectors (`0`)|Top two bits of Z row ignored if operating on four vectors|
+|20|6|Z row|Low bits ignored in some lane width modes<br/>When 31=1, top bit or top two bits ignored|
+|19|1|Ignored|
+|10|9|X offset (in bytes)|On M4, when 31=1, some low bits ignored|
+|9|1|Ignored|
+|0|9|Y offset (in bytes)|On M4, when 31=1, some low bits ignored|
+
+ALU modes:
+|Floating-point operation|47|Notes|
+|---|---|---|
+|`z + x*y`|`0`|
+|`z - x*y`|`1`|
+|`x <= 0 ? 0 : y`|`4`|Z input not used|
+|`min(x, z)`|`5`|Y input not used|
+|`max(x, z)`|`7`|Y input not used|
+|`x * y`|`10`|M2 only. Z input not used|
+|`z + x`|`11`|M2 only. Y input not used|
+|`z + y`|`12`|M2 only. X input not used|
+|no-op|anything else|
+
+Lane width modes:
+|X,Y|Z|42|Notes|
+|bf16|bf16 (one row)|`0`|M2 only|
+|bf16|f32 (two rows, interleaved pair)|`1`|M2 only|
+|f16|f32 (two rows, interleaved pair)|`3`|
+|f32|f32 (one row)|`4`|
+|f64|f64 (one row)|`7`|
+|f16|f16 (one row)|anything else|
+
+Write enable or broadcast modes when 31=0:
+|Mode|Meaning of value (N)|
+|---:|---|
+|`0`|Enable all lanes (`0`), or odd lanes only (`1`), or even lanes only (`2`), or enable all lanes but override the ALU output to `0.0` (`3`) or enable all lanes but override X values to `0.0` (`4`) or enable all lanes but override Y values to `0.0` (`5`) or no lanes enabled (anything else) |
+|`1`|Enable all lanes, but broadcast Y lane #N to all lanes of Y|
+|`2`|Only enable the first N lanes, or all lanes when N is zero|
+|`3`|Only enable the last N lanes, or all lanes when N is zero|
+|`4`|Only enable the first N lanes (no lanes when N is zero)|
+|`5`|Only enable the last N lanes (no lanes when N is zero)|
+|`6`|No lanes enabled|
+|`7`|No lanes enabled|
+
+Broadcast modes when 31=1:
+|Mode|X inputs|Y inputs|Other effects|
+|---:|---|---|---|
+|`0`|Consecutive registers|Consecutive registers|
+|`1`|Ignored|Ignored|Override ALU output to `0.0`|
+|`2`|Use same register for every iteration|Consecutive registers|
+|`3`|Consecutive registers|Use same register for every iteration|
+|`4`|Override values to `0.0`|Consecutive registers|
+|`5`|Consecutive registers|Override values to `0.0`|
+|`6`|Use same register for every iteration,<br/>and broadcast lane #0 to all lanes|Consecutive registers|
+|`7`|Consecutive registers|Use same register for every iteration,<br/>and broadcast lane #0 to all lanes|
+
+## Description
+
+Performs a pointwise fused-multiply-add (or other ALU operation) between an X vector, a Y vector, and a Z vector, accumulating onto the Z vector. All three vectors have the same element type, either f16 or f32 or f64 (or bf16 on M2). Alternatively, when X and Y are both f16 (or bf16 on M2), Z can have type f32, in which case two rows of Z are used (see [Mixed lane widths](RegisterFile.md#mixed-lane-widths)).
+
+On M2, the whole operation can optionally be repeated multiple times, by setting bit 31. Bit 25 controls the repetition count; either two times or four times. By default, consecutive X or Y registers are used as the source operands, but broadcast mode settings can cause the same vector (or lane therein) to be used multiple times. If repeated twice, the top bit of Z row is ignored, and Z row is incremented by 32 for the 2<sup>nd</sup> iteration. If repeated four times, the top two bits of Z row are ignored, and Z row is incremented by 16 on each iteration.
+
+## Emulation code
+
+See [vecfp.c](vecfp.c). Note the code in [test.c](test.c) to set the DN bit of `fpcr`.
+
+```c
+void emulate_AMX_VECFP(amx_state* state, uint64_t operand) {
+    if ((operand >> 54) & 7) {
+        return;
+    }
+    operand &=~ (1ull << 37);
+
+    int alumode = (operand & VECFP_INDEXED_LOAD) ? 0 : (operand >> 47) & 0x3f;
+    switch (alumode) {
+    case 0: case 1: case 4: case 5: case 7:
+        break;
+    case 10: case 11: case 12:
+        if (AMX_VER >= AMX_VER_M2) {
+            break;
+        } else {
+            return;
+        }
+    default:
+        return;
+    }
+
+    uint32_t xybits, zbits, bf16 = 0;
+    switch ((operand >> 42) & 0xf) {
+    case  0: xybits = 16; if (AMX_VER >= AMX_VER_M2) { zbits = 16; bf16 = 1; } else { zbits = 16; } break;
+    case  1: xybits = 16; if (AMX_VER >= AMX_VER_M2) { zbits = 32; bf16 = 1; } else { zbits = 16; } break;
+    case  3: xybits = 16; zbits = 32; break;
+    case  4: xybits = 32; zbits = 32; break;
+    case  7: xybits = 64; zbits = 64; break;
+    default: xybits = 16; zbits = 16; break;
+    }
+    uint32_t xybytes = xybits / 8;
+
+    uint64_t z_row = operand >> 20;
+    uint64_t z_step = 64;
+    uint64_t x_step = 64;
+    uint64_t y_step = 64;
+    int32_t ximask = -1;
+    if ((AMX_VER >= AMX_VER_M2) && (operand & (1ull << 31))) {
+        uint64_t bmode = (operand >> 32) & 0x7;
+        operand &=~ (0x1ffull << 32);
+        switch (bmode) {
+        case 1: operand |= 3ull << 32; break; // override ALU operation to 0
+        case 2: x_step = 0; break; // same x vector for all operations
+        case 3: y_step = 0; break; // same y vector for all operations
+        case 4: operand |= 4ull << 32; break; // override x operand to zero
+        case 5: operand |= 5ull << 32; break; // override y operand to zero
+        case 6: x_step = 0; ximask = 0; break; // use lane 0 of x vector 0 for all operations
+        case 7: y_step = 0; operand |= 1ull << 38; break; // use lane 0 of y vector 0 for all operations
+        }
+        z_step = z_row & 32 ? 16 : 32;
+    }
+
+    uint64_t x_offset = operand >> 10;
+    uint64_t y_offset = operand;
+    for (z_row &= z_step - 1; z_row <= 63; z_row += z_step) {
+        amx_reg x;
+        amx_reg y;
+        load_xy_reg(&x, state->x, x_offset & 0x1FF); x_offset += x_step;
+        load_xy_reg(&y, state->y, y_offset & 0x1FF); y_offset += y_step;
+        if (operand & VECFP_INDEXED_LOAD) {
+            uint32_t src_reg = (operand >> 49) & 7;
+            uint32_t ibits = (operand & VECFP_INDEXED_LOAD_4BIT) ? 4 : 2;
+            if (operand & VECFP_INDEXED_LOAD_Y) {
+                load_xy_reg_indexed(y.u8, state->y[src_reg].u8, ibits, xybits);
+                y_offset -= y_step - y_step * ibits / xybits;
+            } else {
+                load_xy_reg_indexed(x.u8, state->x[src_reg].u8, ibits, xybits);
+                x_offset -= x_step - x_step * ibits / xybits;
+            }
+        }
+        xy_shuffle(x.u8, (operand >> 29) & 3, xybytes);
+        xy_shuffle(y.u8, (operand >> 27) & 3, xybytes);
+
+        uint64_t x_enable = parse_writemask(operand >> 32, xybytes, 9);
+        bool broadcast_y = ((operand >> (32+6)) & 7) == 1;
+        int32_t omask = -1;
+        if (broadcast_y) {
+            x_enable = ~(uint64_t)0;
+        } else if (((operand >> (32+6)) & 7) == 0) {
+            uint32_t val = (operand >> 32) & 0x3F;
+            if (val == 3) {
+                omask = 0;
+            } else if (val == 4) {
+                memset(&x, 0, 64);
+            } else if (val == 5) {
+                memset(&y, 0, 64);
+            }
+        }
+
+        if (zbits == 16) {
+            if (bf16) {
+                ...
+            } else {
+                for (uint32_t i = 0; i < 32; i += 1) {
+                    if (!((x_enable >> (i*xybytes)) & 1)) continue;
+                    uint32_t j = broadcast_y ? ((operand >> 32) & 0x1f) : i;
+                    _Float16* z = &state->z[z_row].f16[i];
+                    *z = omask ? vecfp_alu16(x.f16[i & ximask], y.f16[j], *z, alumode) : 0;
+                }
+            }
+        } else {
+            ...
+        }
+    }
+}
+
+_Float16 vecfp_alu16(_Float16 x, _Float16 y, _Float16 z, int alumode) {
+    switch (alumode) {
+    case 0: __asm("fmadd %h0, %h1, %h2, %h3" : "=w"(z) : "w"(x), "w"(y), "w"(z)); break;
+    case 1: __asm("fmsub %h0, %h1, %h2, %h3" : "=w"(z) : "w"(x), "w"(y), "w"(z)); break;
+    case 4: z = (x <= (_Float16)0) ? (_Float16)0 : y; break;
+    case 5: __asm("fmin %h0, %h1, %h2" : "=w"(z) : "w"(x), "w"(z)); break;
+    case 7: __asm("fmax %h0, %h1, %h2" : "=w"(z) : "w"(x), "w"(z)); break;
+    case 10: z = x * y; break;
+    case 11: z = z + x; break;
+    case 12: z = z + y; break;
+    }
+    return z;
+}
+```
+
+## Performance (M1 Max)
+
+Note that a fused-multiply-add counts as _two_ floating-point operations. A measurement of 1.0 GFLOPS would mean 10<sup>9</sup> floating-point operations per second. The measurements are done without any load or store instructions; real-world workloads will need loads and stores, and thus will achieve lower numbers.
+
+X and Y being `f16[32]`, each Z accumulator being `f16[32]`, ALU operation being `z + x*y` or `z - x*y`:
+
+|Z Accumulators|1 Thread|2 Threads|3 Threads|4 Threads|5 Threads|6 Threads|
+|---:|---:|---:|---:|---:|---:|---:|
+|1 per thread|45.4 GFLOPS|92.4 GFLOPS|105.2 GFLOPS|140.1 GFLOPS|177.4 GFLOPS|182.1 GFLOPS|
+|2 per thread|90.0 GFLOPS|174.4 GFLOPS|210.3 GFLOPS|301.1 GFLOPS|384.2 GFLOPS|378.0 GFLOPS|
+|3 per thread|135.2 GFLOPS|275.3 GFLOPS|311.2 GFLOPS|409.9 GFLOPS|500.4 GFLOPS|463.3 GFLOPS|
+|4 per thread|183.7 GFLOPS|369.3 GFLOPS|417.2 GFLOPS|549.9 GFLOPS|595.2 GFLOPS|570.3 GFLOPS|
+|5 per thread|230.2 GFLOPS|458.5 GFLOPS|434.6 GFLOPS|605.1 GFLOPS|678.5 GFLOPS|636.2 GFLOPS|
+|6 per thread|272.3 GFLOPS|546.9 GFLOPS|522.3 GFLOPS|710.3 GFLOPS|743.6 GFLOPS|758.3 GFLOPS|
+|7 per thread|321.9 GFLOPS|646.6 GFLOPS|579.7 GFLOPS|757.0 GFLOPS|777.5 GFLOPS|787.9 GFLOPS|
+|8 per thread|369.5 GFLOPS|737.6 GFLOPS|667.2 GFLOPS|796.3 GFLOPS|792.8 GFLOPS|744.4 GFLOPS|
+|9 per thread|339.9 GFLOPS|685.4 GFLOPS|625.4 GFLOPS|786.4 GFLOPS|803.6 GFLOPS|812.0 GFLOPS|
+|10 per thread|362.0 GFLOPS|703.8 GFLOPS|642.9 GFLOPS|755.8 GFLOPS|742.5 GFLOPS|811.2 GFLOPS|
+|11 per thread|361.1 GFLOPS|731.6 GFLOPS|704.4 GFLOPS|789.6 GFLOPS|787.2 GFLOPS|822.5 GFLOPS|
+|12 per thread|359.3 GFLOPS|728.4 GFLOPS|649.4 GFLOPS|777.5 GFLOPS|785.2 GFLOPS|830.3 GFLOPS|
+|13 per thread|370.4 GFLOPS|729.3 GFLOPS|655.7 GFLOPS|794.0 GFLOPS|816.7 GFLOPS|792.1 GFLOPS|
+|14 per thread|365.9 GFLOPS|731.8 GFLOPS|649.5 GFLOPS|789.4 GFLOPS|782.8 GFLOPS|806.1 GFLOPS|
+|15 per thread|364.8 GFLOPS|697.6 GFLOPS|657.2 GFLOPS|802.0 GFLOPS|776.0 GFLOPS|821.9 GFLOPS|
+|16 per thread|369.1 GFLOPS|733.9 GFLOPS|662.7 GFLOPS|790.0 GFLOPS|789.8 GFLOPS|809.1 GFLOPS|
+
+X and Y being `f16[32]`, each Z accumulator being `f32[2][16]`, ALU operation being `z + x*y` or `z - x*y`:
+
+|Z Accumulators|1 Thread|2 Threads|3 Threads|4 Threads|5 Threads|6 Threads|
+|---:|---:|---:|---:|---:|---:|---:|
+|1 per thread|44.6 GFLOPS|91.9 GFLOPS|95.6 GFLOPS|139.6 GFLOPS|171.6 GFLOPS|189.6 GFLOPS|
+|2 per thread|91.4 GFLOPS|183.1 GFLOPS|226.3 GFLOPS|242.7 GFLOPS|273.5 GFLOPS|256.7 GFLOPS|
+|3 per thread|137.9 GFLOPS|276.6 GFLOPS|285.3 GFLOPS|391.2 GFLOPS|461.9 GFLOPS|407.9 GFLOPS|
+|4 per thread|184.1 GFLOPS|367.3 GFLOPS|403.4 GFLOPS|448.1 GFLOPS|470.6 GFLOPS|460.9 GFLOPS|
+|5 per thread|171.7 GFLOPS|345.7 GFLOPS|365.0 GFLOPS|406.9 GFLOPS|461.2 GFLOPS|423.5 GFLOPS|
+|6 per thread|184.6 GFLOPS|369.3 GFLOPS|406.4 GFLOPS|433.2 GFLOPS|465.7 GFLOPS|456.0 GFLOPS|
+|7 per thread|182.0 GFLOPS|366.9 GFLOPS|377.2 GFLOPS|420.8 GFLOPS|463.3 GFLOPS|434.6 GFLOPS|
+|8 per thread|178.9 GFLOPS|363.8 GFLOPS|389.1 GFLOPS|436.8 GFLOPS|474.7 GFLOPS|449.5 GFLOPS|
+|9 per thread|185.1 GFLOPS|369.9 GFLOPS|376.3 GFLOPS|442.7 GFLOPS|465.5 GFLOPS|424.9 GFLOPS|
+|10 per thread|178.1 GFLOPS|365.0 GFLOPS|352.8 GFLOPS|418.3 GFLOPS|445.1 GFLOPS|429.2 GFLOPS|
+|11 per thread|182.2 GFLOPS|362.9 GFLOPS|417.9 GFLOPS|435.3 GFLOPS|457.6 GFLOPS|455.3 GFLOPS|
+|12 per thread|179.0 GFLOPS|362.1 GFLOPS|395.5 GFLOPS|442.8 GFLOPS|452.1 GFLOPS|440.0 GFLOPS|
+|13 per thread|184.2 GFLOPS|368.3 GFLOPS|368.7 GFLOPS|433.7 GFLOPS|465.8 GFLOPS|434.9 GFLOPS|
+|14 per thread|184.6 GFLOPS|369.9 GFLOPS|391.5 GFLOPS|445.7 GFLOPS|477.9 GFLOPS|459.5 GFLOPS|
+|15 per thread|182.7 GFLOPS|368.3 GFLOPS|382.6 GFLOPS|436.2 GFLOPS|470.8 GFLOPS|442.0 GFLOPS|
+|16 per thread|182.0 GFLOPS|369.2 GFLOPS|391.2 GFLOPS|435.9 GFLOPS|460.0 GFLOPS|449.9 GFLOPS|
+
+X and Y being `f32[16]`, each Z accumulator being `f32[16]`, ALU operation being `z + x*y` or `z - x*y`:
+
+|Z Accumulators|1 Thread|2 Threads|3 Threads|4 Threads|5 Threads|6 Threads|
+|---:|---:|---:|---:|---:|---:|---:|
+|1 per thread|22.8 GFLOPS|46.2 GFLOPS|52.5 GFLOPS|72.2 GFLOPS|85.5 GFLOPS|101.1 GFLOPS|
+|2 per thread|45.9 GFLOPS|91.5 GFLOPS|99.8 GFLOPS|151.0 GFLOPS|176.2 GFLOPS|193.5 GFLOPS|
+|3 per thread|68.8 GFLOPS|137.7 GFLOPS|147.9 GFLOPS|198.9 GFLOPS|226.3 GFLOPS|232.9 GFLOPS|
+|4 per thread|91.6 GFLOPS|183.2 GFLOPS|192.7 GFLOPS|268.0 GFLOPS|295.6 GFLOPS|285.9 GFLOPS|
+|5 per thread|113.9 GFLOPS|229.0 GFLOPS|235.0 GFLOPS|313.3 GFLOPS|358.5 GFLOPS|361.0 GFLOPS|
+|6 per thread|138.4 GFLOPS|276.6 GFLOPS|320.7 GFLOPS|357.2 GFLOPS|380.4 GFLOPS|377.3 GFLOPS|
+|7 per thread|156.8 GFLOPS|318.0 GFLOPS|299.3 GFLOPS|378.7 GFLOPS|387.0 GFLOPS|380.0 GFLOPS|
+|8 per thread|184.6 GFLOPS|369.2 GFLOPS|330.5 GFLOPS|404.1 GFLOPS|424.1 GFLOPS|401.2 GFLOPS|
+|9 per thread|172.3 GFLOPS|346.6 GFLOPS|318.7 GFLOPS|389.4 GFLOPS|382.3 GFLOPS|404.6 GFLOPS|
+|10 per thread|180.5 GFLOPS|359.7 GFLOPS|327.1 GFLOPS|400.3 GFLOPS|391.0 GFLOPS|401.5 GFLOPS|
+|11 per thread|176.7 GFLOPS|355.4 GFLOPS|323.6 GFLOPS|381.9 GFLOPS|380.1 GFLOPS|393.9 GFLOPS|
+|12 per thread|181.7 GFLOPS|367.4 GFLOPS|330.8 GFLOPS|400.9 GFLOPS|388.6 GFLOPS|412.3 GFLOPS|
+|13 per thread|180.7 GFLOPS|363.7 GFLOPS|340.4 GFLOPS|398.4 GFLOPS|386.9 GFLOPS|409.7 GFLOPS|
+|14 per thread|183.2 GFLOPS|367.5 GFLOPS|334.0 GFLOPS|397.1 GFLOPS|414.1 GFLOPS|410.0 GFLOPS|
+|15 per thread|185.1 GFLOPS|369.0 GFLOPS|332.6 GFLOPS|367.8 GFLOPS|395.1 GFLOPS|416.4 GFLOPS|
+|16 per thread|184.5 GFLOPS|368.5 GFLOPS|333.3 GFLOPS|398.5 GFLOPS|395.9 GFLOPS|411.7 GFLOPS|
+
+X and Y being `f64[8]`, each Z accumulator being `f64[8]`, ALU operation being `z + x*y` or `z - x*y`:
+
+|Z Accumulators|1 Thread|2 Threads|3 Threads|4 Threads|5 Threads|6 Threads|
+|---:|---:|---:|---:|---:|---:|---:|
+|1 per thread|11.5 GFLOPS|23.1 GFLOPS|26.5 GFLOPS|34.5 GFLOPS|50.2 GFLOPS|49.3 GFLOPS|
+|2 per thread|23.1 GFLOPS|46.2 GFLOPS|54.1 GFLOPS|71.2 GFLOPS|93.8 GFLOPS|97.8 GFLOPS|
+|3 per thread|34.6 GFLOPS|69.3 GFLOPS|85.3 GFLOPS|104.0 GFLOPS|121.7 GFLOPS|118.4 GFLOPS|
+|4 per thread|46.2 GFLOPS|92.3 GFLOPS|116.1 GFLOPS|137.0 GFLOPS|163.0 GFLOPS|146.3 GFLOPS|
+|5 per thread|57.7 GFLOPS|115.5 GFLOPS|127.1 GFLOPS|157.4 GFLOPS|176.2 GFLOPS|171.2 GFLOPS|
+|6 per thread|68.8 GFLOPS|138.5 GFLOPS|133.5 GFLOPS|178.3 GFLOPS|189.1 GFLOPS|185.1 GFLOPS|
+|7 per thread|80.7 GFLOPS|161.8 GFLOPS|150.3 GFLOPS|190.6 GFLOPS|193.9 GFLOPS|200.1 GFLOPS|
+|8 per thread|92.4 GFLOPS|184.9 GFLOPS|166.9 GFLOPS|200.4 GFLOPS|203.5 GFLOPS|210.6 GFLOPS|
+|9 per thread|85.2 GFLOPS|171.2 GFLOPS|158.2 GFLOPS|194.7 GFLOPS|199.1 GFLOPS|202.7 GFLOPS|
+|10 per thread|91.1 GFLOPS|182.2 GFLOPS|162.5 GFLOPS|194.0 GFLOPS|196.1 GFLOPS|203.5 GFLOPS|
+|11 per thread|91.7 GFLOPS|182.9 GFLOPS|164.8 GFLOPS|200.6 GFLOPS|195.7 GFLOPS|193.7 GFLOPS|
+|12 per thread|91.7 GFLOPS|184.5 GFLOPS|165.8 GFLOPS|198.8 GFLOPS|198.0 GFLOPS|205.5 GFLOPS|
+|13 per thread|92.4 GFLOPS|184.6 GFLOPS|166.7 GFLOPS|201.5 GFLOPS|204.2 GFLOPS|206.4 GFLOPS|
+|14 per thread|92.7 GFLOPS|184.9 GFLOPS|165.4 GFLOPS|197.8 GFLOPS|198.0 GFLOPS|209.4 GFLOPS|
+|15 per thread|92.0 GFLOPS|184.4 GFLOPS|167.2 GFLOPS|201.2 GFLOPS|212.0 GFLOPS|195.4 GFLOPS|
+|16 per thread|92.3 GFLOPS|184.7 GFLOPS|166.4 GFLOPS|199.8 GFLOPS|198.8 GFLOPS|203.2 GFLOPS|
+
+---
+
+# vecint.md
+
+Source: https://github.com/corsix/amx/blob/main/vecint.md
+
+## Quick summary
+
+|`vecint`&nbsp;(47≠4)|<code>z[_][i]&nbsp;±=&nbsp;f(x[i],&nbsp;y[i])</code>|9 bit|Indexed X or Y, shuffle X, shuffle Y,<br/>broadcast Y element, right shift, `sqrdmlah`|
+
+## Instruction encoding
+
+|5|5|Instruction|Must be `18`|
+
+## Operand bitfields
+
+|(47=4) 63|1|Z is signed (`1`) or unsigned (`0`)|
+|(47≠4) 63|1|X is signed (`1`) or unsigned (`0`)|
+|58|5|Right shift amount|Ignored when ALU mode in {5, 6}|
+|57|1|Ignored|
+|54|3|Must be zero|No-op otherwise|
+|53|1|[Indexed load](RegisterFile.md#indexed-loads) (`1`) or regular load (`0`)|
+|(53=1) 52|1|Ignored|
+|(53=1) 49|3|Register to index into|
+|(53=1) 48|1|Indices are 4 bits (`1`) or 2 bits (`0`)|
+|(53=1) 47|1|Indexed load of Y (`1`) or of X (`0`)|
+|(53=0) 47|6|ALU mode|
+|46|1|Ignored|
+|42|4|Lane width mode|Meaning dependent upon ALU mode|
+|41|1|Ignored|
+|(31=1)&nbsp;35|6|Ignored|
+|(31=1)&nbsp;32|3|Broadcast mode|
+|(31=0)&nbsp;38|3|Write enable or broadcast mode|
+|(31=0)&nbsp;32|6|Write enable value or broadcast lane index|Meaning dependent upon associated mode|
+|31|1|Perform operation for multiple vectors (`1`)<br/>or just one vector (`0`)|M2 only (always reads as `0` on M1)|
+|(47=4) 30|1|Saturate Z (`1`) or truncate Z (`0`)|
+|(47=4) 29|1|Right shift is rounding (`1`) or truncating (`0`)|
+|(47≠4) 29|2|[X shuffle](RegisterFile.md#shuffles)|
+|27|2|[Y shuffle](RegisterFile.md#shuffles)|
+|(47=4) 26|1|Z saturation is signed (`1`) or unsigned (`0`)|
+|(47≠4) 26|1|Y is signed (`1`) or unsigned (`0`)|
+|(31=1)&nbsp;25|1|"Multiple" means four vectors (`1`)<br/>or two vectors (`0`)|Top two bits of Z row ignored if operating on four vectors|
+|20|6|Z row|Low bits ignored in some lane width modes<br/>When 31=1, top bit or top two bits ignored|
+|19|1|Ignored|
+|10|9|X offset (in bytes)|On M4, when 31=1, some low bits ignored|
+|9|1|Ignored|
+|0|9|Y offset (in bytes)|On M4, when 31=1, some low bits ignored|
+
+ALU modes:
+|Integer operation|47|Notes|
+|---|---|---|
+|`z+((x*y)>>s)`|`0`|
+|`z-((x*y)>>s)`|`1`|
+|`z+((x+y)>>s)`|`2`|Particular write enable mode can skip `x` or `y`|
+|`z-((x+y)>>s)`|`3`|Particular write enable mode can skip `x` or `y`|
+|`z>>s` or `sat(z>>s)`|`4`|Shift can be rounding, saturation is optional|
+|`sat(z+((x*y*2)>>16))`|`5`|Shift is rounding, saturation is signed|
+|`sat(z-((x*y*2)>>16))`|`6`|Shift is rounding, saturation is signed|
+|`(x*y)>>s`|`10`|M2 only|
+|`z+(x>>s)`|`11`|M2 only (on M1, consider 47=2 with skipped `y`)|
+|`z+(y>>s)`|`12`|M2 only (on M1, consider 47=2 with skipped `x`)|
+|no-op|anything else|
+
+When ALU mode < 4 or ALU mode > 6, lane width modes:
+|X|Y|Z|42|
+|i16 or u16|i16 or u16|i32 or u32 (two rows, interleaved pair)|`3`|
+|i8 or u8|i8 or u8|i32 or u32 (four rows, interleaved quartet)|`10`|
+|i8 or u8|i8 or u8|i16 or u16 (two rows, interleaved pair)|`11`|
+|i8 or u8|i16 or u16 (each lane used twice)|i32 or u32 (four rows, interleaved quartet)|`12`|
+|i16 or u16 (each lane used twice)|i8 or u8|i32 or u32 (four rows, interleaved quartet)|`13`|
+|i16 or u16|i16 or u16|i16 or u16 (one row)|anything else|
+
+When ALU mode = 4, lane width modes:
+|Z |Z saturation|42|
+|---|---|---|
+|i32 or u32 (one row)|i16 or u16|`3`|
+|i32 or u32 (one row)|i32 or u32|`4`|
+|i8 or u8 (one row)|i8 or u8|`9`|
+|i32 or u32 (one row)|i8 or u8|`10`|
+|i16 or u16 (one row)|i8 or u8|`11`|
+|i16 or u16 (one row)|i16 or u16|anything else|
+
+When ALU mode in {5, 6}, lane width modes:
+
+|X|Y|Z|42|
+|i16 or u16|i16 or u16|i16 or u16 (one row)|anything|
+
+Write enable or broadcast modes when 31=0:
+|Mode|Meaning of value (N)|
+|---:|---|
+|`0`|Enable all lanes (`0`), or odd lanes only (`1`), or even lanes only (`2`), or enable all lanes but override the ALU output to `0` (`3`) or enable all lanes but override X values to `0` (`4`) or enable all lanes but override Y values to `0` (`5`) or no lanes enabled (anything else)|
+|`1`|Enable all lanes, but broadcast Y lane #N to all lanes of Y|
+|`2`|Only enable the first N lanes, or all lanes when N is zero|
+|`3`|Only enable the last N lanes, or all lanes when N is zero|
+|`4`|Only enable the first N lanes (no lanes when N is zero)|
+|`5`|Only enable the last N lanes (no lanes when N is zero)|
+|`6`|No lanes enabled|
+|`7`|No lanes enabled|
+
+Broadcast modes when 31=1:
+|Mode|X inputs|Y inputs|Other effects|
+|---:|---|---|---|
+|`0`|Consecutive registers|Consecutive registers|
+|`1`|Ignored|Ignored|Override ALU output to `0`|
+|`2`|Use same register for every iteration|Consecutive registers|
+|`3`|Consecutive registers|Use same register for every iteration|
+|`4`|Override values to `0`|Consecutive registers|
+|`5`|Consecutive registers|Override values to `0`|
+|`6`|Use same register for every iteration,<br/>and broadcast lane #0 to all lanes|Consecutive registers|
+|`7`|Consecutive registers|Use same register for every iteration,<br/>and broadcast lane #0 to all lanes|
+
+## Description
+
+When 47=4, performs an in-place reduction of an integer vector from Z, where reduction means right shift (either rounding or truncating), optionally followed by saturation (to i8/u8/i16/u16/i32/u32). Z values are 8 bit or 16 bit or 32 bit integers.
+
+When 47≠4, performs some ALU operation between an X vector, a Y vector, and a Z vector, accumulating onto Z. Various combinations of line widths are permitted. When X or Y are narrower than Z, then multiple Z rows are used (as required to get the total number of Z elements to equal the number of X or Y elements). When this results in four Z rows, the data layout is:
+
+<table><tr><th>Z0</th><td>0</td><td>4</td><td>8</td><td>12</td><td>16</td><td>20</td><td>24</td><td>28</td><td>32</td><td>36</td><td>40</td><td>44</td><td>48</td><td>52</td><td>56</td><td>60</td></tr>
+<tr><th>Z1</th><td>1</td><td>5</td><td>9</td><td>13</td><td>17</td><td>21</td><td>25</td><td>29</td><td>33</td><td>37</td><td>41</td><td>45</td><td>49</td><td>53</td><td>57</td><td>61</td></tr>
+<tr><th>Z2</th><td>2</td><td>6</td><td>10</td><td>14</td><td>18</td><td>22</td><td>26</td><td>30</td><td>34</td><td>38</td><td>42</td><td>46</td><td>50</td><td>54</td><td>58</td><td>62</td></tr>
+<tr><th>Z3</th><td>3</td><td>7</td><td>11</td><td>15</td><td>19</td><td>23</td><td>27</td><td>31</td><td>35</td><td>39</td><td>43</td><td>47</td><td>51</td><td>55</td><td>59</td><td>63</td></tr></table>
+
+On M2, the whole operation can optionally be repeated multiple times, by setting bit 31. Bit 25 controls the repetition count; either two times or four times. By default, consecutive X or Y registers are used as the source operands, but broadcast mode settings can cause the same vector (or lane therein) to be used multiple times. If repeated twice, the top bit of Z row is ignored, and Z row is incremented by 32 for the 2<sup>nd</sup> iteration. If repeated four times, the top two bits of Z row are ignored, and Z row is incremented by 16 on each iteration.
+
+## Emulation code
+
+See [vecint.c](vecint.c).
+
+```c
+void emulate_AMX_VECINT(amx_state* state, uint64_t operand) {
+    if ((operand >> 54) & 7) {
+        return;
+    }
+
+    uint64_t z_row = operand >> 20;
+    uint64_t z_step = 64;
+    uint64_t x_step = 64;
+    uint64_t y_step = 64;
+    int32_t ximask = -1;
+    if ((AMX_VER >= AMX_VER_M2) && (operand & (1ull << 31))) {
+        uint64_t bmode = (operand >> 32) & 0x7;
+        operand &=~ (0x1ffull << 32);
+        switch (bmode) {
+        case 1: operand |= 3ull << 32; break; // override ALU operation to 0
+        case 2: x_step = 0; break; // same x vector for all operations
+        case 3: y_step = 0; break; // same y vector for all operations
+        case 4: operand |= 4ull << 32; break; // override x operand to zero
+        case 5: operand |= 5ull << 32; break; // override y operand to zero
+        case 6: x_step = 0; ximask = 0; break; // use lane 0 of x vector 0 for all operations
+        case 7: y_step = 0; operand |= 1ull << 38; break; // use lane 0 of y vector 0 for all operations
+        }
+        z_step = z_row & 32 ? 16 : 32;
+    }
+    z_row &= z_step - 1;
+    int32_t omask = (((operand >> 32) & 0x1ff) == 3) ? 0 : -1;
+    bool broadcast_y = ((operand >> (32+6)) & 7) == 1;
+    int alumode = (operand & VECINT_INDEXED_LOAD) ? 0 : (operand >> 47) & 0x3f;
+    uint32_t shift = (operand >> 58) & 0x1f;
+
+    uint32_t xbits = 0, ybits = 0, zbits, satbits;
+    if (alumode == 4) {
+        switch ((operand >> 42) & 0xf) {
+        case  3: zbits = 32; satbits = 16; break;
+        case  4: zbits = 32; satbits = 32; break;
+        case  9: zbits =  8; satbits =  8; break;
+        case 10: zbits = 32; satbits =  8; break;
+        case 11: zbits = 16; satbits =  8; break;
+        default: zbits = 16; satbits = 16; break;
+        }
+    } else if (alumode == 5 || alumode == 6) {
+        xbits = 16; ybits = 16; zbits = 16;
+        shift = 15;
+    } else {
+        switch ((operand >> 42) & 0xf) {
+        case  3: xbits = 16; ybits = 16; zbits = 32; break;
+        case 10: xbits =  8; ybits =  8; zbits = 32; break;
+        case 11: xbits =  8; ybits =  8; zbits = 16; break;
+        case 12: xbits =  8; ybits = 16; zbits = 32; break;
+        case 13: xbits = 16; ybits =  8; zbits = 32; break;
+        default: xbits = 16; ybits = 16; zbits = 16; break;
+        }
+    }
+    uint32_t xbytes = xbits / 8;
+    uint32_t ybytes = ybits / 8;
+    uint32_t zbytes = zbits / 8;
+
+    if (alumode == 4) {
+        ...
+        return;
+    } else if ((AMX_VER >= AMX_VER_M2) && (alumode == 10 || alumode == 11 || alumode == 12)) {
+    } else if (alumode >= 7) {
+        return;
+    }
+
+    uint64_t x_offset = operand >> 10;
+    uint64_t y_offset = operand;
+    for (; z_row <= 63; z_row += z_step) {
+        uint8_t x[64];
+        uint8_t y[64];
+        load_xy_reg(x, state->x, x_offset & 0x1FF); x_offset += x_step;
+        load_xy_reg(y, state->y, y_offset & 0x1FF); y_offset += y_step;
+        if (operand & VECINT_INDEXED_LOAD) {
+            uint32_t src_reg = (operand >> 49) & 7;
+            uint32_t ibits = (operand & VECINT_INDEXED_LOAD_4BIT) ? 4 : 2;
+            if (operand & VECINT_INDEXED_LOAD_Y) {
+                load_xy_reg_indexed(y, state->y[src_reg].u8, ibits, ybits);
+                y_offset -= y_step - y_step * ibits / ybits;
+            } else {
+                load_xy_reg_indexed(x, state->x[src_reg].u8, ibits, xbits);
+                x_offset -= x_step - x_step * ibits / xbits;
+            }
+        }
+        xy_shuffle(x, (operand >> 29) & 3, xbytes);
+        xy_shuffle(y, (operand >> 27) & 3, ybytes);
+
+        // z =         z +/- (f(x, y) >>  s)  for f being * or +
+        // z = sat_i16(z +/- (f(x, y) >> 16)) for f being SQRDMLAH / SQRDMLSH
+        // with various width/sign/shuffle arrangements for x and y
+        // and various width arrangements for z (interleaving of z dependent on widths of x/y/z)
+        // write-mask, or broadcast from y, or x=0, or y=0
+
+        uint64_t x_enable = parse_writemask(operand >> 32, xbytes, 9);
+        uint64_t y_enable = parse_writemask(operand >> 32, ybytes, 9);
+        if (broadcast_y) {
+            x_enable = ~(uint64_t)0;
+            y_enable = ~(uint64_t)0;
+        } else if (((operand >> (32+6)) & 7) == 0) {
+            uint32_t val = (operand >> 32) & 0x3F;
+            if (val == 4) {
+                memset(x, 0, 64);
+            } else if (val == 5) {
+                memset(y, 0, 64);
+            }
+        }
+
+        uint32_t xsignext = (operand & VECINT_SIGNED_X) ? (64 - xbits) : 0;
+        uint32_t ysignext = (operand & VECINT_SIGNED_Y) ? (64 - ybits) : 0;
+        uint32_t zsignext = 64 - zbits;
+        uint32_t step = min(xbytes, ybytes);
+        uint32_t zmask = (zbytes / step) - 1;
+        for (uint32_t i = 0; i < 64; i += step) {
+            uint32_t xi = i & -xbytes & ximask;
+            if (!((x_enable >> xi) & 1)) continue;
+            uint32_t yj = broadcast_y ? ((operand >> 32) * ybytes) & 0x3f : i & -ybytes;
+            if (!((y_enable >> yj) & 1)) continue;
+
+            int64_t xv = load_int(x + xi, xbytes, xsignext);
+            int64_t yv = load_int(y + yj, ybytes, ysignext);
+            void* z = &state->z[bit_select(z_row, i / step, zmask)].u8[i & -zbytes];
+            int64_t zv = load_int(z, zbytes, zsignext);
+            int64_t result = vecint_alu(xv, yv, zv, alumode, shift) & omask;
+            store_int(z, zbytes, result);
+        }
+    }
+}
+
+int64_t vecint_alu(int64_t x, int64_t y, int64_t z, int alumode, uint32_t shift) {
+    int64_t val = x * y;
+    if (alumode == 5 || alumode == 6) {
+        val += 1ull << (shift - 1);
+    } else if (alumode == 2 || alumode == 3) {
+        val = x + y;
+    } else if (alumode == 9) {
+        return z + __builtin_popcountll((~(x ^ y)) << shift);
+    } else if (alumode == 11) {
+        val = x;
+    } else if (alumode == 12) {
+        val = y;
+    }
+    val >>= shift;
+    if (alumode == 1 || alumode == 3 || alumode == 6) {
+        val = -val;
+    }
+    if (alumode != 10) {
+        val += z;
+    }
+    if (alumode == 5 || alumode == 6) {
+        if (val > 32767) val = 32767;
+        if (val < -32768) val = -32768;
+    }
+    return val;
+}
+```
+
+---
