@@ -1,0 +1,2083 @@
+# SQLPrism
+
+Source: https://github.com/darkcofy/sqlprism/blob/main/README.md
+
+# SQLPrism
+
+
+An MCP server that indexes SQL codebases into a queryable knowledge graph backed by DuckDB. Instead of grepping through files, ask structural questions: *what touches this table, where is this column transformed, what's the blast radius of this PR.*
+
+Built for SQL-heavy data projects — works with raw SQL, [SQLMesh](https://sqlmesh.com/), and [dbt](https://www.getdbt.com/).
+
+## Why Not Just Grep?
+
+Grep finds strings. This tool understands SQL structure.
+
+| Capability | Grep | SQLPrism |
+|---|---|---|
+| Find table references | Yes | Yes |
+| CTE-to-CTE data flow | No — manual file reading | Yes — edges tracked in graph |
+| Column lineage with transforms (CAST, COALESCE, SUM) | No | Yes — parsed from AST |
+| Usage type (WHERE vs SELECT vs JOIN vs GROUP BY) | Fragile regex | Precise — parsed from AST |
+| Multi-hop impact analysis | Manual tracing | Automatic graph traversal |
+| PR blast radius | DIY with git diff | One call |
+| Cross-CTE column tracing | Basically impossible | Built-in |
+
+On a 200-model [SQLMesh](https://sqlmesh.com/) project, a column impact query returns **75 structured results in ~5,000 tokens**. The grep equivalent would need **40-60 files opened, ~100,000+ tokens**, and still wouldn't tell you whether a column appears in a WHERE filter or a SELECT.
+
+## Setup
+
+### 1. Install
+
+```bash
+git clone https://github.com/darkcofy/sqlprism.git && cd sqlprism
+uv sync
+```
+
+### 2. Configure
+
+```bash
+uv run sqlprism init                    # creates sqlprism.yml in the current directory
+# edit sqlprism.yml to add your repos (see Configuration below)
+uv run sqlprism reindex                 # index plain SQL repos
+```
+
+For [dbt](https://www.getdbt.com/) and [SQLMesh](https://sqlmesh.com/) projects, use `reindex-dbt` and `reindex-sqlmesh` respectively. See the [CLI guide](https://darkcofy.github.io/sqlprism/guide/cli/) for full options.
+
+> **Prerequisite:** dbt and SQLMesh are **not** dependencies of sqlprism. The renderers shell out to `dbt compile` / `sqlmesh` inside the target project's own virtualenv (via `uv run` by default). Install the renderer in that project — for example `uv add dbt-core dbt-<adapter>` or `uv add sqlmesh` — before running `reindex-dbt` / `reindex-sqlmesh`. If the renderer is missing, sqlprism will raise a clear error pointing at the project directory.
+
+### 3. Connect your MCP client
+
+**Claude Code:**
+```bash
+claude mcp add sqlprism -- uv run --directory /path/to/sqlprism sqlprism serve
+```
+
+**Claude Desktop / Cursor / Continue.dev** (`.mcp.json`):
+```json
+{
+  "mcpServers": {
+    "sqlprism": {
+      "command": "uv",
+      "args": ["run", "--directory", "/path/to/sqlprism", "sqlprism", "serve"]
+    }
+  }
+}
+```
+
+Replace `/path/to/sqlprism` with the absolute path to your clone.
+
+### 4. Reindex on Save
+
+The graph stays fresh automatically when you set up on-save hooks. There are two modes depending on your editor.
+
+#### Claude Code
+
+Add a [PostToolUse hook](https://docs.anthropic.com/en/docs/claude-code/hooks) so the index updates whenever Claude writes or edits a file. Save this as `.claude/settings.json` in your project root:
+
+```json
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "FILE=$(cat | jq -r '.tool_input.file_path // empty'); [ -n \"$FILE\" ] && [[ \"$FILE\" =~ \\.sql$ ]] && sqlprism reindex-file \"$FILE\" || true"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+This extracts the file path from the hook's stdin JSON, checks it's a `.sql` file, and calls the CLI to reindex it. Run `/hooks` in Claude Code to verify the hook is active.
+
+#### Other MCP clients (Cursor, Continue.dev)
+
+The `reindex_files` MCP tool accepts absolute file paths and reindexes only the affected models. Plain SQL reindexes in ~50ms; [dbt](https://www.getdbt.com/)/[SQLMesh](https://sqlmesh.com/) models compile + reindex in ~2-5s. Calls are debounced per repo (500ms for SQL, 2s for rendered models) so rapid saves batch into a single operation.
+
+Configure your client to call `reindex_files` with the saved file's path on save.
+
+#### Editors without MCP (Vim, Neovim, Emacs, VS Code tasks)
+
+The `reindex-file` CLI command works standalone — no running server needed:
+
+```bash
+sqlprism reindex-file /path/to/model.sql
+```
+
+**Vim / Neovim:**
+```vim
+autocmd BufWritePost *.sql silent !sqlprism reindex-file %:p
+```
+
+**Emacs:**
+```elisp
+(add-hook 'after-save-hook
+  (lambda ()
+    (when (string-match-p "\\.sql\\'" buffer-file-name)
+      (start-process "sqlprism" nil "sqlprism" "reindex-file" buffer-file-name))))
+```
+
+**VS Code** (using the [Run on Save](https://marketplace.visualstudio.com/items?itemName=emeraldwalk.RunOnSave) extension, `.vscode/settings.json`):
+```json
+{
+  "emeraldwalk.runonsave": {
+    "commands": [
+      {
+        "match": "\\.sql$",
+        "cmd": "sqlprism reindex-file ${file}"
+      }
+    ]
+  }
+}
+```
+
+## Configuration
+
+`sqlprism init` creates a default config at `sqlprism.yml` in the working directory. YAML is the default format; JSON is also supported (`--format json`). Existing `sqlprism.json` files are auto-discovered for backwards compatibility. Override the config path with `--config PATH` on any command.
+
+```yaml
+db_path: ~/.sqlprism/graph.duckdb
+sql_dialect: null
+repos:
+  my-queries: /path/to/sql/repo
+  multi-dialect-repo:
+    path: /path/to/repo
+    dialect: starrocks
+    dialect_overrides:
+      athena/: athena
+      postgres/: postgres
+sqlmesh_repos:
+  my-sqlmesh-project:
+    project_path: /path/to/sqlmesh/folder
+    env_file: /path/to/.env
+    dialect: athena
+    variables:
+      GRACE_PERIOD: 7
+dbt_repos:
+  my-dbt-project:
+    project_path: /path/to/dbt/project
+    env_file: /path/to/.env
+    target: dev
+    dialect: starrocks
+    dbt_command: uv run dbt
+```
+
+| Field | Description |
+|---|---|
+| `db_path` | Path to the DuckDB database file. Defaults to `~/.sqlprism/graph.duckdb`. |
+| `sql_dialect` | Global default SQL dialect. `null` for auto-detect. |
+| `repos` | Plain SQL repos. Value is a path string or an object with `path`, `dialect`, `dialect_overrides`. |
+| `dialect` | Per-repo dialect override (e.g. `"starrocks"`, `"athena"`, `"bigquery"`). |
+| `dialect_overrides` | Per-directory overrides using prefix matching or glob patterns. |
+| `sqlmesh_repos` | [SQLMesh](https://sqlmesh.com/) projects. Renders models before parsing. |
+| `dbt_repos` | [dbt](https://www.getdbt.com/) projects. Compiles models before parsing. |
+
+## SQL Dialect Support
+
+Powered by [sqlglot](https://github.com/tobymao/sqlglot), the indexer supports **33 SQL dialects** out of the box:
+
+Athena, BigQuery, ClickHouse, Databricks, Doris, Dremio, Drill, Druid, DuckDB, Dune, Exasol, Fabric, Hive, Materialize, MySQL, Oracle, Postgres, Presto, PRQL, Redshift, RisingWave, SingleStore, Snowflake, Spark, Spark2, SQLite, StarRocks, Tableau, Teradata, Trino, TSQL.
+
+Pass the dialect name as a lowercase string (e.g. `"starrocks"`, `"bigquery"`, `"athena"`). Dialect-specific quoting and identifier case normalization are handled automatically.
+
+## CLI Commands
+
+Full reference: [CLI guide](https://darkcofy.github.io/sqlprism/guide/cli/)
+
+| Command | Description |
+|---|---|
+| `sqlprism init` | Create default config file. |
+| `sqlprism reindex` | Incremental reindex of plain SQL repos. |
+| `sqlprism reindex-file` | Fast on-save reindex of specific files. |
+| `sqlprism reindex-dbt` | Compile and index a [dbt](https://www.getdbt.com/) project. |
+| `sqlprism reindex-sqlmesh` | Render and index a [SQLMesh](https://sqlmesh.com/) project. |
+| `sqlprism serve` | Start the MCP server (stdio or HTTP). |
+| `sqlprism conventions init` | Generate `sqlprism.conventions.yml` from inferred conventions. |
+| `sqlprism conventions refresh` | Re-run convention inference after reindex. |
+| `sqlprism conventions diff` | Show what changed since last `--init`. |
+| `sqlprism status` | Show index status. |
+| `sqlprism query search` | Find entities by name pattern. |
+| `sqlprism query references` | Find inbound/outbound dependencies. |
+| `sqlprism query column-usage` | Find column usage across models. |
+| `sqlprism query trace` | Multi-hop dependency tracing. |
+| `sqlprism query lineage` | End-to-end column lineage chains. |
+
+## MCP Tools
+
+Full reference: [MCP tools guide](https://darkcofy.github.io/sqlprism/guide/mcp-tools/)
+
+When running as an MCP server (`sqlprism serve`), the following tools are exposed:
+
+| Tool | Description |
+|---|---|
+| `search` | Find entities by name pattern with pagination. |
+| `find_references` | Inbound/outbound dependencies with snippets. |
+| `find_column_usage` | Column usage — type, transforms, aliases. |
+| `trace_dependencies` | Multi-hop upstream/downstream chains. |
+| `trace_column_lineage` | End-to-end column lineage through CTEs. |
+| `get_schema` | Table/view schema with columns, types, and dependencies. |
+| `get_context` | One-call comprehensive context dump for a model. |
+| `find_path` | Shortest path between two models (DuckPGQ). |
+| `find_critical_models` | Rank models by PageRank importance (DuckPGQ). |
+| `detect_cycles` | Find circular dependencies in the graph. |
+| `find_subgraphs` | Identify disconnected clusters and orphaned models (DuckPGQ). |
+| `find_bottlenecks` | High fan-out models with risk classification. |
+| `check_impact` | Column-level impact analysis before making changes. |
+| `pr_impact` | Structural diff + blast radius since a base commit. |
+| `reindex` | Background incremental reindex of SQL repos. |
+| `reindex_files` | Fast on-save reindex with per-repo debounce. |
+| `reindex_dbt` | Background dbt compile + index. |
+| `reindex_sqlmesh` | Background SQLMesh render + index. |
+| `get_conventions` | Inferred project conventions — naming, references, columns. |
+| `find_similar_models` | Find existing models similar to what you're building. |
+| `suggest_placement` | Recommend where to place a new model based on references. |
+| `search_by_tag` | Find models by semantic tag (business domain concept). |
+| `list_tags` | List all semantic tags with model counts and confidence. |
+| `index_status` | Index stats, cross-repo edges, and name collisions. |
+
+## Architecture
+
+```
+src/sqlprism/
+  types.py              <- ParseResult, NodeResult, EdgeResult, ColumnUsageResult, parse_repo_config
+  languages/
+    __init__.py         <- SQL_EXTENSIONS, is_sql_file()
+    sql.py              <- sqlglot: tables, views, CTEs, column lineage, transforms
+    sqlmesh.py          <- SQLMesh renderer (full project + selective render_models)
+    dbt.py              <- dbt renderer (full project + selective render_models via --select)
+    utils.py            <- Shared helpers (find_venv_dir, parse_dotenv, build_env, enrich_nodes)
+  core/
+    graph.py            <- DuckDB storage layer (MVCC), queries, snippets, repo_type tracking
+    indexer.py          <- Orchestrator: scan -> checksum -> parse -> store; file-level reindex with repo-type dispatch
+    mcp_tools.py        <- FastMCP tool definitions (non-blocking reindex, per-repo debounce)
+    conventions.py      <- Convention inference engine: layers, naming, references, tags, overrides
+  cli.py                <- Click CLI: serve, reindex, reindex-file, reindex-sqlmesh, reindex-dbt, conventions, status, init
+```
+
+The SQL parser extracts:
+- **Nodes**: tables, views, CTEs, queries (with schema metadata and dialect-aware case normalization)
+- **Edges**: table references, CTE references, JOINs (with context like "FROM clause", "JOIN clause")
+- **Column usage**: per-column tracking with usage type (select, where, join_on, group_by, order_by, having, partition_by, window_order), transforms (CAST, COALESCE, SUM, etc.), output aliases, and WHERE filter expressions
+- **Column lineage**: end-to-end tracing through CTEs and subqueries back to source tables, with SELECT * expansion when schema catalog is available
+
+Full architecture docs: [Architecture overview](https://darkcofy.github.io/sqlprism/architecture/overview/) | [DuckDB schema](https://darkcofy.github.io/sqlprism/architecture/schema/)
+
+### DuckPGQ Graph Analytics
+
+SQLPrism optionally integrates with [DuckPGQ](https://github.com/cwida/duckpgq) for advanced graph analytics. When installed, these tools become available: `find_path`, `find_critical_models`, `find_subgraphs`, `find_bottlenecks` (clustering enrichment). DuckPGQ is installed automatically on first use — no manual setup needed.
+
+## Development
+
+```bash
+uv sync
+uv run pytest                          # run tests (630+ tests)
+uv run pytest --cov=sqlprism           # run with coverage report
+uv run pytest --cov=sqlprism --cov-report=html:coverage_html  # HTML report
+```
+
+### Code Coverage
+
+![Coverage Grid](https://codecov.io/github/darkcofy/sqlprism/graphs/tree.svg?token=8H5XNZEFOW)
+
+## License
+
+Apache License 2.0 — see [LICENSE](LICENSE).
+
+---
+
+# SQLPrism
+
+Source: https://github.com/darkcofy/sqlprism/blob/main/CLAUDE.md
+
+# SQLPrism
+
+SQL knowledge graph MCP server — indexes SQL, dbt, and sqlmesh repos into a DuckDB-backed graph for lineage, impact analysis, and column tracing.
+
+## Quick Reference
+
+- **Language**: Python 3.11+
+- **Package manager**: uv
+- **Lint**: `uv run ruff check .`
+- **Type check**: `uv run ty check`
+- **Tests**: `uv run pytest tests/ -v`
+- **Single test**: `uv run pytest tests/test_indexer.py::test_name -v`
+
+## Project Structure
+
+```
+src/sqlprism/
+  core/
+    graph.py       — DuckDB storage layer (MVCC, repo_type tracking)
+    indexer.py      — Orchestrates parsing + indexing; file-level reindex with repo-type dispatch
+    mcp_tools.py   — MCP server tools (non-blocking reindex, per-repo debounce)
+    conventions.py — Convention inference engine (layers, naming, references, tags, overrides)
+  languages/
+    sql.py         — sqlglot-based SQL parser
+    dbt.py         — dbt renderer (full project + selective render_models)
+    sqlmesh.py     — sqlmesh renderer (full project + selective render_models)
+    utils.py       — Shared venv/env utilities
+  types.py         — Data classes (ParseResult, NodeResult, etc.)
+  cli.py           — Click CLI (serve, reindex, reindex-file, reindex-sqlmesh, reindex-dbt, conventions, status, init)
+tests/
+  test_indexer.py    — Indexer + integration tests
+  test_renderers.py  — dbt/sqlmesh renderer tests
+  test_conventions.py — Convention engine + placement + tags tests
+  test_sql_parser.py — SQL parser, lineage, and dialect tests
+```
+
+## Conventions
+
+- **Branch naming**: `<type>-<issue>-<short-description>` (e.g. `feat-11-indexer-reindex-files`)
+- **Types**: `feat` (enhancement), `fix` (bug), `chore` (maintenance)
+- **Issues**: BDD format with Given/When/Then scenarios
+- **PRs**: Link with `Closes #<number>`, draft first, mark ready after lint+tests pass
+- **Lint before PR**: Always run `uv run ruff check .` and `uv run ty check` before creating or marking a PR ready
+
+## Skills
+
+Custom skills are in `.claude/skills/`:
+
+- **implementing-issues** — End-to-end issue implementation with task planning and sub-agents
+- **creating-branches-and-prs** — Branch/PR naming conventions and creation workflow
+- **reviewing-prs** — Three-persona parallel PR review (SWE, data eng, QA)
+- **managing-project-releases** — Decompose releases into BDD issues with milestones
+
+---
+
+# Contributing to SQLPrism
+
+Source: https://github.com/darkcofy/sqlprism/blob/main/CONTRIBUTING.md
+
+# Contributing to SQLPrism
+
+Thanks for your interest. This document covers the workflow, conventions, and
+checks that apply to all changes.
+
+## Development setup
+
+Requirements:
+
+- Python 3.11+
+- [uv](https://docs.astral.sh/uv/) package manager
+
+```bash
+git clone https://github.com/darkcofy/sqlprism.git
+cd sqlprism
+uv sync
+```
+
+This installs the package and dev dependencies (pytest, ruff, ty, mkdocs) into
+a local `.venv`.
+
+## Running checks locally
+
+Every PR must pass these before it is marked ready:
+
+```bash
+uv run ruff check .       # lint
+uv run ty check           # type check
+uv run pytest tests/ -v   # tests
+```
+
+To run a single test:
+
+```bash
+uv run pytest tests/test_indexer.py::test_name -v
+```
+
+Coverage is configured with a floor of 80% (`[tool.coverage.report] fail_under`).
+
+## Branch and PR conventions
+
+Branch names follow the pattern `<type>-<issue>-<short-description>`:
+
+- `feat-11-indexer-reindex-files`
+- `fix-131-trace-cross-repo-shadow-nodes`
+- `chore-134-critical-review-fixes`
+
+Valid types:
+
+- `feat` — new functionality or enhancement
+- `fix` — bug fix
+- `chore` — maintenance, refactors, docs, hygiene
+
+PR titles should mirror the branch name style. The PR body should link the
+issue with `Closes #<number>`. Open PRs as drafts first; mark them ready once
+`ruff`, `ty`, and `pytest` all pass locally.
+
+## Issue conventions
+
+Issues use a BDD format where applicable: `Given / When / Then` scenarios
+with concrete acceptance criteria. This makes it easier to decompose an issue
+into tasks and to know when it is done.
+
+## Documentation
+
+User-facing docs live under `docs/` and are published with MkDocs Material.
+Preview locally:
+
+```bash
+uv run mkdocs serve
+```
+
+Architectural or longer-form notes can also live under `docs/architecture/`.
+
+## Reporting security issues
+
+See [SECURITY.md](SECURITY.md). Please do not file public issues for
+suspected vulnerabilities.
+
+---
+
+# Convention Engine
+
+Source: https://github.com/darkcofy/sqlprism/blob/main/docs/api/conventions.md
+
+# Convention Engine
+
+The convention inference engine detects project patterns from the indexed SQL graph — naming conventions, layer references, required columns, column style, and semantic tags.
+
+## ConventionEngine
+
+::: sqlprism.core.conventions.ConventionEngine
+
+## Data Classes
+
+::: sqlprism.core.conventions.Layer
+
+::: sqlprism.core.conventions.NamingPattern
+
+::: sqlprism.core.conventions.ReferenceRule
+
+::: sqlprism.core.conventions.RequiredColumn
+
+::: sqlprism.core.conventions.ColumnStyle
+
+::: sqlprism.core.conventions.TagAssignment
+
+::: sqlprism.core.conventions.Cluster
+
+---
+
+# dbt Renderer
+
+Source: https://github.com/darkcofy/sqlprism/blob/main/docs/api/dbt.md
+
+# dbt Renderer
+
+Compiles dbt models via subprocess (`dbt compile`), then parses the compiled SQL with SqlParser.
+
+::: sqlprism.languages.dbt.DbtRenderer
+    options:
+      members_order: source
+      show_root_heading: true
+      show_root_full_path: false
+
+---
+
+# GraphDB (Storage)
+
+Source: https://github.com/darkcofy/sqlprism/blob/main/docs/api/graph.md
+
+# GraphDB (Storage)
+
+DuckDB-backed storage and query layer. Owns the database schema, handles inserts, resolves edges, manages phantom nodes, and provides all query methods.
+
+::: sqlprism.core.graph.GraphDB
+    options:
+      members_order: source
+      show_root_heading: true
+      show_root_full_path: false
+
+---
+
+# Indexer (Orchestrator)
+
+Source: https://github.com/darkcofy/sqlprism/blob/main/docs/api/indexer.md
+
+# Indexer (Orchestrator)
+
+Orchestrates the indexing pipeline: scan repos, checksum files, dispatch to parsers, store results.
+
+::: sqlprism.core.indexer.Indexer
+    options:
+      members_order: source
+      show_root_heading: true
+      show_root_full_path: false
+
+---
+
+# MCP Server
+
+Source: https://github.com/darkcofy/sqlprism/blob/main/docs/api/mcp-tools.md
+
+# MCP Server
+
+FastMCP tool definitions — the interface LLMs interact with. Tools are provider-agnostic; any MCP client can connect via stdio or streamable HTTP.
+
+::: sqlprism.core.mcp_tools
+    options:
+      members_order: source
+      show_root_heading: false
+      show_if_no_docstring: false
+
+---
+
+# SQL Parser
+
+Source: https://github.com/darkcofy/sqlprism/blob/main/docs/api/sql-parser.md
+
+# SQL Parser
+
+Core SQL parser powered by sqlglot. Extracts nodes, edges, column usage, and column lineage from SQL statements.
+
+::: sqlprism.languages.sql.SqlParser
+    options:
+      members_order: source
+      show_root_heading: true
+      show_root_full_path: false
+
+---
+
+# SQLMesh Renderer
+
+Source: https://github.com/darkcofy/sqlprism/blob/main/docs/api/sqlmesh.md
+
+# SQLMesh Renderer
+
+Renders SQLMesh models into clean SQL via subprocess, then parses with SqlParser.
+
+::: sqlprism.languages.sqlmesh.SqlMeshRenderer
+    options:
+      members_order: source
+      show_root_heading: true
+      show_root_full_path: false
+
+---
+
+# Types
+
+Source: https://github.com/darkcofy/sqlprism/blob/main/docs/api/types.md
+
+# Types
+
+Data structures shared across the codebase. Parsers produce these, the indexer consumes them.
+
+::: sqlprism.types
+    options:
+      show_root_heading: false
+      members_order: source
+
+---
+
+# Architecture Overview
+
+Source: https://github.com/darkcofy/sqlprism/blob/main/docs/architecture/overview.md
+
+# Architecture Overview
+
+## Data Flow
+
+```
+                              ┌─────────────────────────────────────┐
+                              │           Entry Points              │
+                              │                                     │
+                              │  CLI (cli.py)    MCP Server          │
+                              │  sqlprism     (mcp_tools.py)     │
+                              │  reindex/query   search/trace/...   │
+                              └──────────┬──────────┬───────────────┘
+                                         │          │
+                              ┌──────────▼──────────▼───────────────┐
+                              │         Indexer (indexer.py)         │
+                              │                                     │
+                              │  Orchestrator — never parses SQL    │
+                              │  directly, never writes to DB       │
+                              │  directly.                          │
+                              │                                     │
+                              │  1. Scan repo for .sql files        │
+                              │  2. Checksum files (skip unchanged) │
+                              │  3. Dispatch to correct parser      │
+                              │  4. Store ParseResult in GraphDB    │
+                              └──┬──────────┬──────────┬────────────┘
+                                 │          │          │
+              ┌──────────────────▼┐  ┌──────▼───────┐ ┌▼──────────────────┐
+              │  SqlParser         │  │ SqlMesh      │ │ DbtRenderer       │
+              │  (sql.py)          │  │ Renderer     │ │ (dbt.py)          │
+              │                    │  │ (sqlmesh.py) │ │                   │
+              │  sqlglot AST →     │  │              │ │ dbt compile →     │
+              │  nodes, edges,     │  │ subprocess → │ │ subprocess →      │
+              │  column_usage,     │  │ render all/  │ │ read compiled/    │
+              │  column_lineage    │  │ selected     │ │ all or --select   │
+              │                    │  │ models →     │ │ models →          │
+              │                    │  │ SqlParser    │ │ SqlParser         │
+              └────────┬───────────┘  └──────┬───────┘ └┬──────────────────┘
+                       │                     │          │
+                       │    ParseResult      │          │
+                       │  ┌────────────────┐ │          │
+                       └──►  nodes[]       ◄─┘          │
+                          │  edges[]       ◄────────────┘
+                          │  column_usage[]│
+                          │  column_lineage[] │
+                          └───────┬────────┘
+                                  │
+                       ┌──────────▼──────────────────────┐
+                       │       GraphDB (graph.py)         │
+                       │                                  │
+                       │  DuckDB storage layer            │
+                       │                                  │
+                       │  ┌─────────┐  ┌────────┐        │
+                       │  │  repos  │  │ files  │        │
+                       │  └─────────┘  └────────┘        │
+                       │  ┌─────────┐  ┌────────┐        │
+                       │  │  nodes  │  │ edges  │        │
+                       │  └─────────┘  └────────┘        │
+                       │  ┌──────────────┐ ┌───────────┐ │
+                       │  │column_usage  │ │col_lineage│ │
+                       │  └──────────────┘ └───────────┘ │
+                       │                                  │
+                       │  Query methods:                  │
+                       │  query_search, query_references, │
+                       │  query_trace, query_column_usage,│
+                       │  query_column_lineage            │
+                       └──────────────────────────────────┘
+```
+
+## Component Responsibilities
+
+### Separation of Concerns
+
+The architecture enforces a strict separation:
+
+- **Parsers** (`sql.py`, `sqlmesh.py`, `dbt.py`) produce `ParseResult` objects. They never touch the database.
+- **GraphDB** (`graph.py`) stores and queries data. It never parses SQL.
+- **Indexer** (`indexer.py`) orchestrates the pipeline. It calls parsers, then stores results via GraphDB.
+- **MCP Tools / CLI** are thin wrappers that call Indexer (for writes) or GraphDB (for reads).
+
+### SqlParser
+
+The core SQL parser uses [sqlglot](https://github.com/tobymao/sqlglot) to build an AST and extract:
+
+- **Nodes**: Tables, views, CTEs, and top-level queries. Each has a name, kind, optional schema, and line numbers.
+- **Edges**: Relationships between nodes — table references from FROM/JOIN clauses, CTE references, subquery dependencies.
+- **Column usage**: Per-column tracking with usage type (select, where, join_on, group_by, etc.), transforms (CAST, COALESCE, SUM), aliases, and filter expressions.
+- **Column lineage**: End-to-end tracing from output columns back through CTEs and subqueries to source table columns.
+
+### SQLMesh Renderer
+
+Runs an inline Python script inside the sqlmesh project's virtualenv. The script:
+
+1. Creates a lightweight `Context` with a local DuckDB gateway (no remote connections)
+2. Passes user-supplied variables
+3. Calls `context.render(model_name)` for each model
+4. Returns rendered SQL as JSON
+
+The rendered SQL is then parsed by `SqlParser`.
+
+### dbt Renderer
+
+Runs `dbt compile` via subprocess. Reads the compiled SQL from `target/compiled/<project_name>/models/`, wraps each as `CREATE TABLE ... AS <sql>`, and feeds it to `SqlParser`.
+
+### GraphDB
+
+DuckDB-backed storage with 6 tables (see [Schema](schema.md)). Key design decisions:
+
+- **Read/write separation**: Read queries use fresh cursors for MVCC snapshot isolation. Write operations use a dedicated write lock. This allows queries to execute concurrently during reindex — no more blocking.
+- **Incremental indexing**: Files are checksummed. Only changed files are re-parsed.
+- **Phantom nodes**: When a file is deleted/re-indexed, nodes that are referenced from other files become "phantoms" (file_id=NULL) rather than being deleted. This preserves cross-file edges.
+- **Batch inserts**: Nodes, edges, column_usage, and column_lineage are inserted in batches for performance.
+- **Schema-aware**: Nodes track their SQL schema (e.g. `bronze`, `silver`) separately from their name.
+
+### Indexer
+
+The orchestrator for all indexing operations:
+
+1. **`reindex_repo`**: Scan directory → checksum → parse changed files → store results
+2. **`reindex_sqlmesh`**: Render via subprocess → parse rendered SQL → store results
+3. **`reindex_dbt`**: Compile via subprocess → parse compiled SQL → store results
+4. **`reindex_files`**: Resolve files to repos → dispatch by repo type (SQL/dbt/sqlmesh) → selective reindex
+
+The indexer also handles:
+
+- File-to-repo resolution (matching file paths to configured repos, picking deepest match for nested repos)
+- File-level deletion (cleans up old data before inserting new)
+- Edge resolution (matching edge target names to actual node IDs)
+- Git metadata (storing current commit and branch per repo)
+- Per-file error resilience (unreadable files are skipped, not fatal)
+
+## Control Flow: Indexing
+
+```
+reindex_repo("my-repo", "/path/to/repo", dialect="starrocks")
+  │
+  ├─ scan directory for .sql files
+  ├─ for each file:
+  │    ├─ compute checksum
+  │    ├─ skip if unchanged (checksum matches DB)
+  │    ├─ parse(file_path, content, dialect) → ParseResult
+  │    │    ├─ sqlglot.parse(content, dialect=dialect)
+  │    │    ├─ walk AST → extract nodes, edges
+  │    │    ├─ extract column_usage per node
+  │    │    └─ extract column_lineage chains
+  │    ├─ delete old file data from DB
+  │    ├─ insert_file(repo_id, path, checksum)
+  │    ├─ insert_nodes_batch(nodes)
+  │    ├─ insert_edges_batch(edges)  ← resolves target node IDs
+  │    ├─ insert_column_usage_batch(column_usage)
+  │    └─ insert_column_lineage_batch(column_lineage)
+  │
+  ├─ remove files no longer on disk
+  └─ return stats {scanned, added, changed, removed, nodes, edges}
+```
+
+## Control Flow: Querying
+
+```
+query_search("animal", kind="table", schema="bronze", limit=20)
+  │
+  └─ GraphDB.query_search()
+       ├─ SQL: SELECT from nodes JOIN files JOIN repos
+       │       WHERE name ILIKE '%animal%'
+       │       AND kind = 'table' AND schema = 'bronze'
+       │       LIMIT 20 OFFSET 0
+       ├─ optionally attach source code snippets
+       └─ return {matches: [...], total_count: N}
+
+query_trace("entity_event", direction="downstream", max_depth=3)
+  │
+  └─ GraphDB.query_trace()
+       ├─ find starting node(s)
+       ├─ BFS traversal through edges table
+       │   depth 1: entity_event → bovine_event_weight, ovine_event_mating, ...
+       │   depth 2: bovine_event_weight → computed_weight, ...
+       │   depth 3: computed_weight → dashboard_weights, ...
+       └─ return {root, paths: [...], depth_summary: {1: N, 2: N, 3: N}}
+
+reindex (MCP tool, non-blocking)
+  │
+  ├─ If reindex already running → return current status
+  ├─ Launch asyncio background task
+  │    └─ asyncio.to_thread(_blocking_reindex)
+  │         ├─ for each repo: indexer.reindex_repo(...)
+  │         └─ update _reindex_status on completion/failure
+  ├─ Return immediately: {"status": "started"}
+  └─ Queries continue serving via MVCC snapshots
+
+reindex_files (MCP tool, on-save fast path)
+  │
+  ├─ Filter to SQL files only
+  ├─ Resolve each file → (repo_name, repo_type) via _resolve_file_repo
+  ├─ Enqueue per repo with debounce:
+  │    ├─ SQL repos: 500ms debounce window
+  │    └─ dbt/sqlmesh repos: 2s debounce window
+  ├─ Return immediately: {"accepted": N}
+  └─ On debounce timer fire (_flush_reindex):
+       ├─ Deduplicate accumulated paths
+       ├─ Acquire _reindex_lock (waits if full reindex running)
+       └─ indexer.reindex_files(paths)
+            ├─ SQL: read → parse → atomic insert (~50ms)
+            ├─ dbt: dbt compile --select model → parse → insert (~2-5s)
+            └─ sqlmesh: render with model filter → parse → insert (~2-5s)
+```
+
+---
+
+# DuckDB Schema
+
+Source: https://github.com/darkcofy/sqlprism/blob/main/docs/architecture/schema.md
+
+# DuckDB Schema
+
+The index is stored in a single DuckDB file (default: `~/.sqlprism/graph.duckdb`). Current schema version: **1.0**.
+
+## Tables (9)
+
+### `repos`
+
+Registered repositories.
+
+| Column | Type | Description |
+|---|---|---|
+| `repo_id` | INTEGER PK | Auto-increment ID. |
+| `name` | TEXT UNIQUE | Repo name (used in queries to filter). |
+| `path` | TEXT | Absolute path to the repo directory. |
+| `repo_type` | TEXT | Repo type: `sql`, `dbt`, or `sqlmesh`. Default: `sql`. Used by `reindex_files` to select the correct renderer. |
+| `last_commit` | TEXT | Git commit hash at last index time. |
+| `last_branch` | TEXT | Git branch at last index time. |
+| `indexed_at` | TIMESTAMP | When the repo was last indexed. |
+
+### `files`
+
+Indexed SQL files. Each file belongs to one repo.
+
+| Column | Type | Description |
+|---|---|---|
+| `file_id` | INTEGER PK | Auto-increment ID. |
+| `repo_id` | INTEGER | FK to `repos`. |
+| `path` | TEXT | Relative path within the repo. |
+| `language` | TEXT | Always `sql`. |
+| `checksum` | TEXT | SHA-256 of file content. Used for incremental indexing. |
+| `indexed_at` | TIMESTAMP | When this file was last parsed. |
+
+Unique constraint: `(repo_id, path)`.
+
+### `nodes`
+
+SQL entities: tables, views, CTEs, queries.
+
+| Column | Type | Description |
+|---|---|---|
+| `node_id` | INTEGER PK | Auto-increment ID. |
+| `file_id` | INTEGER or NULL | FK to `files`. NULL for phantom nodes. |
+| `kind` | TEXT | `table`, `view`, `cte`, or `query`. |
+| `name` | TEXT | Entity name (dialect-normalised). |
+| `schema` | TEXT or NULL | SQL schema (e.g. `bronze`, `silver`, `public`). |
+| `language` | TEXT | Always `sql`. |
+| `line_start` | INTEGER or NULL | First line in source file. |
+| `line_end` | INTEGER or NULL | Last line in source file. |
+| `metadata` | JSON or NULL | Extra metadata (e.g. `sqlmesh_model`, `dbt_model`). |
+
+Unique constraint: `(file_id, kind, name, schema)`.
+
+**Phantom nodes**: When a file is deleted or re-indexed, nodes that are referenced by edges from *other* files are kept with `file_id = NULL` rather than deleted. This preserves cross-file relationships. When the node reappears (e.g. the file is re-parsed), the phantom is merged with the new node.
+
+### `edges`
+
+Relationships between nodes.
+
+| Column | Type | Description |
+|---|---|---|
+| `edge_id` | INTEGER PK | Auto-increment ID. |
+| `source_id` | INTEGER | FK to `nodes` — the node that contains the reference. |
+| `target_id` | INTEGER | FK to `nodes` — the node being referenced. |
+| `relationship` | TEXT | e.g. `references`, `cte_reference`. |
+| `context` | TEXT or NULL | e.g. `FROM clause`, `JOIN clause`. |
+| `metadata` | JSON or NULL | Extra edge metadata. |
+
+### `column_usage`
+
+Per-column usage tracking across models.
+
+| Column | Type | Description |
+|---|---|---|
+| `usage_id` | INTEGER PK | Auto-increment ID. |
+| `node_id` | INTEGER | FK to `nodes` — the CTE/query where the column is used. |
+| `table_name` | TEXT | Referenced table name (short name, not fully qualified). |
+| `column_name` | TEXT | Column name. |
+| `usage_type` | TEXT | `select`, `where`, `join_on`, `group_by`, `order_by`, `having`, `partition_by`, `window_order`, `insert`, `update`. |
+| `alias` | TEXT or NULL | Output alias (for SELECT columns). |
+| `transform` | TEXT or NULL | Transform expression (e.g. `CAST(x AS DATE)`, `SUM(amount)`). |
+| `file_id` | INTEGER | FK to `files`. |
+
+### `column_lineage`
+
+End-to-end column lineage chains.
+
+| Column | Type | Description |
+|---|---|---|
+| `lineage_id` | INTEGER PK | Auto-increment ID. |
+| `file_id` | INTEGER | FK to `files`. |
+| `output_node` | TEXT | Final output entity name (table/view/query). |
+| `output_column` | TEXT | Output column name. |
+| `chain_index` | INTEGER | Disambiguates multiple lineage paths for the same output column. |
+| `hop_index` | INTEGER | Position in the chain (0 = source, increasing toward output). |
+| `hop_column` | TEXT | Column name at this hop. |
+| `hop_table` | TEXT | Table/CTE name at this hop. |
+| `hop_expression` | TEXT or NULL | Transform expression at this hop (e.g. `CAST(x AS VARCHAR)`). |
+
+A lineage chain traces one output column back to its source. Multiple chains (different `chain_index` values) exist when a column has multiple source paths (e.g. COALESCE of two columns).
+
+### `columns`
+
+Column definitions extracted from DDL or schema files.
+
+| Column | Type | Description |
+|---|---|---|
+| `column_id` | INTEGER PK | Auto-increment ID. |
+| `node_id` | INTEGER | FK to `nodes`. |
+| `column_name` | TEXT | Column name. |
+| `data_type` | TEXT or NULL | Column data type (e.g. `INTEGER`, `TEXT`). |
+| `position` | INTEGER | Column ordinal position in the table. |
+| `source` | TEXT | How the column was discovered: `definition`, `usage`, `lineage`. |
+
+### `conventions`
+
+Inferred or overridden project conventions per layer.
+
+| Column | Type | Description |
+|---|---|---|
+| `convention_id` | INTEGER PK | Auto-increment ID. |
+| `repo_id` | INTEGER | FK to `repos`. |
+| `layer` | TEXT | Layer name (e.g. `staging`, `marts`). |
+| `convention_type` | TEXT | `naming`, `references`, `required_columns`, or `column_style`. |
+| `payload` | JSON | Convention data (pattern, allowed_targets, etc.). |
+| `confidence` | FLOAT | Confidence score (0.0-1.0). |
+| `source` | TEXT | `inferred` or `override`. |
+| `model_count` | INTEGER | Number of models in this layer when inferred. |
+
+Unique constraint: `(repo_id, layer, convention_type)`.
+
+### `semantic_tags`
+
+Semantic tags assigned to models by clustering or explicit override.
+
+| Column | Type | Description |
+|---|---|---|
+| `tag_id` | INTEGER PK | Auto-increment ID. |
+| `repo_id` | INTEGER | FK to `repos`. |
+| `tag_name` | TEXT | Tag name (e.g. `customer`, `order`, `revenue`). |
+| `node_id` | INTEGER | FK to `nodes`. |
+| `confidence` | FLOAT | Confidence score (0.0-1.0). |
+| `source` | TEXT | `inferred`, `anchor`, or `explicit`. |
+
+Unique constraint: `(repo_id, tag_name, node_id)`.
+
+## Indexes
+
+```sql
+CREATE INDEX idx_nodes_name ON nodes(name);
+CREATE INDEX idx_nodes_kind ON nodes(kind);
+CREATE INDEX idx_nodes_file ON nodes(file_id);
+CREATE INDEX idx_nodes_kind_name ON nodes(kind, name);
+CREATE INDEX idx_nodes_schema ON nodes(schema);
+CREATE INDEX idx_edges_source ON edges(source_id);
+CREATE INDEX idx_edges_target ON edges(target_id);
+CREATE INDEX idx_edges_relationship ON edges(relationship);
+CREATE INDEX idx_col_table ON column_usage(table_name);
+CREATE INDEX idx_col_column ON column_usage(column_name);
+CREATE INDEX idx_col_table_column ON column_usage(table_name, column_name);
+CREATE INDEX idx_col_usage_type ON column_usage(usage_type);
+CREATE INDEX idx_lineage_output ON column_lineage(output_node, output_column);
+CREATE INDEX idx_lineage_hop ON column_lineage(hop_table, hop_column);
+CREATE INDEX idx_lineage_file ON column_lineage(file_id);
+CREATE INDEX idx_conventions_repo ON conventions(repo_id);
+CREATE INDEX idx_conventions_type ON conventions(convention_type);
+CREATE INDEX idx_tags_name ON semantic_tags(tag_name);
+CREATE INDEX idx_tags_node ON semantic_tags(node_id);
+CREATE INDEX idx_tags_repo ON semantic_tags(repo_id);
+```
+
+## Entity Relationship
+
+```
+repos 1──* files 1──* nodes
+                       │
+                  source_id / target_id
+                       │
+                      edges
+
+files 1──* column_usage *──1 nodes
+files 1──* column_lineage
+nodes 1──* columns
+repos 1──* conventions
+repos 1──* semantic_tags *──1 nodes
+```
+
+---
+
+# Configuration
+
+Source: https://github.com/darkcofy/sqlprism/blob/main/docs/getting-started/configuration.md
+
+# Configuration
+
+`sqlprism init` creates a config file at `sqlprism.yml` in the working directory. You can override the path with `--config PATH` on any command. JSON is also supported (`--format json`).
+
+## Full Config Example
+
+```yaml
+db_path: ~/.sqlprism/graph.duckdb
+sql_dialect: null
+repos:
+  my-queries: /path/to/sql/repo
+  multi-dialect-repo:
+    path: /path/to/repo
+    dialect: starrocks
+    dialect_overrides:
+      athena/: athena
+      postgres/: postgres
+sqlmesh_repos:
+  my-sqlmesh-project:
+    project_path: /path/to/sqlmesh/folder
+    env_file: /path/to/.env
+    dialect: athena
+    variables:
+      GRACE_PERIOD: 7
+dbt_repos:
+  my-dbt-project:
+    project_path: /path/to/dbt/project
+    env_file: /path/to/.env
+    target: dev
+    dialect: starrocks
+    dbt_command: uv run dbt
+```
+
+## Top-Level Fields
+
+| Field | Type | Description |
+|---|---|---|
+| `db_path` | string | Path to the DuckDB database file. Default: `~/.sqlprism/graph.duckdb`. |
+| `sql_dialect` | string or null | Global default SQL dialect. Set to `null` for auto-detection. |
+| `repos` | object | Plain SQL repositories to index. See [Plain SQL Repos](#plain-sql-repos). |
+| `sqlmesh_repos` | object | SQLMesh projects. See [SQLMesh Integration](../guide/sqlmesh.md). |
+| `dbt_repos` | object | dbt projects. See [dbt Integration](../guide/dbt.md). |
+
+## Plain SQL Repos
+
+Each entry in `repos` maps a repo name to either a path string or a config object.
+
+**Simple form** — just a path:
+```yaml
+my-queries: /path/to/sql/repo
+```
+
+**Full form** — with dialect and overrides:
+```yaml
+my-repo:
+  path: /path/to/repo
+  dialect: starrocks
+  dialect_overrides:
+    athena/: athena
+    postgres/: postgres
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `path` | string | Absolute path to the repo directory. |
+| `dialect` | string or null | SQL dialect for this repo. Overrides the global `sql_dialect`. |
+| `dialect_overrides` | object | Per-directory dialect overrides. Keys are path prefixes or glob patterns, values are dialect names. |
+
+## SQLMesh Repos
+
+| Field | Required | Description |
+|---|---|---|
+| `project_path` | Yes | Path to the sqlmesh project directory (containing `config.yaml`). |
+| `env_file` | No | Path to `.env` file. Loaded into the subprocess environment before rendering. |
+| `dialect` | No | SQL dialect for rendering. Default: `athena`. |
+| `variables` | No | SQLMesh macro variables as key-value pairs (e.g. `GRACE_PERIOD: 7`). |
+| `sqlmesh_command` | No | Command to run Python in the sqlmesh project's venv. Default: `uv run python`. |
+
+## dbt Repos
+
+| Field | Required | Description |
+|---|---|---|
+| `project_path` | Yes | Path to dbt project directory (containing `dbt_project.yml`). |
+| `env_file` | No | Path to `.env` file for dbt connection variables. |
+| `target` | No | dbt target name (e.g. `dev`, `prod`). |
+| `dialect` | No | SQL dialect for parsing compiled output (e.g. `starrocks`, `postgres`). |
+| `dbt_command` | No | Base command to invoke dbt. Default: `uv run dbt`. `compile` is appended automatically. |
+| `profiles_dir` | No | Path to directory containing `profiles.yml`. Defaults to the project directory. |
+
+## SQL Dialect Support
+
+Powered by [sqlglot](https://github.com/tobymao/sqlglot), the indexer supports **33 SQL dialects**:
+
+Athena, BigQuery, ClickHouse, Databricks, DuckDB, Doris, Dremio, Drill, Druid, Dune, Exasol, Fabric, Hive, Materialize, MySQL, Oracle, Postgres, Presto, PRQL, Redshift, RisingWave, SingleStore, Snowflake, Spark, Spark2, SQLite, StarRocks, Tableau, Teradata, Trino, TSQL.
+
+Pass the dialect name as a lowercase string (e.g. `"starrocks"`, `"bigquery"`, `"athena"`). Dialect-specific quoting and case normalization are handled automatically.
+
+---
+
+# Installation
+
+Source: https://github.com/darkcofy/sqlprism/blob/main/docs/getting-started/installation.md
+
+# Installation
+
+## Prerequisites
+
+- Python 3.11+
+- [uv](https://docs.astral.sh/uv/) package manager
+
+## Install from Source
+
+```bash
+git clone https://github.com/darkcofy/sqlprism.git
+cd sqlprism
+uv sync
+```
+
+This installs the package and all dependencies into a local `.venv`. All commands use `uv run sqlprism` to execute within this venv.
+
+!!! tip
+    If you activate the venv (`source .venv/bin/activate`), you can drop the `uv run` prefix and just use `sqlprism` directly.
+
+## Verify Installation
+
+```bash
+uv run sqlprism --help
+```
+
+## First Run
+
+```bash
+# 1. Create default config
+uv run sqlprism init
+
+# 2. Edit sqlprism.yml to add your repos
+#    (see Configuration for details)
+
+# 3. Index your SQL files
+uv run sqlprism reindex
+
+# 4. Check what was indexed
+uv run sqlprism status
+```
+
+## MCP Client Setup
+
+### Claude Code
+
+```bash
+claude mcp add sqlprism -- uv run --directory /path/to/sqlprism sqlprism serve
+```
+
+### Claude Desktop / Cursor / Continue.dev
+
+Add to your `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "sqlprism": {
+      "command": "uv",
+      "args": ["run", "--directory", "/path/to/sqlprism", "sqlprism", "serve"]
+    }
+  }
+}
+```
+
+Replace `/path/to/sqlprism` with the absolute path to your clone.
+
+---
+
+# CLI Reference
+
+Source: https://github.com/darkcofy/sqlprism/blob/main/docs/guide/cli.md
+
+# CLI Reference
+
+All commands use `uv run sqlprism` (or just `sqlprism` if the venv is activated).
+
+## Global Options
+
+| Parameter | Default | Description |
+|---|---|---|
+| `--log-level` | `WARNING` | Logging verbosity: `DEBUG`, `INFO`, `WARNING`, `ERROR`. The `serve` command automatically uses `INFO` if the configured level is less verbose. |
+
+## Setup Commands
+
+### `sqlprism init`
+
+Creates a default config file with example entries.
+
+```bash
+sqlprism init [--format yaml|json]
+```
+
+| Parameter | Default | Description |
+|---|---|---|
+| `--format` | `yaml` | Config file format: `yaml` or `json`. |
+
+### `sqlprism status`
+
+Shows index status: repos, file counts, node counts, last indexed time, git commit/branch.
+
+```bash
+sqlprism status [--config PATH] [--db PATH]
+```
+
+## Server
+
+### `sqlprism serve`
+
+Starts the MCP server, exposing all tools to any MCP client.
+
+```bash
+sqlprism serve [--config PATH] [--db PATH] [--transport stdio|streamable-http] [--port 8000]
+```
+
+| Parameter | Default | Description |
+|---|---|---|
+| `--transport` | `stdio` | Transport mode. Use `stdio` for Claude Code / Claude Desktop. Use `streamable-http` for web-based clients. |
+| `--port` | `8000` | Port for HTTP transport. Only used with `streamable-http`. |
+| `--config` | Auto-discovered (see Configuration) | Path to config file. |
+| `--db` | From config | Path to DuckDB file. Overrides `db_path` in config. |
+
+## Indexing Commands
+
+### `sqlprism reindex-file`
+
+Reindex specific files (fast on-save path). Works standalone without a running MCP server. Resolves each file to its repo, determines the repo type (plain SQL, dbt, sqlmesh), and reindexes accordingly.
+
+```bash
+sqlprism reindex-file /path/to/model.sql [/path/to/another.sql ...]
+```
+
+| Parameter | Required | Description |
+|---|---|---|
+| `PATHS` | Yes | One or more file paths to reindex (positional). |
+| `--config` | No | Path to config file. Default: auto-discovered. |
+| `--db` | No | Path to DuckDB file. Overrides config. |
+
+**Editor integration (non-MCP):**
+```bash
+# Vim/Neovim
+autocmd BufWritePost *.sql silent !sqlprism reindex-file %:p
+
+# Emacs — add to after-save-hook
+```
+
+**Output:** `reindexed=N, skipped=M, deleted=K`
+
+### `sqlprism reindex`
+
+Incremental reindex of plain SQL repos (from `repos` in config). Checksums files and only re-parses what changed.
+
+```bash
+sqlprism reindex [--config PATH] [--db PATH] [--repo NAME]
+```
+
+| Parameter | Description |
+|---|---|
+| `--repo` | Reindex a single repo only. Omit to reindex all. |
+
+### `sqlprism reindex-sqlmesh`
+
+Renders all SQLMesh models via subprocess, then parses the clean SQL output.
+
+```bash
+sqlprism reindex-sqlmesh \
+  --name my-project \
+  --project /path/to/sqlmesh/project \
+  --dialect athena \
+  --env-file /path/to/.env \
+  --var GRACE_PERIOD 7
+```
+
+| Parameter | Required | Description |
+|---|---|---|
+| `--name` | Yes | Repo name for the index. Used to filter queries later. |
+| `--project` | Yes | Path to the sqlmesh project directory (containing `config.yaml`). |
+| `--dialect` | No | SQL dialect for rendering output. Default: `athena`. |
+| `--env-file` | No | Path to `.env` file. Variables are loaded into the subprocess environment before rendering. |
+| `--var` | No | SQLMesh macro variables as key-value pairs. Repeatable. e.g. `--var GRACE_PERIOD 7 --var ENV prod`. Overrides variables in `config.yaml`. |
+| `--sqlmesh-command` | No | Command to run python in the sqlmesh project's venv. Default: `uv run python`. The indexer runs an inline script that imports sqlmesh's Python API. |
+
+### `sqlprism reindex-dbt`
+
+Runs `dbt compile` via subprocess, then parses the compiled SQL from `target/compiled/`.
+
+```bash
+sqlprism reindex-dbt \
+  --name my-project \
+  --project /path/to/dbt/project \
+  --dialect starrocks \
+  --env-file /path/to/.env \
+  --target dev
+```
+
+| Parameter | Required | Description |
+|---|---|---|
+| `--name` | Yes | Repo name for the index. |
+| `--project` | Yes | Path to dbt project directory (containing `dbt_project.yml`). |
+| `--dialect` | No | SQL dialect for parsing compiled output (e.g. `starrocks`, `postgres`, `bigquery`). |
+| `--env-file` | No | Path to `.env` file for dbt connection variables. |
+| `--target` | No | dbt target name (e.g. `dev`, `prod`). Maps to the target in `profiles.yml`. |
+| `--profiles-dir` | No | Path to directory containing `profiles.yml`. Defaults to the project directory. |
+| `--dbt-command` | No | Base command to invoke dbt. `compile` is appended automatically. Default: `uv run dbt`. Use `dbt` if globally installed, or `uvx --with dbt-starrocks dbt` for ephemeral install. |
+
+## Convention Commands
+
+### `sqlprism conventions init`
+
+Generate a `sqlprism.conventions.yml` file from inferred conventions. Includes confidence scores as comments.
+
+```bash
+sqlprism conventions init [--config PATH] [--db PATH] [--force]
+```
+
+| Parameter | Description |
+|---|---|
+| `--force` | Overwrite existing conventions file. Without this flag, init refuses to overwrite. |
+
+### `sqlprism conventions refresh`
+
+Re-run convention inference after reindex. Preserves explicit overrides (source: 'override').
+
+```bash
+sqlprism conventions refresh [--config PATH] [--db PATH]
+```
+
+### `sqlprism conventions diff`
+
+Show what conventions changed since the last `init`. Compares the YAML file against current inferred conventions.
+
+```bash
+sqlprism conventions diff [--config PATH] [--db PATH]
+```
+
+## Query Commands
+
+All query commands output JSON to stdout. They share common parameters:
+
+| Parameter | Description |
+|---|---|
+| `--config PATH` | Path to config file. Default: auto-discovered. |
+| `--db PATH` | Path to DuckDB file. Overrides config. |
+| `--repo TEXT` | Filter results by repo name. Omit to query across all repos. |
+
+### `sqlprism query search`
+
+Find tables, views, CTEs, and queries by name pattern (case-insensitive partial match).
+
+```bash
+sqlprism query search PATTERN [--kind KIND] [--schema SCHEMA] [--repo REPO] [--limit 20]
+```
+
+| Parameter | Description |
+|---|---|
+| `PATTERN` | Search string. Matches against node names (partial, case-insensitive). |
+| `--kind` | Filter by node kind: `table`, `view`, `cte`, `query`. |
+| `--schema` | Filter by SQL schema name (e.g. `bronze`, `silver`, `public`). |
+| `--limit` | Max results to return. Default: `20`. |
+
+**Example:**
+```bash
+sqlprism query search "animal" --schema bronze --repo sqlmesh
+```
+
+### `sqlprism query references`
+
+Find what depends on an entity (inbound) and what it depends on (outbound).
+
+```bash
+sqlprism query references NAME [--direction both|inbound|outbound] [--kind KIND] [--schema SCHEMA] [--repo REPO]
+```
+
+| Parameter | Description |
+|---|---|
+| `NAME` | Entity name (table, view, CTE, etc.). |
+| `--direction` | `inbound` (what depends on this), `outbound` (what this depends on), or `both`. Default: `both`. |
+| `--kind` | Filter by node kind to disambiguate. |
+| `--schema` | Filter by SQL schema name. |
+
+**Example:**
+```bash
+sqlprism query references "entity_event" --direction outbound --repo sqlmesh
+```
+
+### `sqlprism query column-usage`
+
+Find where and how a table's columns are used across the codebase.
+
+```bash
+sqlprism query column-usage TABLE [--column COL] [--usage-type TYPE] [--repo REPO]
+```
+
+| Parameter | Description |
+|---|---|
+| `TABLE` | Table name to search column usage for. |
+| `--column` | Filter by specific column name. Omit for all columns. |
+| `--usage-type` | Filter by usage type: `select`, `where`, `join_on`, `group_by`, `order_by`, `having`, `partition_by`, `window_order`, `insert`, `update`. |
+
+Each result includes: table, column, usage type, alias, transform expression, the node/CTE it appears in, file path, and repo.
+
+**Example:**
+```bash
+sqlprism query column-usage "entity_event" --column db_name --usage-type join_on --repo sqlmesh
+```
+
+### `sqlprism query trace`
+
+Multi-hop dependency tracing for impact analysis.
+
+```bash
+sqlprism query trace NAME [--direction downstream|upstream|both] [--max-depth 3] [--kind KIND] [--repo REPO]
+```
+
+| Parameter | Description |
+|---|---|
+| `NAME` | Starting entity name. |
+| `--direction` | `downstream` (what breaks if I change this), `upstream` (what does this depend on), or `both`. Default: `downstream`. |
+| `--max-depth` | Maximum hops to traverse. Default: `3`, max: `6`. Higher values find more transitive dependencies but produce larger results. |
+| `--kind` | Filter by node kind to disambiguate. |
+
+**Example:**
+```bash
+sqlprism query trace "view_animal_metadata" --direction downstream --max-depth 2 --repo sqlmesh
+```
+
+### `sqlprism query lineage`
+
+Query end-to-end column lineage chains through CTEs and subqueries.
+
+```bash
+sqlprism query lineage [--table TABLE] [--column COL] [--output-node NODE] [--repo REPO]
+```
+
+| Parameter | Description |
+|---|---|
+| `--table` | Filter by source or intermediate table name in the lineage chain. |
+| `--column` | Filter by column name at any hop in the chain. |
+| `--output-node` | Filter by the output entity name (the final table/view/query the lineage flows into). |
+
+At least one filter should be provided to avoid returning the entire lineage graph.
+
+**Example:**
+```bash
+sqlprism query lineage --table entity_event --column db_name --repo sqlmesh
+```
+
+---
+
+# Conventions
+
+Source: https://github.com/darkcofy/sqlprism/blob/main/docs/guide/conventions.md
+
+# Conventions
+
+The conventions engine automatically infers project patterns from the indexed SQL graph -- naming conventions, layer references, required columns, column naming style, and semantic tags. It runs after every reindex, giving AI agents (and developers) a machine-readable description of how the project is structured.
+
+## How It Works
+
+- Convention inference runs automatically after reindex.
+- Detects layers from directory structure (`models/staging/`, `models/marts/`, etc.).
+- Infers naming patterns per layer (e.g. `stg_{source}_{entity}`).
+- Infers reference rules (which layers reference which).
+- Detects required columns (columns appearing in >70% of models per layer).
+- Detects column naming style (`snake_case`, `camelCase`, etc.).
+- Assigns semantic tags via structural clustering (no ML, deterministic).
+
+## Confidence Scores
+
+All conventions have a confidence score (0.0--1.0):
+
+| Range | Meaning |
+|---|---|
+| **>0.9** | High confidence. Follow this convention. |
+| **0.7--0.9** | Moderate. Likely correct but worth verifying. |
+| **<0.7** | Low confidence. Consider an explicit override. |
+
+## Overrides
+
+You can override inferred conventions with a YAML file:
+
+```bash
+sqlprism conventions init      # generates sqlprism.conventions.yml
+# edit the file to add explicit overrides
+sqlprism conventions refresh   # re-runs inference, preserving overrides
+sqlprism conventions diff      # shows changes since last init
+```
+
+Overrides take precedence over inferred conventions (`source: 'override'` vs `source: 'inferred'`).
+
+## MCP Tools
+
+Five MCP tools expose conventions to AI agents:
+
+| Tool | Description |
+|---|---|
+| `get_conventions` | Naming rules, reference rules, required columns per layer. |
+| `find_similar_models` | Find existing models similar to what you're building. |
+| `suggest_placement` | Recommend where to place a new model based on references. |
+| `search_by_tag` | Find models by semantic tag (business domain concept). |
+| `list_tags` | List all semantic tags with model counts and confidence. |
+
+See [MCP Tools](mcp-tools.md) for parameter details.
+
+## Semantic Tags
+
+Tags are assigned by structural clustering -- models that share many upstream references get grouped and auto-labeled based on common name tokens. Tags represent business domain concepts (e.g. "customer", "order", "revenue").
+
+Tag sources:
+
+| Source | Description |
+|---|---|
+| **inferred** | Automatically assigned via clustering. |
+| **anchor** | Manually specified in the YAML override as cluster anchors. |
+| **explicit** | Manually assigned to specific models in the YAML override. |
+
+## Example Workflow
+
+```bash
+# 1. Index your project
+sqlprism reindex
+
+# 2. Generate conventions file
+sqlprism conventions init
+# -> creates sqlprism.conventions.yml with inferred conventions
+
+# 3. Review and adjust
+# Edit the YAML to fix any conventions the engine got wrong
+
+# 4. Re-run inference (preserves your overrides)
+sqlprism conventions refresh
+
+# 5. Check what changed
+sqlprism conventions diff
+```
+
+---
+
+# dbt Integration
+
+Source: https://github.com/darkcofy/sqlprism/blob/main/docs/guide/dbt.md
+
+# dbt Integration
+
+The indexer compiles dbt models via `dbt compile`, then parses the resulting SQL from the `target/compiled/` directory.
+
+## How It Works
+
+1. The indexer runs `dbt compile --project-dir ... --profiles-dir ...` via subprocess.
+2. dbt expands all Jinja macros, refs, and sources into clean SQL files under `target/compiled/<project_name>/models/`.
+3. The indexer reads each compiled `.sql` file, wraps it as a `CREATE TABLE` statement (dbt compiled SQL is bare SELECT), and parses it with sqlglot.
+4. Nodes, edges, column usage, and column lineage are extracted and stored in the graph.
+
+No dbt Python dependency is needed in the indexer's environment — it shells out to whatever `dbt` command you specify.
+
+## CLI Usage
+
+```bash
+sqlprism reindex-dbt \
+  --name my-project \
+  --project /path/to/dbt/project \
+  --dialect starrocks \
+  --env-file /path/to/.env \
+  --target dev
+```
+
+## Config Usage
+
+Add to `dbt_repos` in `sqlprism.yml`:
+
+```yaml
+dbt_repos:
+  my-project:
+    project_path: /path/to/dbt/project
+    env_file: /path/to/.env
+    target: dev
+    dialect: starrocks
+    dbt_command: uv run dbt
+```
+
+## dbt Command
+
+The `--dbt-command` parameter is the **base command** to invoke dbt. The indexer appends `compile --project-dir ... --profiles-dir ...` automatically.
+
+Examples:
+
+| Command | When to use |
+|---|---|
+| `uv run dbt` (default) | dbt installed in the project's `.venv` via uv |
+| `dbt` | dbt installed globally or in active venv |
+| `uvx --with dbt-starrocks dbt` | Ephemeral install with a specific adapter |
+
+## Profiles
+
+By default, the indexer looks for `profiles.yml` in the project directory. Use `--profiles-dir` to point elsewhere (e.g. `~/.dbt`).
+
+## Environment Variables
+
+Use `--env-file` to load variables needed by `profiles.yml` (database host, credentials, etc.). These are loaded into the subprocess environment before running `dbt compile`.
+
+## Dialect
+
+The `--dialect` parameter tells the sqlglot parser how to interpret the compiled SQL. This should match your target database:
+
+- StarRocks uses backtick quoting
+- Postgres uses double-quote quoting
+- Snowflake uses uppercase identifiers
+
+If dialect is wrong, you may get parse errors or incorrect identifier resolution.
+
+## SELECT * Lineage
+
+The indexer expands `SELECT *` into individual column lineage chains when a schema catalog is available. The catalog is built from column usage records in previous indexes. On a fresh database, the first index will not expand `SELECT *` — run a second full reindex to populate the catalog.
+
+## Venv Detection
+
+The indexer auto-detects where the `.venv` lives. If your dbt project is nested (e.g. `dbt/dp_starrocks/` but `.venv` is at `dbt/`), the indexer searches parent directories for the venv.
+
+---
+
+# MCP Tools
+
+Source: https://github.com/darkcofy/sqlprism/blob/main/docs/guide/mcp-tools.md
+
+# MCP Tools
+
+When running as an MCP server (`sqlprism serve`), the tools below are exposed. Any MCP client (Claude Code, Claude Desktop, Cursor, Continue.dev) can call these.
+
+## Query Tools
+
+### `search`
+
+Find tables, views, CTEs, and queries by name pattern.
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `pattern` | string | Yes | | Partial name match, case-insensitive. |
+| `kind` | string | No | | Filter: `table`, `view`, `cte`, `query`. |
+| `schema` | string | No | | Filter by SQL schema (e.g. `bronze`, `silver`). |
+| `repo` | string | No | | Filter by repo name. Omit to search all. |
+| `limit` | int | No | 20 | Max results (1-100). |
+| `offset` | int | No | 0 | Skip N results for pagination. |
+| `include_snippets` | bool | No | true | Include source code snippets in results. |
+
+### `find_references`
+
+Find everything connected to a named SQL entity — both inbound (what depends on this) and outbound (what this depends on).
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `name` | string | Yes | | Entity name (table, view, CTE). |
+| `kind` | string | No | | Filter by node kind to disambiguate. |
+| `schema` | string | No | | Filter by SQL schema. |
+| `repo` | string | No | | Filter by repo name. |
+| `direction` | string | No | `both` | `inbound`, `outbound`, or `both`. |
+| `include_snippets` | bool | No | true | Include source code snippets. |
+| `limit` | int | No | 100 | Max results per direction (1-500). |
+| `offset` | int | No | 0 | Skip N results for pagination. |
+
+### `find_column_usage`
+
+Find where and how columns are used across SQL models. Shows usage type, transforms (CAST, COALESCE, etc.), output aliases, and WHERE conditions.
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `table` | string | Yes | | Table name to search column usage for. |
+| `column` | string | No | | Specific column name. Omit for all columns. |
+| `usage_type` | string | No | | Filter: `select`, `where`, `join_on`, `group_by`, `order_by`, `having`, `insert`, `update`. |
+| `repo` | string | No | | Filter by repo name. |
+| `limit` | int | No | 100 | Max results (1-500). |
+| `offset` | int | No | 0 | Skip N results for pagination. |
+
+### `trace_dependencies`
+
+Trace multi-hop dependency chains through the SQL graph. Use for impact analysis: "if I change this table, what models break?"
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `name` | string | Yes | | Starting entity name. |
+| `kind` | string | No | | Filter by node kind to disambiguate. |
+| `direction` | string | No | `downstream` | `upstream`, `downstream`, or `both`. |
+| `max_depth` | int | No | 3 | Maximum hops (1-6). |
+| `repo` | string | No | | Filter by repo name. |
+| `include_snippets` | bool | No | false | Include source code snippets (can be large for traces). |
+| `limit` | int | No | 100 | Max results (1-500). |
+
+### `trace_column_lineage`
+
+Trace end-to-end column lineage through CTEs and subqueries. Shows how an output column traces back to source table columns.
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `table` | string | No | | Source or intermediate table name. |
+| `column` | string | No | | Column name to trace. |
+| `output_node` | string | No | | Output entity name to trace lineage from. |
+| `repo` | string | No | | Filter by repo name. |
+| `limit` | int | No | 100 | Max lineage chains (1-500). |
+| `offset` | int | No | 0 | Skip N chains for pagination. |
+
+### `pr_impact`
+
+Analyse the structural impact of SQL changes since a base commit. Computes structural diff (added/removed/modified tables, views, CTEs, column usage) then traces the blast radius.
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `base_commit` | string | Yes | | Git commit hash or ref to compare against (e.g. `main`, `abc123f`). |
+| `repo` | string | No | | Repo to analyse. Required if multiple repos configured. |
+| `max_blast_radius_depth` | int | No | 3 | Hops to trace from changed nodes (1-6). |
+| `compare_mode` | string | No | `delta` | `delta` = net-new impact vs base (default). `absolute` = total blast radius (v1 behavior). |
+
+#### Delta Mode (default)
+
+In delta mode, `pr_impact` compares the blast radius at HEAD against an approximation of the base branch's blast radius. The response includes:
+
+- `head_total` / `base_total` — blast radius count on each branch
+- `delta` — change in blast radius size
+- `newly_affected` — models that are *newly* in the blast radius due to this PR
+- `no_longer_affected` — models that were in the blast radius on base but aren't anymore
+- `unchanged_affected` — models in the blast radius on both branches
+
+This tells reviewers what *net-new risk* the PR introduces, filtering out pre-existing downstream dependencies.
+
+!!! note
+    Delta mode captures **net-new downstream impact** only. It does not detect reduced blast radius from removed edges — `no_longer_affected` may be undercounted when a PR removes dependencies.
+
+#### Absolute Mode
+
+Set `compare_mode: "absolute"` for v1 behavior — total downstream blast radius without comparison to base.
+
+## Index Management Tools
+
+### `reindex_files`
+
+Fast on-save reindex of specific files. Accepts absolute file paths, resolves each to its repo, and reindexes only the affected models. Non-blocking with per-repo debounce.
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `paths` | list[string] | Yes | | Absolute file paths that changed. Non-SQL files are silently ignored. |
+
+> **Non-blocking with debounce:** Returns immediately. Reindex is debounced per repo — 500ms for plain SQL (fast parse), 2s for dbt/sqlmesh (subprocess compilation). Multiple rapid calls accumulate paths and execute as a single batch. Plain SQL files reindex in ~50ms; dbt/sqlmesh models compile + reindex in ~2-5s.
+
+### `reindex`
+
+Trigger an incremental reindex of plain SQL repos. Checksums files and only re-parses what changed.
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `repo` | string | No | | Specific repo to reindex. Omit for all. |
+
+> **Non-blocking:** Reindex runs in the background. The tool returns immediately with `{"status": "started"}`. Queries remain available during reindex (reads use DuckDB MVCC snapshots). Call `index_status` to check progress. If a reindex is already running, returns the current status instead of starting a new one.
+
+### `reindex_sqlmesh`
+
+Render and index a SQLMesh project. Uses sqlmesh's rendering engine to expand macros and resolve variables.
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `name` | string | Yes | | Repo name for the index. |
+| `project_path` | string | Yes | | Path to sqlmesh project dir (containing `config.yaml`). |
+| `env_file` | string | No | | Path to `.env` file for config variables. |
+| `dialect` | string | No | `athena` | SQL dialect for rendering. |
+| `variables` | object | No | | SQLMesh variables as key-value pairs (e.g. `{"GRACE_PERIOD": "7"}`). |
+| `sqlmesh_command` | string | No | `uv run python` | Command to run python in sqlmesh venv. |
+
+> **Non-blocking:** Reindex runs in the background. The tool returns immediately with `{"status": "started"}`. Queries remain available during reindex (reads use DuckDB MVCC snapshots). Call `index_status` to check progress. If a reindex is already running, returns the current status instead of starting a new one.
+
+### `reindex_dbt`
+
+Compile and index a dbt project. Runs `dbt compile`, then parses the compiled SQL.
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `name` | string | Yes | | Repo name for the index. |
+| `project_path` | string | Yes | | Path to dbt project dir (containing `dbt_project.yml`). |
+| `profiles_dir` | string | No | | Path to directory containing `profiles.yml`. |
+| `env_file` | string | No | | Path to `.env` file for dbt connection variables. |
+| `target` | string | No | | dbt target name. |
+| `dbt_command` | string | No | `uv run dbt` | Command to invoke dbt. `compile` is appended automatically. |
+| `dialect` | string | No | | SQL dialect for parsing (e.g. `starrocks`, `mysql`). |
+
+> **Non-blocking:** Reindex runs in the background. The tool returns immediately with `{"status": "started"}`. Queries remain available during reindex (reads use DuckDB MVCC snapshots). Call `index_status` to check progress. If a reindex is already running, returns the current status instead of starting a new one.
+
+### `index_status`
+
+Returns the current state of the index — repos, file counts, node counts, last commit, staleness. When a background reindex is in progress, includes `reindex_in_progress: true` and `reindex_status` with the current state. After completion, includes `last_reindex` with the result. No parameters.
+
+## Schema & Context Tools
+
+### `get_schema`
+
+Get table/view schema including columns, types, and upstream/downstream dependencies.
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `name` | string | Yes | | Entity name (table, view, CTE). |
+| `repo` | string | No | | Filter by repo name. |
+
+### `get_context`
+
+One-call comprehensive context dump — schema, dependencies, column usage summary, code snippet, and optional graph metrics.
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `name` | string | Yes | | Entity name. |
+| `repo` | string | No | | Filter by repo name. |
+
+## Graph Analytics Tools
+
+### `find_path`
+
+Find the shortest path between two models in the dependency graph. Requires DuckPGQ.
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `source` | string | Yes | | Starting model name. |
+| `target` | string | Yes | | Destination model name. |
+| `max_depth` | int | No | 10 | Maximum path length (1-15). |
+
+### `find_critical_models`
+
+Rank models by PageRank importance — models with high scores are referenced by many important models. Requires DuckPGQ.
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `top_n` | int | No | 20 | Number of top models to return (1-100). |
+| `repo` | string | No | | Filter by repo name. |
+
+### `detect_cycles`
+
+Find circular dependencies in the SQL dependency graph. Uses recursive CTE — no DuckPGQ required.
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `repo` | string | No | | Filter by repo name. |
+| `max_cycle_length` | int | No | 10 | Maximum cycle length (2-15). |
+
+### `find_subgraphs`
+
+Identify weakly connected components (disconnected clusters) and orphaned models. Requires DuckPGQ.
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `repo` | string | No | | Filter by repo name. |
+
+### `find_bottlenecks`
+
+Find bottleneck models with high fan-out and low clustering — single points of failure.
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `min_downstream` | int | No | 5 | Minimum downstream dependents (1-100). |
+| `repo` | string | No | | Filter by repo name. |
+
+### `check_impact`
+
+Analyze the downstream impact of proposed column changes BEFORE modifying code.
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `model` | string | Yes | | Model or table name to check impact for. |
+| `changes` | list | Yes | | List of column changes (remove_column, rename_column, add_column). |
+| `repo` | string | No | | Filter by repo name. |
+
+## Convention Tools
+
+### `get_conventions`
+
+Get naming conventions, reference rules, and required columns for a layer. Returns inferred conventions with confidence scores.
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `layer` | string | No | | Layer name (e.g. 'staging', 'marts'). Omit for all layers. |
+| `repo` | string | No | | Filter by repo name. |
+
+### `search_by_tag`
+
+Find models tagged with a business domain concept. Returns models ranked by confidence.
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `tag` | string | Yes | | Tag name to search for (e.g. 'customer', 'order'). |
+| `min_confidence` | float | No | | Minimum confidence threshold (0.0-1.0). |
+| `repo` | string | No | | Filter by repo name. |
+
+### `list_tags`
+
+List all semantic tags with model counts and average confidence. Provides the project's business domain vocabulary.
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `repo` | string | No | | Filter by repo name. |
+
+### `find_similar_models`
+
+Find existing models similar to what you're building. Compares reference overlap, column overlap, and layer placement.
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `references` | list[string] | No | | Tables this model will reference. |
+| `output_columns` | list[string] | No | | Columns this model will output. |
+| `model` | string | No | | Existing model name to find similar models to. |
+| `limit` | int | No | 5 | Max results (1-50). |
+| `repo` | string | No | | Filter by repo name. |
+
+### `suggest_placement`
+
+Recommend where to place a new model based on its references. Uses inferred layer flow rules and naming conventions.
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `references` | list[string] | Yes | | Tables this new model will reference. |
+| `name` | string | No | | Proposed model name (for naming validation). |
+| `repo` | string | No | | Filter by repo name. |
+
+## DuckPGQ Tools
+
+The following tools require the [DuckPGQ](https://github.com/cwida/duckpgq) extension: `find_path`, `find_critical_models`, `find_subgraphs`. The extension is installed automatically on first use. Tools that don't require DuckPGQ (`detect_cycles`, `find_bottlenecks`, `check_impact`) use plain SQL and work everywhere.
+
+## Pagination
+
+`search`, `find_references`, `find_column_usage`, and `trace_column_lineage` all support `limit` and `offset` for paginating through large result sets:
+
+- **`limit`**: Max results to return per call.
+- **`offset`**: Number of results to skip. To get page 2 of 100-result pages, set `offset: 100`.
+
+## Snippets
+
+`search`, `find_references`, and `trace_dependencies` support `include_snippets`:
+
+- When `true`, results include source code context around each match.
+- Default is `true` for `search` and `find_references`, `false` for `trace_dependencies` (which can produce very large output).
+
+---
+
+# SQLMesh Integration
+
+Source: https://github.com/darkcofy/sqlprism/blob/main/docs/guide/sqlmesh.md
+
+# SQLMesh Integration
+
+The indexer renders SQLMesh models into clean SQL before parsing, so macros like `@start_dt`, `@end_dt`, and custom variables are fully expanded.
+
+## How It Works
+
+1. The indexer runs an inline Python script inside the **sqlmesh project's own virtualenv** (via `uv run python`).
+2. The script creates a local DuckDB gateway (no remote connections needed), loads the project context, and renders each model.
+3. Rendered SQL is returned as JSON to the indexer process.
+4. The indexer parses each rendered model with sqlglot, extracting nodes, edges, column usage, and column lineage.
+
+No sqlmesh Python dependency is needed in the indexer's environment — it uses whatever version the project already has installed.
+
+## CLI Usage
+
+```bash
+sqlprism reindex-sqlmesh \
+  --name my-project \
+  --project /path/to/sqlmesh/project \
+  --dialect athena \
+  --env-file /path/to/.env \
+  --var GRACE_PERIOD 7
+```
+
+## Config Usage
+
+Add to `sqlmesh_repos` in `sqlprism.yml`:
+
+```yaml
+sqlmesh_repos:
+  my-project:
+    project_path: /path/to/sqlmesh/project
+    env_file: /path/to/.env
+    dialect: athena
+    variables:
+      GRACE_PERIOD: 7
+```
+
+## Variables
+
+SQLMesh projects often define macro variables in `config.yaml` under the `variables:` key. However, the indexer creates a separate lightweight context (with a local DuckDB gateway) that doesn't inherit these variables.
+
+You must pass variables explicitly:
+
+- **CLI**: `--var KEY VALUE` (repeatable)
+- **Config**: `variables:` with `KEY: value` entries
+
+If a variable is missing, the render will fail with `Macro variable 'X' is undefined.`
+
+## Environment Variables
+
+Use `--env-file` to load environment variables needed by the sqlmesh `config.yaml` (e.g. `S3_WAREHOUSE_LOCATION`, database credentials). These are loaded into the subprocess environment before rendering.
+
+## Dialect
+
+The `--dialect` parameter controls the SQL dialect used for rendering output. This should match the dialect in your sqlmesh `config.yaml` `model_defaults`. Common values: `athena`, `bigquery`, `postgres`, `starrocks`.
+
+## SELECT * Lineage
+
+The indexer expands `SELECT *` into individual column lineage chains when a schema catalog is available. The catalog is built from column usage records in previous indexes. On a fresh database, the first index will not expand `SELECT *` — run a second full reindex to populate the catalog.
+
+## Venv Detection
+
+The indexer auto-detects where the `.venv` lives by searching from the project path upward. If your venv is in a non-standard location, the render script will use whatever `uv run` resolves to from the project directory.
+
+---
+
+# SQLPrism
+
+Source: https://github.com/darkcofy/sqlprism/blob/main/docs/index.md
+
+# SQLPrism
+
+An MCP server that indexes SQL codebases into a queryable knowledge graph backed by DuckDB. Instead of grepping through files, ask structural questions: *what touches this table, where is this column transformed, what's the blast radius of this PR.*
+
+Built for SQL-heavy data projects — works with raw SQL, [SQLMesh](https://sqlmesh.com/), and [dbt](https://www.getdbt.com/).
+
+## Why Not Just Grep?
+
+Grep finds strings. This tool understands SQL structure.
+
+| Capability | Grep | SQLPrism |
+|---|---|---|
+| Find table references | Yes | Yes |
+| CTE-to-CTE data flow | No — manual file reading | Yes — edges tracked in graph |
+| Column lineage with transforms (CAST, COALESCE, SUM) | No | Yes — parsed from AST |
+| Usage type (WHERE vs SELECT vs JOIN vs GROUP BY) | Fragile regex | Precise — parsed from AST |
+| Multi-hop impact analysis | Manual tracing | Automatic graph traversal |
+| PR blast radius | DIY with git diff | One call |
+| Cross-CTE column tracing | Basically impossible | Built-in |
+| Graph analytics (PageRank, cycles, bottlenecks) | No | Yes — DuckPGQ integration |
+
+On a 200-model SQLMesh project, a column impact query returns **75 structured results in ~5,000 tokens**. The grep equivalent would need **40-60 files opened, ~100,000+ tokens**, and still wouldn't tell you whether a column appears in a WHERE filter or a SELECT.
+
+## Quick Start
+
+```bash
+git clone https://github.com/darkcofy/sqlprism.git && cd sqlprism
+uv sync
+uv run sqlprism init       # creates sqlprism.yml
+# edit config to add your repos
+uv run sqlprism reindex     # index plain SQL repos
+uv run sqlprism serve       # start MCP server
+```
+
+See [Installation](getting-started/installation.md) and [Configuration](getting-started/configuration.md) for details.
+
+---
+
+# Security policy
+
+Source: https://github.com/darkcofy/sqlprism/blob/main/SECURITY.md
+
+# Security policy
+
+## Supported versions
+
+SQLPrism is pre-1.x in spirit (published as 1.x with a "Beta" development
+status). Only the latest minor release on the `main` branch receives security
+fixes.
+
+| Version | Supported |
+|---------|-----------|
+| 1.2.x   | Yes       |
+| < 1.2   | No        |
+
+## Reporting a vulnerability
+
+Please **do not** open a public GitHub issue for suspected vulnerabilities.
+
+Instead, email the maintainer at **alfjohnfred@gmail.com** with:
+
+- A description of the issue and its potential impact.
+- Steps to reproduce, or a minimal proof of concept.
+- Any relevant logs, stack traces, or affected commits.
+
+You can expect an acknowledgement within **72 hours**. If the report is
+confirmed, we will work on a fix and coordinate a release; you will be
+credited in the `CHANGELOG.md` entry unless you prefer to remain anonymous.
+
+## Scope
+
+In scope:
+
+- Arbitrary code execution, SQL injection, or path traversal in the parser,
+  indexer, CLI, or MCP server.
+- Secret leakage through logs, snippets, or the graph store.
+- Unsafe subprocess handling in the dbt / sqlmesh renderers.
+
+Out of scope:
+
+- Vulnerabilities in upstream dependencies (DuckDB, sqlglot, dbt, sqlmesh) —
+  please report those to the respective projects.
+- Findings that require the attacker to already control the machine running
+  `sqlprism serve`.
+
+---

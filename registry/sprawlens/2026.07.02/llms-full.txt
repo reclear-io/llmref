@@ -1,0 +1,1958 @@
+# sprawlens
+
+Source: https://github.com/mizchi/sprawlens/blob/main/README.md
+
+# sprawlens
+
+Visualize the structure of a code repository as a stacked, zoomable map —
+modules as concentric dependency rings (or a bundled treemap), subdivided down
+to files and symbols with capacity-constrained power diagrams, and linked by
+their real import / call graph. Point it at any repo and read how the code is
+laid out and how it depends on itself.
+
+Supports **TypeScript / JavaScript, Go, Rust, and MoonBit**, auto-detected.
+
+## Run it on any repo
+
+```bash
+# from a checkout of this repo (built bin):
+pnpm install && pnpm build
+node packages/cli/dist/index.js <path-to-repo>     # analyze + open the browser
+
+# or during development, without building:
+pnpm cli serve <path-to-repo>
+```
+
+`sprawlens [repo]` (default `.`) snapshots the working tree, starts a local
+server that serves the map + the snapshot + the detail endpoints, and opens the
+browser. `--port <n>`, `--no-open`, `--lang <id>`.
+
+Language detection keys off the root manifest: `go.mod` → Go, `Cargo.toml` →
+Rust, `moon.mod.json` → MoonBit, `package.json` / `tsconfig.json` → TypeScript.
+A single manifest wins outright (stray source files of another language in a
+subdirectory don't override it). When the root genuinely names more than one
+language, sprawlens asks which to use (or errors with the choices off a TTY);
+`--lang typescript|go|rust|moonbit` forces it.
+
+### What the map shows
+
+- **Modules → directories → files → classes → symbols**, area ∝ code size,
+  position from graph proximity. Toggle boundary levels in the left drawer.
+- **Internal dependency edges** (resolved file→file / symbol→symbol) and
+  **external packages** on the deps plane.
+- **Stacked planes**: source, tests, and external deps, linked by the edges
+  that cross between them — hover a node to light its rope, hold alt for all.
+- **Live working-tree diff** (added / modified files, highlighted) and, for
+  TypeScript, **per-symbol CFG and call hierarchy** on demand.
+
+## Git-history commands (TypeScript)
+
+```bash
+pnpm cli collect <repo> --commits 50   # snapshot N commits into .codesprawl/
+pnpm cli analyze <repo>                # diff consecutive snapshots
+```
+
+## Architecture
+
+A pnpm workspace split into responsibility layers. Each package only depends
+on lower layers; `@sprawlens/contracts` (the `Snapshot` / `AtlasGraph` shapes)
+is the spine every other package agrees on, and only the cli — the composition
+root — knows the concrete analyzers.
+
+| layer          | package                       | responsibility                                                                                                                                         |
+| -------------- | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| L0 contract    | `@sprawlens/contracts`        | language-neutral data shapes only: `Snapshot`, `AtlasGraph`, the detail graph, the `LanguageProvider` / `LanguageDetail` interfaces. Zero dependencies |
+| L1 domain      | `@sprawlens/schema`           | neutral computation over the contracts: metrics, diff, the snapshot→graph adapter, hierarchy / layer / module / overlay / delta derivations            |
+| L1 domain      | `@sprawlens/layout`           | geometry + graph layout kernel (rings, treemap, power diagram, force, ...)                                                                             |
+| L2 capability  | `@sprawlens/analyzer-ts`      | TypeScript/JS provider — TS compiler for structure, LSP for CFG / call hierarchy                                                                       |
+| L2 capability  | `@sprawlens/analyzer-go`      | Go provider — tree-sitter                                                                                                                              |
+| L2 capability  | `@sprawlens/analyzer-rust`    | Rust provider — tree-sitter                                                                                                                            |
+| L2 capability  | `@sprawlens/analyzer-moonbit` | MoonBit provider — heuristic (until a tree-sitter grammar ships)                                                                                       |
+| L2 capability  | `@sprawlens/providers`        | the provider registry: the ordered `PROVIDERS` list + `selectProvider`, so the match order lives in one place                                          |
+| L3 application | `@sprawlens/server`           | neutral HTTP shell: static viz, snapshot, working-tree diff (SSE), injected detail. Depends on no analyzer                                             |
+| L3 application | `@sprawlens/viz`              | the Preact + SVG map                                                                                                                                   |
+| L4 composition | `@sprawlens/cli`              | language detection → analyze → serve → open; wires a provider's detail into the neutral server                                                         |
+
+A language provider implements `match` + `analyze(repo) → Snapshot` and an
+optional `detail` (CFG, call hierarchy). Adding a language is one package.
+
+`pnpm lint:layers` enforces this table: each package's `@sprawlens/*`
+dependencies must stay within its layer (e.g. the server may not reach a
+concrete analyzer). It runs in CI.
+
+## Develop
+
+```bash
+pnpm install
+pnpm test                 # vitest across all packages
+pnpm -r exec tsc --noEmit -p tsconfig.json   # typecheck (per package)
+pnpm --filter @sprawlens/viz dev             # the map dev server
+pnpm dev:server                              # detail/diff server for the viz dev
+pnpm build                                   # build viz + bundle the CLI bin
+```
+
+---
+
+# 1. Use tsgo for type-level re-export resolution only; keep parsing in-process
+
+Source: https://github.com/mizchi/sprawlens/blob/main/docs/adr/0001-tsgo-for-ts-reexport-resolution.md
+
+# 1. Use tsgo for type-level re-export resolution only; keep parsing in-process
+
+- Status: Accepted
+- Date: 2026-06-26
+- Deciders: mizchi
+- Related PRs: #41 (parse speedups), #43 (tsgo re-export resolution), #44 (resident tsgo)
+
+## Context
+
+`analyzer-ts` turns a TypeScript working tree into the atlas snapshot: per-file
+symbols, import edges, and symbol-level import links (`symbolImports`). Two
+qualities matter — analysis speed (it runs live, re-analysing on every change
+over SSE) and correctness of the import graph.
+
+Two facts pulled in opposite directions:
+
+1. **Symbol extraction is cheap in-process.** After the #41 work (parse each
+   file once, `setParentNodes=false`, merged walks) a full cold analysis of
+   sprawlens (256 files) is ~113ms, ~95% of which is `ts.createSourceFile`
+   parse+extract. It is already fast.
+
+2. **Re-export resolution is wrong without type info.** The syntactic resolver
+   follows only one re-export hop and skips `export *`. Barrel files
+   (`index.ts` doing `export * from "./x"`) — and the cross-package imports
+   routed through them, e.g. `import { CodeNode } from "@sprawlens/schema"` —
+   lost their symbol-level links entirely.
+
+The question was whether to adopt an external compiler tool
+(`tsgo` = `@typescript/native-preview`, or `corsa-bind`) for TS analysis, as we
+did for MoonBit (`moon ide gen-symbols`, which replaced a slow vendored parser).
+
+## Decision
+
+**1. Keep symbol extraction in-process (`ts.createSourceFile`).** Do not route
+parsing through tsgo. Measured: tsgo's per-file fetch+decode is roughly equal to
+the JS parser warm (Go parser + binary AST transfer), but it adds a 100–230ms
+cold spawn and a per-snapshot `getSourceFile` IPC, with no bulk
+symbol/`workspace symbol`/`documentSymbol` API to amortise it. For symbol
+extraction tsgo is at best a wash and usually slower. This is the **opposite**
+of the MoonBit case, where the in-tree parser was slow and a CLI won.
+
+**2. Resolve re-exports with the tsgo type checker, with a syntactic fallback.**
+Only the barrel re-export resolution uses tsgo's `Checker`: when the repo builds
+into tsconfig projects, each barrel's exports are resolved to their original
+declaration (`file:line`), expanding `export *`, chasing transitive chains, and
+tracking `as` renames. When the repo isn't built or tsgo can't start, the
+analyzer falls back to the syntactic resolver. tsgo has no `getAliasedSymbol`,
+so this is a hybrid: `export *` is expanded by walking the AST and recursing,
+named re-exports are followed via the `ExportSpecifier`'s module specifier.
+
+**3. Keep tsgo resident per repo.** A `Map<repoRoot, residentApi>` holds one
+tsgo process across analyses. The first analysis spawns and `openProject`s each
+package tsconfig; warm re-analysis pushes only the changed files via
+`updateSnapshot({ fileChanges })` (derived from the `ParseCache` mtime diff) with
+no respawn. cold 420ms → warm 21ms (~18×). Idle-closed (5 min) and reaped on
+process exit; the child also dies with the parent.
+
+## Alternatives considered
+
+- **`corsa-bind`** (`@corsa-bind/napi`): an FFI binding to the Corsa checker over
+  stdio. It exposes type-checking, **not** symbol/workspace-symbol extraction —
+  unusable for this. Rejected.
+- **Replace all parsing with tsgo**: no bulk symbol API (only per-file
+  `getSourceFile` + walk, same shape as in-process), plus the cold spawn.
+  Measured slower overall. Rejected.
+- **tsgo LSP server** (`tsgo lsp -stdio` + `workspace/symbol`): still no bulk
+  resolution, and adds a JSON-RPC client and a second process to manage. The
+  unstable `API` instance already covers spawn amortisation, incremental
+  `fileChanges`, and an in-memory `fs` overlay. Rejected.
+- **Syntactic recursive re-export resolution** (walk every file's exports and
+  resolve transitively, no tsgo): handles common barrels and chains with zero
+  spawn cost, but misses type-level edge cases (re-exports through conditional
+  types, namespace re-exports, etc.). Viable and cheaper; not chosen because the
+  decision was to use real type information for correctness.
+
+## Consequences
+
+Positive:
+
+- 36 cross-package imports through a barrel now resolve their `symbolImports` to
+  the origin file (e.g. `@sprawlens/schema` `snapshotToAtlasGraph → adapter.ts`),
+  where before they were empty.
+- The resident process makes the live cost negligible after the first analysis,
+  and `fileChanges` keeps incremental updates ~1ms.
+- Symbol extraction stays simple and fast; only the (smaller) re-export concern
+  takes on the tsgo dependency.
+
+Negative / risks:
+
+- **Unstable API dependency.** `@typescript/native-preview` is 7.0.0-dev; the
+  used surface (`updateSnapshot`, `getProjects`, `Checker`, `Symbol`) has no
+  stable types and several decode traps (`.modifiers`/`.getStart()` crash; use
+  `getExports()`, `node.name.pos`; `/Users`→`/users` lowercasing). Pinned by
+  inline shapes and kind/flag constants that may drift across tsgo versions.
+- **Build prerequisite.** tsgo resolution needs the IDE build artifacts
+  (`_build`/tsconfig projects); unbuilt repos silently take the syntactic
+  fallback, so re-export precision is build-dependent.
+- **Resident process lifecycle** to manage (idle close, exit reaping). Mitigated
+  by `unref`'d timer + the child dying with the parent (no zombies, verified).
+
+The fallback design means a missing/unusable tsgo never breaks analysis — it
+just degrades re-export precision to the syntactic level.
+
+---
+
+# Terraform service layer
+
+Source: https://github.com/mizchi/sprawlens/blob/main/docs/design/2026-06-18-terraform-service-layer.md
+
+# Terraform service layer
+
+Status: Phase A + Phase B done (2026-06-18).
+
+Phase B shipped: a "group by service" toggle prepends `serviceGrouping` as the
+outermost hierarchy boundary, nesting the module map inside each terraform
+service. `serviceFileMap` (schema) matches snapshot files to services by their
+`source` globs, served as `ServiceGraph.fileServices`; the viz builds `serviceOf`
+from it and feeds the terraform edges in as `nativeEdges["service"]`. Files
+matching no service collect in a single `(no service)` bucket. Kept orthogonal to
+the boundary/granularity axes (additive, gated behind the toggle).
+
+## Goal
+
+Visualize how services communicate, with Terraform as the top ("upper") layer.
+Terraform supplies a set of _services_ and the _communication_ between them;
+the existing per-repo module map is later nested inside each service node.
+
+The hierarchy contract already anticipates this: `AtlasNodeKind` includes
+`"service"`, `AtlasEdgeKind` includes `"flow"` ("observed/declared communication
+link — service RPC, queue"), and `serviceGrouping(serviceOf)` /
+`DeriveLevelsOptions.nativeEdges["service"]` exist. What is missing is the data
+source (Terraform → services + edges) and the service↔code mapping.
+
+## Scope
+
+- **Phase A (this work): the service layer only.** Parse Terraform, derive
+  service nodes and service-to-service edges, render them as a standalone plane.
+- **Phase B (later): nest modules inside services.** Swap the standalone plane
+  for `serviceGrouping(serviceOf)` as the top hierarchy boundary, placing the
+  existing module map inside each service node. The `source` mapping is captured
+  now but only rendered in Phase B.
+
+## Data flow
+
+`ServiceGraph` is the infra-layer analysis contract, the counterpart to
+`Snapshot` for code. It is produced independently of the code language and
+served alongside the snapshot.
+
+```
+.tf files ──[analyzer-terraform: hcl2json]──▶ RawResource[]
+RawResource[] + LayersConfig ──[schema: resolveServices]──▶ ServiceGraph
+ServiceGraph ──[server: /api/services]──▶ viz Services view
+```
+
+Terraform analysis is orthogonal to code analysis: it runs whenever `.tf` files
+are present, regardless of the repo's programming language.
+
+## Contracts (`@sprawlens/contracts`)
+
+```ts
+/** A service: a deployment/communication unit backed by Terraform resources. */
+export type ServiceNode = {
+  id: string; // service id (config name, or derived tf module/resource)
+  label: string;
+  kind: "service";
+  resources: string[]; // backing terraform resource addresses
+  resourceType?: string; // dominant resource type, e.g. aws_lambda_function
+  source?: string[]; // mapped code-dir globs (captured; rendered in Phase B)
+  metrics: { resources: number; loc?: number };
+};
+
+/** A communication/dependency edge between two services. */
+export type ServiceEdge = {
+  source: string;
+  target: string;
+  kind: ServiceEdgeKind; // depends | invoke | event | queue | http
+  via?: string; // the tf resource/attr that creates the link
+  weight?: number;
+};
+
+export type ServiceGraph = { services: ServiceNode[]; edges: ServiceEdge[] };
+```
+
+`ServiceEdge.kind` maps onto the existing `AtlasEdgeKind` `"flow"` when fed into
+`nativeEdges["service"]` in Phase B; the finer `ServiceEdgeKind` is kept for edge
+styling/labels.
+
+### Raw resource shape (analyzer → schema boundary)
+
+```ts
+export type RawResource = {
+  address: string; // "aws_lambda_function.orders_api"
+  type: string; // "aws_lambda_function"
+  name: string; // "orders_api"
+  module?: string; // enclosing terraform module call, if any
+  references: string[]; // referenced addresses: "aws_sqs_queue.orders", "module.x"
+};
+```
+
+## Semantic ruleset (`@sprawlens/schema`, data-driven like `BUILTIN_LAYERS`)
+
+`serviceRules.ts` carries built-in presets, overridable from config:
+
+- **service-like types** — resources that are their own service when not grouped
+  by config: `aws_lambda_function`, `aws_ecs_service`, `aws_apprunner_service`,
+  `aws_instance`, `google_cloud_run_service`, `google_cloudfunctions*`, …
+- **communication patterns → edge kind** — recognized wiring resources/refs:
+  - `aws_lambda_event_source_mapping` (event_source_arn → function_name) ⇒ `queue`/`event`
+  - `aws_sns_topic_subscription` ⇒ `event`
+  - `aws_api_gateway_integration` / `aws_apigatewayv2_integration` ⇒ `http`
+  - generic cross-service reference (no recognized pattern) ⇒ `depends`
+
+Both requested sources are handled by one ruleset: the **resource-graph
+dependency** (any cross-service reference ⇒ `depends`) and the **communication
+semantics** (recognized patterns ⇒ a typed edge that supersedes `depends`).
+
+## `resolveServices(resources, config)` (`@sprawlens/schema`, pure)
+
+Pure function, no IO — the testable core.
+
+1. **Group resources into services.** A resource belongs to the configured
+   `[[service]]` whose `terraform` address globs match it; otherwise it falls
+   back to its enclosing tf module, else (for service-like types) to a service
+   of its own; non-service, ungrouped resources (roles, queues) are infra glue
+   attached to whichever service references them.
+2. **Derive edges.** For each reference crossing a service boundary, emit a
+   `ServiceEdge`. Apply the communication ruleset to type it (`queue`/`event`/
+   `http`/`invoke`); unrecognized cross-service references are `depends`. Dedupe
+   by `(source, target, kind)`, summing `weight`.
+
+## Config (`sprawlens.toml`)
+
+```toml
+[terraform]
+root = "infra/"            # where to scan for .tf (default: repo root)
+
+[[service]]
+name = "orders-api"
+terraform = ["aws_lambda_function.orders*", "module.orders"]  # address globs
+source = ["services/orders/**"]   # code dir, captured for Phase B
+```
+
+`LayersConfig` gains optional `terraform?: { root?: string }` and
+`services?: ServiceMapping[]`. The CLI toml reader normalizes `[terraform]` and
+`[[service]]` (snake_case and camelCase both accepted, matching the layer rules).
+
+## analyzer-terraform (`@sprawlens/analyzer-terraform`)
+
+- `matchesTerraform(root, tfRoot)`: any `.tf` under the terraform root.
+- Parse each `.tf` with `@cdktf/hcl2json` (HashiCorp cdktf wasm; no terraform CLI
+  required) → JSON of the form `{ resource: { <type>: { <name>: [attrs] } },
+module: { <name>: [attrs] } }`.
+- Walk every attribute value (recursively) collecting `${...}` interpolations;
+  extract `<type>.<name>` and `module.<name>` references → `RawResource.references`.
+- Returns `RawResource[]`. Grouping and edge semantics live in schema, so the
+  analyzer stays a thin, dependency-light parser.
+
+Optional future enrichment (out of scope): `terraform graph` / state when the
+CLI is installed — the same optional-detail pattern as LSP.
+
+## CLI / server
+
+- **doctor**: report Terraform detection — `.tf` found under the tf root, the
+  resolved service/edge counts.
+- **serve**: when `.tf` is present, run the terraform analyzer → `resolveServices`
+  → expose the `ServiceGraph` at `GET /api/services` (empty graph when none).
+  Re-derive on `.tf` change via the existing `watchDir` mechanism.
+- `createAtlasServer` gains an optional `services?: ServiceGraph | (() => …)`.
+
+## viz — Services view (Phase A deliverable)
+
+- A new top-level **Services** view that fetches `/api/services` and renders the
+  `ServiceGraph` with the existing `@sprawlens/layout` force layout: node radius
+  from `metrics.resources`, edges styled by `ServiceEdge.kind`.
+- Standalone for now; structured so Phase B replaces it with
+  `serviceGrouping(serviceOf)` as the top hierarchy boundary.
+
+## Testing
+
+- `resolveServices`: grouping precedence (config > tf module > own service),
+  edge typing per pattern, `depends` fallback, cross-service dedup/weight. Pure
+  unit tests with hand-built `RawResource[]`.
+- analyzer-terraform: fixture `.tf` → `RawResource[]` (addresses, module nesting,
+  reference extraction incl. nested attributes).
+- config reader: `[terraform]` + `[[service]]` normalization.
+- No behavior change to existing code paths; the service layer is additive.
+
+---
+
+# Runtime trace overlay
+
+Source: https://github.com/mizchi/sprawlens/blob/main/docs/design/2026-06-20-runtime-trace.md
+
+# Runtime trace overlay
+
+Status: Sampling + coverage overlays implemented (2026-06-20). Per-test deferred.
+
+Relates to #16 (runtime trace / coverage visualization).
+
+Shipped: the `Trace` contract, schema `resolveTraceSymbols` / `traceOverlay` /
+`parseFoldedStacks` / `parseLlvmCoverage`, the TS adapters `tsCpuProfileAdapter`
+(`.cpuprofile`, sampling) and `tsV8CoverageAdapter` (V8 precise coverage), the
+`/api/trace` endpoint + `sprawlens serve --trace <artifact>` (auto-detects the
+artifact format, resolves frames against the snapshot), and the viz
+execution-path overlay (hot symbols tinted by self time / call count, the call
+path drawn as a warm edge for sampling sources) in both the rings and treemap
+layouts.
+
+Verified end-to-end (demo repos):
+
+- **sampling** — `.cpuprofile` (TS): 6/7 frames resolved, call path lit.
+- **coverage** — V8 precise coverage (TS): 4/4 functions, exact counts; llvm-cov
+  export (Rust `-C instrument-coverage`): 5/6 functions, exact counts. Coverage
+  traces carry `calls` and no edges, so the overlay shows a node heatmap (no
+  path lines), reusing the same renderer.
+
+Format detection in the CLI (`loadTrace`): `{nodes,samples}` → cpuprofile;
+`{result:[{functions}]}` → V8 coverage; `{data:[{functions}]}` → llvm coverage;
+otherwise folded/collapsed stacks.
+
+Deviation from the plan below: the Rust sampling ingest is **folded/collapsed
+stacks** (`parseFoldedStacks`, the perf/inferno interchange — already
+symbolicated text), not samply's raw profile. samply's `--save-only` output is
+unsymbolicated module-relative offsets; resolving them offline against the
+binary's DWARF is a larger task deferred to a follow-up. Folded stacks are what
+`cargo flamegraph` / perf emit and are language-agnostic, so the path is covered
+today; native samply parsing can be added as another `TraceAdapter` later.
+
+## Goal
+
+Capture a program's runtime execution and light up the path it took on the
+existing symbol graph: which functions ran, which call edges were exercised, and
+(where available) how hot each was. The trace is a language-neutral artifact
+overlaid on the snapshot's symbols and call edges — the dynamic counterpart to
+the static `Snapshot`.
+
+## Feasibility (verified empirically)
+
+Same call structure measured in both languages (`main → alpha → beta → gamma`,
+`main → delta`). Two capture families exist per language, both without sudo:
+
+|                         | TypeScript                                                                                                | Rust                                                                                        |
+| ----------------------- | --------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| Node counts (exact)     | V8 `Profiler.takePreciseCoverage` → exact call counts (gamma=800, beta=400, alpha=200, delta=200, main=1) | `-C instrument-coverage` + `llvm-cov export` → same exact counts (rustup `llvm-tools` only) |
+| Edges + time (sampling) | `--cpu-prof` / inspector `Profiler` → call tree (`main→delta`, `alpha→beta`, `beta→gamma`) + self time    | `samply record` → sampled call stacks + module-relative addresses (no sudo on macOS)        |
+| Source mapping          | `callFrame`: url + lineNumber + columnNumber + scriptId                                                   | function symbol + file:line via DWARF (`nm`/`atos`/`addr2line`/`llvm-symbolizer`)           |
+
+Findings:
+
+- **Two granularities, complementary.** _Coverage_ gives exact per-function
+  call counts but no edges. _Sampling_ gives caller→callee edges and self/total
+  time but is approximate (unsampled functions are missing).
+- **Both normalize** to `function + source position + counts/time`, which maps
+  onto the existing `symbol:<path>:<kind>:<name>:<line>` ids and the
+  call-hierarchy / CFG graph.
+- **Rust sampling needs symbolication.** `samply --save-only` leaves frames as
+  module-relative offsets; resolving them against the binary's debuginfo yields
+  function + file:line. samply does this itself when it serves its UI.
+
+## Decisions
+
+- **Ingest only.** sprawlens does not drive the profiler. The user runs their
+  tool of choice and sprawlens ingests the resulting artifact (`.cpuprofile`,
+  samply `profile.json`, coverage export JSON). A per-language `TraceAdapter`
+  parses one artifact format into the neutral `Trace`; tool specifics stay in
+  the adapter.
+- **Sampling call-path is the first-class implementation.** The headline view is
+  "the execution path on the graph": nodes lit by self time, edges lit as the
+  call path. TS = `.cpuprofile`, Rust = samply. Coverage (exact node counts, no
+  edges) is a later complement; the contract already carries its fields so a
+  coverage adapter slots in without a schema change.
+
+## Contract
+
+Language-neutral, lives in `@sprawlens/contracts`. The `Trace` is the dynamic
+sibling of `Snapshot`, joined to it by symbol reference.
+
+```ts
+type TraceSource =
+  | "v8-cpuprofile" // TS/JS sampling
+  | "v8-coverage" // TS/JS exact node counts
+  | "samply" // Rust/native sampling
+  | "llvm-coverage" // Rust/native exact node counts
+  | string;
+
+/** How a trace node links back to a source function. The join key to the graph. */
+type TraceSymbolRef = {
+  /** Resolved snapshot symbol id when computable. */
+  symbolId?: string;
+  /** Raw location for (re)resolution to the nearest enclosing symbol. */
+  file?: string; // repo-relative
+  name: string; // function name
+  line?: number; // 1-based declaration line
+};
+
+type TraceNode = {
+  id: string; // stable within a trace
+  ref: TraceSymbolRef;
+  /** Exact entry count (coverage sources); absent for sampling-only. */
+  calls?: number;
+  /** Sampling sources: self/total weight. */
+  selfSamples?: number;
+  selfTimeUs?: number;
+  totalTimeUs?: number;
+};
+
+type TraceEdge = {
+  from: string; // caller TraceNode id
+  to: string; // callee TraceNode id
+  /** Call count (instrumented) or transition sample count (sampling). */
+  count: number;
+};
+
+type Trace = {
+  schemaVersion: 1;
+  source: TraceSource;
+  /** What produced it: a test name, a command, a binary. */
+  label?: string;
+  capturedAt?: string;
+  /** Normalizers for weighting. */
+  sampleCount?: number;
+  durationUs?: number;
+  nodes: TraceNode[];
+  edges: TraceEdge[]; // empty for coverage-only sources
+};
+
+/** Per-language artifact parser, sibling to LanguageProvider / TestAdapter. */
+interface TraceAdapter {
+  source: TraceSource;
+  /** Normalize one captured artifact into a neutral Trace. */
+  parse(rawArtifact: unknown, repoRoot: string): Trace;
+}
+```
+
+Design notes:
+
+- **Granularity is encoded in optional fields + `source`.** The viz reads
+  `source` to know whether edges are reliable (sampling) and whether counts are
+  exact (coverage). A coverage trace ships `calls` and an empty `edges`; a
+  sampling trace ships `selfSamples`/`selfTimeUs` and a populated `edges`.
+- **Symbol resolution is the server's job.** The adapter emits `TraceSymbolRef`
+  (file + name + line). The server resolves it to a snapshot `symbolId` by the
+  nearest enclosing symbol (the snapshot already has every symbol's line range),
+  reusing the call-hierarchy/CFG machinery for the overlay.
+- **Overlay semantics.** Trace nodes → lit symbols (weight by `selfTimeUs` or
+  `calls`); trace edges → lit call edges. Reuses the existing symbol-edge
+  rendering; no new layout. Selecting a trace shows its path; multiple traces
+  (e.g. per test) can be compared.
+
+## Data flow
+
+```
+profiler artifact ──[TraceAdapter.parse]──▶ Trace (neutral)
+Trace + Snapshot ──[server: resolve refs → symbolId]──▶ resolved Trace
+resolved Trace ──[/api/trace]──▶ viz overlay (lit path on the symbol graph)
+```
+
+## Scope
+
+- **Done: sampling overlay.** `.cpuprofile` (TS) + folded stacks (Rust/native);
+  server resolution to symbol ids; `/api/trace`; lit-path overlay in the viz.
+- **Done: coverage complement.** `tsV8CoverageAdapter` (V8 precise coverage) and
+  `parseLlvmCoverage` (llvm-cov export) feed the same `Trace` (node heatmap from
+  `calls`, no edges).
+- **Later: native samply parsing.** Symbolicate samply's raw offsets offline
+  against the binary's DWARF, as another sampling `TraceAdapter`.
+- **Later: per-test traces.** Ties into the deferred test-reporter (#22): one
+  trace per test case, so selecting a test shows exactly the code it exercised.
+
+## Open questions
+
+- Artifact discovery: explicit path argument vs a conventional location
+  (`.sprawlens/traces/*.json`) the server watches.
+- Multiple traces: union vs switch vs diff in the UI.
+- Cross-language: a single run that crosses a TS↔native boundary (e.g. napi)
+  would need two artifacts merged by symbol ref — out of scope for now.
+
+---
+
+# Rendering-test harness for the viz
+
+Source: https://github.com/mizchi/sprawlens/blob/main/docs/design/2026-06-21-rendering-test-harness.md
+
+# Rendering-test harness for the viz
+
+Status: Design (2026-06-21). Unblocks #1 Phase 5 (and any viz refactor) by
+catching visual regressions; adds reproducible config URLs as a side benefit.
+
+## Why
+
+The viz has no rendering tests — every edge/layout refactor risked a silent
+visual regression (the reason #1 Phase 5 was deferred). The map is also
+stochastic-looking but actually deterministic (seeded), so a reproducible
+capture is feasible. Two layers: a cheap deterministic structural snapshot that
+gates refactors, and a VLM visual evaluation for intent-level checks a DOM diff
+can't express.
+
+## Determinism — the control mechanism
+
+The placement is already seeded (mulberry32, `layout/src/rng.ts`); no
+`Math.random`/`Date.now` in layout. `App.tsx` `SEED = 1` drives the outer
+layouts, inner Voronoi uses `seed: 1`. Louvain is deterministic. Stepping is
+iteration-based, not wall-clock. So a render is reproducible once three things
+hold:
+
+1. **Fixed seed.** Promote `SEED` to a `seed` parameter (default 1) threaded
+   into the layout calls, so a render's randomness is pinned (and variable for
+   stability testing).
+2. **Settled state.** The solver converges by error threshold, not time; a
+   capture mid-convergence differs. Expose an explicit signal — a
+   `window.__sprawlensConverged` flag / `data-converged` attribute set when
+   `isConverged` holds — for the harness to await (instead of scraping status
+   text like the existing e2e).
+3. **Normalized capture.** Serialize the top-level `<svg>` (`outerHTML`) and
+   round coordinates (e.g. 1 decimal) so float jitter across runs/arches
+   doesn't cause spurious diffs. The normalized SVG is the snapshot.
+
+## Reproducible config via URL (nuqs)
+
+The render-affecting settings become URL query state with **nuqs**, so a config
+is shareable and a test can pin a state by URL alone — the harness's state
+driver. Synced: `source`, `layout`, `boundaries`, `displayLevels`, `showEdges`,
+`groupByService`, `dark`, `tilt` (enabled), `seed`. **Excluded:** camera
+position, zoom, selection, hover — these are not reproducible and stay local.
+
+`params` is assembled from nuqs URL state (the synced settings) plus the
+remaining local UI state. nuqs targets React; the viz is Preact, but
+`@preact/preset-vite` aliases `react` → `preact/compat`. **Risk:** nuqs v2 leans
+on `useSyncExternalStore`/`startTransition`; a feasibility spike runs first. If
+it fails under preact/compat, fall back to plain `URLSearchParams` sync — same
+design (URL ⇄ settings), different plumbing.
+
+## Capture & evaluation
+
+- **Layer 1 — deterministic structural snapshot (no token).** Playwright loads
+  `/atlas.html?source=…&layout=…&seed=1&tilt=…`, awaits the converged signal,
+  serializes + normalizes the `<svg>`, and snapshots it. Any change to the
+  rendered SVG (attrs, paths, structure) fails the test — the refactor-safety
+  net. Lives in `e2e/` reusing `playwright.atlas.config.ts`.
+- **Layer 2 — VLM visual evaluation (vlmkit + ui-tars).** Screenshot the
+  converged viz to PNG; hand it to `@mizchi/vlmkit` (its `/playwright` export or
+  CLI) with a natural-language expectation (e.g. "the runtime-trace path is lit
+  in warm orange", "test cells read green/red/grey", "labels don't overlap"),
+  evaluated by **ui-tars** via OpenRouter. Reads `OPENROUTER_API_KEY` +
+  `VLM_MODEL` from the env (wired by the user's home-manager, not read here);
+  **skipped when `OPENROUTER_API_KEY` is unset** so Layer 1 always runs.
+
+## Phasing
+
+- **Phase 1 — deterministic snapshot.** nuqs feasibility spike → migrate the
+  render-affecting settings to URL state (or URLSearchParams fallback) → `seed`
+  param + converged signal → `e2e/` snapshot spec covering rings & treemap on a
+  fixed fixture, with SVG normalization. Unblocks #1 Phase 5.
+- **Phase 2 — VLM evaluation.** vlmkit integration: capture PNG → ui-tars
+  expectations for the trace / test-reporter / edge overlays; token-gated.
+
+## Out of scope
+
+- Cross-machine pixel-exact PNG baselines (float/font drift); Layer 1 uses
+  normalized SVG, Layer 2 uses VLM judgment, neither needs pixel equality.
+- URL-syncing ephemeral state (camera/selection) — deliberately excluded.
+
+---
+
+# Test reporter view
+
+Source: https://github.com/mizchi/sprawlens/blob/main/docs/design/2026-06-21-test-reporter.md
+
+# Test reporter view
+
+Status: Implemented (2026-06-21), Phases A–C. Builds on the `TestTree` contract
+and the runtime trace overlay.
+
+Implements #22 (test reporter: hierarchical runs with source edges and
+click-to-run). Relates to #16 (runtime trace) — the source edges reuse the same
+symbol-join machinery.
+
+## Goal
+
+Turn the static test plane (nested dir → file → describe → it districts) into a
+**reporter** driven by actual test execution:
+
+- **Run + report** — pass / fail / skip status and duration per case, surfaced
+  on the test-case cells.
+- **Edges to source** — each test case carries edges to the code it exercises;
+  selecting a case lights up that code (and the reverse).
+- **Click to run** — clicking a case runs just that one test and reflects the
+  fresh result.
+
+## Contract shape: a `TestRun` is the dynamic sibling of `TestTree`
+
+Mirror the `Snapshot` / `Trace` split already in the repo. `TestTree` stays a
+pure static extraction (regenerable from source); a **`TestRun`** is the dynamic
+overlay, joined to the tree by **test-case id** (`test:<file>:<line>:<title>`)
+and to the symbol graph by symbol ref. Keeping results out of `TestTree` keeps
+the analyzer's extraction deterministic and the run an ingestible artifact —
+consistent with "contracts strict, implementation regenerable".
+
+```ts
+// @sprawlens/contracts/src/testRun.ts
+type TestStatus = "pass" | "fail" | "skip" | "todo";
+
+type TestCaseResult = {
+  /** Join key into TestTree: test:<file>:<line>:<title>. */
+  testId: string;
+  /** Raw locators for (re)resolution when ids drift across a re-extraction. */
+  file?: string;
+  name?: string; // full title ("suite › case")
+  status: TestStatus;
+  durationMs?: number;
+  /** Failure message / assertion diff (fail only). */
+  message?: string;
+  /** Symbols this case exercised — the source edges. Resolved server-side from
+   *  a per-test coverage/trace artifact; absent when no per-test trace exists. */
+  covers?: TraceSymbolRef[];
+};
+
+type TestRun = {
+  schemaVersion: 1;
+  /** What produced it: a command, a CI job. */
+  label?: string;
+  capturedAt?: string;
+  results: TestCaseResult[];
+};
+
+/** Per-runner report parser, sibling to TraceAdapter. */
+interface TestRunAdapter {
+  /** Normalize one runner's report (vitest/node:test JSON) into a TestRun. */
+  parse(rawReport: unknown, repoRoot: string): TestRun;
+}
+```
+
+`covers` reuses `TraceSymbolRef` so the existing `resolveTraceSymbols`-style
+join (nearest enclosing line → name) resolves it to snapshot symbol ids without
+a new mechanism. A per-test trace is just a `Trace` captured under one test; its
+resolved node symbol ids become that case's `covers`.
+
+## Resolution + overlay (schema)
+
+- `resolveTestRun(run, tree, snapshot)` — match each result to a `TestNode`
+  case id; fall back to file + full-title when ids drifted. Resolve `covers`
+  refs to symbol ids (reuse the trace resolver).
+- `testRunOverlay(run)` — `statusOf: Map<testId, TestStatus>`,
+  `durationOf: Map<testId, number>`, and `coversOf: Map<testId, symbolId[]>`.
+  The viz tints test-case cells by status, labels duration, and on selection of
+  a case drives the existing `traceEdges` / `traceHeat` overlay from `coversOf`.
+
+## Ingest (CLI), mirroring `--trace`
+
+- `sprawlens serve --test-report <path>` — read the runner's JSON report,
+  detect format (vitest `--reporter=json` → `{ testResults: [{ assertionResults }] }`;
+  node:test TAP/JSON later), parse to `TestRun`, resolve against the snapshot,
+  pass to `createAtlasServer`. `GET /api/test-run` returns it (or null), exactly
+  like `/api/trace`.
+- Per-test source edges (`covers`) come from `--test-traces <file>`, a
+  `{ testId: artifact }` map ingested via the existing trace adapters and
+  resolved to symbols (Phase B). A case with a trace but no report row is
+  recorded as `pass` (a trace means it ran).
+
+## Click-to-run (the one place sprawlens drives a runner)
+
+This is the only part that breaks the "ingest only, sprawlens does not drive the
+profiler" rule from the runtime-trace design, and #22 asks for it explicitly. It
+needs a configured command and a mutating endpoint:
+
+- `sprawlens.toml` gains `[test] command = "pnpm vitest run"` (the base run
+  command; the case is appended as `-t <title>` or by `file`).
+- `POST /api/test-run/case { testId }` — the server spawns
+  `<command> <file> -t <title> --reporter=json`, parses the fresh report for
+  that case, updates the in-memory `TestRun`, and returns the new
+  `TestCaseResult`. No command runs unless `[test] command` is set; the endpoint
+  404s otherwise. The command is read from the repo's own config, never from a
+  request body, so a page cannot inject a command to run.
+
+## Phasing
+
+- **Phase A — report ingest + status on nodes. (done)** `TestRun` contract,
+  `resolveTestRun` / `testRunOverlay`, the vitest-json adapter, `--test-report`
+  - `GET /api/test-run`, and test-case cells tinted pass/fail/skip with a
+    duration label. No runner driving. Verified e2e: a vitest `--reporter=json`
+    report joins to the extracted tree (by file + full title when the runner omits
+    task locations) and tints the cases.
+- **Phase B — source edges per test. (done)** `serve --test-traces <file>`
+  ingests a `{ testId: artifact }` map (each artifact any format `--trace`
+  accepts), resolves each to the symbols that case exercised, and fills the
+  case's `covers`. The viz sets those symbol ids as the test cell's `sourceIds`,
+  so the existing cross-layer ropes draw test → code on hover / selection (and
+  source → test in reverse). Verified e2e: per-test V8 coverage resolved each
+  case to its exact source symbol.
+- **Phase C — click-to-run. (done)** `[test] command` in `sprawlens.toml` +
+  `POST /api/test-run/case { testId }`: the CLI injects a `runTestCase` that
+  spawns `<command> <file> -t <title> --reporter=json` (no shell; the file is
+  validated repo-relative; the command comes from config, the request supplies
+  only the case id), parses the fresh report, and the server merges the result
+  into the served run. The endpoint 404s when no command is configured.
+  Double-clicking a test cell triggers it. Verified e2e: a POST ran one case and
+  its `pass` result appeared in `/api/test-run`; the endpoint 404s with no
+  `[test] command`.
+
+## Open questions
+
+- Hierarchical outline vs the spatial treemap: #22 sketches a plain indented
+  outline (no tilt). Phase A keeps the existing treemap and only tints it; an
+  outline panel is a separate UI question.
+- node:test / other runners: one `TestRunAdapter` each, like the trace adapters.
+- Stale results across a re-extraction: match by file + title when the line in a
+  test id drifts.
+
+---
+
+# Unify the scattered edge-rendering paths
+
+Source: https://github.com/mizchi/sprawlens/blob/main/docs/design/2026-06-21-unify-edge-rendering.md
+
+# Unify the scattered edge-rendering paths
+
+Status: Phases 1–5 done (2026-06-21). Refactor — behavior-preserving.
+
+Implements #1. Edge rendering is split across `RingsMapSvg`, `TreemapSvg`, and
+`mapShared`, with parallel endpoint-resolution, bundling, picking, and per-kind
+`<g><path>` loops in each renderer. The goal: route every edge kind
+(file / symbol / detail / trace / selection / focus) through one shared,
+testable path, so the two renderers stop drifting.
+
+## Constraint
+
+No rendering tests exist; visual regressions are hard to catch. So the refactor
+is **incremental and behavior-preserving**: extract the duplicated _pure_ logic
+(endpoint resolution, pick-candidate assembly) behind unit tests first, then a
+shared rendering component, leaving each renderer's geometry inputs intact. Each
+phase keeps all gates green and changes no visible output.
+
+## What's duplicated today
+
+- **Endpoint resolution** — `edgeEndpoints` (rings ~RingsMapSvg:488, treemap
+  ~TreemapSvg:510) is copy-pasted: resolve `source`/`target` to a position, then
+  re-anchor through CFG call/entry anchors. Same logic, two copies.
+- **Bundling** — both call the shared `makeEdgeBundler` (mapShared:1189) but each
+  builds its own near-identical `positionOf` map first.
+- **Per-kind render loops** — each edge kind is a `<g>`+`path` map, repeated per
+  renderer with parallel style gates (color / opacity / width / dash / zoom).
+- **Picking** — `pickNearestEdge` / `pickEdgeAtPoint` are shared (edgePick.ts),
+  but each renderer assembles its candidate list with parallel code.
+
+## Phasing
+
+- **Phase 1 — shared endpoint resolver.** Extract the CFG-anchor re-anchoring
+  into `makeEdgeEndpointResolver({ positionOf, cfgAnchors, symbolNameOf })` in
+  mapShared: each renderer supplies its own `positionOf` (rings' multi-map
+  `resolveSite`, treemap's `positionOf` map) and gets the identical re-anchor +
+  `[a,b]` assembly. Unit-tested. Replaces both `edgeEndpoints` copies. (TDD;
+  this PR.)
+- **Phase 2 — shared edge-group component. (done)** `<BundledEdges>` renders one
+  kind's `<g><path>` list (shared stroke / opacity / dash, per-edge width). It
+  replaces the rings focus / selection / lsp / trace loops and the treemap trace
+  loop — the byte-identical ones — with one component; same SVG output. The
+  treemap selection (`directions`) and per-edge-colored focus loops, and the
+  per-edge-styled file/symbol loops, stay until Phase 4 carries kind + style
+  uniformly.
+- **Phase 3 — shared edge-pick resolution. (done)** `resolveEdgeAtClient`
+  (edgePickDom.ts) holds the DOM-aware half both `resolveEdgeAt` copies shared:
+  the over-node grab-radius tightening (`elementFromPoint` → node vs canvas) and
+  the `pickEdgeAtPoint` call. edgePick.ts stays pure (the geometry); each
+  renderer still assembles its own candidate list (rings ranks lit edges first,
+  treemap memoizes selection/focus) and hands it to the shared resolver.
+- **Phase 4 — shared edge styling. (done)** `edgeStyle.ts` holds the styling
+  both renderers duplicated verbatim: `ambientEdgeVisual` (the file-edge mesh —
+  active edge leads, the rest recede further under a selection) and the
+  `selectionDash` / `lspDash` zoom-scaled dashes. Unit-tested; theme colors are
+  passed in so it stays pure. Removes the last copied magic numbers from the two
+  ambient/selection loops.
+- **Phase 5 — edge model on the scene. (done)** Group the scene's scattered
+  edge fields (fileEdges/traceEdges/traceHeat on common, symbolEdges/detailEdges
+  on rings) into one `SceneEdges` on the common scene; `buildScene` fills it
+  once, `SvgRenderer` maps it to the unchanged renderer props. Verified
+  behavior-preserving by the synthetic render snapshots. The ambient file/symbol
+  _render loops_ stay per-renderer — rings culls-then-bundles per edge, treemap
+  memoizes pre-bundled, a legitimate perf difference, not worth forcing into one
+  loop. Gated by the rendering-test harness added first
+  (docs/design/2026-06-21-rendering-test-harness.md).
+
+## Out of scope
+
+Cross-layer correspondence ropes (`PlaneLayerView`) and exit previews
+(`ExitPreviewsLayer`) are already shared in `mapShared`; they stay as-is unless a
+phase naturally absorbs them. No visual or interaction changes — purely
+structural.
+
+---
+
+# Entry-point execution-trace player
+
+Source: https://github.com/mizchi/sprawlens/blob/main/docs/design/2026-06-22-entrypoint-trace-player.md
+
+# Entry-point execution-trace player
+
+Capture sprawlens' own execution — from the CLI entry point through to the
+browser render — and replay it as a **time-ordered, animated path** over the
+atlas. Approach C (hybrid): ship a sampled-timeline player now, with a data
+model shaped so a live debugger can drive the same player later.
+
+## Goal & non-goal
+
+- **Goal**: run sprawlens on the sprawlens repo, record what executed (server
+  side: entry → analyze → serve; browser side: viz render), and scrub/play the
+  execution path in the dev viz — the active symbol pulses, the caller→callee
+  edge lights warm-orange, a trail decays behind it.
+- **Non-goal (Phase 1)**: stitching call stacks across the HTTP boundary into
+  one cross-runtime stack; precise enter/exit of every fast call; live debugger
+  stepping (Phase 2).
+
+## What already exists (reuse)
+
+Mapped in exploration — the _ingest_ side is built:
+
+- Contract `Trace`/`TraceNode`/`TraceEdge` + `resolveTraceSymbols()`
+  (`packages/schema/src/core/trace.ts`) joins frames to snapshot symbols by
+  (file, name, line) via `buildSymbolResolver()`.
+- Adapters parse `.cpuprofile` (`packages/analyzer-ts/src/trace.ts`,
+  `parseCpuProfile`), V8 coverage, llvm-cov, folded stacks.
+- Viz renders trace edges + heat (warm orange `#ff7a1a`) in `RingsMapSvg` /
+  `TreemapSvg` via `SceneEdges.trace` / `traceHeat`.
+- `/api/trace` serves a `Trace`; CLI `--trace <path>` ingests one.
+
+**Missing** = (1) a _capture driver_ that records sprawlens' own run, and (2) a
+_time-ordered_ model + player. The existing `Trace` is aggregate (heat/counts),
+not ordered — so the timeline is a new, parallel artifact.
+
+## Data model (new contract)
+
+`packages/contracts/src/traceTimeline.ts` — ordered, resolvable, plane-tagged.
+The cpuprofile sample stream is already time-ordered (`samples` + `timeDeltas`);
+we collapse consecutive identical stack-tops into spans to keep the step count
+navigable.
+
+```ts
+export type TracePlane = "server" | "browser";
+
+export interface TraceStep {
+  /** microseconds from this plane's capture start (monotonic within plane) */
+  t: number;
+  /** CPU time the stack-top held before the next distinct step (collapsed span) */
+  durUs: number;
+  plane: TracePlane;
+  /** resolved top-of-stack symbol id, or null for unresolved/library frames */
+  symbolId: string | null;
+  /** call depth of the sampled stack */
+  depth: number;
+  /** resolved stack ids caller→callee — drives the edge trail and future debugger */
+  stack: (string | null)[];
+}
+
+export interface TraceTimeline {
+  /** ordered server steps, then browser steps (wall-clock: server boots first) */
+  steps: TraceStep[];
+  /** per-plane wall-clock spans so the player can show the phase boundary */
+  planes: { plane: TracePlane; startUs: number; durationUs: number }[];
+}
+```
+
+`schema/src/core/traceTimeline.ts` builds a `TraceTimeline` from a parsed
+cpuprofile + the snapshot resolver: walk samples in order, map each node id →
+callFrames → `resolveTraceSymbols` ids, collapse runs of identical top symbol
+into one step. Library-only spans (all-null stack) are dropped or merged so the
+animation stays on first-party code.
+
+### Step granularity (decision)
+
+- Collapse consecutive samples whose **top resolved symbol** is unchanged into
+  one step (a span). This turns ~10⁴ raw samples into ~10²–10³ navigable steps.
+- Drop spans shorter than a floor (e.g. `< 1` sample after collapse is already
+  impossible; additionally merge spans whose top symbol is `null`/library into
+  the surrounding first-party step so the trail doesn't blink into the void).
+- Keep the full resolved `stack` per step for depth shading and Phase 2.
+
+## Capture harness (Playwright e2e)
+
+New `e2e/trace-self.spec.ts` + `playwright.trace.config.ts`. Runs the **real**
+CLI on the sprawlens repo (not the static fixture) so the entry path is real.
+
+**Browser plane is captured against the vite _dev_ server (unbundled ESM), not
+the production bundle**, so `callFrame.url` resolves to real source files
+without sourcemaps. (Resolving the minified production bundle via sourcemap is a
+later option; dev is what "確認したい開発環境" means anyway.)
+
+1. **Server plane**: spawn the sprawlens server with an in-process inspector
+   `Profiler` (Node `node:inspector` `Session`: `Profiler.enable` +
+   `Profiler.start`, write the profile on `SIGINT`). A thin capture entry wraps
+   the existing serve boot so the profile flushes deterministically on shutdown
+   — more reliable than `--cpu-prof` + signal timing. Output:
+   `e2e/__trace__/self-server.cpuprofile`.
+   - Risk to validate first: getting a clean flush on shutdown and that the
+     entry/analyze frames (not just the idle server loop) are in the samples —
+     capture must start _before_ analyze runs.
+2. **Browser plane**: Playwright `context.newCDPSession(page)` →
+   `Profiler.enable` → `Profiler.start` → `goto` the dev server → wait
+   `__sprawlensConverged` → `Profiler.stop` returns the profile. Output:
+   `e2e/__trace__/self-browser.cpuprofile`.
+3. **Resolve + merge**: parse both profiles, build per-plane `TraceTimeline`
+   against the sprawlens snapshot, concatenate (server then browser), write
+   `e2e/__trace__/self-timeline.json`.
+
+Driven by a task: `pnpm test:trace` (and `:update` to refresh the saved
+timeline), mirroring the render harness.
+
+## Dev viewing & wiring
+
+- The saved `self-timeline.json` loads in dev as a fixture (like the `sprawlens`
+  snapshot source) — a new data source `served`/`trace-self`, or a
+  `--trace-timeline <path>` CLI flag served at `/api/trace-timeline`. Phase 1
+  picks the fixture path (no server change needed to view).
+- `App.tsx` fetches the timeline alongside the existing `/api/trace`.
+
+## Viz: the trace player
+
+- **Cursor**: ephemeral component state `timelineCursor` (step index) +
+  play/pause + speed. Like camera/selection, it is **not** URL-synced (excluded
+  per the render-affecting-settings rule).
+- **Drive the existing overlay from the cursor** instead of the static
+  aggregate: the active step's `symbolId` cell pulses; the last _N_ steps'
+  caller→callee pairs render as warm-orange edges (reusing `BundledEdges` /
+  `SceneEdges.trace`), opacity decaying with age → a moving comet trail.
+- **Plane phase**: a scrubber marked with the server→browser boundary; a label
+  shows the current plane.
+- **Playback**: `requestAnimationFrame` advances the cursor by wall-clock-scaled
+  `durUs` (with a speed multiplier); scrubbing seeks.
+
+## Phase 2 (design only — debugger)
+
+The player consumes a **cursor over an ordered step stream**. A live CDP
+`Debugger` (paused events: current frame + call stack) emits the same
+`TraceStep` shape in real time. Phase 2 swaps the recorded timeline for a live
+stream and adds step/continue controls — no player rewrite. The `stack` field is
+already the debugger's call stack.
+
+## Verification (TDD)
+
+- **Contract/schema**: feeding a hand-built ordered cpuprofile to the timeline
+  builder yields the expected ordered, collapsed, symbol-resolved steps
+  (including: null/library spans merged, span durations summed).
+- **Capture**: `pnpm test:trace` produces a non-empty `self-timeline.json` with
+  both planes present and a non-trivial fraction of steps resolved to real
+  sprawlens symbols (entry-point symbols appear early in the server plane).
+- **Player**: a focused test that setting `timelineCursor = k` lights the
+  expected cell + trail; playback advances monotonically and stops at the end.
+- Gates unchanged: `pnpm test` / typecheck / check-layers / lint:exports.
+
+## Out of scope
+
+- Cross-runtime stack stitching; production-bundle (sourcemap) browser
+  resolution; sub-sample precise call enter/exit; persisting timelines beyond
+  the dev fixture.
+
+## Phasing
+
+1. **Phase 1**: `TraceTimeline` contract + builder; capture harness
+   (server inspector profile + browser CDP profile) saving the fixture; the
+   cursor-driven player (scrub + play, two planes, comet trail). Dogfoods on
+   sprawlens itself.
+2. **Phase 2**: live CDP `Debugger` driving the same player; step/continue.
+
+---
+
+## Revision (v2): dynamic capture tied to test runs
+
+Feedback after Phase 1: replaying one baked recording is not useful. The value
+is in **fresh** traces tied to activity, with the **recent ones reviewable**.
+Decisions: trigger from **both** an in-app test run and an external watcher;
+**play after the run completes** (not live-streamed); pick from the **recent N**
+captures. The Phase 1 player (projection + playback + scrubber) is reused
+unchanged — only the _source_ of timelines changes from a baked fixture to a
+live store.
+
+### Server: a recent-traces store
+
+`@sprawlens/server` keeps an in-memory ring buffer of the last N (≈10)
+`TraceTimeline`s, each with `{ id, label, capturedAt, stepCount, planes }`.
+
+- `GET /api/traces` → the list (metadata only).
+- `GET /api/traces/:id` → one full timeline.
+- `GET /api/traces/stream` (SSE) → ping on each new capture, so the viz refreshes
+  the list and can auto-select the newest.
+
+### Capture sources (both feed the store)
+
+1. **External watch** — watch a drop dir (default `.sprawlens/traces/`, configurable
+   via `--trace-watch <dir>`). A test command configured to emit a `.cpuprofile`
+   there (e.g. `vitest` under `node --cpu-prof`, or a per-test profile) lands a
+   file; the server builds a timeline against the current snapshot and pushes it
+   to the store, labelled by filename. Decoupled and editor-agnostic.
+2. **In-app click-to-run** — extend the existing `runTestCase` (#22): run the
+   chosen case under `--cpu-prof`, build a timeline for that run, push to the
+   store, and return its id alongside the test result so the viz auto-selects it.
+
+Both reuse `buildTraceTimeline` + the snapshot resolver; server-only (a future
+browser plane can be merged when a captured run drives a page).
+
+### Viz: recent picker + auto-follow
+
+- Fetch `/api/traces` for the recent list; subscribe to `/api/traces/stream`.
+- A small picker (recent N, newest first, labelled) selects one → fetch its
+  timeline → load into the existing player.
+- On a new capture, refresh the list; auto-select+play the newest unless the user
+  pinned an older one.
+- The baked `/self-timeline.json` fixture stays as a zero-setup demo fallback.
+
+### Phasing (revised)
+
+- **v2a**: server trace store + endpoints + external-watch source; viz recent
+  picker + SSE follow. (Delivers "dynamic + recent" with any test runner.)
+- **v2b**: click-to-run capture integration (#22) for in-app triggering.
+- **Phase 2** (unchanged): live CDP debugger driving the player.
+
+---
+
+# `sprawlens render --diff` Implementation Plan
+
+Source: https://github.com/mizchi/sprawlens/blob/main/docs/superpowers/plans/2026-06-23-diff-render.md
+
+# `sprawlens render --diff` Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Add a `--diff [base]` option to `sprawlens render` that tints PR-changed files (added/modified) on the headless SVG map and embeds a legend with counts.
+
+**Architecture:** Single-pass — analyze the head working tree once, then call the existing `workingDiff(root, base)` (`@sprawlens/server`) to learn which files changed vs a base ref (or vs the working tree when no base is given). The change map flows into `renderAtlasSvg` via a new `changed` option, which populates the already-present `changedOf` scene hook; the existing `leafFillOf` colors added/modified leaf cells for free. A legend `<g>` with counts is injected at SVG finalize time. Removed files are not on the map, so they appear in the legend as a count only.
+
+**Tech Stack:** TypeScript, pnpm workspace, Preact + preact-render-to-string (headless SVG), commander (CLI), vitest, git plumbing via `@sprawlens/server`.
+
+---
+
+## File Structure
+
+- **Modify** `packages/viz/src/mapShared.tsx` — export the `ADDED_FILL` / `MODIFIED_FILL` theme tokens so the legend can reuse them (currently module-private `let`).
+- **Modify** `packages/viz/src/headless/renderAtlasSvg.ts` — extend `AtlasSvgOptions` with `changed` + `diffSummary`, wire `changedOf`, build & inject the legend, extend `finalize`.
+- **Modify** `packages/viz/src/headless/renderAtlasSvg.test.ts` — add a diff-fill + legend test.
+- **Create** `packages/cli/src/diffRender.ts` — `toDiffOverlay(diff: WorkingDiff)` → `{ changed, diffSummary }` (pure, testable wiring helper).
+- **Create** `packages/cli/src/diffRender.test.ts` — temp git repo → `workingDiff` → `toDiffOverlay` → `renderAtlasSvg`, assert fills + legend counts.
+- **Modify** `packages/cli/src/index.ts` — add `--diff [base]` option to the `render` command and wire it through.
+- **Modify** `packages/cli/README.md` — GitHub Actions usage snippet.
+
+---
+
+### Task 1: Export the diff color tokens from `mapShared`
+
+**Files:**
+
+- Modify: `packages/viz/src/mapShared.tsx:33-34`
+
+The legend swatches reuse the same `ADDED_FILL` / `MODIFIED_FILL` tokens the map uses, so dark mode (handled by `setMapTheme`) applies automatically. They are currently private `let` bindings. The reassignments inside `setMapTheme` (lines ~134-135 and ~196-197) keep working unchanged because they assign to the same module binding — only the declaration gains `export`.
+
+- [ ] **Step 1: Add `export` to both tokens**
+
+Change:
+
+```tsx
+let MODIFIED_FILL = "hsl(8 85% 78%)";
+let ADDED_FILL = "hsl(150 55% 80%)";
+```
+
+to:
+
+```tsx
+export let MODIFIED_FILL = "hsl(8 85% 78%)";
+export let ADDED_FILL = "hsl(150 55% 80%)";
+```
+
+- [ ] **Step 2: Verify nothing else breaks**
+
+Run: `pnpm --filter @sprawlens/viz exec tsc --noEmit -p tsconfig.json`
+Expected: PASS (no type errors). Exporting a `let` is valid ESM.
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add packages/viz/src/mapShared.tsx
+git commit -m "feat(viz): export ADDED_FILL/MODIFIED_FILL tokens for the diff legend"
+```
+
+---
+
+### Task 2: Extend `renderAtlasSvg` options and wire `changedOf` (TDD)
+
+**Files:**
+
+- Modify: `packages/viz/src/headless/renderAtlasSvg.ts` (type at lines 31-48; `changedOf` at line 196; imports at line 18)
+- Test: `packages/viz/src/headless/renderAtlasSvg.test.ts`
+
+- [ ] **Step 1: Write the failing test**
+
+Append to `renderAtlasSvg.test.ts` (inside the existing `describe("renderAtlasSvg", ...)`):
+
+```ts
+it("tints added/modified files when a changed map is supplied", () => {
+  const changed = new Map<string, "added" | "modified">([
+    ["src/a/foo.ts", "modified"],
+    ["src/b/qux.ts", "added"],
+  ]);
+  const svg = renderAtlasSvg(GRAPH, { layout: "treemap", level: "file", seed: 1, changed });
+  // ADDED_FILL = hsl(150 55% 80%), MODIFIED_FILL = hsl(8 85% 78%) in the light theme
+  expect(svg).toContain("hsl(150 55% 80%)");
+  expect(svg).toContain("hsl(8 85% 78%)");
+});
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `pnpm --filter @sprawlens/viz exec vitest run src/headless/renderAtlasSvg.test.ts -t "tints added/modified"`
+Expected: FAIL — `changed` is not an accepted option (type error) or the fills are absent.
+
+- [ ] **Step 3: Extend the options type**
+
+In `renderAtlasSvg.ts`, add these fields to `AtlasSvgOptions` (before the closing `}` at line 48):
+
+```ts
+  /** Map of node id → change kind; tints added/modified leaf cells. */
+  changed?: Map<string, "added" | "modified">;
+  /** Counts for the diff legend; when present and non-zero, a legend is drawn. */
+  diffSummary?: { added: number; modified: number; removed: number };
+```
+
+- [ ] **Step 4: Wire `changedOf` to the map**
+
+In the `buildScene({ ... })` call, replace:
+
+```ts
+    changedOf: () => undefined,
+```
+
+with:
+
+```ts
+    changedOf: (id) => options.changed?.get(id),
+```
+
+- [ ] **Step 5: Run test to verify it passes**
+
+Run: `pnpm --filter @sprawlens/viz exec vitest run src/headless/renderAtlasSvg.test.ts -t "tints added/modified"`
+Expected: PASS
+
+- [ ] **Step 6: Run the full viz headless test to check for regressions**
+
+Run: `pnpm --filter @sprawlens/viz exec vitest run src/headless/renderAtlasSvg.test.ts`
+Expected: PASS (all cases, including determinism and empty-graph).
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add packages/viz/src/headless/renderAtlasSvg.ts packages/viz/src/headless/renderAtlasSvg.test.ts
+git commit -m "feat(viz): renderAtlasSvg accepts a changed map and tints diff cells"
+```
+
+---
+
+### Task 3: Render the diff legend in `renderAtlasSvg` (TDD)
+
+**Files:**
+
+- Modify: `packages/viz/src/headless/renderAtlasSvg.ts` (import line 18; the `return finalize(...)` at line 222; the `finalize` function at lines 230-240; add a `buildDiffLegend` helper)
+- Test: `packages/viz/src/headless/renderAtlasSvg.test.ts`
+
+- [ ] **Step 1: Write the failing test**
+
+Append to `renderAtlasSvg.test.ts`:
+
+```ts
+it("embeds a diff legend with per-kind counts", () => {
+  const svg = renderAtlasSvg(GRAPH, {
+    layout: "treemap",
+    seed: 1,
+    diffSummary: { added: 2, modified: 7, removed: 3 },
+  });
+  expect(svg).toContain("added 2");
+  expect(svg).toContain("modified 7");
+  expect(svg).toContain("removed 3");
+});
+
+it("omits zero-count rows from the legend and draws none when all zero", () => {
+  const someZero = renderAtlasSvg(GRAPH, {
+    layout: "treemap",
+    seed: 1,
+    diffSummary: { added: 1, modified: 0, removed: 0 },
+  });
+  expect(someZero).toContain("added 1");
+  expect(someZero).not.toContain("modified 0");
+  expect(someZero).not.toContain("removed 0");
+
+  const allZero = renderAtlasSvg(GRAPH, {
+    layout: "treemap",
+    seed: 1,
+    diffSummary: { added: 0, modified: 0, removed: 0 },
+  });
+  expect(allZero).not.toContain("added 0");
+});
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `pnpm --filter @sprawlens/viz exec vitest run src/headless/renderAtlasSvg.test.ts -t "legend"`
+Expected: FAIL — no legend text in the SVG.
+
+- [ ] **Step 3: Import the legend tokens**
+
+In `renderAtlasSvg.ts`, replace the import at line 18:
+
+```ts
+import { MAP_BG, setMapTheme } from "../mapShared.tsx";
+```
+
+with:
+
+```ts
+import {
+  ADDED_FILL,
+  INK,
+  MAP_BG,
+  MODIFIED_FILL,
+  PANEL_BG,
+  PANEL_BORDER,
+  setMapTheme,
+} from "../mapShared.tsx";
+```
+
+- [ ] **Step 4: Add the `buildDiffLegend` helper**
+
+Add this function near `finalize` in `renderAtlasSvg.ts`. It reads the theme tokens at call time (after `setMapTheme` has run), so dark mode is honored via the ESM live bindings:
+
+```ts
+function buildDiffLegend(
+  summary: { added: number; modified: number; removed: number },
+  height: number,
+): string {
+  const rows: Array<{ label: string; count: number; fill: string; open: boolean }> = [];
+  if (summary.added > 0)
+    rows.push({ label: "added", count: summary.added, fill: ADDED_FILL, open: false });
+  if (summary.modified > 0)
+    rows.push({ label: "modified", count: summary.modified, fill: MODIFIED_FILL, open: false });
+  if (summary.removed > 0)
+    rows.push({ label: "removed", count: summary.removed, fill: "none", open: true });
+  if (rows.length === 0) return "";
+
+  const rowH = 20;
+  const padX = 10;
+  const padY = 8;
+  const boxW = 132;
+  const boxH = padY * 2 + rows.length * rowH;
+  const x = 16;
+  const y = height - boxH - 16;
+
+  const items = rows
+    .map((r, i) => {
+      const top = padY + i * rowH;
+      const swatch = r.open
+        ? `<rect x="${padX}" y="${top + 2}" width="12" height="12" rx="2" fill="none" stroke="${INK}" stroke-width="1.5"/>`
+        : `<rect x="${padX}" y="${top + 2}" width="12" height="12" rx="2" fill="${r.fill}" stroke="${INK}" stroke-opacity="0.25"/>`;
+      const text = `<text x="${padX + 18}" y="${top + 12}" font-family="ui-sans-serif, system-ui, sans-serif" font-size="11" fill="${INK}">${r.label} ${r.count}</text>`;
+      return swatch + text;
+    })
+    .join("");
+
+  return (
+    `<g transform="translate(${x} ${y})">` +
+    `<rect x="0" y="0" width="${boxW}" height="${boxH}" rx="6" fill="${PANEL_BG}" stroke="${PANEL_BORDER}"/>` +
+    items +
+    `</g>`
+  );
+}
+```
+
+- [ ] **Step 5: Build the legend and pass it to `finalize`**
+
+In `renderAtlasSvg`, replace the final return (line 222):
+
+```ts
+return finalize(body, width, height);
+```
+
+with:
+
+```ts
+const legend = options.diffSummary ? buildDiffLegend(options.diffSummary, height) : "";
+return finalize(body, width, height, legend);
+```
+
+- [ ] **Step 6: Extend `finalize` to inject the legend before `</svg>`**
+
+Replace the `finalize` function body:
+
+```ts
+function finalize(body: string, width: number, height: number): string {
+  const open = body.indexOf(">");
+  if (!body.startsWith("<svg") || open === -1) return body;
+  const head = body.slice(0, open);
+  const rest = body.slice(open + 1);
+  const ns = head.includes("xmlns=")
+    ? head
+    : `${head} xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}"`;
+  const bg = `<rect x="0" y="0" width="${width}" height="${height}" fill="${MAP_BG}"/>`;
+  return `${ns}>${bg}${rest}`;
+}
+```
+
+with:
+
+```ts
+function finalize(body: string, width: number, height: number, legend = ""): string {
+  const open = body.indexOf(">");
+  if (!body.startsWith("<svg") || open === -1) return body;
+  const head = body.slice(0, open);
+  const rest = body.slice(open + 1);
+  const ns = head.includes("xmlns=")
+    ? head
+    : `${head} xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}"`;
+  const bg = `<rect x="0" y="0" width="${width}" height="${height}" fill="${MAP_BG}"/>`;
+  const withLegend = legend ? rest.replace(/<\/svg>\s*$/, `${legend}</svg>`) : rest;
+  return `${ns}>${bg}${withLegend}`;
+}
+```
+
+- [ ] **Step 7: Run the legend tests**
+
+Run: `pnpm --filter @sprawlens/viz exec vitest run src/headless/renderAtlasSvg.test.ts`
+Expected: PASS (all cases).
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add packages/viz/src/headless/renderAtlasSvg.ts packages/viz/src/headless/renderAtlasSvg.test.ts
+git commit -m "feat(viz): embed a diff legend with per-kind counts in renderAtlasSvg"
+```
+
+---
+
+### Task 4: CLI `toDiffOverlay` helper (TDD)
+
+**Files:**
+
+- Create: `packages/cli/src/diffRender.ts`
+- Test: `packages/cli/src/diffRender.test.ts`
+
+This is the wiring from a `WorkingDiff` (git plumbing result) to the `renderAtlasSvg` inputs. Keeping it as a pure function makes the CLI action thin and the conversion testable.
+
+- [ ] **Step 1: Write the failing test**
+
+Create `packages/cli/src/diffRender.test.ts`:
+
+```ts
+import { describe, expect, it } from "vitest";
+import type { WorkingDiff } from "@sprawlens/server";
+import { toDiffOverlay } from "./diffRender.ts";
+
+describe("toDiffOverlay", () => {
+  it("splits changed entries into added/modified and counts removed", () => {
+    const diff: WorkingDiff = {
+      changed: { "src/a.ts": "modified", "src/b.ts": "added", "src/c.ts": "added" },
+      removed: ["src/old.ts", "src/gone.ts"],
+    };
+    const { changed, diffSummary } = toDiffOverlay(diff);
+    expect(changed.get("src/a.ts")).toBe("modified");
+    expect(changed.get("src/b.ts")).toBe("added");
+    expect(diffSummary).toEqual({ added: 2, modified: 1, removed: 2 });
+  });
+
+  it("handles an empty diff", () => {
+    const { changed, diffSummary } = toDiffOverlay({ changed: {}, removed: [] });
+    expect(changed.size).toBe(0);
+    expect(diffSummary).toEqual({ added: 0, modified: 0, removed: 0 });
+  });
+});
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `pnpm --filter @sprawlens/cli exec vitest run src/diffRender.test.ts`
+Expected: FAIL — `./diffRender.ts` does not exist.
+
+- [ ] **Step 3: Write the implementation**
+
+Create `packages/cli/src/diffRender.ts`:
+
+```ts
+import type { WorkingDiff } from "@sprawlens/server";
+
+export type DiffOverlay = {
+  changed: Map<string, "added" | "modified">;
+  diffSummary: { added: number; modified: number; removed: number };
+};
+
+/** Convert a git WorkingDiff into the inputs renderAtlasSvg expects. */
+export function toDiffOverlay(diff: WorkingDiff): DiffOverlay {
+  const changed = new Map<string, "added" | "modified">(Object.entries(diff.changed));
+  let added = 0;
+  let modified = 0;
+  for (const kind of changed.values()) {
+    if (kind === "added") added += 1;
+    else modified += 1;
+  }
+  return {
+    changed,
+    diffSummary: { added, modified, removed: diff.removed.length },
+  };
+}
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `pnpm --filter @sprawlens/cli exec vitest run src/diffRender.test.ts`
+Expected: PASS
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add packages/cli/src/diffRender.ts packages/cli/src/diffRender.test.ts
+git commit -m "feat(cli): add toDiffOverlay to map a WorkingDiff onto renderAtlasSvg inputs"
+```
+
+---
+
+### Task 5: End-to-end diff render against a temp git repo (TDD)
+
+**Files:**
+
+- Test: `packages/cli/src/diffRender.test.ts` (extend)
+
+Proves the real path: `workingDiff` (git) → `toDiffOverlay` → `renderAtlasSvg` produces an SVG whose changed files are tinted and whose legend counts match. Uses the temp-git-repo pattern from `packages/analyzer-ts/src/collect.test.ts`.
+
+- [ ] **Step 1: Write the failing test**
+
+Add to the top of `packages/cli/src/diffRender.test.ts` (imports) and a new `describe`:
+
+```ts
+import { execFile } from "node:child_process";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { promisify } from "node:util";
+import { workingDiff } from "@sprawlens/server";
+import { tsProvider } from "@sprawlens/analyzer-ts";
+import { snapshotToAtlasGraph } from "@sprawlens/schema";
+import { renderAtlasSvg } from "@sprawlens/viz/headless";
+
+const exec = promisify(execFile);
+const git = (cwd: string, args: string[]) => exec("git", args, { cwd });
+
+describe("diff render end-to-end", () => {
+  it("tints changed files and reports counts vs a base commit", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "sprawlens-diff-"));
+    try {
+      await git(root, ["init"]);
+      await git(root, ["config", "user.email", "test@example.com"]);
+      await git(root, ["config", "user.name", "Test User"]);
+      await mkdir(path.join(root, "src"), { recursive: true });
+      await writeFile(path.join(root, "src", "a.ts"), "export const a = 1;\n");
+      await writeFile(path.join(root, "src", "old.ts"), "export const old = 0;\n");
+      await git(root, ["add", "."]);
+      await git(root, ["commit", "-m", "base"]);
+      const base = (await git(root, ["rev-parse", "HEAD"])).stdout.trim();
+
+      // modify a.ts, add b.ts, remove old.ts
+      await writeFile(path.join(root, "src", "a.ts"), "export const a = 2;\n");
+      await writeFile(path.join(root, "src", "b.ts"), "export const b = 3;\n");
+      await rm(path.join(root, "src", "old.ts"));
+      await git(root, ["add", "-A"]);
+      await git(root, ["commit", "-m", "change"]);
+
+      const diff = await workingDiff(root, base);
+      const { changed, diffSummary } = toDiffOverlay(diff);
+      expect(diffSummary).toEqual({ added: 1, modified: 1, removed: 1 });
+
+      const snapshot = await tsProvider.analyze(root);
+      const graph = snapshotToAtlasGraph(snapshot as Parameters<typeof snapshotToAtlasGraph>[0]);
+      const svg = renderAtlasSvg(graph, { layout: "treemap", seed: 1, changed, diffSummary });
+
+      expect(svg).toContain("hsl(150 55% 80%)"); // ADDED_FILL — b.ts
+      expect(svg).toContain("hsl(8 85% 78%)"); // MODIFIED_FILL — a.ts
+      expect(svg).toContain("removed 1");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+```
+
+`tsProvider` is the TypeScript `LanguageProvider` exported from `@sprawlens/analyzer-ts` (`provider.ts`); `tsProvider.analyze(root)` returns the same `Snapshot` the `render` command builds via `chooseProvider`. `snapshotToAtlasGraph` is re-exported from `@sprawlens/schema` (`adapter.ts`). `renderAtlasSvg` is the `@sprawlens/viz/headless` entry.
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `pnpm --filter @sprawlens/cli exec vitest run src/diffRender.test.ts -t "end-to-end"`
+Expected: FAIL — before Tasks 2-4 are merged the SVG would lack the diff fills/legend. (When executed after Tasks 2-4, this should pass directly; this task adds only the test.)
+
+- [ ] **Step 3: Make it pass**
+
+No production code change is expected here — Tasks 2-4 already provide the behavior. Re-run until green.
+
+Run: `pnpm --filter @sprawlens/cli exec vitest run src/diffRender.test.ts`
+Expected: PASS (both `toDiffOverlay` unit cases and the end-to-end case).
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add packages/cli/src/diffRender.test.ts
+git commit -m "test(cli): end-to-end diff render against a temp git repo"
+```
+
+---
+
+### Task 6: Wire `--diff [base]` into the `render` command
+
+**Files:**
+
+- Modify: `packages/cli/src/index.ts` (the `render` command, lines ~360-440)
+
+- [ ] **Step 1: Add the import**
+
+Ensure `toDiffOverlay` is imported near the other local imports in `index.ts`:
+
+```ts
+import { toDiffOverlay } from "./diffRender.ts";
+```
+
+`workingDiff` is already imported at line 54 (`import { createAtlasServer, watchDir, workingDiff } from "@sprawlens/server";`).
+
+- [ ] **Step 2: Add the option to the `render` command**
+
+After the `.option("--dark", ...)` line, add:
+
+```ts
+  .option(
+    "--diff [base]",
+    "highlight files changed vs <base> ref, or uncommitted changes if no base",
+  )
+```
+
+- [ ] **Step 3: Add `diff` to the action's options type**
+
+In the `.action(async (repo, options: { ... })` type literal, add:
+
+```ts
+        diff?: string | boolean;
+```
+
+- [ ] **Step 4: Compute the diff overlay before calling `renderAtlasSvg`**
+
+Immediately after the `if (graph.nodes.length === 0) { ... }` guard and before `const svg = renderAtlasSvg(...)`, insert:
+
+```ts
+let overlay: ReturnType<typeof toDiffOverlay> | undefined;
+if (options.diff !== undefined) {
+  // commander yields `true` for a bare --diff (no base), a string for --diff <base>
+  const base = typeof options.diff === "string" ? options.diff : undefined;
+  overlay = toDiffOverlay(await workingDiff(root, base));
+}
+```
+
+- [ ] **Step 5: Pass the overlay into `renderAtlasSvg`**
+
+Change the `renderAtlasSvg(graph, { ... })` call to spread the overlay:
+
+```ts
+const svg = renderAtlasSvg(graph, {
+  layout: options.layout,
+  level: options.level,
+  seed: options.seed,
+  showEdges: options.edges ?? false,
+  dark: options.dark ?? false,
+  ...(options.width ? { width: options.width } : {}),
+  ...(options.height ? { height: options.height } : {}),
+  ...(overlay ? { changed: overlay.changed, diffSummary: overlay.diffSummary } : {}),
+});
+```
+
+- [ ] **Step 6: Surface the counts in the success log**
+
+Replace the final `console.log(...)` in the render action with a variant that appends diff counts when present:
+
+```ts
+const diffNote = overlay
+  ? `, diff +${overlay.diffSummary.added} ~${overlay.diffSummary.modified} -${overlay.diffSummary.removed}`
+  : "";
+console.log(
+  `wrote ${out} (${options.layout}, ${options.level}, ${graph.nodes.length} files, seed ${options.seed}${diffNote})`,
+);
+```
+
+- [ ] **Step 7: Typecheck**
+
+Run: `pnpm --filter @sprawlens/cli exec tsc --noEmit -p tsconfig.json`
+Expected: PASS
+
+- [ ] **Step 8: Smoke test the CLI against this very repo**
+
+Run: `pnpm --filter @sprawlens/cli exec tsx src/index.ts render . --diff -o /tmp/sprawlens-self-diff.svg`
+Expected: prints `wrote /tmp/sprawlens-self-diff.svg (treemap, file, N files, seed 1, diff +A ~M -R)`. (With a clean tree all counts may be 0 and no legend is drawn — make a throwaway edit first to see a non-empty legend, then revert it.)
+
+- [ ] **Step 9: Commit**
+
+```bash
+git add packages/cli/src/index.ts
+git commit -m "feat(cli): add render --diff to highlight PR-changed files on the map"
+```
+
+---
+
+### Task 7: Document GitHub Actions usage
+
+**Files:**
+
+- Modify: `packages/cli/README.md`
+
+- [ ] **Step 1: Add a "PR diff visualization" section**
+
+Append to `packages/cli/README.md`:
+
+````markdown
+## PR diff visualization (GitHub Actions)
+
+`render --diff` tints files changed vs a base ref and embeds a legend, so you can
+attach a structure-map of a PR's blast radius as an artifact:
+
+```yaml
+- run: git fetch origin ${{ github.base_ref }} --depth=1
+- run: npx sprawlens render . --diff origin/${{ github.base_ref }} -o sprawlens-diff.svg
+- uses: actions/upload-artifact@v4
+  with:
+    name: sprawlens-diff
+    path: sprawlens-diff.svg
+```
+
+- `--diff <base>` colors added files green and modified files orange against the base ref.
+- `--diff` with no base highlights uncommitted working-tree changes instead.
+- Removed files cannot appear on the map; they are reported as a count in the legend.
+````
+
+- [ ] **Step 2: Commit**
+
+```bash
+git add packages/cli/README.md
+git commit -m "docs(cli): document render --diff for PR diff visualization"
+```
+
+---
+
+### Task 8: Full verification
+
+- [ ] **Step 1: Run the whole test suite**
+
+Run: `pnpm test`
+Expected: all tests pass (existing 571 + the new diff cases).
+
+- [ ] **Step 2: Typecheck the workspace**
+
+Run: `pnpm typecheck`
+Expected: PASS
+
+- [ ] **Step 3: Lint exports (knip) if it is part of the normal gate**
+
+Run: `pnpm lint:exports`
+Expected: no new unused-export errors for `toDiffOverlay` / `DiffOverlay` / the new tokens (they are consumed by the CLI and the legend). If knip flags `DiffOverlay` as unused, either consume it in the CLI action's `overlay` type or drop the standalone type alias.
+
+---
+
+## Notes for the implementer
+
+- **Do not bump versions or publish in this plan.** Release is a separate, explicit step the user drives (npm requires an interactive OTP).
+- The diff colors come for free from the existing `leafFillOf` priority chain (`packages/viz/src/mapShared.tsx:350-359`): `added` → `ADDED_FILL`, `modified` → `MODIFIED_FILL`. No renderer cell-styling changes are needed beyond wiring `changedOf`.
+- `AtlasNode.id` at file level equals the repo-relative path, which is exactly the key `workingDiff` returns — so the change map keys line up with node ids without translation. If a future provider keys nodes differently, the overlay would silently miss; out of scope here.
+- The CLI build is esbuild-bundled (`packages/cli/esbuild.config.mjs` already bundles viz); no esbuild config change is needed because `diffRender.ts` and the extended `renderAtlasSvg` are ordinary TS in already-bundled packages.
+
+---
+
+# `sprawlens render --diff` — PR diff visualization
+
+Source: https://github.com/mizchi/sprawlens/blob/main/docs/superpowers/specs/2026-06-23-diff-render-design.md
+
+# `sprawlens render --diff` — PR diff visualization
+
+Date: 2026-06-23
+
+## Goal
+
+Extend the existing `sprawlens render` CLI command with a `--diff` option that
+highlights the files changed in a pull request directly on the headless SVG
+structure map. Intended primary use: a GitHub Actions step that fetches the base
+ref, renders an SVG, and attaches it as an artifact / PR comment so reviewers can
+see _where_ in the codebase a PR lands.
+
+Added and modified files are tinted on the map; a small legend with counts is
+embedded in the SVG. Removed files cannot appear on the map (the map is built
+from the current working tree, which no longer contains them), so they are
+reported as a count in the legend only.
+
+## Non-goals
+
+- Two-state full analysis (analyzing the base ref separately with
+  `diffSnapshots`). Rejected in favor of a single-pass `git diff` because CI only
+  needs to `fetch` the base, not check it out, and the single pass is faster. The
+  cost is that removed files are not drawn on the map.
+- Dimming unchanged files / focus mode. We keep the full-color map and only
+  overlay the added/modified tint, so the overall structure stays visible.
+- Symbol-level diff. Diff operates at file (and module) granularity, matching the
+  headless renderer's existing levels.
+
+## CLI interface
+
+```
+sprawlens render [repo] --diff [base] [existing options...]
+```
+
+- `--diff` with **no value** → uncommitted working-tree changes
+  (`git status --porcelain`, via `workingDiff(root)`).
+- `--diff <base>` (e.g. `--diff origin/main`) → diff against a base ref
+  (`git diff --name-status <base>`, via `workingDiff(root, base)`).
+- Composes with all existing `render` options: `--lang`, `--layout`, `--level`,
+  `--seed`, `--edges`, `--dark`, `--width`, `--height`, `-o/--output`.
+
+Commander option: `.option("--diff [base]", "highlight files changed vs <base>, or uncommitted changes if omitted")`.
+When the flag is absent, behavior is unchanged. When present with no value,
+commander yields `true`; we treat that as "no base" and pass `undefined` to
+`workingDiff`.
+
+## Data flow
+
+1. Unchanged: analyze the head working tree once →
+   `provider.analyze(root)` → `applyLayers` → `snapshotToAtlasGraph` → `AtlasGraph`.
+2. **New**: when `--diff` is set, call `workingDiff(root, base)` from
+   `@sprawlens/server` (already a dependency of `@sprawlens/cli`, already imported
+   in `index.ts` for the `tui` command). Returns
+   `{ changed: Record<path, "added" | "modified">, removed: string[], loc?: ... }`.
+3. Build `const changed = new Map(Object.entries(diff.changed))` —
+   `Map<string, "added" | "modified">`. Keys are repo-relative paths, which match
+   `AtlasNode.id` at file level (both produced from repo-relative paths).
+4. Build `const diffSummary = { added, modified, removed }` by counting `changed`
+   values and `removed.length`.
+5. Pass `changed` and `diffSummary` into `renderAtlasSvg`.
+
+## `renderAtlasSvg` changes (`packages/viz/src/headless/renderAtlasSvg.ts`)
+
+Extend `AtlasSvgOptions`:
+
+```ts
+changed?: Map<string, "added" | "modified">;
+diffSummary?: { added: number; modified: number; removed: number };
+```
+
+- Replace `changedOf: () => undefined` (currently line 196) with
+  `changedOf: (id) => options.changed?.get(id)`.
+  Because the scene already routes `changedOf` to `leafFillOf`, which prioritizes
+  `ADDED_FILL` / `MODIFIED_FILL`, no styling work is needed for the cells — full
+  color + diff tint falls out for free.
+- Pass `diffSummary` into `finalize` so the legend can be drawn.
+
+### Legend rendering
+
+In `finalize` (currently injects the background rect), when `diffSummary` is
+present, append a legend `<g>` just before the closing `</svg>`:
+
+- Position: bottom-left, with a small padded translucent backing rect for
+  legibility on both light and dark maps.
+- Rows (omit any row whose count is 0; if all three are 0, draw no legend):
+  - `● added N` — swatch filled with `ADDED_FILL`
+  - `● modified N` — swatch filled with `MODIFIED_FILL`
+  - `○ removed N` — open swatch (stroke only), since removed files are not on the
+    map
+- Colors reuse the `ADDED_FILL` / `MODIFIED_FILL` ESM theme tokens already used by
+  the map, so dark mode is handled by the existing `setMapTheme(dark)` call.
+- Text color uses the existing map foreground token; reuse whatever token the
+  renderer already uses for labels.
+
+The legend is plain SVG string construction (swatch `<rect>`s + `<text>`s),
+consistent with how `finalize` already builds the background rect as a string.
+
+## Package dependencies
+
+No new dependencies. `@sprawlens/cli` already declares `@sprawlens/server`
+(`workspace:*`) and imports `workingDiff`. `renderAtlasSvg` lives in
+`@sprawlens/viz`, already used by the `render` command.
+
+## Testing
+
+Add a test that exercises the full `render --diff` path against a throwaway git
+repo (reuse the temp-git-repo pattern from `packages/analyzer-ts/src/collect.test.ts`):
+
+1. Create a temp dir, `git init`, commit an initial TypeScript file set, capture
+   the base commit.
+2. Modify one file, add a new file, delete one file. Commit (or leave in working
+   tree to also cover the no-base path).
+3. Run the diff-render path (call the CLI action function or `workingDiff` +
+   `renderAtlasSvg` directly) and assert on the returned SVG string:
+   - the added file's id is colored with `ADDED_FILL`
+   - the modified file's id is colored with `MODIFIED_FILL`
+   - the legend contains the correct `added` / `modified` / `removed` counts
+4. A unit test on the headless renderer: given a graph and a `changed` map,
+   `renderAtlasSvg` emits the diff fills and a legend with the supplied counts.
+
+Prefer asserting on substrings of the SVG (fill color tokens, legend count text)
+rather than full snapshot equality, to stay robust against layout jitter.
+
+## GitHub Actions usage (documentation)
+
+Add a short README example under `packages/cli/README.md`:
+
+```yaml
+- run: git fetch origin ${{ github.base_ref }} --depth=1
+- run: npx sprawlens render --diff origin/${{ github.base_ref }} -o sprawlens-diff.svg
+- uses: actions/upload-artifact@v4
+  with: { name: sprawlens-diff, path: sprawlens-diff.svg }
+```
+
+## Open questions / decisions resolved
+
+- Input model: single-pass + `git diff` (decided).
+- Unchanged files: full color + diff tint, no dimming (decided).
+- Legend: yes, with added/modified/removed counts (decided).
+- Removed files: count-only in legend, not drawn (consequence of single-pass).
+
+---
+
+# TODO
+
+Source: https://github.com/mizchi/sprawlens/blob/main/TODO.md
+
+# TODO
+
+## Experimental features to finish
+
+All gated behind `sprawlens serve --experimental` (or `?experimental=1`); see the
+"exp on/off" chip in the viz. Each needs a decision + polish before it graduates.
+
+- **Trace player** (`docs/design/2026-06-22-entrypoint-trace-player.md`)
+  - Recorded replay proved low-value; the intended direction is dynamic capture
+    tied to test runs (v2: recent-traces store + external watch + click-to-run,
+    pick from recent N). v2a/v2b not built yet.
+  - Browser-plane capture (Playwright CDP profile) + merge is still TODO; only
+    the server plane is wired.
+  - Comet visuals are thin (edge trail sparse, heat over-saturates large cells).
+  - Decide: build v2, or retire the player.
+
+- **Commit-log / history**
+  - Vertical (right) and horizontal (bottom) layouts both exist for A/B — pick
+    one as the default and drop the toggle.
+  - The vertical "graph" column is a single lane; draw real branch lanes if the
+    history fixture carries parents.
+  - Confirm shift-range highlight reads well at module vs symbol granularity.
+
+- **Test reporter** (`docs/design/2026-06-21-test-reporter.md`)
+  - Dot panel + selection log panel + failing-cell pulse are in.
+  - Click-to-run output capture works; surface a re-run button in the log panel.
+  - Decide whether the dot panel or the on-map tint is the primary preview.
+
+- **VLM render eval** (`docs/design/2026-06-21-rendering-test-harness.md`)
+  - Already opt-in (`pnpm test:render:vlm`, token-gated); default judge
+    `google/gemini-2.5-flash`. Not part of the served app.
+
+## CI preview images
+
+- Generate atlas preview images on every code change so a diff's macro shape is
+  visible at a glance (rendered from the live analysis of the current code).
+
+---

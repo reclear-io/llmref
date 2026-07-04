@@ -1,0 +1,1831 @@
+# snmalloc
+
+Source: https://github.com/microsoft/snmalloc/blob/main/README.md
+
+# snmalloc
+
+snmalloc is a high-performance allocator. 
+snmalloc can be used directly in a project as a header-only C++ library, 
+it can be `LD_PRELOAD`ed on Elf platforms (e.g. Linux, BSD),
+and there is a [crate](https://crates.io/crates/snmalloc-rs) to use it from Rust.
+
+Its key design features are:
+
+* Memory that is freed by the same thread that allocated it does not require any
+  synchronising operations.
+* Freeing memory in a different thread to initially allocated it, does not take
+  any locks and instead uses a novel message passing scheme to return the
+  memory to the original allocator, where it is recycled.  This enables 1000s of remote 
+  deallocations to be performed with only a single atomic operation enabling great
+  scaling with core count. 
+* The allocator uses large ranges of pages to reduce the amount of meta-data
+  required.
+* The fast paths are highly optimised with just two branches on the fast path 
+  for malloc (On Linux compiled with Clang).
+* The platform dependencies are abstracted away to enable porting to other platforms. 
+
+snmalloc's design is particular well suited to the following two difficult 
+scenarios that can be problematic for other allocators:
+
+  * Allocations on one thread are freed by a different thread
+  * Deallocations occur in large batches
+
+Both of these can cause massive reductions in performance of other allocators, but 
+do not for snmalloc.
+
+The implementation of snmalloc has evolved significantly since the [initial paper](snmalloc.pdf).
+The mechanism for returning memory to remote threads has remained, but most of the meta-data layout has changed.
+We recommend you read [docs/security](./docs/security/README.md) to find out about the current design, and 
+if you want to dive into the code [docs/AddressSpace.md](./docs/AddressSpace.md) provides a good overview of the allocation and deallocation paths.
+
+
+# Hardening
+
+There is a hardened version of snmalloc, it contains
+
+*  Randomisation of the allocations' relative locations,
+*  Most meta-data is stored separately from allocations, and is protected with guard pages,
+*  All in-band meta-data is protected with a novel encoding that can detect corruption, and
+*  Provides a `memcpy` that automatically checks the bounds relative to the underlying malloc.
+
+A more comprehensive write up is in [docs/security](./docs/security/README.md).
+
+# Further documentation
+
+ - [Instructions for building snmalloc](docs/BUILDING.md)
+ - [Instructions for porting snmalloc](docs/PORTING.md)
+
+# Contributing
+
+This project welcomes contributions and suggestions.  Most contributions require you to agree to a
+Contributor License Agreement (CLA) declaring that you have the right to, and actually do, grant us
+the rights to use your contribution. For details, visit https://cla.microsoft.com.
+
+When you submit a pull request, a CLA-bot will automatically determine whether you need to provide
+a CLA and decorate the PR appropriately (e.g., label, comment). Simply follow the instructions
+provided by the bot. You will only need to do this once across all repos using our CLA.
+
+This project has adopted the [Microsoft Open Source Code of Conduct](https://opensource.microsoft.com/codeofconduct/).
+For more information see the [Code of Conduct FAQ](https://opensource.microsoft.com/codeofconduct/faq/) or
+contact [opencode@microsoft.com](mailto:opencode@microsoft.com) with any additional questions or comments.
+
+---
+
+# How snmalloc Manages Address Space
+
+Source: https://github.com/microsoft/snmalloc/blob/main/docs/AddressSpace.md
+
+# How snmalloc Manages Address Space
+
+Like any modern, high-performance allocator, `snmalloc` contains multiple layers of allocation.
+We give here some notes on the internal orchestration.
+
+## From platform to malloc
+
+Consider a first, "small" allocation (typically less than a platform page); such allocations showcase more of the machinery.
+For simplicity, we assume that
+
+- this is not an `OPEN_ENCLAVE` build,
+- the `BackendAllocator` has not been told to use a `fixed_range`,
+- this is not a `SNMALLOC_CHECK_CLIENT` build, and
+- (as a consequence of the above) `SNMALLOC_META_PROTECTED` is not `#define`-d.
+
+Since this is the first allocation, all the internal caches will be empty, and so we will hit all the slow paths.
+For simplicity, we gloss over much of the "lazy initialization" that would actually be implied by a first allocation.
+
+1. The `Allocator::small_alloc` finds that it cannot satisfy the request because its lacks a fast free list for this size class.
+   The request is delegated, unchanged, to `Allocator::small_refill`.
+
+2. The `Allocator` has no active slab for this sizeclass, so `Allocator::small_refill_slow` delegates to `BackendAllocator::alloc_chunk`.
+   At this point, the allocation request is enlarged to one or a few chunks (a small counting number multiple of `MIN_CHUNK_SIZE`, which is typically 16KiB); see `sizeclass_to_slab_size`.
+
+3. `BackendAllocator::alloc_chunk` at this point splits the allocation request in two, allocating both the chunk's metadata structure (of size `PAGEMAP_METADATA_STRUCT_SIZE`) and the chunk itself (a multiple of `MIN_CHUNK_SIZE`).
+   Because the two exercise similar bits of machinery, we now track them in parallel in prose despite their sequential nature.
+
+4. The `BackendAllocator` has a chain of "range" types that it uses to manage address space.
+   By default (and in the case we are considering), that chain begins with a per-thread "small buddy allocator range".
+
+   1. For the metadata allocation, the size is (well) below `MIN_CHUNK_SIZE` and so this allocator, which by supposition is empty, attempts to `refill` itself from its parent.
+      This results in a request for a `MIN_CHUNK_SIZE` chunk from the parent allocator.
+
+   2. For the chunk allocation, the size is `MIN_CHUNK_SIZE` or larger, so this allocator immediately forwards the request to its parent.
+
+5. The next range allocator in the chain is a per-thread *large* buddy allocator that refills in 2 MiB granules.
+   (2 MiB chosen because it is a typical superpage size.)
+   At this point, both requests are for at least one and no more than a few times `MIN_CHUNK_SIZE` bytes.
+
+   1. The first request will `refill` this empty allocator by making a request for 2 MiB to its parent.
+
+   2. The second request will stop here, as the allocator will no longer be empty.
+
+6. The chain continues with a `CommitRange`, which simply forwards all allocation requests and (upon unwinding) ensures that the address space is mapped.
+
+7. The chain now transitions from thread-local to global; the `GlobalRange` simply serves to acquire a lock around the rest of the chain.
+
+8. The next entry in the chain is a `StatsRange` which serves to accumulate statistics.
+   We ignore this stage and continue onwards.
+
+9. The next entry in the chain is another *large* buddy allocator which refills at 16 MiB but can hold regions
+   of any size up to the entire address space.
+   The first request triggers a `refill`, continuing along the chain as a 16 MiB request.
+   (Recall that the second allocation will be handled at an earlier point on the chain.)
+
+10. The penultimate entry in the chain is a `PagemapRegisterRange`, which always forwards allocations along the chain.
+
+11. At long last, we have arrived at the last entry in the chain, a `PalRange`.
+    This delegates the actual allocation, of 16 MiB, to either the `reserve_aligned` or `reserve` method of the Platform Abstraction Layer (PAL).
+
+12. Having wound the chain onto our stack, we now unwind!
+    The `PagemapRegisterRange` ensures that the Pagemap entries for allocations passing through it are mapped and returns the allocation unaltered.
+
+13. The global large buddy allocator splits the 16 MiB refill into 8, 4, and 2 MiB regions it retains as well as returning the remaining 2 MiB back along the chain.
+
+14. The `StatsRange` makes its observations, the `GlobalRange` now unlocks the global component of the chain, and the `CommitRange` ensures that the allocation is mapped.
+    Aside from these side effects, these propagate the allocation along the chain unaltered.
+
+15. We now arrive back at the thread-local large buddy allocator, which takes its 2 MiB refill and breaks it down into powers of two down to the requested `MIN_CHUNK_SIZE`.
+    The second allocation (of the chunk), will either return or again break down one of these intermediate chunks.
+
+16. For the first (metadata) allocation, the thread-local *small* allocator breaks the `MIN_CHUNK_SIZE` allocation down into powers of two down to `PAGEMAP_METADATA_STRUCT_SIZE` and returns one of that size.
+    The second allocation will have been forwarded and so is not additionally handled here.
+
+Exciting, no?
+
+## What Can I Learn from the Pagemap?
+
+### Decoding a MetaEntry
+
+The centerpiece of `snmalloc`'s metadata is its `Pagemap`, which associates each "chunk" of the address space (~16KiB; see `MIN_CHUNK_BITS`) with a `MetaEntry`.
+A `MetaEntry` is a pair of pointers, suggestively named `meta` and `remote_and_sizeclass`.
+In more detail, `MetaEntry`s are better represented by Sigma and Pi types, all packed into two pointer-sized words in ways that preserve pointer provenance on CHERI.
+
+To begin decoding, a bit (`REMOTE_BACKEND_MARKER`) in `remote_and_sizeclass` distinguishes chunks owned by frontend and backend allocators.
+
+For chunks owned by the *frontend* (`REMOTE_BACKEND_MARKER` not asserted),
+
+1. The `remote_and_sizeclass` field is a product of
+
+   1. A `RemoteAllocator*` indicating the `LocalAlloc` that owns the region of memory.
+
+   2. A "full sizeclass" value (itself a tagged sum type between large and small sizeclasses).
+
+2. The `meta` pointer is a bit-stuffed pair of
+
+   1. A pointer to a larger metadata structure with type dependent on the role of this chunk
+
+   2. A bit (`META_BOUNDARY_BIT`) that serves to limit chunk coalescing on platforms where that may not be possible, such as CHERI.
+
+See `src/backend/metatypes.h` and `src/mem/metaslab.h`.
+
+For chunks owned by a *backend* (`REMOTE_BACKEND_MARKER` asserted), there are again multiple possibilities.
+
+For chunks owned by a *small buddy allocator*, the remainder of the `MetaEntry` is zero.
+That is, it appears to have small sizeclass 0 and an implausible `RemoteAllocator*`.
+
+For chunks owned by a *large buddy allocator*, the `MetaEntry` is instead a node in a red-black tree of all such chunks.
+Its contents can be decoded as follows:
+
+1. The `meta` field's `META_BOUNDARY_BIT` is preserved, with the same meaning as in the frontend case, above.
+
+2. `meta` (resp. `remote_and_sizeclass`) includes a pointer to the left (resp. right) *chunk* of address space.
+   (The corresponding child *node* in this tree is found by taking the *address* of this chunk and looking up the `MetaEntry` in the Pagemap.
+   This trick of pointing at the child's chunk rather than at the child `MetaEntry` is particularly useful on CHERI:
+   it allows us to capture the authority to the chunk without needing another pointer and costs just a shift and add.)
+
+3. The `meta` field's `LargeBuddyRep::RED_BIT` is used to carry the red/black color of this node.
+
+See `src/backend/largebuddyrange.h`.
+
+### Encoding a MetaEntry
+
+We can also consider the process for generating a MetaEntry for a chunk of the address space given its state.
+The following cases apply:
+
+1. The address is not associated with `snmalloc`:
+   Here, the `MetaEntry`, if it is mapped, is all zeros and so it...
+   * has `REMOTE_BACKEND_MARKER` clear in `remote_and_sizeclass`.
+   * appears to be owned by a frontend RemoteAllocator at address 0 (probably, but not certainly, `nullptr`).
+   * has "small" sizeclass 0, which has size 0.
+   * has no associated metadata structure.
+
+2. The address is part of a free chunk in a backend's Large Buddy Allocator:
+   The `MetaEntry`...
+   * has `REMOTE_BACKEND_MARKER` asserted in `remote_and_sizeclass`.
+   * has "small" sizeclass 0, which has size 0.
+   * the remainder of its `MetaEntry` structure will be a Large Buddy Allocator rbtree node.
+   * has no associated metadata structure.
+
+3. The address is part of a free chunk inside a backend's Small Buddy Allocator:
+   Here, the `MetaEntry` is zero aside from the asserted `REMOTE_BACKEND_MARKER` bit, and so it...
+   * has "small" sizeclass 0, which has size 0.
+   * has no associated metadata structure.
+
+4. The address is part of a live large allocation (spanning one or more 16KiB chunks):
+   Here, the `MetaEntry`...
+   * has `REMOTE_BACKEND_MARKER` clear in `remote_and_sizeclass`.
+   * has a *large* sizeclass value.
+   * has an associated `RemoteAllocator*` and `Metaslab*` metadata structure
+     (holding just the original chunk pointer in its `MetaCommon` substructure;
+      it is configured to always trigger the deallocation slow-path to skip the logic when a chunk is in use as a slab).
+
+5. The address, whether or not it is presently within an allocated object, is part of an active slab.  Here, the `MetaEntry`....
+   * encodes the *small* sizeclass of all objects in the slab.
+   * has a `RemoteAllocator*` referencing the owning `LocalAlloc`'s message queue.
+   * points to the slab's `Metaslab` structure containing additional metadata (e.g., free list).
+
+---
+
+# Building on Windows
+
+Source: https://github.com/microsoft/snmalloc/blob/main/docs/BUILDING.md
+
+Building snmalloc
+=================
+
+snmalloc uses a CMake build system and can be built on many platforms.
+
+# Building on Windows
+
+The Windows build currently depends on at least Visual Studio 2019.
+Both Visual Studio 2019 and 2022 are regularly tested in CI.
+Additionally, `clang-cl` is also supported and tested by CI.
+To build with Visual Studio:
+
+```
+mkdir build
+cd build
+cmake -G "Visual Studio 17 2022" -A x64 ..
+cmake --build . --config Debug
+cmake --build . --config Release
+cmake --build . --config RelWithDebInfo
+```
+
+You can also omit the last three steps and build from the IDE.
+Visual Studio builds use a separate directory to keep the binaries for each
+build configuration.
+
+Alternatively, you can follow the steps in the next section to build with Ninja
+using the Visual Studio compiler.
+
+# Building on UNIX-like platforms
+
+snmalloc has platform abstraction layers for XNU (macOS, iOS, and so on),
+FreeBSD, NetBSD, OpenBSD, and Linux and is expected to work out of the box on
+these systems.
+Please open issues if it does not.
+Note that NetBSD, by default, ships with a toolchain that emits calls to
+`libatomic` but does not ship `libatomic`.
+To use snmalloc on NetBSD, you must either acquire a `libatomic` implementation
+(for example, from the GCC or LLVM project) or compile with clang.
+
+snmalloc has very few dependencies: CMake, Ninja, Clang 6.0 or later and a C++17
+standard library.
+Building with GCC is currently not recommended because GCC emits calls to
+libatomic for 128-bit atomic operations.
+
+To build a debug configuration:
+```
+mkdir build
+cd build
+cmake -G Ninja .. -DCMAKE_BUILD_TYPE=Debug
+ninja
+```
+To build a release configuration:
+```
+mkdir build
+cd build
+cmake -G Ninja .. -DCMAKE_BUILD_TYPE=Release
+ninja
+```
+To build with optimizations on, but with debug information:
+```
+mkdir build
+cd build
+cmake -G Ninja .. -DCMAKE_BUILD_TYPE=RelWithDebInfo
+ninja
+```
+
+On ELF platforms, the build produces a binary `libsnmallocshim.so`.
+This file can be 
+`LD_PRELOAD`ed to use the allocator in place of the system allocator, for
+example, you can run the build script using the snmalloc as the allocator for
+your toolchain:
+
+```
+LD_PRELOAD=/usr/local/lib/libsnmallocshim.so ninja
+```
+
+## Cross Compile for Android
+Android is supported out-of-the-box.
+
+To cross-compile the library for arm android, you can simply invoke CMake with the toolchain file and the andorid api settings (for more infomation, check this [document](https://developer.android.com/ndk/guides/cmake)).
+
+For example, you can cross-compile for `arm64-v8a` with the following command:
+```
+cmake /path/to/snmalloc -DCMAKE_TOOLCHAIN_FILE=${ANDROID_NDK}/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a
+```
+
+# CMake Feature Flags
+
+These can be added to your cmake command line.
+
+```
+-DUSE_SNMALLOC_STATS=ON // Track allocation stats
+```
+
+# Using snmalloc as header-only library
+
+In this section we show how to compile snmalloc into your project such that it replaces the standard allocator functions such as free and malloc. The following instructions were tested with CMake and Clang running on Ubuntu 18.04.
+
+Add these lines to your CMake file.
+
+```cmake
+set(SNMALLOC_HEADER_ONLY_LIBRARY ON)
+add_subdirectory(snmalloc EXCLUDE_FROM_ALL)
+```
+
+In addition make sure your executable is compiled to support 128 bit atomic operations. This may require you to add the following to your CMake file.
+
+```cmake
+target_link_libraries([lib_name] PRIVATE snmalloc_lib)
+```
+
+You will also need to compile the relevant parts of snmalloc itself. Create a new file with the following contents and compile it with the rest of your application.
+
+```c++
+#include "src/snmalloc/override/malloc.cc"
+#include "src/snmalloc/override/new.cc"
+```
+
+To enable the `reallocarray` symbol export, this can be added to your cmake command line.
+
+```
+-DSNMALLOC_NO_REALLOCARRAY=OFF
+```
+
+likewise for `reallocarr`.
+
+```
+-DSNMALLOC_NO_REALLOCARR=OFF
+```
+
+
+---
+
+# The Combining Lock
+
+Source: https://github.com/microsoft/snmalloc/blob/main/docs/combininglock.md
+
+# The Combining Lock
+
+`snmalloc` tries very hard to avoid using locks.
+However, there are a few core places where locks are required to manage the global state of the allocator.
+These global operations are rare, so the overhead of a lock is not a significant issue.
+However, when a thread starts it must acquire this lock to perform its first allocation.
+If multiple threads are starting at the same time, then this lock can become contended.
+
+As part of `snmalloc` 0.7, we optimised the lock acquisition for the first allocation.
+This optimisation involved a bunch of profiling and simple optimisations.
+To further improve the startup time, we introduced a new [_combining lock_](../src/snmalloc/ds/combininglock.h).
+
+The core idea of the combining lock is that it holds a queue of operations that need to be executed while holding the lock,
+and then the thread holding the lock can execute multiple threads' operations in a single lock acquisition.
+This can reduce the amount of cache misses as a single thread performs multiple updates,
+and thus overall the system may have fewer cache misses.
+
+The rest of this document will describe the combining lock in more detail.
+
+## Background: Flat Combining
+
+The core idea behind the combining lock is the flat combining technique of [Hendler et al.](https://dl.acm.org/doi/10.1145/1810479.1810540).
+Their paper observes that cache misses in a contended scenario can be extremely costly.
+Consider a case where you need to modify a shared data structure, and say that involves writing to several cache lines.
+If there are 5 threads contending for the lock, then each thread will have to acquire the lock, and then acquire the caches line in exclusive mode.
+This means that it will need to invalidate the exclusive mode cache lines in the previous thread.
+These cache misses can result in a significant cost to the system.
+
+Flat combining reduces the number of cache misses in a contended scenario by having threads initially write their operations to a shared queue.
+Then a single thread will acquire the lock and execute all the operations in the queue.
+This means that the thread holding the lock will have all the cache lines in exclusive mode, and the other threads will only need to invalidate the cache lines of the thread holding the lock.
+
+The flat combining paper goes on to show how to amalgamate the operations in the queue to reduce the amount of work required.
+For instance, taking the largest element 5 times from a balanced binary search tree is 5 logarithmic walks of the tree, but it is possible to remove the five smallest elements in a single logarithmic walk.
+This can also have significant benefits in throughput.
+The combining lock we have built does not amalgamate the operations, just execute them on a single thread.
+
+[Gupta et al.](https://www.usenix.org/conference/osdi23/presentation/gupta) provide OS level support to enable flat combining locks that are transparent to the user.
+For `snmalloc`, we have a much simpler use case as we control the code, and so we can make the combining lock explicit in the API.
+
+[Dice el al.](https://dl.acm.org/doi/pdf/10.1145/1989493.1989502) built a flat combining lock that was NUMA aware.
+This is a more complex version of the combining lock that we have built that provides additional performance benefits on NUMA systems.
+
+## The API
+
+The API for our combining lock is super simple.  We have one type `CombiningLock` and one function `with`.  The `with` function takes a lambda and executes it while the lock is held.
+Once the lambda has completed, `with` will return.
+We have mutual exclusion, there is at most one lambda executing at a time on `my_lock`.
+
+```C++
+CombiningLock my_lock;
+...
+
+with(my_lock, [&] (){
+  // Code that needs to be protected by the lock
+});
+```
+
+The lambda passed to `with` can capture state that needs to be executed while holding the lock.
+As the lambda may be executed on a different thread the use of `thread_local` state can be a little tricky.
+
+Let us assume we have a thread local variable `my_state` that we want to update while holding the lock.
+```C++
+// a global thread local variable.
+thread_local int my_state = 0;
+```
+We can update this variable while holding the lock as follows:
+```C++
+with(my_lock, [&] (){
+  // Code that needs to be protected by the lock
+  my_state=8;
+});
+// One threads my_state is 8, but we aren't guaranteed which thread.
+// Hence, the following assert may fail.
+assert(my_state == 8);
+```
+The problem is that the lambda may be executed on a different thread, so the `thread_local` variable `my_state` may not have been updated on the thread that requested it.
+
+We can address this by directly capturing the thread local variable in the lambda.
+```C++
+with(my_lock, [&my_state] (){
+  // Code that needs to be protected by the lock
+  my_state=8;
+});
+```
+
+
+## Background: MCS Queue Lock
+
+Our implementation of the combining lock is based on the classic [MCS queue lock by Mellor-Crummy and Scott, 1991](https://dl.acm.org/doi/10.1145/103727.103729).
+This lock is a simple queue lock that allows threads to spin on a single cache line.
+
+Let us provide an MCS queue lock for our API given above:
+```C++
+struct LockNode
+{
+  std::atomic<LockNode*> next{nullptr};
+  std::atomic<bool> available{false};
+};
+
+struct MCSLock
+{
+  // End of queue
+  std::atomic<LockNode*> last;
+};
+
+template<typename F>
+inline void with(MCSLock& lock, F&& f)
+{
+  // Stack allocate our node to use in the queue.
+  LockNode node;
+
+  // **************ACQUIRE**************
+  // Add ourselves to the end of the queue.
+  LockNode* prev = lock.last.exchange(&node, std::memory_order_acq_rel);
+  if (prev != nullptr)
+  {
+    // Add link to previous element in the queue
+    prev->next.store(&node, std::memory_order_release);
+    // Wait for out turn.
+    while (!node.available.load(std::memory_order_acquire))
+      ;
+  }
+
+  // **************PERFORM**************
+  // Run lambda
+  f();
+
+  // **************RELEASE**************
+  // Check if there is a next thread.
+  if (node.next.load(std::memory_order_acquire) == nullptr)
+  {
+    auto node_address = &node;
+    // No next thread so remove ourselves from the end of the queue
+    if (lock.last.compare_exchange_strong(node_address, nullptr, std::memory_order_acq_rel))
+      return;
+    // Wait for next thread to be set as we failed to remove ourselves from the end of the queue.
+    while (node.next.load(std::memory_order_acquire) == nullptr)
+      ;
+  }
+
+  // Wake next thread.
+  node.next.load(std::memory_order_acquire)->available.store(true, std::memory_order_release);
+}
+```
+The code can be broken into three parts:
+* `ACQUIRE`: Add ourselves to the end of the queue.
+* `PERFORM`: Execute the lambda.
+* `RELEASE`: Remove ourselves from the queue and wake the next thread.
+
+The `ACQUIRE` part is simple.
+We add ourselves to the end of the queue and then wait for the previous thread to set the `available` flag.
+If there is no previous thread, then we can immediately execute the lambda.
+
+The `PERFORM` part simply executes the lambda.
+
+The most challenging part of the MCS lock is the release of the lock.
+When a thread has finished executing its lambda, it must check if there is another thread waiting to execute.
+If there is, it must wake that thread.
+If there is no other thread waiting, then it must remove itself from the queue, because a subsequent thread may write to the `next` field of the node that is on the stack.
+To unlink this stack allocated node from the queue, we need to use a compare and exchange operation.
+This checks if the `last` still points at this node, and if it does, then it sets the `last` to `nullptr`, which signifies that there is no thread waiting to execute.
+The awkward case is if the compare and exchange fails.
+This means that another thread has joined the queue, but had not set the `next` field when we checked.
+In this case, we must wait for the `next` field to be set, and then we can simply notify the next thread to execute.
+
+
+## The Combining Lock
+
+The combining lock follows the same pattern as the MCS queue lock, but adds a few extra fields to the queue.
+Firstly, instead of the status being a boolean for whether the lock is available to this thread.
+We have a status that represents three cases:
+```C++
+enum class LockStatus
+{
+  WAITING,
+  DONE,
+  HEAD
+};
+```
+The `WAITING` state is when the thread is waiting for the lock to become available to it.  This roughly corresponds to the `available` field in the MCS queue lock being `false`.
+The `HEAD` state is when this thread is responsible for completing more work from the queue. This roughly corresponds to the `available` field in the MCS queue lock being `true`.
+The `DONE` state is when another thread has completed the operation (lambda) for this thread. This is a new state that is not present in the MCS queue lock and represents the case where another thread has completed the work for this thread.
+
+The lock node has an extra field that is a function pointer.
+This represents the operation that the must be executed for this thread.
+```C++
+struct CombiningLockNode
+{
+  std::atomic<CombiningLockNode*> next{nullptr};
+  std::atomic<LockStatus> status{WAITING};
+  void (*f_raw)(CombiningLockNode*);
+
+  void run()
+  {
+    f_raw(this);
+  }
+};
+```
+
+The `f_raw` field is a function pointer that is effectively going to do our lambda.
+
+```C++
+template<typename F>
+struct CombiningLockNodeTempl : CombiningLockNode
+{
+  F f;
+
+  CombiningLockNodeTempl(F&& f_)
+  : CombiningLockNode([](CombiningLockNode* self) {
+      auto self_templ = reinterpret_cast<CombiningLockNodeTempl*>(self);
+      self_templ->f();
+    }), 
+    f(f_) {}
+};
+```
+Here we need to use `reinterpret_cast` to convert the `CombiningLockNode*` to the specific instantiation of the `CombiningLockNodeTempl*`.
+This is really the virtual dispatch, but we are doing it manually, so as not to incur the overheads of vtables.
+
+We can now provide our new version of the `with` function that uses the combining lock.
+```C++
+template<typename F>
+inline void with(CombiningLock& lock, F&& f)
+{
+  CombiningLockNodeTempl<F> node(stl::forward<F>(f));
+
+  // **************ACQUIRE**************
+  // Add ourselves to the end of the queue.
+  CombiningLockNode* prev = lock.last.exchange(&node, std::memory_order_acq_rel);
+
+  if (prev != nullptr)
+  {
+    // Add link to previous element in the queue
+    prev->next.store(&node, std::memory_order_release);
+    
+    // Wait for our turn.
+    while (node.status.load(std::memory_order_relaxed) == LockStatus::WAITING)
+      ;
+
+    // Check if another thread completed our work.
+    if (node.status.load(std::memory_order_acquire) == LockStatus::DONE)
+      return;
+  }
+
+  // **************PERFORM**************
+  // We are now the head of the queue.
+  // Perform work until we hit a nullptr.
+  auto curr = this;
+  while (true)
+  {
+    curr->run();
+
+    // Check if there is another operation to execute
+    auto next = curr->next.load(std::memory_order_acquire);
+    if (next == nullptr)
+      break;
+
+    // Notify thread that we completed its work.
+    curr->status.store(LockStatus::DONE, std::memory_order_release);
+    curr = next;
+  }
+
+  // ***********RELEASE**************
+  // Attempt to close the queue
+  auto curr_address = curr;
+  if (lock.last.compare_exchange_strong(curr_address, nullptr, std::memory_order_acq_rel))
+  {
+    curr->status.store(LockStatus::DONE, std::memory_order_release);
+    return;
+  }
+
+  // Wait for next thread to be set as we failed to remove
+  // ourselves from the end of the queue.
+  while (curr->next.load(std::memory_order_relaxed) == nullptr)
+    ;
+
+  // Read the next thread
+  auto next = curr->next.load(std::memory_order_acquire);
+
+  // Notify the current thread that its work has been completed.
+  curr->status.store(LockStatus::DONE, std::memory_order_release);
+  // Notify the next thread it is the head of the queue, and should
+  // perform operations from the queue.
+  next->status.store(LockStatus::HEAD, std::memory_order_release);
+  return;
+}
+```
+Again, the code can be broken into three parts.
+The `ACQUIRE` part is almost the same as the MCS queue lock.
+However, it additionally checks if another thread completed the lambda for this thread.
+If this happens, then the thread can return immediately.
+
+The `PERFORM` part is where the executing thread can run the lambdas for itself and many other threads.
+It walks the queue executing the lambdas until it reaches a queue node with `next` pointer containing `nullptr`.
+
+The `RELEASE` part attempts to remove the last node from the `PERFORM` phase from the end of the queue.
+If this succeeds, then it can simply notify that queue node that its work is `DONE`,
+and return.
+Otherwise, as with the MCS lock, it must wait for a new thread that is joining the queue to set the `next` pointer.
+Then it can notify (`HEAD`) the newly joined thread that it can execute the remaining work.
+Finally, it must notify the last element it ran the lambda for that its work is `DONE`.
+The `DONE` notification must be done after the read of `next`, as signalling `DONE` can cause the memory for the node to be freed from the stack.
+
+## Full Implementation
+
+The [actual implementation](../src/snmalloc/ds/combininglock.h) in the `snmalloc` codebase is a little more complex as it uses a fast path lock for the uncontended case.
+This uses fewer atomic operations in the common case where the lock is not contended,
+and is a standard technique for queue locks.
+
+The implementation is also optionally integrated with the OS primitive for waiting such as `futex` or `waitonaddress`.
+This means that if enabled, then after spinning for a while the thread will back off to the OS primitive.
+This leads to better tail latency in the case where the lock is highly contended.
+
+We observed the OS waiting primitive can be negatively impacted by virtualization. So we provide a flag to disable
+the OS waiting primitive. Setting `SNMALLOC_ENABLE_WAIT_ON_ADDRESS` to `OFF` will disable the OS waiting primitive.
+The PR adding this feature is [#685](https://github.com/microsoft/snmalloc/pull/685/).
+
+## Performance Results
+
+We have a particularly tough benchmark for testing [lock contention at startup](../src/test/perf/startup/startup.cc).
+We used a machine with 72 hardware threads.
+The benchmark causes all the threads to synchronise on starting their first allocation.
+This means all 72 threads are contending on the lock at the same time to get their allocator initialised.
+
+We ran this benchmark with a standard spin-lock (0.7.0-spin) and with the new combining lock (0.7.0):
+
+![Combining lock performance](combininglockperf.svg)
+
+As we can see from the benchmark, the combining lock is significantly faster than the spin lock in this highly contented scenario taking only 60% of the time to complete the initialisation.
+
+This benchmark is not at all representative of most scenarios, and is stressing a worst case scenario of the system.
+
+The benchmarking also disabled the OS level support for waiting, so the combining lock is only using spinning.
+This was because on a virtualized system the OS level support was slower than spinning.
+
+## Conclusion
+
+The combining lock can be surfaced in C++ with a really simple API that just takes a lambda to execute while holding the lock.
+It was really easy to integrate into the `snmalloc` codebase and has provided a significant performance improvement in a highly contended micro-benchmark.
+
+---
+
+# PORTING.md
+
+Source: https://github.com/microsoft/snmalloc/blob/main/docs/PORTING.md
+
+Porting snmalloc to a new platform
+==================================
+
+All of the platform-specific logic in snmalloc is isolated in the [Platform
+Abstraction Layer (PAL)](../src/snmalloc/pal).
+To add support for a new platform, you will need to implement a new PAL for
+your system.
+
+After version 0.5.2, the PAL is defined by a [C++20 Concept](../src/pal/pal_concept.h).
+When compiling with C++20 or later, you should get helpful messages about any fields or methods that your PAL is missing.
+
+The PAL must implement the following methods:
+
+```c++
+[[noreturn]] static void error(const char* const str) noexcept;
+```
+Report a fatal error and exit.
+
+The memory that snmalloc is supplied from the Pal should be in one of three
+states
+
+* `using`
+* `using readonly`
+* `not using`
+
+Before accessing the memory for a read, `snmalloc` will change the state to 
+either `using` or `using readonly`,
+and before a write by it will change the state to `using`.
+If memory is not required any more, then `snmalloc` will change the state to
+`not using`, and will ensure that it notifies the `Pal` again
+before it every accesses that memory again.  
+The `not using` state allows the `Pal` to recycle the memory for other purposes.
+If `pal_enforce_access` is set as a mitigation, then accessing memory that has not been notified
+correctly should trigger an exception/segfault.
+
+The state for a particular region of memory is set with 
+```c++
+static void notify_not_using(void* p, size_t size) noexcept;
+
+template<ZeroMem zero_mem>
+static bool notify_using(void* p, size_t size) noexcept;
+
+static bool notify_using_readonly(void* p, size_t size) noexcept;
+```
+These functions notify the system that the range of memory from `p` to `p` + 
+`size` is in the relevant state.
+
+If the template parameter is set to `YesZero` then `notify_using` must ensure
+the range is full of zeros.
+
+The function should return `true` if the memory is now in the requested state, and `false` if it failed to make the memory useable.
+
+```c++
+template<bool page_aligned = false>
+static void zero(void* p, size_t size) noexcept;
+```
+Zero the range of memory from `p` to `p` + `size`.
+This may be a simple `memset` call, but the `page_aligned` template parameter
+allows for more efficient implementations when entire pages are being zeroed.
+This function is typically called with very large ranges, so it may be more
+efficient to request that the operating system provides background-zeroed
+pages, rather than zeroing them synchronously in this call
+
+```c++
+template<bool state_using>
+static void* reserve_aligned(size_t size) noexcept;
+static void* reserve(size_t size) noexcept;
+```
+All platforms should provide `reserve` and can optionally provide
+`reserve_aligned` if the underlying system can provide strongly aligned 
+memory regions.
+If the system guarantees only page alignment, implement only the second. `snmalloc` will
+overallocate to ensure it can find suitably aligned blocks inside the region.
+`reserve` should consider memory initially as `not_using`, and `snmalloc` will notify when it 
+needs the range of memory.
+
+If the system provides strong alignment, implement the first to return memory
+at the desired alignment. If providing the first, then the `Pal` should also 
+specify the minimum size block it can provide: 
+```
+static constexpr size_t minimum_alloc_size = ...;
+```
+
+The PAL is also responsible for advertising the page size:
+
+```c++
+static constexpr size_t page_size = 0x1000;
+```
+
+This is the granularity at which the PAL is able to mark memory as in-use or not-in-use.
+The PAL is free to advertise a size greater than the minimum page size if that would be more efficient.
+When a slab is deallocated, the PAL will be instructed to mark everything after the first `page_size` bytes as not-in-use and so larger values can lead to more memory overhead.
+
+The page size for any given system depends on both the underlying architecture and the operating system.
+The value exposed by the PAL may also depend on the Architecture Abstraction Layer (AAL).
+For example, the Linux PAL advertises 64 KiB on PowerPC but 4 KiB on every other supported architecture:
+
+```c++
+static constexpr size_t page_size =
+	Aal::aal_name == PowerPC ? 0x10000 : 0x1000;
+```
+
+Finally, you need to define a field to indicate the features that your PAL supports:
+```c++
+static constexpr uint64_t pal_features = ...;
+```
+
+These features are defined in the [`PalFeatures`](src/pal/pal_consts.h) enumeration.
+
+There are several partial PALs that can be used when implementing POSIX-like systems:
+
+ - `PALPOSIX` defines a PAL for a POSIX platform using no non-standard features.
+ - `PALBSD` defines a PAL for the common set of BSD extensions to POSIX.
+ - `PALBSD_Aligned` extends `PALBSD` to provide support for aligned allocation
+   from `mmap`, as supported by NetBSD and FreeBSD.
+
+Each of these template classes takes the PAL that inherits from it as a
+template parameter.
+A purely POSIX-compliant platform could have a PAL as simple as this:
+
+```c++
+class PALMyOS : public PALPOSIX<PALMyOS> {}
+```
+
+Typically, a PAL will implement at least one of the functions outlined above in
+a more-efficient platform-specific way, but this is not required.
+Non-POSIX systems will need to implement the entire PAL interface.
+The [Windows](src/pal/pal_windows.h), and
+[OpenEnclave](src/pal/pal_open_enclave.h) and
+[FreeBSD kernel](src/pal/pal_freebsd_kernel.h) implementations give examples of
+non-POSIX environments that snmalloc supports.
+
+The POSIX PAL uses `mmap` to map memory.
+Some POSIX or POSIX-like systems require minor tweaks to this behaviour.
+Rather than requiring these to copy and paste the code, a PAL that inherits from the POSIX PAL can define one or both of these (`static constexpr`) fields to customise the `mmap` behaviour.
+
+ - `default_mmap_flags` allows a PAL to provide additional `MAP_*`
+    flags to all `mmap` calls.
+ - `anonymous_memory_fd` allows the PAL to override the default file
+   descriptor used for memory mappings.
+
+
+---
+
+# Release 0.7.0
+
+Source: https://github.com/microsoft/snmalloc/blob/main/docs/release/0.7/README.md
+
+# Release 0.7.0
+
+The latest release of `snmalloc` has a few interesting features that are worth discussing in more detail.
+Primarily this release focuses on improving the performance of `snmalloc` in a few key areas.
+But we have also added some new features to build new security features on top of `snmalloc`.
+
+## BatchIt
+
+The main addition is the 0.7 release is integrating the `BatchIt` algorithm from the paper
+
+> [BatchIt: Optimizing Message-Passing Allocators for Producer-Consumer Workloads: An Intellectual Abstract](https://dl.acm.org/doi/10.1145/3652024.3665506)
+> Nathaniel Wesley Filardo, Matthew J. Parkinson
+
+As the title suggests, the paper considers producer-consumer workloads, wherein producer threads allocate memory for messages that get passed to consumer threads, which free their received messages.
+For workloads that do significant amounts of such message passing, the `snmalloc` implementation prior to this release can be sub-optimal.
+In particular, the current algorithm can suffer a lot of cache-misses while it handles returning the deallocated messages back to the producer threads' allocators.
+
+BatchIt proposes to add a small consumer- (that is, deallocator-) side cache to allow messages to the same slab of memory to be batched together.
+This results in smaller message queues within `snmalloc` and gives much better cache locality when handling messages.
+
+We developed [a micro-benchmark](../../../src/test/perf/msgpass/msgpass.cc) that simulates a producer-consumer workload with back-pressure sending a fixed number of messages per producer.
+We then measure the time taken to process all the messages with different numbers of producer and consumer threads.
+`msgpass-1` has a single producer and a single consumer, `msgpass-2` has two producers and two consumers, and so on.
+
+![Graph of BatchIt performance](./snmalloc-msgpass.svg)
+
+The results show a significant potential for improvement in the producer-consumer workload.
+As the number of threads increases the cache becomes less effective as each producer can send to all the other consumers,
+that is, in the `msgpass-8` case each of the 8 producers can talk to each of the 8 consumers.
+
+The [paper](https://dl.acm.org/doi/10.1145/3652024.3665506) contains a lot more results, we have just given you a taste of the improvement here.
+
+## Start-up performance
+
+Due to a potential customers benchmarking, we observed that `snmalloc` was slower than some other allocators when starting up when there are a lot of threads.
+During start-up, we use a lock to ensure that certain tasks are only performed once.
+However, when starting a lot of threads, this lock can become a bottleneck.
+
+To address this, we analysed what was doing while holding the lock.
+We found that we were doing a several things that were causing more time to be spent inside the lock than was necessary.
+Overall, we improve the start-up time of `snmalloc` in high thread scenarios as follows:
+
+We have a particularly tough benchmark for testing [startup time](../../../src/test/perf/startup/startup.cc).
+We used a machine with 72 hardware threads.
+The benchmark causes all the threads to synchronise on starting their first allocation.
+This means all 72 threads are contending on the lock at the same time to get their allocator initialised.
+The results are shown in the graph below.
+
+![Performance graph for startup times](./perf-startup.svg)
+
+Here 0.6.2 is the last release of snmalloc, and 0.7 is the current release.
+We use `spin` to mean that the combining lock is not using OS level waiting, but is spinning instead.
+We use `sec` to mean that `snmalloc` has been compiled with the security checks enabled.
+
+The results show that the 0.7 release is significantly faster than the 0.6.2 release.
+The improvements are smaller in the `sec` case as there are more interactions with the OS to set up disjoint address spaces for the meta-data and the object-data.
+The benchmarks were run on an Azure VM with 72 hardware threads.  Virtualization seems to be costly for the futex system call, so the `spin` version is faster.
+
+The rest of this section details some improvements to get those results.
+
+### Combining Lock
+
+The most interesting feature was the combining lock.
+This uses ideas from the Flat Combining work to provide a C++ lock that can be used to reduce the number of cache misses during lock contention.
+You can read more about that in [combininglock.md](../../combininglock.md).
+
+### DO_DUMP and DONT_DUMP
+
+To understand what each part of memory is used for, `snmalloc` allocates a pagemap.
+This is normally 1/1024 of the address space, and is very sparsely populated.
+If we get a core dump while running snmalloc, and the platform does not compress the core dump, then the pagemap can be very large.
+To address this, `snmalloc` judiciously uses `madvise` to tell the kernel that it does not need to dump the pagemap.
+However, we were also applying this to other structures that were not as large. 
+
+We found that the additional `madvise` calls were taking a noticeable amount of time. 
+To address this, we refactored the use to DO_DUMP and DONT_DUMP to only apply to the page map, and not the other smaller overallocations.
+
+See [#665](https://github.com/microsoft/snmalloc/pull/665).
+
+### Lazy initialization of the buddy allocator
+
+The backend of `snmalloc` uses a buddy allocator to manage the large ranges of memory.
+This stores power of two sized and aligned blocks of memory, and consolidates them when possible.
+To reduce the amount of system calls snmalloc typically requests a large range of memory from the OS.
+However, we found that the faulting in the pages for the buddy allocator was taking a noticeable amount of time.
+This lead to us refactoring the buddy allocator to lazily initialize the structures it needs, so the number of initial faults is reduced.
+
+See [#665](https://github.com/microsoft/snmalloc/pull/665).
+
+### Miscellaneous
+
+There were other small changes that were made to reduce the number of times the lock had to be held, e.g. [#639](https://github.com/microsoft/snmalloc/pull/639).
+
+
+## Custom meta-data
+
+We have been designing a new feature in `snmalloc` to build new security features on top of.
+The key idea is to allow the allocator to be built with an optional data structure that can be used to store meta-data about every allocation.
+In `snmalloc` we have a pagemap that for each 16KiB of memory stores 16 bytes of data.
+This stores three things for each chunk of memory:
+* The size class of allocations in the chunk of memory;
+* The owning allocator of the chunk of memory; and
+* A pointer to additional meta-data.
+
+The additional meta-data in snmalloc, is information such as how many allocations are free, and various free-lists for that chunk.
+The meta-data can be shared between adjacent chunks of memory, which provides up with variable sized slabs of memory.
+
+The additional meta-data size in snmalloc 0.6 was fixed and under a cache line in most configurations.
+In snmalloc 0.7, we have made this meta-data size configurable.
+This allows developers to build new security features on top of snmalloc.
+
+For instance, building snmalloc with the following definition of `Config` will allow you to store a 64-bit counter for each allocation:
+```cpp
+  using Config = snmalloc::StandardConfigClientMeta<
+    ArrayClientMetaDataProvider<std::atomic<size_t>>>;
+```
+
+This does not affect the underlying alignment of the allocations.
+It also only increases the size of the meta-data by the required additional meta-data size.
+It does not increase the size of the pagemap.
+
+We have built a simple example inspired by Google's `miracle_ptr`,
+that uses this feature to provide the reference counting for all allocations, but out-of-band.
+See [miracle_ptr](../../../src/test/func/miracle_ptr/miracle_ptr.cc) for our current experiment.
+We are still experimenting with this feature, and would love to hear your feedback.
+
+## Conclusion
+
+The 0.7 release addresses a few awkward performance issues in `snmalloc`, and provides an interesting platform to develop new security features on top of `snmalloc`.
+Happy allocating!
+
+---
+
+# Protecting meta-data
+
+Source: https://github.com/microsoft/snmalloc/blob/main/docs/security/FreelistProtection.md
+
+# Protecting meta-data
+
+Corrupting an allocator's meta-data is a common pattern for increasing the power of a use-after-free or out-of-bounds write vulnerabilities.
+If you can corrupt the allocator's meta-data, then you can take a control gadget in one part of a system, and use it to affect other parts of the system.
+There are various approaches to protecting allocator meta-data, the most common are:
+
+* make the allocator meta-data hard to find through randomisation
+* use completely separate ranges of memory for meta-data and allocations
+* surround meta-data with guard pages
+* add some level of encryption/checksuming
+
+With the refactoring of the page table ([described earlier](./VariableSizedChunks.md)), we can put all the slab meta-data in completely separate regions of memory to the allocations.
+We maintain this separation over time, and never allow memory that has been used for allocations to become meta-data and vice versa.
+Within the meta-data regions, we add randomisation to make the data hard to find, and add large guard regions around the meta-data.
+By using completely separate regions of memory for allocations and meta-data we ensure that no dangling allocation can refer to current meta-data.
+This is particularly important for CHERI as it means a UAF can be used to corrupt allocator meta-data.
+
+But there is one super important bit that still remains: free lists.
+
+##  What are free lists?
+
+Many allocators chain together unused allocations into a linked list.
+This is remarkably space efficient, as it doesn't require meta-data proportional to the number of allocations on a slab.
+The disused objects can be used in either a linked stack or queue.
+However, the key problem is neither randomisation or guard pages can be used to protect this _in-band_ meta-data.
+
+In snmalloc, we have introduced a novel technique for protecting this data.
+
+## Protecting a free queue.
+
+The idea is remarkably simple: a doubly linked list is far harder to corrupt than a single linked list, because you can check its invariant:
+```
+   x.next.prev == x
+```
+In every kind of free list in snmalloc, we encode both the forward and backward pointers in our lists.
+For the forward direction, we use an [involution](https://en.wikipedia.org/wiki/Involution_(mathematics)), `f`, such as XORing a randomly choosen value:
+```
+  f(a) = a XOR k0
+```
+For the backward direction, we use a more complex, two-argument function
+```
+  g(a, b) = (a XOR k1) * (b XOR k2)
+```
+where `k1` and `k2` are two randomly chosen 64 bit values.
+The encoded back pointer of the node after `x` in the list is `g(x, f(x.next))`, which gives a value that is hard to forge and still encodes the back edge relationship.
+
+As we build the list, we add this value to the disused object, and when we consume the free list later, we check the value is correct.
+Importantly, the order of construction and consumption have to be the same, which means we can only use queues, and not stacks.
+
+The checks give us a way to detect that the list has not been corrupted.
+In particular, use-after-free or out-of-bounds writes to either the `next` or `prev` value are highly likely to be detected later.
+
+## Double free protection
+
+This encoding also provides a great double free protection.
+If you free twice, it will corrupt the `prev` pointer, and thus when we come to reallocate that object later, we will detect the double free.
+The following animation shows the effect of a double free:
+
+![Double free protection example](./data/doublefreeprotection.gif)
+
+This is a weak protection as it is lazy, in that only when the object is reused will snmalloc raise an error, so a `malloc` can fail due to double free, but we are only aiming to make exploits harder; this is not a bug finding tool.
+
+
+## Where do we use this?
+
+Everywhere we link disused objects, so (1) per-slab free queues and (2) per-allocator message queues for returning freed allocations to other threads.
+Originally, snmalloc used queues for returning memory to other threads.
+We had to refactor the per slab free lists to be queues rather than stacks, but that is fairly straightforward.
+The code for the free lists can be found here:
+
+[Code](https://github.com/microsoft/snmalloc/blob/main/src/snmalloc/mem/freelist.h)
+
+The idea could easily be applied to other allocators, and we're happy to discuss this.
+
+## Finished assembly
+
+So let's look at what costs we incur from this.
+There are bits that are added to both creating the queues, and taking elements from the queues.
+Here we show the assembly for taking from a per-slab free list, which is integrated into the fast path of allocation:
+```x86asm
+<malloc(unsigned long)>:
+    lea    rax,[rdi-0x1]                       # Check for small size class
+    cmp    rax,0xdfff                          # | zero is considered a large size
+    ja     SLOW_SIZE                           # | to remove from fast path.
+    shr    rax,0x4                             # Lookup size class in table
+    lea    rcx,[size_table]                    # | 
+    movzx  edx,BYTE PTR [rax+rcx*1]            # | 
+    mov    rdi,rdx                             #+Caclulate index into free lists
+    shl    rdi,0x4                             #+| (without checks this is a shift by
+                                               # |  0x3, and can be fused into an lea)
+    mov    r8,QWORD PTR [rip+0xab9b]           # Find thread local allocator state
+    mov    rcx,QWORD PTR fs:0x0                # |
+    add    rcx,r8                              # |
+    add    rcx,rdi                             # Load head of free list for size class
+    mov    rax,QWORD PTR fs:[r8+rdi*1]         # |
+    test   rax,rax                             # Check if free list is empty
+    je     SLOW_PATH_REFILL                    # |
+    mov    rsi,QWORD PTR fs:0x0                # Calculate location of free list structure
+    add    rsi,r8                              # | rsi = fs:[r8]
+    mov    rdx,QWORD PTR fs:[r8+0x2e8]         #+Load next pointer key
+    xor    rdx,QWORD PTR [rax]                 # Load next pointer
+    prefetcht0 BYTE PTR [rdx]                  # Prefetch next object
+    mov    QWORD PTR [rcx],rdx                 # Update head of free list
+    mov    rcx,QWORD PTR [rax+0x8]             #+Check signed_prev value is correct
+    cmp    rcx,QWORD PTR fs:[r8+rdi*1+0x8]     #+|
+    jne    CORRUPTION_ERROR                    #+|
+    lea    rcx,[rdi+rsi*1]                     #+Calculate signed_prev location
+    add    rcx,0x8                             #+|  rcx = fs:[r8+rdi*1+0x8]
+    mov    rsi,QWORD PTR fs:[r8+0x2d8]         #+Calculate next signed_prev value
+    add    rsi,rax                             #+|
+    add    rdx,QWORD PTR fs:[r8+0x2e0]         #+|
+    imul   rdx,rsi                             #+|
+    mov    QWORD PTR [rcx],rdx                 #+Store signed_prev for next entry.
+    ret
+```
+The extra instructions specific to handling the checks are marked with `+`.
+As you can see the fast path is about twice the length of the fast path without protection, but only adds a single branch to the fast path, one multiplication, five additional loads, and one store.
+The loads only involve one additional cache line for key material.
+Overall, the cost is surprisingly low.
+
+Note: the free list header now contains the value that `prev` should contain, which leads to slightly worse x86 codegen.
+For instance the checks introduce `shl rdi,0x4`, which was previously fused with an `lea` instruction without the checks.
+
+## Conclusion
+
+This approach provides a strong defense against corruption of the free lists used in snmalloc.
+This means all inline meta-data has corruption detection.
+The check is remarkably simple for building double free detection, and has far lower memory overhead compared to using an allocation bitmap.
+
+[Next we show how to randomise the layout of memory in snmalloc, and thus make it harder to guess relative address of a pair of allocations.](./Randomisation.md)
+
+---
+
+# Providing a guarded memcpy
+
+Source: https://github.com/microsoft/snmalloc/blob/main/docs/security/GuardedMemcpy.md
+
+# Providing a guarded memcpy
+
+Out of bounds errors are a serious problem for systems.
+We did some analysis of the Microsoft Security Response Center data to look at the out-of-bounds heap corruption, and found a common culprit: `memcpy`.
+Of the OOB writes that were categorised as leading to remote code execution (RCE), 1/3 of them had a block copy operation like memcpy as the initial source of corruption.
+This makes any mitigation to `memcpy` extremely high-value.
+
+Now, if a `memcpy` crosses a boundary of a `malloc` allocation, then we have a well-defined error in the semantics of the program.
+No sensible program should do this.
+So let's see how we detect this with snmalloc.
+
+
+## What is `memcpy`?
+
+So `memcpy(dst, src, len)` copies `len` bytes from `src` to `dst`.
+For this to be valid, we can check: 
+```C++
+  if (src is managed by snmalloc)
+    check(remaining_bytes(src) >= len);
+  if (dst is managed by snmalloc)
+    check(remaining_bytes(dst) >= len);
+```
+Now, the first `if` is checking for reading beyond the end of the object, and the second is checking for writing beyond the end of the destination object.
+By default, for release checks we only check the `dst` is big enough.
+
+
+##  How can we implement `remaining_bytes`?
+
+In the previous [page](./VariableSizedChunks.md), we discussed how we enable variable sized slabs.
+Let's consider how that representation enables us to quickly find the start/end of any object.
+
+All slab sizes are powers of two, and a given slab's lowest address will be naturally aligned for the slab's size.
+(For brevity, slabs are sometimes said to be "naturally aligned (at) powers of two".)
+That is if `x` is the start of a slab of size `2^n`, then `x % (2^n) == 0`.
+This means that a single mask can be used to find the offset into a slab.
+As the objects are layed out continguously, we can also get the offset in the object with a modulus operations, that is, `remaining_bytes(p)` is effectively:
+```C++
+    object_size - ((p % slab_size) % object_size)
+```
+
+Well, as anyone will tell you, division/modulus on a fast path is a non-starter.
+The first modulus is easy to deal with, we can replace `% slab_size` with a bit-wise mask.
+However, as `object_size` can be non-power-of-two values, we need to work a little harder.
+
+##  Reciprocal division to the rescue
+
+When you have a finite domain, you can lower divisions into a multiply and shift.
+By pre-calculating `c = (((2^n) - 1)/size) + 1`, the division `x / size` can instead be computed by
+```C++
+  (x * c) >> n
+```
+The choice of `n` has to be done carefully for the possible values of `x`, but with a large enough `n` we can make this work for all slab offsets and sizes.
+
+Now from division, we can calculate the modulus, by multiplying the result of the division
+by the size, and then subtracting the result from the original value:
+```C++
+  x - (((x * c) >> n) * size)
+```
+and thus `remaining_bytes(x)` is:
+```
+  (((x * c) >> n) * size) + size - x
+```
+
+There is a great article that explains this in more detail by [Daniel Lemire](https://lemire.me/blog/2019/02/20/more-fun-with-fast-remainders-when-the-divisor-is-a-constant/).
+
+Making sure you have everything correct is tricky, but thankfully computers are fast enough to check all possilities.
+In snmalloc, we have a test program that verifies, for all possible slab offsets and all object sizes, that our optimised result is equivalent to the original modulus.
+
+We build the set of constants per sizeclass using `constexpr`, which enables us to determine the end of an object in a handful of instructions.
+
+## Non-snmalloc memory.
+
+The `memcpy` function is not just called on memory that is received from `malloc`.
+This means we need our lookup to work on all memory, and in the case where it is not managed by `snmalloc` to assume it is correct.
+We ensure that the `0` value in the chunk map is interpreted as an object covering the whole of the address space.
+This works for compatibility.
+
+To achieve this nicely, we map 0 to a slab that covers the whole of address space, and consider there to be single object in this space.
+This works by setting the reciprocal constant to 0, and then the division term is always zero.
+
+There is a second complication: `memcpy` can be called before `snmalloc` has been initialised.
+So we need a check for this case.
+
+## Finished Assembly
+
+The finished assembly for checking the destination length in `memcpy` is:
+
+```asm
+<memcpy_guarded>:
+    mov    rax,QWORD PTR [rip+0xbfa]        # Load Chunk map base
+    test   rax,rax                          # Check if chunk map is initialised
+    je     DONE                             #  |
+    mov    rcx,rdi                          # Get chunk map entry
+    shr    rcx,0xa                          #  |
+    and    rcx,0xfffffffffffffff0           #  |
+    mov    rax,QWORD PTR [rax+rcx*1+0x8]    # Load sizeclass
+    and    eax,0x7f                         #  |
+    shl    rax,0x5                          #  |
+    lea    r8,[sizeclass_meta_data]         #  |
+    mov    rcx,QWORD PTR [rax+r8*1]         # Load object size
+    mov    r9,QWORD PTR [rax+r8*1+0x8]      # Load slab mask
+    and    r9,rdi                           # Offset within slab
+    mov    rax,QWORD PTR [rax+r8*1+0x10]    # Load modulus constant
+    imul   rax,r9                           # Perform recripocal modulus
+    shr    rax,0x36                         #  |
+    imul   rax,rcx                          #  |
+    sub    rcx,r9                           # Find distance to end of object.
+    add    rcx,rax                          #  |
+    cmp    rax,rdx                          # Compare to length of memcpy.
+    jb     ERROR                            #  |
+DONE:
+    jmp    <memcpy>
+ERROR:
+    ud2                                     # Trap
+```
+
+## Performance
+
+We measured the overhead of adding checks to various sizes of `memcpy`s.
+We did a batch of 1000 `memcpy`s, and measured the time with and without checks.
+The benchmark code can be found here: [Benchmark Code](../../src/test/perf/memcpy/)
+
+![Performance graphs](./data/memcpy_perf.png)
+
+As you can see, the overhead for small copies can be significant (60% on a single byte `memcpy`), but the overhead rapidly drops and is mostly in the noise once you hit 128 bytes.
+
+When we actually apply this to more realistic examples, we can see a small overhead, which for many examples is not significant.
+We compared snmalloc (`libsnmallocshim.so`) to snmalloc with just the checks enabled for bounds of the destination of the `memcpy` (`libsnmallocshim-checks-memcpy-only`) on the applications contained in mimalloc-bench.
+The results of this comparison are in the following graph:
+
+![Performance Graphs](./data/perfgraph-memcpy-only.png)
+
+The worst regression is for `redis` with a 2-3% regression relative to snmalloc running without memcpy checks.
+However, given that we this benchmark runs 20% faster than jemalloc, we believe the feature is able to be switched on for production workloads.
+
+## Conclusion
+
+We have an efficient check we can add to any block memory operation to prevent corruption.
+The cost on small allocations will be higher due to the number of arithmetic instructions, but as the objects grow the overhead diminishes.
+The memory overhead for adding checks is almost zero as all the dynamic meta-data was already required by snmalloc to understand the memory layout, and the small cost for lookup tables in the binary is negligible.
+
+The idea can easily be applied to other block operations in libc, we have just done `memcpy` as a proof of concept.
+If the feature is tightly coupled with libc, then an initialisation check could also be removed improving the performance.
+
+[Next, we look at how to defend the internal structures of snmalloc against corruption due to memory safety violations.](./FreelistProtection.md)
+
+
+# Thanks
+
+The research behind this has involved a lot of discussions with a lot of people.
+We are particularly grateful to Andrew Paverd, Joe Bialek, Matt Miller, Mike Macelletti, Rohit Mothe, Saar Amar and Swamy Nagaraju for countless discussions on guarded memcpy, its possible implementations and applications.
+
+---
+
+# Randomisation
+
+Source: https://github.com/microsoft/snmalloc/blob/main/docs/security/Randomisation.md
+
+# Randomisation
+
+The relative allocation pattern of objects can also be used to increase the power of an exploit.
+This is a weak defence as spraying can defeat pretty much any randomisation, so this is just a case of doing enough to raise the bar.
+
+There are three things we randomise about the allocation pattern in snmalloc:
+
+* Initial order of allocations on a slab
+* Subsequent order of allocations on a slab
+* When we consume all allocations on a slab
+
+## Initial slab order
+
+We build the initial order of allocation using a classic algorithm for building a permutation of a set.
+When I started writing this code, I remembered my undergraduate lectures on creating a permutation using a Fisher–Yates shuffle.
+Unfortunately, I couldn't find my very old notes, so I had to use Wikipedia to refresh my knowledge.
+
+After reading Wikipedia I realised, I actually wanted Sattolo's algorithm for generating a cyclic permutation using the "inside-out" algorithm.
+This algorithm builds a cyclic permutation of a set, which is exactly what we need to build all possible free lists.
+Using the "inside-out" algorithm gives much better cache performance.
+
+The algorithm is:
+```C++
+  object[0].next = &(object[0]); // 1 element cycle
+  for (i = 1; i < n; i++)
+  {
+    auto j = random(0, i-1);     // Pick element in cycle
+    // Cyclic list insert of i after j
+    object[i].next = object[j].next;
+    object[j].next = &(object[i]);
+  }
+  auto end_index = random(0,n-1);      // Select last element of cycle.
+  auto start = object[end_index].next; // Find start
+  object[end_index].next = nullptr;    // Terminate list
+```
+When this completes you are guaranteed that `start` will be a list where next takes you through all the other elements.
+
+Now, to generate all possible free lists with equal probabilty `random` has to be a uniform distribution, but that is prohibitively expensive.
+Here we cut a corner and approximate the distribution for performance.
+
+Another complexity is that to build the protected free list from the previous blog post, we actually require a second pass over this list as we cannot build the back edges until we know the order of the list.
+
+## Preserving randomness
+
+We have an amazing amount of randomness within a slab, but that becomes predictable if we can't introduce more entropy as the system runs.
+To address this, we actually build pairs of free-queue for each slab.
+
+Each slab has two free-queues, when we deallocate an object we use a cheap coin flip to decide which queue to add the element to.
+When we want a new free-queue to start allocating from, we take the longer of the free-queues from the meta-data and use that in our thread local allocator.
+
+## Almost full slabs
+
+Now the two randomisations above make relative addresses hard to guess, but those alone do not prevent it being easy to predict when a slab will be full.
+We use two mechanisms to handle this
+
+* Only consider a slab for reuse when it has a certain percentage of free elements
+* If there is a single slab that can currently be used, use a random coin flip to decide whether we allocate a new slab instead of using the existing slab.
+
+These two mechanisms are aimed at making it hard to allocate an object that is with high probability adjacent to another allocated object.
+This is important for using the free-queue protection to catch various corruptions.
+
+
+## Improving protection
+
+Now the free-queue protection with randomisation will make exploits considerably harder, but it will not catch all corruptions.
+We have been working on adding support for both CHERI and memory tagging to snmalloc, which are more comprehensive defences to memory corruption.
+Our aim with the hardening of snmalloc has been to provide something that can be always on in production.
+
+[Now, we have explained the various hardening concepts, you are better placed to judge the performance we achieve.](./README.md)
+
+---
+
+# Hardening snmalloc
+
+Source: https://github.com/microsoft/snmalloc/blob/main/docs/security/README.md
+
+# Hardening snmalloc
+
+The key focus of the 0.6.0 release of snmalloc is security.
+This was inspired by a few different things coming together.
+
+First, we had been discussing with the Microsoft Security Response various research on allocator hardening.
+Saar Amar had been categorising exploits and what features an allocator should have.
+As part of this, we both realised the existing structures of snmalloc made certain things hard to harden, but more interesting we had some ideas for stuff that could advance the state of the art.
+
+Secondly, we had been experimenting with adding support to snmalloc for [CHERI](http://www.chericpu.org).
+This support illustrated many places where snmalloc (like most allocators) does pointer tricks that go against the grain of CHERI.
+There were refactorings that would make CHERI support much more natural, but those refactorings were quite involved.
+Fortunately, they were the very refactorings we needed for the other allocator hardening research we wanted to conduct.
+
+The core aim of our refactoring for 0.6.0 is to provide hardening that can be switched on all the time even in allocation heavy work loads.
+We have been super keen to keep fast paths fast, and not lose the awesome performance.
+Here we illustrate the performance using the application benchmarks from mimalloc-bench:
+
+![Performance graph](./data/perfgraph.png)
+
+The primary comparison point in the graphs is to show the introduced overheads of the checks by comparing `sn-0.6.0` with `sn-0.6.0-checks`.
+Here you can see the switching the hardening on leads to regressions under 5%. This is running on a 72-core VM in Azure with each run benchmark repeated 20 times.
+
+We have also included a few other allocators.
+Firstly, [jemalloc](https://github.com/jemalloc/jemalloc) v5.2.1 (labelled `je`) as a baseline for a world-class allocator, and two secure allocators [mimalloc](https://github.com/microsoft/mimalloc) v1.7.6 with its security features enabled (labelled mi-secure), and [SCUDO](https://www.llvm.org/docs/ScudoHardenedAllocator.html) (Commit hash bf0bcd5e, labelled `scudo`).
+The precise hardening features in these allocators is different to snmalloc, hence the performance is not directly comparable.
+We present them to show the hardenings snmalloc hit a lower performance penalty.
+
+To really understand the performance security trade-off, you need to understand the hardening features we have implemented. We have a series of short explanations to explain these mechanisms, and what protections we get:
+
+* [Enabling variable sized slabs](./VariableSizedChunks.md)
+* [Enabling guarded `memcpy`](./GuardedMemcpy.md)
+* [Protecting free lists from user corruption](./FreelistProtection.md)
+* [Randomisation of allocations](./Randomisation.md)
+
+To try out the hardening features of snmalloc on Elf platforms (e.g. Linux, BSD) you can simply [build](../BUILDING.md) and then preload with:
+```
+LD_PRELOAD=[snmalloc_build]/libsnmalloc-checks.so ./my_app
+```
+
+---
+
+# Supporting variable sized slabs
+
+Source: https://github.com/microsoft/snmalloc/blob/main/docs/security/VariableSizedChunks.md
+
+# Supporting variable sized slabs
+
+Before we explain the hardening features, we need to give a bit of background on how snmalloc is structured.
+In snmalloc, we have effectively two layers of allocation:
+
+1) an underlying allocator that returns power-of-two sized, naturally aligned blocks of memory, called chunks
+2) a slab allocator layered on top of the chunk allocator
+
+Large allocations are served directly by the chunk allocator and small allocations through slabs.
+
+## What is a slab?
+
+A slab is a naturally aligned, power-of-two sized chunk split into a series of allocations of exactly the same size.
+For instance, a 16KiB slab could be split into 341 48-byte allocations with 16 bytes that are unused at the end.
+
+## What size should a slab be?
+
+Finding a new slab is inherently going to be a slower path than just allocating an object.
+So we want a slab size that means all our common allocations can fit multiple times onto a slab.
+But making larger slabs means that we can potentially waste a lot of space for small allocations.
+
+In our redesign of snmalloc, we allow multiple slab sizes so that we can ensure a minimum number of allocations on a slab.
+The rest of the article will describe how we achieve this, while efficiently accessing the meta-data associated to a slab.
+
+## Finding meta-data quickly
+
+Allocators must map allocations to associated meta-data.
+There are two common approaches for locating this associated meta-data:
+
+* At some specified aligned position relative to a current pointer
+* In a global map
+
+Most allocators use some combination of both.
+In the original snmalloc design we had a concept of superslab, where the first part represented the meta-data for all the slabs contained in the superslab.
+A superslab was initially 16MiB, with the first 64KiB treated specially as it contained meta-data.
+There was then a global map to specify if memory was a superslab or not, that global map kept a byte per 16MiB of address space.
+
+This worked well for fixed sizes of slabs, but the granularity was hard coded.
+
+## Chunk map representation
+
+In snmalloc 0.6.0, we are using a two-level global map.
+The top-level entries each contain two pointers (with other fields and flags bit-packed into known-zero bits).
+For a region of memory being used as a slab, its top-level entry contains
+
+* sizeclass of memory in the chunk (it may be either part of a large allocation, or a slab of small allocations)
+* which allocator is responsible for this memory
+* a pointer to the associated second-level entry of the map.
+  A given second level entry may be pointed to by each of a contiguous span of one or more top-level entries.
+
+This representation allows multiple 16KiB chunks of memory to have the same meta-data.
+For instance:
+
+![ChunkMap](./data/ChunkMap.png)
+
+This illustrates how a 32KiB slab, a 64KiB slab, and a 16KiB slab would be represented.
+The first (yellow) has two contiguous entries in the chunk map, and the second (blue) has four contiguous entries in the chunk map, and the final (green) has a single entry in the chunk map.
+
+This representation means we can find the meta-data for any slab in a handful of instructions.
+(Unlike the original design, this does not need any branching on the particular size of the slab.)
+
+```C++
+  SlabMetadata* get_slab_metadata(address_t addr)
+  {
+    return chunk_map[addr >> CHUNK_BITS].meta;
+  }
+```
+
+By having a shared `SlabMetadata` across all the entries for the slab, we can have a single free list that covers the whole slab.
+This is quite important as it means our fast path for deallocation can handle deallocations for multiple slab sizes without branching, while having the granularity that particular size requires.
+
+The following annotated asm snippet covers the fast path for deallocation:
+```x86asm
+<free(void*)>:
+    mov    rax,rdi
+    mov    rcx,QWORD PTR [rip+0x99a6]        # TLS OFFSET for allocator
+    mov    rdx,QWORD PTR [rip+0x6df7]        # Chunk Map root
+    shr    rdi,0xa                           # Calculate chunk map entry
+    and    rdi,0xfffffffffffffff0            #  |
+    lea    rsi,[rdx+rdi*1]                   #  |
+    mov    rdx,QWORD PTR [rdx+rdi*1+0x8]     # Load owning allocator
+    mov    rdi,rdx                           #  |
+    and    rdi,0xffffffffffffff80            #  |
+    cmp    QWORD PTR fs:[rcx+0x1a0],rdi      # Check if allocator is current one
+    jne    REMOTE_DEALLOCATION               # Slow path remote deallocation
+    mov    rdx,QWORD PTR [rsi]               # Get SlabMetadata
+    mov    rdi,QWORD PTR [rdx+0x18]          # Add to free list
+    mov    QWORD PTR [rdi],rax               #  |
+    mov    QWORD PTR [rdx+0x18],rax          #  |
+    add    WORD PTR [rdx+0x28],0xffff        # Decrement count to slow path
+    je     SLOW_PATH                         # Check if more complex slab management is required.
+    ret
+```
+
+As you can see this representation gives a very compact code sequence for deallocation that handles multiple slab sizes.
+It also means the majority of meta-data can be stored away from the memory space it is describing.
+[Next, we discuss how we can capitalise on this meta-data representation to provide an efficient checked memcpy.](./GuardedMemcpy.md)
+
+---
+
+# StrictProvenance Architectures
+
+Source: https://github.com/microsoft/snmalloc/blob/main/docs/StrictProvenance.md
+
+# StrictProvenance Architectures
+
+## What is Strict Provenance?
+
+Some architectures, such as CHERI (including Arm's Morello), explicitly consider pointer *provenance* and *bounds* in addition to their target *addresses*.
+Adding these considerations to the architecture enables software to constrain uses of *particular pointers* in ways that are not available with traditional protection mechanisms.
+For example, while code may *have* a pointer that spans its entire C stack, it may construct a pointer that authorizes access only to a particular stack allocation (e.g., a buffer) and use this latter pointer while copying data.
+Even if an attacker is able to control the length of the copy, the bounds imposed upon pointers involved can ensure that an overflow is impossible.
+(On the other hand, if the attacker can influence both the *bounds* and the copy length, an overflow may still be possible; in practice, however, the two concerns are often sufficiently separated.)
+For `malloc()` in particular, it is enormously beneficial to be able to impose bounds on returned pointers: it becomes impossible for allocator clients to use a pointer from `malloc()` to access adjacent allocations!
+(*Temporal* concerns still apply, in that live allocations can overlap prior, now-dead allocations.
+Stochastic defenses are employed within `snmalloc` and deterministic defenses are ongoing research at MSR.)
+
+Borrowing terminology from CHERI, we speak of the **authority** (to a subset of the address space) held by a pointer and will justify actions in terms of this authority.[^mmu-perms]
+While many kinds of authority can be envisioned, herein we will mean either
+
+* *spatial* authority to read/write/execute within a single *interval* within the address space, or
+* *vmem* authority to request modification of the virtual page mappings for a given range of addresses.
+
+We may **bound** the authority of a pointer, deriving a new pointer with a subset of its progenitor's authority; this is assumed to be an ambient action requiring no additional authority.
+Dually, given two pointers, one with a subset of the other's authority, we may **amplify** the less-authorized, constructing a pointer with the same address but with increased authority (up to the held superset authority).[^amplifier-state]
+
+## snmalloc Support For Strict Provenance
+
+### Static Annotations With CapPtr
+
+To aid code auditing, `snmalloc` makes heavy use of a `CapPtr<T, B>` wrapper type around `T*` values.
+You can think of the annotation `B` on a `CapPtr<T, B>` as capturing something about the role of the pointer, e.g.:
+
+* A pointer to a whole chunk or slab, derived from an internal `void*`.
+* A pointer to a particular allocation, destined for the user program
+* A putative pointer returned from the user program
+
+You can also view the annotation `B` as characterising the set of operations that are supported on this pointer, such as
+
+* nothing (because we haven't checked that it's actually a valid pointer)
+* memory access within a certain range (e.g, a chunk or an allocation)
+* requesting manipulation of the virtual memory mappings
+
+Most architectures and platforms cannot enforce these restrictions outside of static constraints, but CHERI enables software to constrain its future use of particular pointers and `snmalloc` imposes strong constraints on its *client(s)* use of memory it manages.
+The remainder of this document...
+
+* gives a "quick start" guide,
+* provides a summary of the constraints imposed on clients,
+* describes the `StrictProvenance` `capptr_*` functions provided by `ds/ptrwrap.h`, the Architecture Abstraction Layer (AAL), and the Platform Abstraction Layer (PAL).
+
+### Limitations
+
+The `CapPtr<T, B>` and `capptr_*` primitives and derived functions are intended to guide developers in useful directions; they are not security mechanisms in and of themselves.
+For non-CHERI architectures, the whole edifice crumbles in the face of an overzealous `reinterpret_cast<>` or `unsafe_*ptr` call.
+On CHERI, these are likely to elicit capability violations, but may not if all subsequent access happen to be within the architecturally-enforced bounds.
+
+## Quick Start Guide
+
+### What will I see?
+
+In practice, `CapPtr<T, B>` and the details of `B` overtly show themselves only in primitive operations or when polymorphism across `B` is required.
+(Or, sadly, when looking at compilation errors or demangled names in a debugger.)
+All the concrete forms we have found useful have layers of aliasing to keep the verbosity down: `capptr::B<T>` is a `CapPtr<T, capptr::bounds::B>` with `capptr::bounds::B` itself an alias for a `capptr::bound<...>` type-level object.
+This trend of aliasing continues into higher-level abstractions, such as the freelist, wherein one finds, for example, `freelist::HeadPtr`, which expands to a type involving several `CapPtr`s and associated annotations.
+
+### How do I safely get an ordinary pointer to reveal to the client?
+
+Almost all memory manipulated by `snmalloc` frontends comes via the backend's `alloc_chunk` method.
+The returned a `capptr::Chunk<void>`; this pointer is spatially bounded to the returned region (which is at least as big as requested).
+This pointer is, however, not restricted in its ability to manipulate the address space within its bounds; this permits the frontend to call `mmap` and `madvise` on pages therein.
+
+To derive a pointer that is suitable for client use, we must
+
+* further spatially refine the pointer: adjust its offset with `pointer_offset` and use `capptr_bound<T, capptr::bounds::AllocFull>` and
+* shed address space control: use `PAL::capptr_to_user_address_control()` to convert `AllocFull` to `Alloc`.
+
+If no additional spatial refinement is required, because the entire chunk is intended for client use,
+
+* shed address space control: use `PAL::capptr_to_user_address_control()` to obtain a `ChunkUser`-bounded pointer, then
+* use `capptr_chunk_is_alloc` to capture intent, converting `ChunkUser` to `Alloc` without architectural consequence.
+
+At this point, we hold a `capptr::Alloc<T>`; use `capptr_reveal()` to obtain the underlying `T*`.
+
+### How do I safely ingest an ordinary pointer from the client?
+
+First, we must admit that, for all its majesty, `CapPtr`'s coverage is merely an impediment to, rather than a complete defense against, malicious client behavior even on CHERI-enabled architectures.
+Further protection is an open research project at MSR.
+
+Nevertheless, if adding a new kind of deallocation, we suggest following the existing flows when given a `void* p_raw` from the client:
+
+* Begin by calling `p_wild = capptr_from_client(p_raw)` to annotate it as `AllocWild` and avoid using the raw form thereafter.
+
+* Check the `Wild` pointer for domestication with `p_tame = capptr_domesticate<Config>(state_ptr, p_wild)`; `p_tame` will be a `capptr::Alloc` and will alias `p_wild` or will be `nullptr`.
+  At this point, we have no more use for `p_wild`.
+
+* We may now probe the Pagemap; either `p_tame` is a pointer we have given out or `nullptr`, or this access may trap (especially on platforms where domestication is just a rubber stamp).
+  This will give us access to the associated `MetaEntry` and, in general, a (path to a) `Chunk`-bounded pointer to the entire backing region.
+
+* If desired, we can now validate other attributes of the provided capability, including its length, base, and permissions.
+  In fact, we can even go further and *reconstruct* the capability we would have given out for the indicated allocation, allowing for exact comparison.
+
+Eventually we would like to reliably detect references to free objects as part of these flows, especially as frees can change the type of metadata found at the head of a chunk.
+When that is possible, we will add guidance that only reads of non-pointer scalar types are to be performed until after such tests have confirmed the object's liveness.
+Until then, we have stochastic defenses (e.g., `encode` in `src/mem/freelist.h`) later on.
+
+### What happened to my cast operators?
+
+Because `CapPtr<T, B>` are not the kinds of pointers C++ expects to manipulate, `static_cast<>` and `reinterpret_cast<>` are not applicable.
+Instead, `CapPtr<T, B>` exposes `as_void()`, `template as_static<U>()`, and `template as_reinterpret<U>()` to perform `static_cast<void*>`, `static_cast<U*>`, and `reinterpret_cast<U*>` (respectively).
+Please use the first viable option from this list, reserving `reinterpret_cast` for more exciting circumstances.
+
+## Constraints Imposed Upon Allocations
+
+`snmalloc` ensures that returned pointers are bounded to no more than the slab entry used to back each allocation.
+That is, **no two live allocations will have overlapping bounds**.
+It may be useful, mostly for debugging, to more precisely bound returned pointers to the actual allocation size,[^bounds-precision] but this is not required for security.
+The pointers returned from `alloc()` will also be stripped of their *vmem* authority, if supported by the platform, ensuring that clients cannot manipulate the page mapping underlying `snmalloc`'s address space.
+
+`realloc()`-ation has several policies that may be sensible.
+As a holdover from snmalloc v1, we have a fairly simple policy: resizing in ways that do not change the backing allocation's `snmalloc` size class are left in place, while any change to the size class triggers an allocate-copy-deallocate sequence.
+Even if `realloc()` leaves the object in place, the returned pointer should have its authority bounded as if this were a new allocation (and so the result may be a subset of the input to `realloc()`).
+
+Because snmalloc v2 no longer benefits from being provided the size of an allocated object (in, for example, dealloc), we may wish to adopt policies that allow objects to shrink in place beyond the lower bound of their sizeclass.
+
+## Impact of Constraints On Deallocation
+
+Previous editions of `snmalloc` stored metadata at "superslab" boundaries in the address space and relied on address arithmetic to map from small allocations to their associated metadata.
+These operations relied on being able to take pointers out of bounds, and so posed challenges for `StrictProvenance` architectures.
+The current edition of `snmalloc` instead follows pointers (starting from TLS or global roots), using address arithmetic only to derive indicies into these metadata pointers.
+
+When the allocator client returns memory (or otherwise refers to an allocation), we will be careful to use the *lower bound* address, not the indicated address per se, for looking up the allocation.
+The indicated address may be out of bounds, while `StrictProvenance` architectures should ensure that bounds are monotonically non-increasing, and so either
+
+* the lower bound will always be within the original allocation.
+* the pointer provided by the user will have zero length.
+
+If we must detach an address from the pointer, as in deallocation, we will generally reject zero-length pointers, as if they were nullptr.
+
+At the moment, **we permit a pointer to any part of an object to deallocate that object**.
+`snmalloc`'s design ensures that we will not create a new, free "object" at an interior pointer but will, instead, always be able to find the beginning and end of the object in question.
+In the future we are likely to be more strict, requiring authority to *the entire object* or at least *its lowest-address pointer-sized word* to free it.
+
+## Object Lookup
+
+`snmalloc` extends the traditional allocator interface with the `template<Boundary> void* external_pointer(void*)` family of functions, which generate additional pointers to live allocations.
+To ensure that this function is not used as an amplification oracle, it must construct a return pointer with the same validity as its input even as it internally accesses metadata.
+We make `external_pointer` use `pointer_offset` on the user-provided pointer, ensuring that the result has no more authority than the client already held.
+
+# Adapting the Implementation
+
+## Design Overview
+
+For the majority of operations, no `StrictProvenance`-specific reasoning, beyond applying bounds, need be entertained.
+However, as regions of memory move out of (and back into) the allocator's client and fast free lists, care must be taken to recover (and preserve) the internal, *vmem*-authorizing pointers from the user's much more tightly bounded pointers.
+
+We store these internal pointers inside metadata, at different locations for each state:
+
+* For free chunks in the "large `Range`" `Pipe`, we expect the `Range` objects themselves to work with these pointers.
+  In practice, these ranges place these pointers in global state or the `Pagemap` `MetaEntry`s directly.
+
+* Once outside the "large `Range`" `Pipe`, chunks holding heap objects will have a `SlabMetadata` structure associated with them, and we can store these high-authority pointers therein.
+  (Specifically, the `StrictProvenanceBackendSlabMetadata` class adds an `arena` member to the `SlabMetadata` in use.)
+
+* Metadata chunks themselves, however, do not have `SlabMetadata` structures and are managed using a "small `Range`" `Pipe`.
+  These require special handling, considered below.
+
+Within each (data) slab, there is (at least) one free list of objects.
+We take the position that free list entries should be suitable for return, i.e., with authority bounded to their backing slab entry.
+(However, the *contents* of free memory may be dangerous to expose to the user and require clearing prior to handing out.)
+
+## Static Pointer Bound Taxonomy
+
+We introduce a multi-dimensional space of bounds.  The facets are `enum class`-es in `snmalloc::capptr::dimension`.
+
+* `Spatial` captures the intended spatial extent / role of the pointer: `Alloc`-ation, `Chunk`, or an entire `Arena`.
+
+* `AddressSpaceControl` captures whether the pointer conveys control of its address space.
+
+* `Wildness` captures whether the pointer has been checked to belong to this allocator.
+
+These `dimension`s are composited using a `capptr::bound<>` type that we use as `B` in `CapPtr<T, B>`.
+This is enforced (loosely) using the `IsBound` C++20 concept.
+
+The namespace `snmalloc::capptr::bounds` contains particular points in the space of `capptr::bound<>` types:
+
+* bounded to a large region of the address space with address space control, `Arena`;
+* bounded to at least `MIN_CHUNK_SIZE` bytes with address space control, `Chunk`;
+* bounded to at least `MIN_CHUNK_SIZE` bytes without address space control, `ChunkUser`;
+* bounded to a smaller region but with address space control, `AllocFull`;
+* bounded to a smaller region and without address space control, `Alloc`;
+* unverified but presumed to be to an `Alloc`-ation, `AllocWild`.
+
+## Primitive Architectural Operations
+
+Several new functions are introduced to AALs to capture primitives of the Architecture.
+
+* `CapPtr<T, Bout> capptr_bound(CapPtr<U, Bin> a, size_t sz)` spatially bounds the pointer `a` to have authority ranging only from its current target to its current target plus `sz` bytes (which must be within `a`'s authority).
+  No imprecision in authority is permitted.
+  The bounds annotations must obey `capptr_is_spatial_refinement`: the spatial dimension may change, but the others must be constant.
+
+Ultimately, all address space manipulated by `snmalloc` comes from its Platform's primitive allocator.
+An **arena** is a region returned by that provider.
+The "large `Range`" `Pipe` serves to carve up `Arena`s; `Arena` pointers become `Chunk`s in the `backend`'s `alloc_chunk`.
+`snmalloc`'s (new, as of `snmalloc2`) heap layouts ensure that metadata associated with any object are reachable through globals, meaning no explicit amplification is required.
+
+## Primitive Platform Operations
+
+* `CapPtr<void, Bout> capptr_to_user_address_control(CapPtr<T, Bin> f)` sheds authority over the address space from the `CapPtr`, on platforms where that is possible.
+On CheriBSD, specifically, this strips the `VMAP` software permission, ensuring that clients cannot have the kernel manipulate heap pages.
+The annotation `Bout` is *computed* as a function of `Bin`.
+In future architectures, this is increasingly likely to be a no-op.
+
+## Backend-Provided Operations
+
+* `CapPtr<T, Bout> capptr_domesticate(LocalState *, CapPtr<T, Bin> ptr)` allows the backend to test whether `ptr` is sensible, by some definition thereof.
+The annotation `Bout` is *computed* as a function of `Bin`.
+`Bin` is required to be `Wild`, and `Bout` is `Tame` but otherwise identical.
+
+## Constructed Operators
+
+* `capptr_from_client` wraps a `void *` as a `capptr::AllocWild<void>` to mark it as unverified.
+
+* `capptr_chunk_is_alloc` converts a `capptr::ChunkUser<T>` to a `capptr::Alloc<T>` without computational effect; it is intended to ease auditing.
+
+* `capptr_reveal` converts a `capptr::Alloc<void>` to a `void*`, annotating where we mean to return a pointer to the user.
+
+* `capptr_reveal_wild` converts a `capptr::AllocWild<void>` to a `void*`, annotating where we mean to return a *wild* pointer to the user (in `external_pointer`, e.g., where the result is just an offset of the user's pointer).
+
+## Metadata Bounds Handling
+
+We presently envision three policies for handling metadata:
+
+1. Metadata kept within `snmalloc` is always `Arena`-bounded; metadata handed to the user (the `Allocator`s themselves) are exactly bounded as `Alloc`.
+   Recycling internal metadata needs no amplification, and, as `Allocator`s are never deallocated, there is never a need to amplify an `Allocator*` back to a `Chunk`- or `Arena`-bounded pointer.
+
+2. All metadata is exactly bounded as `Alloc`.
+   Here, the "small `Range`" `Pipe` will require the ability to amplify back to `Chunk`- or `Arena`-bounded pointers when internal metadata is recycled.
+   We believe this is straightforwardly possible using a "provenance capturing `Range`" above the outermost `Range` in the small `Range` `Pipe`.
+
+3. No metadata is handed to the user; instead, opaque handles to `Allocator`s are given out.
+   (CHERI sealed capabilities are an excellent candidate for such handles, but are beyond the scope of this document.)
+   Here, it is no longer essential to bound any metadata pointers at all, though we may find it useful as a defence in depth.
+
+
+**At the time of this writing, policy 1 is in effect**; pointers to `Allocator`s are bounded only at the periphery of `snmalloc`.
+
+# Endnotes
+
+[^mmu-perms]: Pointer authority generally *intersects* with MMU-based authorization.
+For example, software using a pointer with both write and execute authority will still find that it cannot write to pages considered read-only by the MMU nor will it be able to execute non-executable pages.
+Generally speaking, `snmalloc` requires only read-write access to memory it manages and merely passes through other permissions, with the exception of *vmem*, which it removes from any pointer it returns.
+
+[^amplifier-state]: As we are largely following the fat pointer model and its evolution into CHERI capabilities, we achieve amplification through a *stateful*, *software* mechanism, rather than an architectural mechanism.
+Specifically, the amplification mechanism will retain a superset of any authority it may be asked to reconstruct.
+There have, in times past, been capability systems with architectural amplification (e.g., HYDRA's type-directed amplification), but we believe that future systems are unlikely to adopt this latter approach, necessitating the changes we propose below.
+
+[^bounds-precision]: `StrictProvenance` architectures have historically differed in the precision with which authority can be represented.
+Notably, it may not be possible to achieve byte-granular authority boundaries at every size scale.
+In the case of CHERI specifically, `snmalloc`'s size classes and its alignment policies are already much coarser than existing architectural requirements for representable authority on all existing implementations.
+
+---
+
+# security.md
+
+Source: https://github.com/microsoft/snmalloc/blob/main/security.md
+
+## Security
+
+Microsoft takes the security of our software products and services seriously, which includes all source code repositories managed through our GitHub organizations, which include [Microsoft](https://github.com/Microsoft), [Azure](https://github.com/Azure), [DotNet](https://github.com/dotnet), [AspNet](https://github.com/aspnet), [Xamarin](https://github.com/xamarin), and [our GitHub organizations](https://opensource.microsoft.com/).
+
+If you believe you have found a security vulnerability in any Microsoft-owned repository that meets Microsoft's [Microsoft's definition of a security vulnerability](https://docs.microsoft.com/en-us/previous-versions/tn-archive/cc751383(v=technet.10)), please report it to us as described below.
+
+## Reporting Security Issues
+
+**Please do not report security vulnerabilities through public GitHub issues.**
+
+Instead, please report them to the Microsoft Security Response Center (MSRC) at [https://msrc.microsoft.com/create-report](https://msrc.microsoft.com/create-report).
+
+If you prefer to submit without logging in, send email to [secure@microsoft.com](mailto:secure@microsoft.com).  If possible, encrypt your message with our PGP key; please download it from the the [Microsoft Security Response Center PGP Key page](https://www.microsoft.com/en-us/msrc/pgp-key-msrc).
+
+You should receive a response within 24 hours. If for some reason you do not, please follow up via email to ensure we received your original message. Additional information can be found at [microsoft.com/msrc](https://www.microsoft.com/msrc).
+
+Please include the requested information listed below (as much as you can provide) to help us better understand the nature and scope of the possible issue:
+
+  * Type of issue (e.g. buffer overflow, SQL injection, cross-site scripting, etc.)
+  * Full paths of source file(s) related to the manifestation of the issue
+  * The location of the affected source code (tag/branch/commit or direct URL)
+  * Any special configuration required to reproduce the issue
+  * Step-by-step instructions to reproduce the issue
+  * Proof-of-concept or exploit code (if possible)
+  * Impact of the issue, including how an attacker might exploit the issue
+
+This information will help us triage your report more quickly.
+
+If you are reporting for a bug bounty, more complete reports can contribute to a higher bounty award. Please visit our [Microsoft Bug Bounty Program](https://microsoft.com/msrc/bounty) page for more details about our active programs.
+
+## Preferred Languages
+
+We prefer all communications to be in English.
+
+## Policy
+
+Microsoft follows the principle of [Coordinated Vulnerability Disclosure](https://www.microsoft.com/en-us/msrc/cvd).
+
+---
