@@ -1,0 +1,807 @@
+# gormreuse
+
+Source: https://github.com/mpyw/gormreuse/blob/main/README.md
+
+# gormreuse
+
+
+> [!NOTE]
+> This project was written by AI (Claude Code).
+
+A Go linter that detects unsafe [`*gorm.DB`](https://pkg.go.dev/gorm.io/gorm#DB) instance reuse after chain methods.
+
+## Background
+
+[GORM](https://pkg.go.dev/gorm.io/gorm)'s Traditional API chain methods ([`Where`](https://pkg.go.dev/gorm.io/gorm#DB.Where), [`Order`](https://pkg.go.dev/gorm.io/gorm#DB.Order), etc.) modify internal state. Reusing the same [`*gorm.DB`](https://pkg.go.dev/gorm.io/gorm#DB) instance after chain methods can cause query conditions to accumulate unexpectedly.
+
+This issue is documented in [GORM's official guide on Method Chaining](https://gorm.io/docs/method_chaining.html#Reusability-and-Safety). While GORM's Generics API (v1.30.0+) provides a safer alternative, many production codebases still use the Traditional API and will continue to maintain it for years. This linter helps catch these bugs in real-world scenarios.
+
+```go
+q := db.Where("active = ?", true)
+q.Find(&users)  // SELECT * FROM users WHERE active = true
+q.Find(&admins) // Bug: Conditions accumulate unexpectedly
+```
+
+## Installation & Usage
+
+### Using [`go install`](https://pkg.go.dev/cmd/go#hdr-Compile_and_install_packages_and_dependencies)
+
+```bash
+go install github.com/mpyw/gormreuse/cmd/gormreuse@latest
+gormreuse ./...
+```
+
+### Using [`go vet`](https://pkg.go.dev/cmd/go#hdr-Report_likely_mistakes_in_packages)
+
+Since gormreuse has no custom flags, it can be run via `go vet`:
+
+```bash
+go install github.com/mpyw/gormreuse/cmd/gormreuse@latest
+go vet -vettool=$(which gormreuse) ./...
+```
+
+### Using [`go tool`](https://pkg.go.dev/cmd/go#hdr-Run_specified_go_tool) (Go 1.24+)
+
+```bash
+# Add to go.mod as a tool dependency
+go get -tool github.com/mpyw/gormreuse/cmd/gormreuse@latest
+
+# Run via go tool
+go tool gormreuse ./...
+```
+
+### Using [`go run`](https://pkg.go.dev/cmd/go#hdr-Compile_and_run_Go_program)
+
+```bash
+go run github.com/mpyw/gormreuse/cmd/gormreuse@latest ./...
+```
+
+> [!CAUTION]
+> To prevent supply chain attacks, pin to a specific version tag instead of `@latest` in CI/CD pipelines (e.g., `@v0.13.2`).
+
+## Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-test` | `true` | Analyze test files (`*_test.go`) — built-in driver flag |
+| `-fix` | `false` | Apply suggested fixes automatically — built-in driver flag |
+
+Generated files (containing `// Code generated ... DO NOT EDIT.`) are always excluded and cannot be opted in.
+
+### Examples
+
+```bash
+# Exclude test files from analysis
+gormreuse -test=false ./...
+
+# Apply automatic fixes
+gormreuse -fix ./...
+```
+
+## Automatic Fixes
+
+The `-fix` flag enables automatic repair of violations using two complementary strategies:
+
+### Strategy 1: Reassignment (Creating New Roots)
+
+Adds reassignment for non-finisher method calls, creating a new mutable root at each step:
+
+```go
+// Before
+q := db.Where("base")
+q.Where("a")           // VIOLATION: 1st branch (non-finisher)
+q.Where("b").Find(nil) // VIOLATION: 2nd branch (finisher)
+
+// After -fix
+q := db.Where("base")
+q = q.Where("a")       // ← Reassignment creates new root
+q.Where("b").Find(nil) // OK: first branch from new root
+```
+
+**When applied:**
+- Non-finisher methods (chain builders like `Where`, `Order`, `Limit`)
+- Result is not assigned to a variable
+- Expression used as a statement (not part of a larger expression)
+
+### Strategy 2: Session (Making Roots Immutable)
+
+Adds `.Session(&gorm.Session{})` to make branch roots immutable when reassignment alone isn't sufficient:
+
+```go
+// Before
+q := db.Where("base")
+q.Where("a").Find(nil) // First branch
+q.Where("b").Find(nil) // VIOLATION: second branch
+
+// After -fix
+q := db.Where("base").Session(&gorm.Session{})  // ← Immutable root
+q.Where("a").Find(nil) // OK: independent chain from immutable root
+q.Where("b").Find(nil) // OK: independent chain from immutable root
+```
+
+**When applied:**
+- A root still has 2+ branches after simulating Phase 1 reassignments
+- Special handling for Phi nodes (conditional branches): adds Session to each incoming edge
+
+### Combined Example
+
+Both strategies work together for complex cases:
+
+```go
+// Before
+q := db.Where("base")
+q.Where("a")           // non-finisher
+q.Where("b").Find(nil) // finisher
+q.Where("c")           // non-finisher
+q.Where("d").Find(nil) // finisher
+
+// After -fix (both strategies applied)
+q := db.Where("base")
+q = q.Where("a").Session(&gorm.Session{})  // Reassignment + Session
+q.Where("b").Find(nil)
+q = q.Where("c")                            // Reassignment
+q.Where("d").Find(nil)
+```
+
+> [!TIP]
+> The fix generator intelligently determines which strategy to apply. Run `gormreuse -fix ./...` to automatically repair all violations in your codebase.
+
+## Detection Model: Mutable Branching
+
+This linter detects when a **mutable [`*gorm.DB`](https://pkg.go.dev/gorm.io/gorm#DB) branches into multiple code paths**. The core concept:
+
+1. **Immutable-returning methods** ([`Session`](https://pkg.go.dev/gorm.io/gorm#DB.Session), [`WithContext`](https://pkg.go.dev/gorm.io/gorm#DB.WithContext), [`Debug`](https://pkg.go.dev/gorm.io/gorm#DB.Debug), etc.) return an **immutable** instance that can branch freely
+2. **All other methods** on a mutable instance create a **branch** that consumes the instance
+3. **Second branch** from the same mutable root is a **violation**
+
+### Method Classification
+
+> [!IMPORTANT]
+> This linter analyzes the **Traditional API** ([`*gorm.DB`](https://pkg.go.dev/gorm.io/gorm#DB)) only. The Generics API ([`gorm.G[T]`](https://pkg.go.dev/gorm.io/gorm#G), available since v1.30.0) returns different types ([`Interface[T]`](https://pkg.go.dev/gorm.io/gorm#Interface), [`ChainInterface[T]`](https://pkg.go.dev/gorm.io/gorm#ChainInterface)) and is automatically excluded from analysis.
+
+| Category                    | Methods                  | Description                    |
+| --------------------------- | ------------------------ | ------------------------------ |
+| Immutable-Returning Methods | [`Session`](https://pkg.go.dev/gorm.io/gorm#DB.Session), [`WithContext`](https://pkg.go.dev/gorm.io/gorm#DB.WithContext), [`Debug`](https://pkg.go.dev/gorm.io/gorm#DB.Debug), [`Open`](https://pkg.go.dev/gorm.io/gorm#Open), [`Begin`](https://pkg.go.dev/gorm.io/gorm#DB.Begin), [`Transaction`](https://pkg.go.dev/gorm.io/gorm#DB.Transaction) | Return new immutable instance |
+| All Other Methods           | [`Where`](https://pkg.go.dev/gorm.io/gorm#DB.Where), [`Find`](https://pkg.go.dev/gorm.io/gorm#DB.Find), [`Count`](https://pkg.go.dev/gorm.io/gorm#DB.Count), [`Order`](https://pkg.go.dev/gorm.io/gorm#DB.Order), etc. | Create a branch from receiver |
+
+### Automatic Pollution Sources
+
+The linter conservatively marks [`*gorm.DB`](https://pkg.go.dev/gorm.io/gorm#DB) as polluted in these scenarios:
+
+| Operation                | Description                                              |
+| ------------------------ | -------------------------------------------------------- |
+| Interface method call    | `repo.Query(db)` - Can't statically analyze              |
+| Channel send             | `ch <- db` - May be received and used elsewhere          |
+| Slice/Map storage        | `[]*gorm.DB{db}` - May be accessed elsewhere             |
+| Interface conversion     | `interface{}(db)` - May be extracted via type assertion  |
+| Non-pure function call   | `helper(db)` - Unless marked with `//gormreuse:pure`     |
+| Struct field access      | `h.db.Find(nil)` - Traces back to the stored value       |
+
+Note: Simple struct literal storage (`_ = &S{db: q}`) without actual field usage does NOT pollute.
+
+### Examples
+
+#### Safe: Branching from immutable
+
+```go
+// Session at end creates immutable - safe to branch multiple times
+q := db.Where("active = ?", true).Session(&gorm.Session{})
+q.Count(&count)  // OK - first branch from q
+q.Find(&users)   // OK - q is immutable, can branch freely
+
+// Each branch from immutable creates independent mutable chains
+q := db.Where("base").Session(&gorm.Session{})
+q.Where("a").Find(&users1)  // OK - branch 1 (independent chain)
+q.Where("b").Find(&users2)  // OK - branch 2 (independent chain)
+```
+
+#### Violation: Multiple branches from mutable
+
+```go
+// Second branch from mutable is a violation
+q := db.Where("active = ?", true)  // q is mutable
+q.Find(&users)   // first branch from q - OK
+q.Count(&count)  // VIOLATION: second branch from q
+
+// Even without "finisher" - any method creates a branch
+q := db.Where("x")
+q.Where("a")     // first branch from q - OK
+q.Where("b")     // VIOLATION: second branch from q
+
+// Session in middle doesn't help - result is still mutable
+q := db.Session(&gorm.Session{}).Where("x")  // q is mutable!
+q.Find(&users)   // first branch - OK
+q.Count(&count)  // VIOLATION: second branch
+
+// Using immutable-returning method on polluted value is also a violation
+q := db.Where("x")
+q.Find(&users)                       // first branch - OK
+q.Session(&gorm.Session{}).Count(&c) // VIOLATION: second branch from q
+```
+
+> [!IMPORTANT]
+> **Chaining without reassignment is a violation!** Each statement using the same variable creates a separate branch:
+> ```go
+> q := db.Where("base")
+> q.Where("a")           // first branch - OK
+> q.Where("b")           // VIOLATION: second branch
+> q.Find(&users)         // VIOLATION: third branch
+> ```
+> **Solution**: Reassign the result or use method chaining in a single expression:
+> ```go
+> // Option 1: Reassign each step
+> q := db.Where("base")
+> q = q.Where("a")
+> q = q.Where("b")
+> q.Find(&users)         // OK - first branch from final q
+>
+> // Option 2: Single chained expression
+> db.Where("base").Where("a").Where("b").Find(&users)  // OK - single chain
+> ```
+
+#### Safe: Variable reassignment
+
+Variable reassignment creates a **new mutable root**, so the variable can be used fresh:
+
+```go
+q := db.Where("x")
+q.Find(&users)        // first branch from original q - OK
+
+q = db.Where("y")     // reassignment creates NEW mutable root
+q.Find(&admins)       // first branch from new q - OK
+
+q = db.Where("z")     // another reassignment
+q.Count(&count)       // first branch from newest q - OK
+```
+
+This is safe because internally, the linter uses [SSA (Static Single Assignment)](https://pkg.go.dev/golang.org/x/tools/go/ssa) form where each assignment creates a distinct value. The new value has no relationship to the previous one.
+
+```go
+// Reassignment in loops is also safe
+for _, filter := range filters {
+    q := db.Where(filter)  // new mutable root each iteration
+    q.Find(&results)       // OK - first branch in this iteration
+}
+
+// Conditional reassignment
+q := db.Where("base")
+if condition {
+    q = db.Where("alt")    // reassignment on this path
+}
+q.Find(&users)             // OK - first branch from whichever root
+```
+
+## Directives
+
+- Directives can be combined with commas: `//gormreuse:pure,immutable-return`
+- Trailing comments use `//`: `//gormreuse:ignore // reason here`
+
+### `//gormreuse:ignore`
+
+Suppress warnings for a specific line:
+
+```go
+q := db.Where("active = ?", true)
+q.Find(&users)
+//gormreuse:ignore // intentional reuse for pagination
+q.Count(&count)  // Suppressed
+```
+
+Or suppress for an entire function:
+
+```go
+//gormreuse:ignore
+func legacyCode(db *gorm.DB) {
+    // All violations in this function are suppressed
+}
+```
+
+Or suppress for an entire file (place before package declaration):
+
+```go
+//gormreuse:ignore
+
+package mypackage
+
+// All violations in this file are suppressed
+```
+
+> [!WARNING]
+> Unused `//gormreuse:ignore` directives are reported as warnings for line-level and function-level ignores. This helps keep the codebase clean by identifying stale ignore comments. File-level ignores do not trigger unused warnings.
+
+### `//gormreuse:pure`
+
+Mark a function or closure as not polluting its [`*gorm.DB`](https://pkg.go.dev/gorm.io/gorm#DB) argument:
+
+```go
+//gormreuse:pure
+func withTenant(db *gorm.DB, tenantID int) *gorm.DB {
+    return db.Session(&gorm.Session{}).Where("tenant_id = ?", tenantID)
+}
+
+// Also works on closures (next-line or same-line pattern):
+//gormreuse:pure
+helper := func(q *gorm.DB) { _ = q }
+
+helper2 := func(q *gorm.DB) { //gormreuse:pure
+    _ = q
+}
+```
+
+> [!TIP]
+> All user-defined functions/methods that accept or return [`*gorm.DB`](https://pkg.go.dev/gorm.io/gorm#DB) are treated as polluting by default. You must add `//gormreuse:pure` to any helper function that safely wraps [`*gorm.DB`](https://pkg.go.dev/gorm.io/gorm#DB) without polluting it.
+
+> [!WARNING]
+> The linter validates that functions marked `//gormreuse:pure` actually satisfy the pure contract:
+>
+> ```go
+> //gormreuse:pure
+> func badPure(db *gorm.DB) {
+>     db.Where("x")  // ERROR: pure function pollutes *gorm.DB argument by calling Where
+> }
+> ```
+>
+> Valid pure functions must:
+> - NOT call polluting methods ([`Where`](https://pkg.go.dev/gorm.io/gorm#DB.Where), [`Find`](https://pkg.go.dev/gorm.io/gorm#DB.Find), etc.) directly on [`*gorm.DB`](https://pkg.go.dev/gorm.io/gorm#DB) **arguments**
+> - MAY call polluting methods on **immutable values** (e.g., `db.Session(&gorm.Session{}).Where(...)` is OK)
+>
+> **Note**: Pure functions MAY return mutable [`*gorm.DB`](https://pkg.go.dev/gorm.io/gorm#DB). Callers must treat the return value as potentially mutable:
+> ```go
+> q := withTenant(db, 1)  // q is mutable!
+> q.Find(&users)          // first branch - OK
+> q.Count(&count)         // VIOLATION - second branch from mutable q
+> ```
+
+### `//gormreuse:immutable-return`
+
+Mark a function as returning an **immutable** [`*gorm.DB`](https://pkg.go.dev/gorm.io/gorm#DB) (like builtin [`Session`](https://pkg.go.dev/gorm.io/gorm#DB.Session), [`WithContext`](https://pkg.go.dev/gorm.io/gorm#DB.WithContext)):
+
+```go
+//gormreuse:immutable-return
+func GetDB() *gorm.DB {
+    return globalDB.Session(&gorm.Session{})
+}
+
+func useIt() {
+    db := GetDB()
+    db.Where("x").Find(&users)
+    db.Where("y").Find(&admins) // OK - GetDB returns immutable
+}
+```
+
+> [!TIP]
+> Use this directive for DB connection helpers that return a fresh, immutable [`*gorm.DB`](https://pkg.go.dev/gorm.io/gorm#DB) instance. This allows callers to reuse the returned value freely without worrying about pollution.
+
+### `//gormreuse:pure,immutable-return`
+
+The recommended pattern for DB connection helpers - combines both guarantees:
+
+```go
+//gormreuse:pure,immutable-return
+func GetTenantDB(db *gorm.DB, tenantID int) *gorm.DB {
+    return db.Session(&gorm.Session{}).Where("tenant_id = ?", tenantID)
+}
+
+func useIt(db *gorm.DB) {
+    tenant1 := GetTenantDB(db, 1)
+    tenant2 := GetTenantDB(db, 2)
+    tenant1.Where("x").Find(&users)   // OK
+    tenant2.Where("y").Find(&admins)  // OK
+    tenant1.Count(&count)             // OK - immutable-return
+    db.Find(&all)                     // OK - pure (db not polluted)
+}
+```
+
+> [!WARNING]
+> Unused `//gormreuse:pure` and `//gormreuse:immutable-return` directives are reported as warnings. This helps identify misplaced or stale directives. For combined directives like `//gormreuse:pure,immutable-return`, if either part is used, no unused warning is reported.
+
+## Documentation
+
+- [CLAUDE.md](./CLAUDE.md) - AI assistant guidance for development
+
+## Development
+
+```bash
+# Run tests
+go test ./...
+
+# Build CLI
+go build -o bin/gormreuse ./cmd/gormreuse
+
+# Run linter on a project
+./bin/gormreuse ./...
+```
+
+## Related Tools
+
+- [goroutinectx](https://github.com/mpyw/goroutinectx) - Goroutine context propagation linter
+- [zerologlintctx](https://github.com/mpyw/zerologlintctx) - Zerolog context propagation linter
+- [ctxweaver](https://github.com/mpyw/ctxweaver) - Code generator for context-aware instrumentation
+
+## License
+
+MIT License
+
+---
+
+# CLAUDE.md
+
+Source: https://github.com/mpyw/gormreuse/blob/main/CLAUDE.md
+
+# CLAUDE.md
+
+This file provides guidance to Claude Code when working with code in this repository.
+
+## Project Overview
+
+**gormreuse** is a Go linter that detects unsafe [`*gorm.DB`](https://pkg.go.dev/gorm.io/gorm#DB) instance reuse after chain methods. It uses [SSA](https://pkg.go.dev/golang.org/x/tools/go/ssa) (Static Single Assignment) form to track `*gorm.DB` values through variable assignments and method chains.
+
+### Core Concept: Mutable Branching Problem
+
+**The fundamental problem this linter detects is when a mutable `*gorm.DB` branches into multiple code paths.**
+
+GORM's chain methods (like `Where`, `Order`, `Limit`) create **shallow clones** that share the internal `Statement` object. When multiple chains branch from the same mutable root, they interfere with each other:
+
+```go
+q := db.Where("x")           // q is mutable (derived from chain method)
+branch1 := q.Where("a")      // Branch 1: shares Statement with q
+branch2 := q.Where("b")      // Branch 2: PROBLEM! Also shares Statement
+// branch1 and branch2 interfere - conditions accumulate unexpectedly
+```
+
+**"Reused" means "second branch from the same mutable root"**. The linter warns when a mutable value is used to create multiple independent chains:
+
+```go
+q := db.Where("x")
+q.Where("a").Find(nil)       // First branch from q - OK
+q.Where("b")                 // Second branch - VIOLATION! (even without Find)
+```
+
+#### IIFE Chains Count as Single Branch
+
+When a mutable value is used inside an IIFE that returns the chain, and that chain is immediately consumed, it counts as **one branch**, not multiple:
+
+```go
+q := db.Where("x")
+_ = func() *gorm.DB {
+    return q.Where("y")
+}().Find(nil)                // First branch (entire IIFE chain) - OK
+q.Count(nil)                 // Second branch - VIOLATION!
+```
+
+The IIFE chain `q.Where("y")...Find(nil)` is a single chain from q. Only `q.Count(nil)` is a separate branch.
+
+**Solution**: Use `Session()` to create isolation before branching:
+
+```go
+q := db.Session(&gorm.Session{}).Where("x")  // q is immutable (Session creates isolation)
+branch1 := q.Where("a")                       // OK: creates new Statement
+branch2 := q.Where("b")                       // OK: creates new Statement
+```
+
+### Detection Model: Mutable Branching
+
+The linter detects when a mutable `*gorm.DB` branches into multiple code paths:
+
+1. **Immutable-returning methods** ([`Session`](https://pkg.go.dev/gorm.io/gorm#DB.Session), [`WithContext`](https://pkg.go.dev/gorm.io/gorm#DB.WithContext), [`Debug`](https://pkg.go.dev/gorm.io/gorm#DB.Debug), [`Open`](https://pkg.go.dev/gorm.io/gorm#Open), [`Begin`](https://pkg.go.dev/gorm.io/gorm#DB.Begin), [`Transaction`](https://pkg.go.dev/gorm.io/gorm#DB.Transaction)) return a new immutable instance
+2. **All other methods** on a mutable instance create a **branch** that consumes the instance
+3. **Second branch** from the same mutable root is a **violation**
+
+### Directives
+
+- `//gormreuse:ignore` - Suppress warnings for the next line or same line
+- `//gormreuse:pure` - Mark function/method/closure as not polluting its `*gorm.DB` argument
+- `//gormreuse:immutable-return` - Mark function/method/closure as returning immutable `*gorm.DB` (like Session/WithContext)
+
+Directives can be combined with commas: `//gormreuse:pure,immutable-return`
+
+Trailing comments use `//`: `//gormreuse:ignore // reason here`
+
+**Directive placement for closures:**
+
+```go
+// Next-line pattern (before closure):
+//gormreuse:pure
+helper := func(q *gorm.DB) { ... }
+
+// Same-line pattern (after opening brace):
+helper := func(q *gorm.DB) { //gormreuse:pure
+    ...
+}
+
+// Multi-assignment (all direct closures get the directive):
+//gormreuse:pure
+a, b := func(q *gorm.DB) { _ = q }, func(q *gorm.DB) { _ = q }
+```
+
+> **Important**: User-defined functions that accept `*gorm.DB` are treated as polluting **unless** the function returns `*gorm.DB` and the result is assigned (e.g., `q = helper(q)`). In that case, it's treated like a gorm method assignment. Use `//gormreuse:pure` to mark functions that don't pollute arguments even when result is discarded, and `//gormreuse:immutable-return` to mark functions whose return value can be safely reused (like DB connection helpers).
+
+> **Note**: Unused directives are reported as warnings:
+> - Unused `//gormreuse:ignore` - line/function-level ignores that suppress no violations
+> - Unused `//gormreuse:pure` - directives that don't match any function
+> - Unused `//gormreuse:immutable-return` - directives that don't match any function
+> - For combined directives (`//gormreuse:pure,immutable-return`), if either part is used, no unused warning is reported
+
+## Architecture
+
+```
+gormreuse/
+├── analyzer.go                 # Public analyzer definition (go/analysis entry point)
+├── analyzer_test.go            # Integration tests using analysistest
+├── cmd/gormreuse/main.go       # CLI entry point (singlechecker)
+│
+├── internal/                   # Internal implementation
+│   ├── analyzer.go             # SSA analysis orchestrator (RunSSA entry point)
+│   │
+│   ├── directive/              # Comment directive handling
+│   │   ├── directive.go        # Directive detection (hasDirective, IsIgnore/IsPure)
+│   │   ├── ignore.go           # //gormreuse:ignore - IgnoreMap, unused tracking
+│   │   └── pure.go             # //gormreuse:pure - PureFuncSet, function key matching
+│   │
+│   ├── ssa/                    # SSA-based analysis (modular subpackages)
+│   │   ├── analyzer.go         # Analyzer - orchestrates analysis phases
+│   │   │
+│   │   ├── tracer/             # Value tracing to find mutable roots
+│   │   │   └── root.go         # RootTracer - traces SSA values to mutable origins
+│   │   │
+│   │   ├── pollution/          # Pollution state tracking
+│   │   │   └── tracker.go      # Tracker - records uses, detects violations
+│   │   │
+│   │   ├── cfg/                # Control flow graph analysis
+│   │   │   └── analyzer.go     # Analyzer - loop detection, reachability
+│   │   │
+│   │   ├── handler/            # SSA instruction handlers
+│   │   │   └── call.go         # Handlers for Call, Go, Defer, Send, Store, etc.
+│   │   │
+│   │   └── purity/             # Pure function validation for //gormreuse:pure
+│   │       └── validator.go    # ValidateFunction - checks pure contracts
+│   │
+│   └── typeutil/               # Type utilities
+│       └── gorm.go             # IsGormDB, IsImmutableReturningBuiltin
+│
+├── testdata/src/               # Test fixtures
+│   ├── gormreuse/              # Analyzer test cases
+│   │   ├── basic.go            # Basic patterns
+│   │   ├── advanced.go         # Complex patterns
+│   │   ├── evil.go             # Edge cases with [LIMITATION] markers
+│   │   ├── ignore.go           # //gormreuse:ignore tests
+│   │   └── directive_validation.go  # Directive tests (pure, immutable-return)
+│   └── gorm.io/gorm/           # GORM stub for testing
+│
+└── testdata/
+    ├── cmd/gengolden/          # Golden file generator
+    └── e2e/                    # SQL behavior verification (separate module)
+```
+
+### Analysis Pipeline
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         analyzer.go (public)                            │
+│  Analyzer.Run() → buildssa → internal.RunSSA()                         │
+└─────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                      internal/analyzer.go                               │
+│  For each function:                                                     │
+│    1. Check ignores (directive.IgnoreMap)                              │
+│    2. Validate pure functions (purity.ValidateFunction)                │
+│    3. Detect violations (ssa.Analyzer)                                 │
+└─────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        ssa/analyzer.go                                  │
+│  Three-phase analysis:                                                  │
+│    PHASE 1: TRACKING    - Process instructions, record usages          │
+│    PHASE 2: DETECTION   - DetectViolations() via CFG reachability      │
+│    PHASE 3: COLLECTION  - Return violations list                       │
+└─────────────────────────────────────────────────────────────────────────┘
+                                    │
+                    ┌───────────────┼───────────────┐
+                    ▼               ▼               ▼
+              ┌──────────┐   ┌──────────┐   ┌──────────┐
+              │  tracer  │   │ pollution│   │   cfg    │
+              │ RootTracer│   │ Tracker  │   │ Analyzer │
+              └──────────┘   └──────────┘   └──────────┘
+                    │               │               │
+                    └───────────────┼───────────────┘
+                                    ▼
+                            ┌──────────────┐
+                            │   handler    │
+                            │  Dispatch()  │
+                            └──────────────┘
+```
+
+### Design Patterns
+
+1. **Composition over Inheritance**: `Analyzer` composes `RootTracer`, `cfg.Analyzer`, `pollution.Tracker`
+2. **Type Switch Dispatch**: `handler.Dispatch()` routes SSA instructions to handlers via type switch
+3. **Two-Phase Detection**: First collect all uses, then detect violations via CFG reachability
+4. **Separation of Concerns**:
+   - `tracer/`: WHERE is the mutable root? (value tracing)
+   - `pollution/`: WHAT uses exist and are they violations? (state tracking)
+   - `cfg/`: CAN use A reach use B? (control flow)
+   - `handler/`: HOW to process each instruction type? (dispatch)
+
+### Key Design Decisions
+
+1. **SSA-based analysis**: Uses `go/ssa` to track `*gorm.DB` values through method chains
+2. **Pollute model**: Tracks pollution state of mutable values (branching = pollution)
+3. **Branch detection**: Detects when mutable `*gorm.DB` is used in multiple code paths
+4. **Mutable root finding**: Traces back to find the origin of each chain
+5. **Conservative approach**: Prefer false positives over false negatives (reduces false-negatives)
+6. **IIFE return tracing**: Traces through immediately invoked function expressions to find mutable roots
+7. **Method value tracking**: Detects bound methods (e.g., `find := q.Find; find(nil)`) via `$bound` suffix in SSA
+
+### Pollution Sources (Safe Side)
+
+The linter marks `*gorm.DB` as polluted in these scenarios:
+
+- **Interface method calls**: Assumed to pollute (can't statically analyze)
+- **Channel send**: `ch <- db` marks db as polluted
+- **Slice/Array storage**: `[]*gorm.DB{db}` marks db as polluted
+- **Map storage**: `map[string]*gorm.DB{"k": db}` marks db as polluted
+- **Interface conversion**: `interface{}(db)` marks db as polluted (type assertion may extract)
+- **Function arguments**: Non-pure functions receiving `*gorm.DB` pollute if result is discarded (not assigned)
+- **Struct field access**: `h.field.Find(nil)` traces back to the original value stored in field
+
+Note: Simple struct literal storage (`_ = &S{db: q}`) without actual field usage does NOT pollute.
+The linter tracks actual usage through struct fields, not just storage.
+
+### SSA Tracking Strategy
+
+```
+Pollute Model:
+  Immutable: Created by Immutable-returning Methods - can be reused freely
+  Mutable:   Created by Chain Methods - gets polluted on first use (any branch)
+
+Branch Detection:
+  q := db.Where("x")
+  q.Where("a").Find(nil)  <- First branch from q - OK
+  q.Where("b")            <- Second branch from q - VIOLATION (even without Find)
+  q.Count(nil)            <- Third branch from q - VIOLATION
+
+Mutable Root Finding:
+  q := db.Where("x").Session(...)  <- q is immutable (Session at end)
+  q := db.Session(...).Where("x")  <- q is mutable (Chain after Session)
+
+IIFE Return Tracing (single chain):
+  q := db.Where("x")
+  _ = func() *gorm.DB {
+    return q.Where("y")
+  }().Find(nil)           <- First branch (IIFE chain = single branch) - OK
+  q.Count(nil)            <- Second branch - VIOLATION
+
+  IIFE that returns a chain and is immediately consumed = ONE branch.
+  Only subsequent uses of q from outside the IIFE are separate branches.
+
+Bound Method Tracking:
+  find := q.Find    <- MakeClosure with receiver q in Bindings[0]
+  find(nil)         <- SSA: Call with Value=*ssa.MakeClosure, Fn.Name()="Find$bound"
+                   <- Receiver extracted from Bindings[0] for pollution tracking
+
+Reassignment Behavior:
+  q := db.Where("x")   <- SSA: q_1 = call db.Where("x")
+  q.Find(nil)          <- First branch from q_1 - OK
+  q = db.Where("y")    <- SSA: q_2 = call db.Where("y") (NEW SSA value)
+  q.Find(nil)          <- First branch from q_2 - OK (no relation to q_1)
+
+  Each assignment creates a new SSA value, so reassignment = new mutable root.
+
+User-Defined Function Reassignment:
+  q := db.Where("x")
+  q = buildQuery(q, "y")   <- Result assigned: treated like gorm method assignment
+  q = buildQuery(q, "z")   <- Result assigned: new mutable root (NO false positive)
+  q.Find(nil)              <- First branch from latest q - OK
+
+  buildQuery(q, "w")       <- Result discarded: q is polluted
+  q.Find(nil)              <- VIOLATION (q was polluted by discarded call)
+
+  When user-defined function returns *gorm.DB and result is assigned,
+  it uses RecordAssignment (like gorm methods) instead of MarkPolluted.
+```
+
+## Development Commands
+
+```bash
+# Run tests
+go test ./...
+
+# Run tests with verbose output
+go test -v ./...
+
+# Build CLI
+go build -o bin/gormreuse ./cmd/gormreuse
+
+# Run linter on itself
+go vet -vettool=./bin/gormreuse ./...
+
+# Run E2E tests (SQL behavior verification)
+cd testdata/e2e && go test -v
+
+# Generate golden files for suggested fixes
+go run ./testdata/cmd/gengolden/main.go
+```
+
+## Testing Strategy
+
+- Use `analysistest` for all analyzer tests
+- Test fixtures use `// want` comments for expected diagnostics
+- Test structure:
+  - `===== SHOULD REPORT =====` - Cases that should trigger warnings
+  - `===== SHOULD NOT REPORT =====` - Negative cases
+
+### Testdata Organization
+
+```
+testdata/src/gormreuse/
+├── basic.go         # Basic reuse patterns, Session at end/middle
+├── advanced.go      # Derived variables, helper functions, conditional reuse
+├── evil.go          # Edge cases: closures, defer, goroutines, struct fields, loops
+└── ignore.go        # //gormreuse:ignore directive tests
+```
+
+### E2E Tests
+
+The `testdata/e2e/` directory contains tests that verify actual GORM SQL behavior using sqlmock. This is a separate Go module to avoid dependency conflicts. These tests document GORM's clone/pollution behavior.
+
+## Code Style
+
+- Follow standard Go conventions
+- Use `go/analysis` framework
+- Unexported types by default; only export what's needed
+
+## Refactoring Guidelines
+
+When refactoring code, follow these rules strictly:
+
+1. **Main code refactoring**: Tests must NEVER fail
+   - Run `go test ./...` after each change
+   - If tests fail, revert and try a different approach
+
+2. **Test code refactoring**: Coverage must NEVER drop
+   - Check coverage before: `go test -coverprofile=/tmp/before.out -coverpkg=./... .`
+   - Check coverage after: `go test -coverprofile=/tmp/after.out -coverpkg=./... .`
+   - Compare with `go tool cover -func=/tmp/before.out` vs `go tool cover -func=/tmp/after.out`
+
+## Known Limitations
+
+- **Closure assignment**: `f := func() { q = db.Where(...) }; f()` - cross-closure assignment not tracked
+- **Defer inside for loop**: `for range items { defer func() { q.Find(nil) }() }` - closure deferred multiple times not fully tracked
+- **Nested defer/goroutine**: `go func() { defer q.Find(nil) }()` - deep nested defer/goroutine chains not fully tracked
+- **IIFE/closure stored result**: When IIFE/closure result is stored (not directly chained), branch tracking differs from runtime order
+
+These are documented in `testdata/src/gormreuse/evil.go` with `[LIMITATION]` markers.
+
+### IIFE/Closure Stored Result Limitation
+
+When a closure result is stored (in a variable or struct field) rather than directly chained to a gorm method, branch tracking may differ from runtime behavior:
+
+```go
+// OK: IIFE result directly chained
+_ = func() *gorm.DB { return q.Where("y") }().Find(nil)  // ONE branch
+q.Count(nil)  // violation (second branch)
+
+// LIMITATION: IIFE result stored - both q and q2 are treated as branching from q
+q2 := func() *gorm.DB { return q.Where("y") }()  // First branch from q
+q2.Find(nil)  // violation (q2 traces back to q, which is already used)
+q.Count(nil)  // also violation
+
+// LIMITATION: Stored closure with interleaved use
+fn := func() *gorm.DB { return q.Where("y") }
+q2 := fn()
+q.Count(nil)  // Expected: violation. Actual: may not detect correctly
+q2.Find(nil)  // Expected: OK. Actual: may report as violation
+```
+
+**Root Cause**: SSA analysis processes closure bodies before closure call sites. The branch tracking order differs from runtime execution order.
+
+## Related Projects
+
+- [goroutinectx](https://github.com/mpyw/goroutinectx) - Goroutine context propagation linter
+- [zerologlintctx](https://github.com/mpyw/zerologlintctx) - Zerolog context propagation linter
+- [ctxweaver](https://github.com/mpyw/ctxweaver) - Code generator for context-aware instrumentation
+
+---

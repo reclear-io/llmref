@@ -1,0 +1,356 @@
+# gostage
+
+Source: https://github.com/davidroman0o/gostage/blob/main/README.md
+
+# gostage
+
+A workflow engine for Go with persistence, suspend/resume, child process spawning, and type-safe state.
+
+## What it does
+
+gostage runs multi-step workflows that can pause, survive crashes, and resume. A workflow that suspends waiting for a payment callback will pick up exactly where it left off — even after a process restart. State is persisted per-step, so a crash mid-workflow loses at most the current step's writes.
+
+```go
+gostage.Task("greet", func(ctx *gostage.Ctx) error {
+    name := gostage.GetOr[string](ctx, "name", "World")
+    return gostage.Set(ctx, "greeting", "Hello, "+name+"!")
+})
+
+wf, _ := gostage.NewWorkflow("hello").Step("greet").Commit()
+engine, _ := gostage.New()
+defer engine.Close()
+
+result, _ := engine.RunSync(ctx, wf, gostage.Params{"name": "Alice"})
+fmt.Println(result.Store["greeting"]) // Hello, Alice!
+```
+
+## Install
+
+```bash
+go get github.com/davidroman0O/gostage
+```
+
+Requires Go 1.24+. No CGo — cross-compiles cleanly.
+
+## Step kinds
+
+The builder supports 10 step kinds that compose freely:
+
+```go
+wf, _ := gostage.NewWorkflow("order").
+    Step("validate").                                             // single task
+    Stage("checks", gostage.Step("credit"), gostage.Step("fraud")).  // sequential group
+    Parallel(gostage.Step("reserve"), gostage.Step("charge")).    // concurrent fan-out
+    Branch(                                                      // conditional
+        gostage.WhenNamed("is-priority").Step("expedite"),
+        gostage.Default().Step("standard"),
+    ).
+    ForEach("items", gostage.Step("process"), gostage.WithConcurrency(4)). // collection iteration
+    MapNamed("summarize").                                       // inline transform
+    DoUntilNamed(gostage.Step("poll"), "is-ready").              // repeat until condition
+    Sub(otherWorkflow).                                          // nested workflow
+    Sleep(time.Hour).                                            // persistent timed delay
+    Step("notify").
+    Commit()
+```
+
+## Suspend and resume
+
+A task can suspend the workflow to wait for external input. The engine persists all state and resumes from the exact same step.
+
+```go
+gostage.Task("wait-for-payment", func(ctx *gostage.Ctx) error {
+    if gostage.IsResuming(ctx) {
+        txID := gostage.ResumeData[string](ctx, "transaction_id")
+        gostage.Set(ctx, "paid", true)
+        return nil
+    }
+    return gostage.Suspend(ctx, gostage.Params{"reason": "awaiting_payment"})
+})
+
+// Start — suspends at payment step
+result, _ := engine.RunSync(ctx, wf, gostage.Params{"order_id": "ORD-1"})
+// result.Status == Suspended
+
+// Later — webhook arrives, resume with payment data
+result, _ = engine.Resume(ctx, result.RunID, gostage.Params{"transaction_id": "TXN-42"})
+// result.Status == Completed
+```
+
+Resume rebuilds the workflow from the persisted definition — the caller doesn't pass the workflow object, eliminating version mismatch bugs.
+
+## Persistence
+
+SQLite is the default durable backend. State is flushed after each step and survives crashes.
+
+```go
+engine, _ := gostage.New(gostage.WithSQLite("app.db"))
+```
+
+Sleeping workflows wake automatically after restart:
+
+```go
+engine, _ := gostage.New(
+    gostage.WithSQLite("app.db"),
+    gostage.WithAutoRecover(),
+)
+```
+
+## Retry with backoff
+
+Tasks can retry with pluggable strategies. Built-in: fixed delay, exponential backoff, exponential with jitter.
+
+```go
+gostage.Task("call-api", handler,
+    gostage.WithRetry(5),
+    gostage.WithRetryStrategy(
+        gostage.ExponentialBackoffWithJitter(100*time.Millisecond, 30*time.Second),
+    ),
+)
+```
+
+## Child process spawning
+
+ForEach items can run in isolated child processes for crash isolation. The spawn subsystem is in a separate `spawn/` package — if you don't import it, the gRPC dependency is not pulled in.
+
+```go
+import "github.com/davidroman0O/gostage/spawn"
+
+engine, _ := gostage.New(
+    gostage.WithSQLite("app.db"),
+    spawn.WithSpawn(),
+)
+
+wf, _ := gostage.NewWorkflow("batch").
+    ForEach("items", gostage.Step("process"), gostage.WithSpawn()).
+    Commit()
+```
+
+## Middleware
+
+Four levels of middleware wrap execution at engine, step, task, and child process levels:
+
+```go
+engine, _ := gostage.New(
+    gostage.WithStepMiddleware(func(ctx context.Context, info gostage.StepInfo, runID gostage.RunID, next func() error) error {
+        start := time.Now()
+        err := next()
+        fmt.Printf("step %s took %s\n", info.Name, time.Since(start))
+        return err
+    }),
+)
+```
+
+Or use the Plugin interface to register at all levels at once.
+
+## Observability
+
+Event handlers receive lifecycle events that middleware cannot observe — run creation, status transitions, cancellation, deletion, and timer wake events:
+
+```go
+engine, _ := gostage.New(
+    gostage.WithEventHandler(myHandler), // implements gostage.EventHandler
+)
+```
+
+## Run garbage collection
+
+Terminal runs are purged automatically or on demand:
+
+```go
+engine, _ := gostage.New(
+    gostage.WithRunGC(24*time.Hour, 5*time.Minute), // purge runs older than 24h every 5m
+)
+
+// Or manually:
+purged, _ := engine.PurgeRuns(ctx, time.Hour) // purge runs older than 1h
+```
+
+## Engine isolation
+
+Each engine can have its own task registry for multi-tenant or testing scenarios:
+
+```go
+reg := gostage.NewRegistry()
+reg.RegisterTask("compute", myHandler)
+
+engine, _ := gostage.New(gostage.WithRegistry(reg))
+```
+
+## Bail (early exit)
+
+A task can bail to exit the workflow intentionally — it's not an error, it's a deliberate stop with a reason:
+
+```go
+gostage.Task("validate", func(ctx *gostage.Ctx) error {
+    if total <= 0 {
+        return gostage.Bail(ctx, "invalid order total")
+    }
+    return nil
+})
+
+// result.Status == Bailed
+// result.BailReason == "invalid order total"
+// result.Error == nil (bail is NOT an error)
+```
+
+## Dynamic mutations
+
+Steps can be inserted, disabled, or re-enabled at runtime:
+
+```go
+gostage.Task("step-a", func(ctx *gostage.Ctx) error {
+    gostage.InsertAfter(ctx, "bonus-step")  // add a step after the current one
+    gostage.DisableStep(ctx, "step-c")      // skip step-c
+    return nil
+})
+```
+
+Mutations survive suspend/resume — they're persisted and replayed.
+
+## IPC messaging
+
+Tasks can send typed messages to registered handlers — works in both parent and child processes:
+
+```go
+// Register a handler
+engine.OnMessage("progress", func(msgType string, payload map[string]any) {
+    fmt.Printf("progress: %v\n", payload)
+})
+
+// Inside a task
+gostage.Send(ctx, "progress", map[string]any{"pct": 50})
+```
+
+## Scoped message handlers
+
+IPC message handlers can be scoped to a specific run:
+
+```go
+engine.OnMessageForRun("progress", runID, func(msgType string, payload map[string]any) {
+    fmt.Printf("run %s: %v\n", runID, payload)
+})
+```
+
+## Async execution
+
+Start workflows without blocking, wait for results, or cancel:
+
+```go
+runID, _ := engine.Run(ctx, wf, params)           // returns immediately
+result, _ := engine.Wait(ctx, runID)               // blocks until done
+engine.Cancel(ctx, runID)                          // abort a running workflow
+run, _ := engine.GetRun(ctx, runID)                // non-blocking status check
+runs, _ := engine.ListRuns(ctx, gostage.RunFilter{Status: gostage.Running})
+engine.DeleteRun(ctx, runID)                       // remove from persistence
+```
+
+## Loops
+
+Repeat steps until or while a condition is met:
+
+```go
+// DoUntil: execute body, then check (do-until)
+wf.DoUntilNamed(gostage.Step("poll"), "is-ready")
+
+// DoWhile: check first, then execute (while-do)
+wf.DoWhileNamed(gostage.Step("fetch-page"), "has-more")
+```
+
+## Tags
+
+Organize tasks and steps with tags for querying and conditional execution:
+
+```go
+gostage.Task("charge", handler, gostage.WithTags("billing", "critical"))
+
+wf.Step("charge", gostage.WithStepTags("billing"))
+
+// Inside a task: find and disable all billing steps
+ids := gostage.FindStepsByTag(ctx, "billing")
+gostage.DisableByTag(ctx, "billing")
+```
+
+## Workflow serialization
+
+Workflows built with named variants can be serialized to JSON and rebuilt:
+
+```go
+def, _ := gostage.WorkflowToDefinition(wf)
+jsonBytes, _ := gostage.MarshalWorkflowDefinition(def)
+
+// Later — rebuild from JSON
+def2, _ := gostage.UnmarshalWorkflowDefinition(jsonBytes)
+rebuilt, _ := gostage.NewWorkflowFromDef(def2)
+```
+
+This is how persistence and child process transfer work internally.
+
+## Examples
+
+The `examples/` directory has 24 standalone programs organized by topic:
+
+**Getting started:**
+- [01-hello-world](examples/01-hello-world) — single task, state read/write
+- [02-multi-step](examples/02-multi-step) — sequential steps with state flow
+- [03-parallel](examples/03-parallel) — concurrent fan-out
+- [04-foreach](examples/04-foreach) — collection iteration with concurrency
+- [05-branching](examples/05-branching) — conditional execution with named conditions
+- [06-loops](examples/06-loops) — DoUntil and DoWhile repeat patterns
+
+**Durability:**
+- [07-suspend-resume](examples/07-suspend-resume) — full suspend/resume lifecycle
+- [08-sleep-recovery](examples/08-sleep-recovery) — crash recovery for sleeping workflows
+- [09-retry-backoff](examples/09-retry-backoff) — exponential backoff with jitter
+- [10-bail-early-exit](examples/10-bail-early-exit) — intentional early exit with reason
+- [11-async-run-wait-cancel](examples/11-async-run-wait-cancel) — non-blocking Run, Wait, and Cancel
+
+**Workflow control:**
+- [12-dynamic-mutations](examples/12-dynamic-mutations) — InsertAfter, DisableStep at runtime
+- [13-tags](examples/13-tags) — task tags, step tags, FindStepsByTag, DisableByTag
+- [14-serialization](examples/14-serialization) — workflow definition round-trip to JSON
+
+**Real-world patterns:**
+- [15-order-processing](examples/15-order-processing) — e-commerce workflow with payment callback
+- [16-etl-pipeline](examples/16-etl-pipeline) — parallel extract, named transform, load
+- [17-approval-workflow](examples/17-approval-workflow) — branching with dynamic step insertion
+- [18-deep-composition](examples/18-deep-composition) — ForEach + Sub + Branch + Parallel nested
+- [19-spawn-processes](examples/19-spawn-processes) — ForEach with child process spawning
+
+**Engine features:**
+- [20-middleware](examples/20-middleware) — custom step and task middleware
+- [21-events](examples/21-events) — lifecycle event monitoring
+- [22-custom-registry](examples/22-custom-registry) — engine isolation with separate registries
+- [23-run-gc](examples/23-run-gc) — automatic and manual run garbage collection
+- [24-ipc-messaging](examples/24-ipc-messaging) — Send/OnMessage and scoped handlers
+
+## Developer Guide
+
+The `guide/` directory has 12 in-depth guides organized by topic:
+
+- [01 — Getting Started](guide/01-quickstart.md) — install, first workflow, core concepts
+- [02 — Step Kinds](guide/02-step-kinds.md) — all 10 step kinds, composition rules, Named vs anonymous
+- [03 — State Management](guide/03-state.md) — Get/Set/GetOk, type fidelity, concurrency rules
+- [04 — Persistence](guide/04-persistence.md) — SQLite, flush semantics, custom backends
+- [05 — Suspend and Resume](guide/05-suspend-resume.md) — the full lifecycle, IsResuming pattern
+- [06 — Retry Strategies](guide/06-retry-strategies.md) — backoff, jitter, precedence rules
+- [07 — Child Process Spawning](guide/07-spawn.md) — gRPC model, orphan detection, depth limits
+- [08 — Middleware](guide/08-middleware.md) — 4 levels, Plugin interface, practical patterns
+- [09 — Events and Observability](guide/09-events-observability.md) — lifecycle events, IPC messaging
+- [10 — Registry Isolation](guide/10-registry-isolation.md) — custom registries, multi-tenant
+- [11 — Workflow Serialization](guide/11-serialization.md) — definition round-trip, persistence internals
+- [12 — Production Configuration](guide/12-production.md) — GC, recovery, timeouts, cache, pool sizing
+
+## Testing
+
+```bash
+go test ./... -race        # 266 tests, race detector
+go test -run TestE2E_ -v   # end-to-end workflow patterns
+go test -run TestStress_ -v # adversarial stress tests
+```
+
+## License
+
+MIT
+
+---
