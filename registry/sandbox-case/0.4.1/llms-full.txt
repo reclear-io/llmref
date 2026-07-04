@@ -1,0 +1,895 @@
+# Introduction
+
+Source: https://sandbox-case.hexdocs.pm/readme.md
+
+# SandboxCase
+
+Batteries-included test isolation for Elixir and Phoenix.
+
+## The problem
+
+Getting test isolation right in Elixir is surprisingly fiddly. Ecto has its SQL Sandbox, but everything else — caches, feature flags, mocks, GenServers — is shared global state that leaks between tests. The more your app uses these, the worse it gets:
+
+- **Caches** (Cachex, ConCache) retain data between tests. A test that writes to a cache poisons every test that runs after it.
+- **Feature flags** (FunWithFlags) are global. Enabling a flag in one test enables it everywhere.
+- **Mocks** (Mimic, Mox) need explicit `allow` or `$callers` wiring to reach spawned processes — LiveViews, GenServers, async tasks.
+- **Async tests** make all of this harder. Every process in the call chain needs to participate in the sandbox, or you get `DBConnection.OwnershipError` and mysterious "cannot find ownership process" crashes.
+
+The common workaround is giving up on `async: true` and running everything synchronously. This is safe but slow, and doesn't actually fix the cache/flag leakage — it just makes it less likely to bite you.
+
+A better default: **no shared state survives between tests**. Each test gets its own database transaction, its own cache instance, its own feature flag store, its own mock context. SandboxCase sets this up with one config and one line in test_helper.
+
+Crucially, each adapter isolates state in a way that's native to the library — Ecto gets a wrapped transaction, Cachex gets a real but isolated cache instance, FunWithFlags gets its own ETS table. Your tests still exercise the actual library code paths, so you catch real bugs in how your app uses the dependency. You can always fully mock a dependency (which itself benefits from the batteries-included approach) when that's what your test calls for — but when you don't, the default should be clean isolation, not leaked state.
+
+## How it works
+
+One config, one setup call, zero boilerplate. Built-in adapters for Ecto, Cachex, FunWithFlags, Mimic, Mox, and Redis — each activated only if the dep is loaded.
+
+All macros expand at compile time. Outside `MIX_ENV=test`, `sandbox_plugs` and `sandbox_on_mount` emit nothing, and `socket_with_sandbox` emits a plain `socket` call. No runtime checks, no dead branches, no production dependencies on test libraries.
+
+### How Cachex and FunWithFlags isolation works
+
+Ecto, Mimic, and Mox expose first-class hooks for redirecting state per
+process. Cachex and FunWithFlags do not, so each needs a different
+mechanism to give every (async) test its own isolated state.
+
+**FunWithFlags — a custom persistence adapter (no patching).** FunWithFlags
+lets you swap its persistence adapter, a documented extension point.
+sandbox_case ships `SandboxCase.Sandbox.FwfAdapter`, which routes flag
+operations to an isolated per-test ETS table when a `:fwf_sandbox` marker
+is present in the process dictionary (or reachable via `$callers`), and
+delegates to your real adapter otherwise. Wire it up in your test config:
+
+```elixir
+# config/test.exs
+config :fun_with_flags, :persistence,
+  adapter: SandboxCase.Sandbox.FwfAdapter,
+  sandbox_real_adapter: FunWithFlags.Store.Persistent.Ecto,
+  repo: MyApp.Repo
+
+config :fun_with_flags, :cache, enabled: false
+```
+
+The cache must be disabled: FunWithFlags keeps a single global ETS
+read-cache in front of the store, which would otherwise serve one test's
+flag to another. `setup/1` validates this wiring and raises with guidance
+if anything is missing, rather than letting isolation silently leak.
+
+**Cachex — a runtime bytecode patch.** Cachex has no equivalent extension
+point, so to isolate it *without forking* sandbox_case patches it at
+runtime (in `MIX_ENV=test` only): it reads `Cachex.Services.Overseer`'s
+compiled `:abstract_code`, rewrites the name-resolution path, and replaces
+the module via `Module.create` so a `:cachex_sandbox` marker redirects to
+an isolated cache.
+
+> ⚠️ **Version coupling (Cachex only).** Because this rewrites Cachex's
+> internals, it's tied to the implementation shape of specific versions —
+> written and tested against **Cachex `4.1.x`** (`Overseer.retrieve/1`).
+> The patcher **probes the shape before patching** and, on a mismatch,
+> **skips with a warning** rather than crashing — so the failure mode is
+> *lost isolation with a warning*, not a hard error. Watch test logs for
+> `SandboxCase: ... doesn't match expected shape` after a Cachex upgrade.
+> (Cachex `main` has already renamed `Overseer.retrieve/1` → `lookup/1`,
+> so the next Cachex release is expected to trip this.)
+>
+> The long-term fix is a supported upstream hook — see
+> [whitfin/cachex#436](https://github.com/whitfin/cachex/pull/436), a
+> proposed per-process name resolver that would let `Cachex` be sandboxed
+> the same clean way FunWithFlags now is.
+
+## Installation
+
+```elixir
+{:sandbox_case, "~> 0.1"}
+```
+
+## Configuration
+
+```elixir
+# config/test.exs
+config :sandbox_case,
+  otp_app: :my_app,
+  mox_mocks: [MyApp.MockWeather],
+  sandbox: [
+    ecto: true,
+    cachex: [:my_cache],
+    fun_with_flags: true,
+    mimic: [MyApp.ExternalService, MyApp.Payments],
+    mox: [{MyApp.MockWeather, MyApp.WeatherBehaviour}],
+    redis: [url: "redis://localhost:6379"]
+  ]
+```
+
+## Setup
+
+```elixir
+# test/test_helper.exs
+SandboxCase.Sandbox.setup()
+ExUnit.start()
+```
+
+## Endpoint and LiveView
+
+```elixir
+# lib/your_app_web/endpoint.ex
+import SandboxCase
+sandbox_plugs()
+
+socket_with_sandbox "/live", Phoenix.LiveView.Socket,
+  websocket: [connect_info: [session: @session_options]]
+```
+
+```elixir
+# lib/your_app_web.ex
+def live_view do
+  quote do
+    use Phoenix.LiveView
+    import SandboxCase
+    sandbox_on_mount()
+  end
+end
+```
+
+Outside test env, both macros emit nothing.
+
+## Test modules
+
+```elixir
+use SandboxCase.Sandbox.Case
+```
+
+Checks out all sandboxes in `setup`, checks them back in via `on_exit`. Ecto metadata for browser sessions:
+
+```elixir
+SandboxCase.Sandbox.ecto_metadata(context.sandbox_tokens)
+```
+
+## GenServers and sandbox access
+
+Ecto sandbox, Mimic stubs, and Mox mocks are resolved via `$callers` — a process dictionary key that Elixir's `Task` module sets automatically. `GenServer.start_link` does **not** set it, so a GenServer started from a LiveView or test won't see sandboxed state by default.
+
+The fix: pass `$callers` explicitly when starting the GenServer.
+
+```elixir
+defmodule MyApp.PriceServer do
+  use GenServer
+
+  def start_supervised(opts \\ []) do
+    callers = [self() | Process.get(:"$callers", [])]
+    GenServer.start_link(__MODULE__, Keyword.put(opts, :callers, callers))
+  end
+
+  @impl true
+  def init(opts) do
+    if callers = opts[:callers], do: Process.put(:"$callers", callers)
+    {:ok, %{}}
+  end
+
+  @impl true
+  def handle_call(:fetch_price, _from, state) do
+    # This works in tests — Mimic finds the test process via $callers,
+    # and Ecto finds the sandbox connection the same way.
+    price = MyApp.PriceService.fetch_price()
+    {:reply, price, state}
+  end
+end
+```
+
+This pattern works for any process you spawn that needs access to the test sandbox: GenServers, Agents, custom processes via `spawn_link`, etc. `Task.start_link` and `Task.async` handle this automatically.
+
+## Custom adapters
+
+Implement `SandboxCase.Sandbox.Adapter` to add isolation for any shared state.
+
+```elixir
+defmodule MyApp.RedisSandbox do
+  @behaviour SandboxCase.Sandbox.Adapter
+
+  # Is the dep available? Return false to skip this adapter entirely.
+  @impl true
+  def available?, do: Code.ensure_loaded?(Redix)
+
+  # One-time setup — called from test_helper.exs via SandboxCase.Sandbox.setup().
+  # Use this to start pools, create isolation resources, etc.
+  @impl true
+  def setup(config) do
+    pool_size = config[:pool_size] || 4
+    # ... start a pool of Redis connections
+    :ok
+  end
+
+  # Per-test checkout — called in each test's setup.
+  # Return an opaque token that will be passed to checkin/1.
+  @impl true
+  def checkout(_config) do
+    # ... claim an isolated Redis DB, flush it
+    %{db: db_number}
+  end
+
+  # Per-test checkin — called in on_exit.
+  @impl true
+  def checkin(nil), do: :ok
+  def checkin(%{db: db}) do
+    # ... release the Redis DB back to the pool
+    :ok
+  end
+
+  # Optional: plug modules to register in the endpoint.
+  # Omit this callback if your adapter doesn't need a plug.
+  @impl true
+  def plugs, do: []
+
+  # Optional: on_mount modules to register in LiveViews.
+  # Omit this callback if your adapter doesn't need a hook.
+  @impl true
+  def hooks, do: []
+end
+```
+
+Register it in config:
+
+```elixir
+config :sandbox_case,
+  sandbox: [
+    ecto: true,
+    {MyApp.RedisSandbox, pool_size: 4}
+  ]
+```
+
+The adapter lifecycle:
+
+1. `available?/0` — checked at compile time (for plugs/hooks) and runtime (for setup/checkout). Return `false` to skip.
+2. `setup/1` — called once from `SandboxCase.Sandbox.setup()` in test_helper.
+3. `checkout/1` — called per test. Returns a token.
+4. `checkin/1` — called in `on_exit` with the token from checkout.
+5. `plugs/0` — (optional) modules emitted by `sandbox_plugs()`.
+6. `hooks/0` — (optional) modules emitted by `sandbox_on_mount()`.
+
+## License
+
+MIT
+
+---
+
+# SandboxCase
+
+Source: https://sandbox-case.hexdocs.pm/SandboxCase.md
+
+# `SandboxCase`
+[🔗](https://github.com/pinetops/sandbox_case/blob/v0.4.1/lib/sandbox_case.ex#L1)
+
+Batteries-included test isolation for Elixir and Phoenix.
+
+Use `SandboxShim` for compile-time macros (endpoint/LiveView wiring).
+Use `SandboxCase.Sandbox` for runtime setup/checkout/checkin.
+
+## Quick start
+
+    # mix.exs
+    {:sandbox_shim, "~> 0.1"},                   # all envs
+    {:sandbox_case, "~> 0.3", only: :test},      # test only
+
+    # test/test_helper.exs
+    SandboxCase.Sandbox.setup()
+
+    # test modules
+    use SandboxCase.Sandbox.Case
+
+---
+
+*Consult [api-reference.md](api-reference.md) for complete listing*
+
+---
+
+# SandboxCase.Sandbox
+
+Source: https://sandbox-case.hexdocs.pm/SandboxCase.Sandbox.md
+
+# `SandboxCase.Sandbox`
+[🔗](https://github.com/pinetops/sandbox_case/blob/v0.4.1/lib/sandbox_case/sandbox.ex#L1)
+
+Orchestrates test sandbox setup and per-test checkout/checkin.
+
+## Setup
+
+Call once in `test/test_helper.exs`:
+
+    SandboxCase.Sandbox.setup()
+
+This reads config and runs each adapter's `setup/1`.
+
+## Configuration
+
+    # config/test.exs
+    config :sandbox_case,
+      otp_app: :my_app,
+      sandbox: [
+        ecto: true,                              # auto-discovers repos from otp_app
+        cachex: [:my_cache],                     # cache names to sandbox
+        fun_with_flags: true,                    # enable FWF sandbox pool
+        mimic: [MyApp.External, MyApp.Payments], # modules to Mimic.copy
+        mox: [{MyApp.MockWeather, MyApp.WeatherBehaviour}],
+        redis: [url: "redis://localhost:6379"]
+      ]
+
+Each key maps to a built-in adapter. You can also pass custom adapters:
+
+    config :sandbox_case,
+      sandbox: [
+        {MyApp.CustomSandbox, [some: :config]}
+      ]
+
+## Per-test checkout
+
+Use the case template:
+
+    use SandboxCase.Sandbox.Case
+
+Or call manually:
+
+    tokens = SandboxCase.Sandbox.checkout()
+    on_exit(fn -> SandboxCase.Sandbox.checkin(tokens) end)
+
+# `await_orphans`
+
+Wait for orphaned processes to finish naturally (up to timeout).
+Does NOT kill survivors — call `kill_orphans/1` separately.
+
+Returns a list of pids that did NOT exit within the timeout.
+
+The timeout can be configured per-test via:
+
+    Process.put(:sandbox_case_orphan_timeout, 15_000)
+
+Or set in your test module setup:
+
+    setup do
+      Process.put(:sandbox_case_orphan_timeout, 15_000)
+      :ok
+    end
+
+# `build_conn`
+
+Build a `Plug.Conn` with sandbox metadata encoded in the user-agent.
+
+Use this instead of `Phoenix.ConnTest.build_conn()` when your endpoint
+has `server: true` — the metadata allows the Plug to propagate sandbox
+state (Ecto, Mimic, Mox, Cachex, FunWithFlags, Logger) to the Bandit
+handler process.
+
+With `server: false`, `Phoenix.ConnTest.build_conn()` works fine since
+requests are dispatched inline in the test process.
+
+# `checkin`
+
+Per-test checkin. Order matters:
+1. Run cleanup callbacks (e.g. close browser sessions)
+2. Wait for orphans to finish naturally
+3. Rollback Ecto sandbox
+4. Kill any remaining orphans
+5. Check unconsumed logs + checkin remaining adapters
+
+# `checkout`
+
+Per-test checkout. Returns a map with `:owner` (the test pid) and
+`:tokens` (a list of `{adapter, token}` tuples).
+Pass the whole map to `checkin/1` in `on_exit`.
+
+# `collect_hooks`
+
+Collects all on_mount modules declared by available adapters.
+Used by the `sandbox_on_mount/0` macro at compile time.
+
+# `collect_plugs`
+
+Collects all plug modules declared by available adapters.
+Used by the `sandbox_plugs/0` macro at compile time.
+
+# `ecto_metadata`
+
+Returns the Ecto metadata from the most recent checkout, if any.
+Useful for passing to browser session start.
+
+# `kill_orphans`
+
+Find and kill orphaned processes immediately (no waiting).
+
+# `mark_cleanup_started`
+
+Mark that cleanup has started. Call before closing browser sessions
+or other teardown that may trigger OwnershipErrors. Errors logged
+after this point are swallowed at checkin.
+
+# `on_cleanup`
+
+Register a cleanup callback to run during checkin, before sandbox
+rollback. Use for teardown that triggers processes needing DB access
+(e.g. closing browser sessions that kill LiveViews mid-transaction).
+
+    SandboxCase.Sandbox.on_cleanup(sandbox, fn ->
+      Wallabidi.end_session(session)
+    end)
+
+Callbacks run in registration order, before await_orphans.
+OwnershipErrors logged during callbacks are swallowed.
+
+# `setup`
+
+One-time setup. Call from test_helper.exs.
+
+# `setup?`
+
+Returns true if `setup/1` has been called.
+
+---
+
+*Consult [api-reference.md](api-reference.md) for complete listing*
+
+---
+
+# SandboxCase.Sandbox.Adapter
+
+Source: https://sandbox-case.hexdocs.pm/SandboxCase.Sandbox.Adapter.md
+
+# `SandboxCase.Sandbox.Adapter`
+[🔗](https://github.com/pinetops/sandbox_case/blob/v0.4.1/lib/sandbox_case/sandbox/adapter.ex#L1)
+
+Behaviour for sandbox adapters.
+
+Each adapter handles setup (once in test_helper), checkout (per test),
+and checkin (on_exit). The adapter returns an opaque token from checkout
+that is passed back to checkin.
+
+Adapters can optionally declare plug and on_mount modules to be
+registered in endpoints and LiveViews via `sandbox_plugs()` and
+`sandbox_on_mount()`.
+
+# `available?`
+
+```elixir
+@callback available?() :: boolean()
+```
+
+Whether this adapter is available (deps loaded).
+
+# `checkin`
+
+```elixir
+@callback checkin(token :: term()) :: :ok
+```
+
+Per-test checkin. Receives the token from checkout.
+
+# `checkout`
+
+```elixir
+@callback checkout(config :: term()) :: term() | nil
+```
+
+Per-test checkout. Returns an opaque token or nil.
+
+# `hooks`
+*optional* 
+
+```elixir
+@callback hooks() :: [module()]
+```
+
+on_mount modules to register in LiveViews. Return [] if none.
+
+# `plugs`
+*optional* 
+
+```elixir
+@callback plugs() :: [module()]
+```
+
+Plug modules to register in the endpoint. Return [] if none.
+
+# `propagate_keys`
+*optional* 
+
+```elixir
+@callback propagate_keys(config :: term()) :: [term()]
+```
+
+Process dictionary keys to propagate to child processes. Return [] if none.
+
+# `setup`
+
+```elixir
+@callback setup(config :: term()) :: :ok
+```
+
+One-time setup in test_helper. Receives adapter-specific config.
+
+---
+
+*Consult [api-reference.md](api-reference.md) for complete listing*
+
+---
+
+# SandboxCase.Sandbox.Cachex
+
+Source: https://sandbox-case.hexdocs.pm/SandboxCase.Sandbox.Cachex.md
+
+# `SandboxCase.Sandbox.Cachex`
+[🔗](https://github.com/pinetops/sandbox_case/blob/v0.4.1/lib/sandbox_case/sandbox/cachex.ex#L1)
+
+Sandbox adapter for Cachex. Works with vanilla Cachex — no fork required.
+
+On setup, patches `Cachex.Services.Overseer.retrieve/1` to check the
+process dictionary for sandbox overrides, then starts a pool of isolated
+Cachex instances. Each test checks out a clean set and checks it back in.
+
+    config :sandbox_case,
+      sandbox: [cachex: [:my_cache, :other_cache]]
+
+# `child_spec`
+
+Returns a specification to start this module under a supervisor.
+
+See `Supervisor`.
+
+---
+
+*Consult [api-reference.md](api-reference.md) for complete listing*
+
+---
+
+# SandboxCase.Sandbox.Case
+
+Source: https://sandbox-case.hexdocs.pm/SandboxCase.Sandbox.Case.md
+
+# `SandboxCase.Sandbox.Case`
+[🔗](https://github.com/pinetops/sandbox_case/blob/v0.4.1/lib/sandbox_case/sandbox/case.ex#L1)
+
+ExUnit case template that checks out all configured sandboxes
+and checks them back in on exit.
+
+    use SandboxCase.Sandbox.Case
+
+Adds `%{sandbox_tokens: tokens}` to the test context. The Ecto
+metadata (for browser test sessions) is available via:
+
+    SandboxCase.Sandbox.ecto_metadata(context.sandbox_tokens)
+
+---
+
+*Consult [api-reference.md](api-reference.md) for complete listing*
+
+---
+
+# SandboxCase.Sandbox.DeadlockDetector
+
+Source: https://sandbox-case.hexdocs.pm/SandboxCase.Sandbox.DeadlockDetector.md
+
+# `SandboxCase.Sandbox.DeadlockDetector`
+[🔗](https://github.com/pinetops/sandbox_case/blob/v0.4.1/lib/sandbox_case/sandbox/deadlock_detector.ex#L1)
+
+On-demand Postgres lock chain reporter.
+
+Attaches to `[:db_connection, :connection_error]` telemetry. When a
+connection checkout fails (typically a timeout), immediately queries
+`pg_stat_activity` and `pg_locks` to show which queries are blocked
+and which are holding the locks.
+
+Only works with Postgres repos.
+
+## Configuration
+
+    config :sandbox_case,
+      sandbox: [
+        ecto: true,
+        deadlock_detector: true
+      ]
+
+Or with an explicit repo:
+
+    deadlock_detector: [repo: MyApp.Repo]
+
+# `check_for_locks`
+
+Query Postgres for blocked queries right now. Can be called manually.
+
+---
+
+*Consult [api-reference.md](api-reference.md) for complete listing*
+
+---
+
+# SandboxCase.Sandbox.FunWithFlags
+
+Source: https://sandbox-case.hexdocs.pm/SandboxCase.Sandbox.FunWithFlags.md
+
+# `SandboxCase.Sandbox.FunWithFlags`
+[🔗](https://github.com/pinetops/sandbox_case/blob/v0.4.1/lib/sandbox_case/sandbox/fun_with_flags.ex#L1)
+
+Sandbox adapter for FunWithFlags. Works with vanilla FunWithFlags — no
+fork and no bytecode patching.
+
+Isolation is provided by a custom persistence adapter,
+`SandboxCase.Sandbox.FwfAdapter`, which routes flag operations to an
+isolated per-test ETS table when a `:fwf_sandbox` marker is present in
+the process dictionary (or reachable via `$callers`), and delegates to
+the real adapter otherwise. This module manages the pool of ETS tables
+and the per-test checkout/checkin.
+
+    config :sandbox_case,
+      sandbox: [fun_with_flags: true]
+
+The host app must point FunWithFlags at the sandbox adapter and disable
+the cache in the test environment:
+
+    config :fun_with_flags, :persistence,
+      adapter: SandboxCase.Sandbox.FwfAdapter,
+      sandbox_real_adapter: FunWithFlags.Store.Persistent.Ecto,
+      repo: MyApp.Repo
+
+    config :fun_with_flags, :cache, enabled: false
+
+`setup/1` validates this wiring and raises with guidance if it's missing
+or wrong, rather than letting flag isolation silently leak.
+
+# `child_spec`
+
+Returns a specification to start this module under a supervisor.
+
+See `Supervisor`.
+
+---
+
+*Consult [api-reference.md](api-reference.md) for complete listing*
+
+---
+
+# SandboxCase.Sandbox.FwfAdapter
+
+Source: https://sandbox-case.hexdocs.pm/SandboxCase.Sandbox.FwfAdapter.md
+
+# `SandboxCase.Sandbox.FwfAdapter`
+[🔗](https://github.com/pinetops/sandbox_case/blob/v0.4.1/lib/sandbox_case/sandbox/fwf_adapter.ex#L1)
+
+A sandbox-aware `FunWithFlags.Store.Persistent` adapter.
+
+This is the no-bytecode-patching replacement for `FwfPatcher`. It is a
+normal FunWithFlags persistence adapter (a documented extension point):
+on every flag operation it checks the process dictionary (and `$callers`)
+for a `:fwf_sandbox` ETS table. When one is present — i.e. inside a
+sandboxed test — reads and writes route to that isolated table (via
+`FwfStore`). When absent, it delegates to the project's real persistence
+adapter, so production/non-sandboxed code paths are unchanged.
+
+## Configuration
+
+    config :fun_with_flags, :persistence,
+      adapter: SandboxCase.Sandbox.FwfAdapter,
+      sandbox_real_adapter: FunWithFlags.Store.Persistent.Ecto,
+      repo: MyApp.Repo            # opts for the real adapter, passed through
+
+    # The FunWithFlags cache must be off so every lookup reaches the
+    # (sandbox-aware) store rather than a shared global ETS cache:
+    config :fun_with_flags, :cache, enabled: false
+
+`:sandbox_real_adapter` is the adapter to use when NOT sandboxed; it
+must be a different module than this one (otherwise lookups would
+recurse). All other keys under `:persistence` are read by the real
+adapter as usual.
+
+# `all_flag_names`
+
+# `all_flags`
+
+# `delete`
+
+# `delete`
+
+# `get`
+
+# `put`
+
+# `worker_spec`
+
+---
+
+*Consult [api-reference.md](api-reference.md) for complete listing*
+
+---
+
+# SandboxCase.Sandbox.Hook
+
+Source: https://sandbox-case.hexdocs.pm/SandboxCase.Sandbox.Hook.md
+
+# `SandboxCase.Sandbox.Hook`
+[🔗](https://github.com/pinetops/sandbox_case/blob/v0.4.1/lib/sandbox_case/sandbox/hook.ex#L2)
+
+LiveView on_mount hook that propagates test sandbox state from the
+test owner process to WebSocket-connected LiveView processes.
+
+Reads the owner PID from the user-agent connect_info (encoded by
+`Phoenix.Ecto.SQL.Sandbox`) and propagates Ecto sandbox access,
+Mimic/Mox stubs, Cachex sandbox, and FunWithFlags sandbox.
+
+Uses `$callers` for Ecto instead of `allow/3` to avoid deadlocks
+with Cachex Courier workers (see Propagator for details).
+
+# `on_mount`
+
+---
+
+*Consult [api-reference.md](api-reference.md) for complete listing*
+
+---
+
+# SandboxCase.Sandbox.LockMonitor
+
+Source: https://sandbox-case.hexdocs.pm/SandboxCase.Sandbox.LockMonitor.md
+
+# `SandboxCase.Sandbox.LockMonitor`
+[🔗](https://github.com/pinetops/sandbox_case/blob/v0.4.1/lib/sandbox_case/sandbox/lock_monitor.ex#L1)
+
+Background monitor that periodically polls Postgres for blocked queries
+and reports the lock chain.
+
+Catches lock contention between async tests as it happens, instead of
+waiting for the ownership timeout (15-120s).
+
+## Configuration
+
+    config :sandbox_case,
+      sandbox: [
+        lock_monitor: true
+        # or with options:
+        lock_monitor: [interval: 2_000, repo: MyApp.Repo]
+      ]
+
+## What it reports
+
+When a query is blocked waiting for a lock, the monitor logs:
+- The blocked query and how long it's been waiting
+- The blocking query and its state
+- Both Postgres PIDs for further investigation
+
+# `child_spec`
+
+Returns a specification to start this module under a supervisor.
+
+See `Supervisor`.
+
+# `start_link`
+
+---
+
+*Consult [api-reference.md](api-reference.md) for complete listing*
+
+---
+
+# SandboxCase.Sandbox.Logger
+
+Source: https://sandbox-case.hexdocs.pm/SandboxCase.Sandbox.Logger.md
+
+# `SandboxCase.Sandbox.Logger`
+[🔗](https://github.com/pinetops/sandbox_case/blob/v0.4.1/lib/sandbox_case/sandbox/logger.ex#L1)
+
+Sandbox adapter that captures logs per test.
+
+Each test gets its own log buffer via an ETS table. Logs from the
+test process and any process in its `$callers` chain are routed to
+that buffer — no interleaving from concurrent tests.
+
+## Configuration
+
+    # Default — fail on unconsumed :error logs
+    logger: true
+
+    # Stricter — fail on unconsumed :warning and above
+    logger: [fail_on: :warning]
+
+    # Capture only, never fail
+    logger: [fail_on: false]
+
+## Pop-based assertions
+
+Reading logs consumes them. At checkin, only unconsumed logs above
+the `fail_on` threshold trigger failure.
+
+    # Pop the next log at a level (returns message string or nil)
+    assert pop_log(sandbox, :error) =~ "sync failed"
+
+    # Pop all logs at a level (returns joined string)
+    assert logs(sandbox, :warning) =~ "duplicate"
+
+    # Happy path — never read logs, any error fails at checkin
+    test "creates user", %{sandbox: sandbox} do
+      User.create!(attrs)
+      # checkin: no errors → passes
+    end
+
+# `get_logs`
+
+Get all logs without consuming them (non-destructive).
+Returns a list of `%{level: atom, message: binary, metadata: map}`.
+
+# `logs`
+
+Pop all log entries at or above `level`. Returns the messages
+joined with newlines as a string. Consumes the entries.
+
+    assert logs(sandbox, :error) =~ "failed"
+    assert logs(sandbox) =~ "some info message"
+
+# `pop_log`
+
+Pop the next log entry at or above `level`. Returns the message
+string, or `nil` if no matching entry exists. Consumes the entry.
+
+    assert pop_log(sandbox, :error) =~ "something broke"
+    refute pop_log(sandbox, :error)  # no more errors
+
+---
+
+*Consult [api-reference.md](api-reference.md) for complete listing*
+
+---
+
+# SandboxCase.Sandbox.Plug
+
+Source: https://sandbox-case.hexdocs.pm/SandboxCase.Sandbox.Plug.md
+
+# `SandboxCase.Sandbox.Plug`
+[🔗](https://github.com/pinetops/sandbox_case/blob/v0.4.1/lib/sandbox_case/sandbox/plug.ex#L2)
+
+Plug that propagates test sandbox state from the test owner process
+to HTTP request processes (controllers, channels).
+
+Reads the owner PID from the user-agent header (encoded by
+`Phoenix.Ecto.SQL.Sandbox`) and propagates Ecto sandbox access,
+Mimic/Mox stubs, Cachex sandbox, and FunWithFlags sandbox.
+
+---
+
+*Consult [api-reference.md](api-reference.md) for complete listing*
+
+---
+
+# SandboxCase.Sandbox.Redis
+
+Source: https://sandbox-case.hexdocs.pm/SandboxCase.Sandbox.Redis.md
+
+# `SandboxCase.Sandbox.Redis`
+[🔗](https://github.com/pinetops/sandbox_case/blob/v0.4.1/lib/sandbox_case/sandbox/redis.ex#L1)
+
+Sandbox adapter for Redis via Redix.
+
+Isolates each test by giving it a dedicated Redis database number.
+A pool of Redix connections (each on a different DB) is created at
+setup. On checkout, the test gets a clean connection; on checkin,
+the DB is flushed and returned to the pool.
+
+## Configuration
+
+    config :sandbox_case,
+      sandbox: [
+        redis: [url: "redis://localhost:6379", pool_size: 8]
+      ]
+
+## Accessing the connection
+
+In your app code, read the sandboxed connection from the process
+dictionary with a fallback to your default connection:
+
+    def redis_conn do
+      Process.get(:redis_sandbox) || MyApp.Redis.default_conn()
+    end
+
+# `child_spec`
+
+Returns a specification to start this module under a supervisor.
+
+See `Supervisor`.
+
+---
+
+*Consult [api-reference.md](api-reference.md) for complete listing*
+
+---
