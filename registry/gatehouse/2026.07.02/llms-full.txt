@@ -1,0 +1,802 @@
+# Gatehouse
+
+Source: https://github.com/thepartly/gatehouse/blob/main/README.md
+
+# Gatehouse
+
+
+An in-process authorization engine for Rust. Gatehouse keeps policy logic in Rust while giving each request an `EvaluationSession` for relationship and backend-loaded facts. Sessions batch, deduplicate, cache, and coalesce fact loads, so list endpoints can stay policy-correct without pushing authorization logic into the data layer.
+
+![Gatehouse Logo](https://raw.githubusercontent.com/thepartly/gatehouse/main/.github/logo.svg)
+
+## Features
+
+- **Typed authorization domains**: Define one `PolicyDomain` per authorization domain and keep subject, action, resource, and context types consistent.
+- **Request-bound evaluation**: Bind session, subject, action, and context once, then call `check`, `evaluate`, `evaluate_by`, `filter`, `filter_by`, or `lookup_page`.
+- **RBAC, ReBAC, and predicate policies**: Use `RbacPolicy`, `RebacPolicy`, or synchronous `PolicyBuilder::when` predicates.
+- **Deny-overrides semantics**: `PolicyBuilder::forbid()` and custom forbid results veto grants, including through combinators and delegation.
+- **Batch-safe list endpoints**: Authorize already-loaded resources or enumerate candidate IDs with `LookupSource` and `Hydrator`.
+- **Evaluation traces and telemetry**: Inspect the policies and fact provenance that were actually evaluated.
+
+## Quick Start
+
+```rust
+use gatehouse::*;
+
+#[derive(Debug, Clone)]
+struct User {
+    id: u64,
+    roles: Vec<&'static str>,
+}
+
+#[derive(Debug, Clone)]
+struct Document {
+    owner_id: u64,
+}
+
+#[derive(Debug, Clone)]
+struct ReadAction;
+
+struct Documents;
+impl PolicyDomain for Documents {
+    type Subject = User;
+    type Action = ReadAction;
+    type Resource = Document;
+    type Context = ();
+}
+
+let admin_policy = PolicyBuilder::<Documents>::new("AdminOnly")
+    .subjects(|user: &User| user.roles.contains(&"admin"))
+    .build();
+
+let owner_policy = PolicyBuilder::<Documents>::new("OwnerOnly")
+    .when(|user: &User, _action: &ReadAction, doc: &Document, _ctx: &()| {
+        user.id == doc.owner_id
+    })
+    .build();
+
+let mut checker = PermissionChecker::<Documents>::new();
+checker.add_policy(admin_policy);
+checker.add_policy(owner_policy);
+
+# tokio_test::block_on(async {
+let session = EvaluationSession::empty();
+let action = ReadAction;
+let document = Document { owner_id: 7 };
+
+let admin = User { id: 1, roles: vec!["admin"] };
+let owner = User { id: 7, roles: vec!["user"] };
+let guest = User { id: 2, roles: vec!["user"] };
+
+assert!(checker.bind(&session, &admin, &action, &()).check(&document).await.is_granted());
+assert!(checker.bind(&session, &owner, &action, &()).check(&document).await.is_granted());
+assert!(!checker.bind(&session, &guest, &action, &()).check(&document).await.is_granted());
+# });
+```
+
+Use `EvaluationSession::empty()` for fact-free checkers. When any policy reads facts through `ctx.session.get(...)`, build a `FactRegistry` at application setup and create a fresh `registry.session()` for each request.
+
+## Core Flow
+
+Most call sites bind request-wide inputs once and evaluate one or more resources through the bound evaluator:
+
+```rust,ignore
+let session = registry.session();
+let bound = checker.bind(&session, &subject, &action, &request_context);
+
+let decision = bound.check(&resource).await;
+let decisions = bound.evaluate(resources.clone()).await;
+let authorized = bound.filter(resources).await;
+let authorized_rows = bound.filter_by(rows, |row| &row.authz_resource).await;
+let page = bound.lookup_page(&lookup, &hydrator, cursor.as_deref(), limit).await?;
+```
+
+```mermaid
+flowchart LR
+    Request[request] --> Session[EvaluationSession]
+    Request --> Bound[BoundEvaluator]
+    Checker[PermissionChecker] --> Bound
+    Bound --> Policies[policies]
+    Policies --> Session
+    Session --> Facts[FactSource::load_many]
+    Facts --> Backend[(backend)]
+    Policies --> Decision[AccessEvaluation + EvalTrace]
+```
+
+`BoundEvaluator::evaluate` preserves input order and returns one `AccessEvaluation` per resource. `BoundEvaluator::filter` keeps only granted resources. Use `evaluate_by` and `filter_by` when the caller owns wider rows and authorization should project each row to an embedded resource. The returned values are still the original rows. `BoundEvaluator::lookup_page` is for list endpoints where the application cannot load every possible candidate first; a `LookupSource` enumerates candidate IDs, a `Hydrator` resolves them, and the full policy stack authorizes the hydrated resources.
+
+## Decision Semantics
+
+- `PermissionChecker` applies fixed deny-overrides semantics: any evaluated result containing `PolicyEvalResult::Forbidden` denies; otherwise the first grant wins.
+- Policies declaring `Effect::Forbid` or `Effect::AllowOrForbid` are evaluated before allow-only policies, so a veto cannot be skipped by grant short-circuiting.
+- If nothing grants, the checker denies with `"All policies denied access"`.
+- An empty checker denies with `"No policies configured"`.
+- `PolicyEvalResult::NotApplicable` means the policy did not grant. `PolicyEvalResult::Forbidden` means the policy actively vetoed.
+- `PolicyBuilder` combines configured predicates with AND logic. `PolicyBuilder::forbid()` makes a matching policy forbid; a non-match remains not applicable and does not block.
+- `AndPolicy` and `OrPolicy` evaluate veto-capable children before allow-only children, then short-circuit normally. `NotPolicy` inverts grants and non-grants, but never turns `Forbidden` into a grant.
+- `Forbidden` propagates through `AndPolicy`, `OrPolicy`, `NotPolicy`, and `DelegatingPolicy`.
+- `not()` does not neutralize a veto: `admin.or(blocked.not())` still denies if `blocked` returns `Forbidden`. For "grant unless blocked", make `blocked` an allow-only predicate and wrap that in `not()`, or register a direct forbid policy when the block should be global.
+
+Denials from `AccessEvaluation` are summary-level. Use `AccessEvaluation::display_trace()` or the attached `EvalTrace` to inspect individual policy reasons and fact provenance.
+
+## Policy Domains
+
+A `PolicyDomain` names the four types involved in one authorization domain:
+
+```rust
+use gatehouse::PolicyDomain;
+
+# struct User;
+# struct DocAction;
+# struct Document;
+# struct RequestContext;
+struct Documents;
+
+impl PolicyDomain for Documents {
+    type Subject = User;
+    type Action = DocAction;
+    type Resource = Document;
+    type Context = RequestContext;
+}
+```
+
+The generic parameter then stays short and consistent:
+
+```rust,ignore
+let policy = PolicyBuilder::<Documents>::new("Owner")
+    .when(|user, _action, doc, _ctx| user.id == doc.owner_id)
+    .build();
+
+let checker = PermissionChecker::<Documents>::new();
+```
+
+## PolicyBuilder
+
+Use `PolicyBuilder` for synchronous predicate logic:
+
+```rust,ignore
+let suspended_account = PolicyBuilder::<Documents>::new("SuspendedAccount")
+    .when(|user, _action, _doc, _ctx| user.is_suspended)
+    .forbid()
+    .build();
+```
+
+Reach for a direct `Policy<D>` implementation when a rule needs async work, custom batching, custom telemetry metadata, or hand-written forbid behavior.
+
+```rust
+use async_trait::async_trait;
+use gatehouse::{EvalCtx, Policy, PolicyDomain, PolicyEvalResult};
+use std::borrow::Cow;
+
+# #[derive(Debug, Clone)]
+# struct User { id: u64 }
+# #[derive(Debug, Clone)]
+# struct Document { owner_id: u64 }
+# #[derive(Debug, Clone)]
+# struct ReadAction;
+# struct Documents;
+# impl PolicyDomain for Documents {
+#     type Subject = User;
+#     type Action = ReadAction;
+#     type Resource = Document;
+#     type Context = ();
+# }
+struct OwnerPolicy;
+
+#[async_trait]
+impl Policy<Documents> for OwnerPolicy {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, Documents>) -> PolicyEvalResult {
+        if ctx.subject.id == ctx.resource.owner_id {
+            ctx.grant("subject owns the document")
+        } else {
+            ctx.not_applicable("subject does not own the document")
+        }
+    }
+
+    fn policy_type(&self) -> Cow<'static, str> {
+        Cow::Borrowed("OwnerPolicy")
+    }
+}
+```
+
+## Built-In Policies
+
+- `RbacPolicy`: role-based access control. Grants when at least one required role for `(action, resource)` is present in the subject's roles.
+- `RebacPolicy`: relationship-based access control. Extracts subject/resource IDs, builds `RelationshipQuery` keys, and grants when the request session loads `Found(true)` from a registered `FactSource`.
+- `DelegatingPolicy`: maps inputs into another `PolicyDomain` and delegates to a child `PermissionChecker` while preserving batching and trace shape.
+
+Use `PolicyBuilder::when` for attribute-style predicates that compare subject, action, resource, and context in one closure.
+
+## Fluent Combinators
+
+Policies can be composed with the `PolicyExt` helpers:
+
+```rust,ignore
+use gatehouse::PolicyExt;
+
+let rule = is_editor.and(not_locked.not()).or(admin_override);
+checker.add_policy(rule);
+```
+
+`AndPolicy::try_new`, `OrPolicy::try_new`, and `NotPolicy::new` remain available when constructing policies from dynamic collections.
+
+`forbid()` creates a global veto, not a local negative predicate. In particular, `grant.and(forbid_only)` can never grant because the forbid-only child never satisfies AND's "all children grant" rule. For a local exclusion, build the blocked condition as an ordinary allow-style predicate and compose `grant.and(blocked.not())`.
+
+## Request-Scoped Facts
+
+`FactSource::load_many` receives unique keys and must return exactly one result per key in the same order. `EvaluationSession` expands duplicate caller inputs, preserves caller order, caches results for the request, chunks loads according to `FactSource::max_batch_size`, and joins concurrent in-flight loads for the same key.
+
+```mermaid
+flowchart LR
+    Policy[policy] --> Session[EvaluationSession]
+    Session --> Cache{cached?}
+    Cache -- yes --> Result[FactLoadResult]
+    Cache -- no --> Source[FactSource::load_many]
+    Source --> Backend[(backend)]
+    Backend --> Result
+```
+
+`RebacPolicy` is the built-in fact-backed policy. Missing sources, missing facts, backend errors, and source contract violations fail closed to denied ReBAC decisions.
+
+Use typed relation enums when the domain has a fixed relation set, even if the backing store uses strings. The `FactSource` owns the backend boundary and can convert `Relation::Viewer` to `"viewer"` when binding SQL parameters.
+
+## List Endpoints
+
+For lists where the application already has candidate resources, use `BoundEvaluator::filter`:
+
+```rust,ignore
+let session = registry.session();
+let visible_posts = checker
+    .bind(&session, &user, &PostAction::View, &request_context)
+    .filter(posts)
+    .await;
+```
+
+If each item is a wide row and the authorization resource is a projection, use the extractor variants:
+
+```rust,ignore
+let visible_rows = checker
+    .bind(&session, &user, &InvoiceAction::View, &request_context)
+    .filter_by(rows, |row| &row.authz_resource)
+    .await;
+```
+
+For lists where the candidate set is too large to load first, implement `LookupSource<Domain>` and `Hydrator<Id>`:
+
+```rust,ignore
+let page = checker
+    .bind(&session, &user, &PostAction::View, &request_context)
+    .lookup_page(&lookup, &hydrator, cursor.as_deref(), limit)
+    .await?;
+```
+
+A `LookupSource` must enumerate a superset of every resource that any policy could grant for the bound subject/action/context. Lookup narrows candidates; it does not replace the policy stack.
+
+## Long-Lived Streams
+
+`EvaluationSession` caches are scoped to one authorization pass. For SSE, WebSocket, and other long-lived streams, do not keep one fact-backed session for the stream lifetime.
+
+If your product contract authorizes once at stream open, create a fresh session, compute the visible ID set with `filter` / `filter_by`, drop the session, and only emit frames for that set. If the stream must observe mid-stream permission revocation, run periodic reauthorization with a fresh `registry.session()` each tick and re-bind the checker for that pass.
+
+## Tracing And Telemetry
+
+When trace-level events are enabled, checker evaluation records spans for single-resource and batch evaluation, and each evaluated policy records a `trace!` event on the `gatehouse::security` target. Batch evaluation records aggregate item counts and nested `gatehouse.batch_policy` spans with per-policy counts.
+
+Reason strings are emitted verbatim. Keep credentials, tokens, raw PII, and other sensitive material out of policy reasons and fact provenance details. Enable the optional `serde` feature to serialize `AccessEvaluation`, `EvalTrace`, `PolicyEvalResult`, and fact provenance for audit logs.
+
+Security event fields:
+
+- `security_rule.name`
+- `security_rule.category`
+- `security_rule.description`
+- `security_rule.reference`
+- `security_rule.ruleset.name`
+- `security_rule.uuid`
+- `security_rule.version`
+- `security_rule.license`
+- `event.outcome`
+- `policy.type`
+- `policy.result.reason`
+
+## Examples
+
+Run a self-contained example with:
+
+```shell
+cargo run --example rbac_policy
+```
+
+Run a server example with:
+
+```shell
+cargo run --example axum
+```
+
+Then send requests to `http://127.0.0.1:8000`; `actix_web` listens on `http://127.0.0.1:8080`.
+
+Examples to start with:
+
+- `rbac_policy`: basic role-based access control.
+- `policy_builder`: attribute-style custom policies.
+- `combinator_policy`: fluent `and` / `or` / `not` composition.
+- `deny_override`: global veto policies with `PolicyBuilder::forbid()`.
+- `delegating_policy`: cross-domain checks with `DelegatingPolicy`.
+- `mfa_freshness_context`: request-scoped context inputs.
+- `rebac_policy`: relationship checks through `FactSource`.
+- `in_ram_rebac`: in-memory relationship facts and session caching.
+- `lookup_in_ram`: `LookupSource` plus `Hydrator` list authorization.
+- `factsource_n_plus_one`: why request-scoped facts matter for list endpoints.
+- `axum` and `actix_web`: web-framework integration.
+- `postgres_bulk_rebac`: SQL-backed ReBAC fact loading.
+
+## Performance
+
+Criterion benchmarks in `benches/permission_checker.rs` exercise bound checker evaluation, fact loading, batching, and policy-builder batch shortcuts. Run them with:
+
+```shell
+cargo bench
+```
+
+The `postgres_bulk_rebac` example demonstrates a SQL-backed ReBAC `FactSource` with one batched `WITH ORDINALITY` query per request. It expects a live PostgreSQL database and reads `DATABASE_URL`.
+
+---
+
+# AGENTS.md
+
+Source: https://github.com/thepartly/gatehouse/blob/main/AGENTS.md
+
+# AGENTS.md
+
+Notes for coding agents. Assumes you know Rust tooling — this covers only what is specific or non-obvious to this repo.
+
+## Project-specific commands
+
+```bash
+cargo run --example axum        # HTTP server on :8000
+cargo run --example actix_web   # HTTP server on :8080
+
+# Reproduce the PR mutation gate locally (see "CI gates" below)
+git diff origin/main...HEAD -- src/checker.rs src/combinators.rs > mutants.diff
+cargo mutants --in-place --in-diff=mutants.diff \
+  --file src/checker.rs --file src/combinators.rs \
+  --baseline=skip --timeout=60 --build-timeout=300 --all-features \
+  -- --test checker_contract --test tracing_contract
+```
+
+## CI gates that bite
+
+- Clippy runs with `-D warnings`; any warning fails CI. `fmt` + `clippy` before committing.
+- A **diff-scoped `cargo-mutants` gate** mutates the PR's changes to `src/checker.rs` and `src/combinators.rs` only. Every new/changed line there must be killed by a test or CI fails (~20 min run). When you touch veto/short-circuit logic, add a test that *distinguishes the mutation* (e.g. a case where `&&` vs `||` actually diverge), not just a happy-path assertion — a green test that survives the mutant is the usual failure mode here.
+- `main` is governed by a require-approval ruleset: PRs need an approving review (you cannot self-approve); repo/org admins can bypass.
+- Publishing a GitHub Release for tag `vX.Y.Z` triggers `cargo publish` to crates.io — irreversible. Releases finalize `CHANGELOG.md` (`[Unreleased]` → `[X.Y.Z] - <date>`) in a small "Release vX.Y.Z" PR; `Cargo.toml`/`Cargo.lock` are bumped in the feature PR.
+
+## Architecture
+
+One library crate, split across `src/*.rs` and re-exported from `src/lib.rs`. Unit tests are in `src/tests.rs`; integration tests in `tests/` — and the examples are `include!`d into those tests, so a broken example breaks the test build.
+
+`Policy<D: PolicyDomain>` is the core trait: async `evaluate` → `PolicyEvalResult`, plus `evaluate_batch` (must return one result per input, in order). `PolicyDomain` names `Subject`/`Action`/`Resource`/`Context` once. `PermissionChecker<D>` is bound per request — `checker.bind(&session, &subject, &action, &context)` yields a `BoundEvaluator` with `check` / `evaluate` / `evaluate_by` / `filter` / `filter_by` / `lookup_page`.
+
+Built-ins: `RbacPolicy`, `RebacPolicy`, `DelegatingPolicy`; `PolicyBuilder::when` for ABAC-style predicates; combinators `AndPolicy` / `OrPolicy` / `NotPolicy` plus fluent `PolicyExt`. Closures are `Send + Sync + 'static`. Decisions are never `Result`: `PolicyEvalResult::{Granted, NotApplicable, Forbidden, Combined}` at the policy level, `AccessEvaluation::{Granted, Denied}` at the top. Public enums are `#[non_exhaustive]`. Telemetry is `tracing` (OpenTelemetry semantic conventions); reason strings and `FactProvenance.detail` reach subscribers — treat them as audit surface, no secrets.
+
+## Load-bearing invariants (read before editing `checker.rs` / `combinators.rs`)
+
+- **Deny-overrides via veto-prefix ordering.** Veto-capable policies (`effect().can_forbid()`) are scheduled ahead of allow-only ones, and a grant is never returned until *every* veto-capable policy has been evaluated — so a `Forbidden` is always observed before a grant can short-circuit. `evaluate_one` (single) and `evaluate_batch_by` (batch) implement this independently and **must agree per item**; differential proptests against a deny-overrides oracle in `tests/checker_contract.rs` enforce it.
+- **Forbid detection is whole-tree.** `is_forbidden()` is `forbidden_leaf().is_some()`, which recurses through `Combined` children unconditionally; `is_granted()` on a `Combined` reads only `outcome`. Soundness rests on one invariant: **no combinator returns `outcome: true` while keeping a `Forbidden` leaf in its children.** Preserve it when adding or altering a combinator.
+- **`effect()` is a security contract.** A policy that can return `Forbidden` must declare `Effect::Forbid` or `Effect::AllowOrForbid`, or its veto can be short-circuited by an earlier grant. The checker emits a `WARN` when an `Effect::Allow` policy returns `Forbidden` (it honors the veto where observed, but cannot reorder it).
+
+---
+
+# CLAUDE.md
+
+Source: https://github.com/thepartly/gatehouse/blob/main/CLAUDE.md
+
+AGENTS.md
+
+---
+
+# Migrating from 0.4 to 0.5
+
+Source: https://github.com/thepartly/gatehouse/blob/main/MIGRATION.md
+
+# Migrating from 0.4 to 0.5
+
+Gatehouse 0.5 intentionally breaks the public API to make the authorization surface smaller and harder to misuse. The main changes are:
+
+- policies are parameterized by one `PolicyDomain` instead of four repeated generics;
+- every checker call goes through a session-bound evaluator;
+- policy-level non-grants are now `NotApplicable`;
+- explicit veto policies use `forbid` / `Effect::Forbid`;
+- forbids propagate through combinators and delegation;
+- built-in ABAC is removed in favor of `PolicyBuilder::when`.
+
+If you are upgrading from 0.2 or 0.3, first read the release notes for 0.3 and 0.4 in `CHANGELOG.md`, then apply this guide.
+
+## Migration checklist
+
+1. Define one `PolicyDomain` marker per authorization domain.
+2. Change `Policy<S, A, R, C>` impls to `Policy<Domain>`.
+3. Change `EvalCtx<'_, S, A, R, C>` to `EvalCtx<'_, Domain>`.
+4. Replace `ctx.deny(...)` with `ctx.not_applicable(...)`.
+5. Replace `PolicyEvalResult::Denied` with `PolicyEvalResult::NotApplicable`.
+6. Replace `PolicyBuilder::<S, A, R, C>` with `PolicyBuilder::<Domain>`.
+7. Replace `checker.check(...)`, `evaluate_in_session(...)`, batch, filter, and lookup checker methods with `checker.bind(...).check(...)`, `.evaluate(...)`, `.filter(...)`, or `.lookup_page(...)`.
+8. Build request sessions through `FactRegistry` for fact-backed policies.
+9. Replace `AbacPolicy` with `PolicyBuilder::when` or a hand-written `Policy`.
+10. Update direct `BatchEvalCtx` / `PolicyBatchItem` construction in tests.
+11. Add wildcard arms to matches on public gatehouse enums; they are now `#[non_exhaustive]`.
+
+## Policy domains
+
+Before, the same four generic parameters appeared on every policy, builder, and checker:
+
+```rust,ignore
+type DocumentChecker = PermissionChecker<User, ReadAction, Document, RequestContext>;
+
+impl Policy<User, ReadAction, Document, RequestContext> for OwnerPolicy {
+    async fn evaluate(
+        &self,
+        ctx: &EvalCtx<'_, User, ReadAction, Document, RequestContext>,
+    ) -> PolicyEvalResult {
+        // ...
+    }
+}
+```
+
+Now define a domain marker once:
+
+```rust
+use gatehouse::PolicyDomain;
+
+# struct User;
+# struct ReadAction;
+# struct Document;
+# struct RequestContext;
+struct Documents;
+
+impl PolicyDomain for Documents {
+    type Subject = User;
+    type Action = ReadAction;
+    type Resource = Document;
+    type Context = RequestContext;
+}
+```
+
+Then use that domain everywhere:
+
+```rust,ignore
+type DocumentChecker = PermissionChecker<Documents>;
+
+impl Policy<Documents> for OwnerPolicy {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, Documents>) -> PolicyEvalResult {
+        // ...
+    }
+}
+```
+
+The associated types are always read in `Subject`, `Action`, `Resource`, `Context` order.
+
+## Policy results
+
+`PolicyEvalResult::Denied` used to mean "this policy did not grant". That was too easy to confuse with the final top-level `AccessEvaluation::Denied`.
+
+Policy-level non-grants are now `PolicyEvalResult::NotApplicable`:
+
+```rust,ignore
+// Before
+if ctx.subject.id == ctx.resource.owner_id {
+    ctx.grant("owner")
+} else {
+    ctx.deny("not owner")
+}
+
+// After
+if ctx.subject.id == ctx.resource.owner_id {
+    ctx.grant("owner")
+} else {
+    ctx.not_applicable("not owner")
+}
+```
+
+For direct constructors:
+
+```rust,ignore
+// Before
+PolicyEvalResult::denied("OwnerPolicy", "not owner")
+
+// After
+PolicyEvalResult::not_applicable("OwnerPolicy", "not owner")
+```
+
+`AccessEvaluation::Denied` still exists. It is the final result returned by the checker when no policy grants or a forbid policy vetoes.
+
+## Forbid policies
+
+Explicit veto rules use `Effect::Forbid` and `PolicyEvalResult::Forbidden`. `PolicyBuilder` has a direct `.forbid()` helper:
+
+```rust,ignore
+let suspended_account = PolicyBuilder::<Documents>::new("SuspendedAccount")
+    .when(|user, _action, _doc, _ctx| user.is_suspended)
+    .forbid()
+    .build();
+```
+
+A hand-written policy that can veto should return `ctx.forbid(...)` and declare its effect:
+
+```rust,ignore
+impl Policy<Documents> for LegalHold {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, Documents>) -> PolicyEvalResult {
+        if ctx.resource.legal_hold {
+            ctx.forbid("document is under legal hold")
+        } else {
+            ctx.not_applicable("no legal hold")
+        }
+    }
+
+    fn effect(&self) -> Effect {
+        Effect::Forbid
+    }
+}
+```
+
+Forbid-effect policies are evaluated before allow-only policies, so their result is not skipped by the grant short-circuit. If a hand-written policy can return `Forbidden` but does not declare `Effect::Forbid` or `Effect::AllowOrForbid`, the checker can only honor the veto if evaluation reaches that policy before a grant.
+
+`Forbidden` now propagates through `AndPolicy`, `OrPolicy`, `NotPolicy`, and `DelegatingPolicy`. If you previously placed a forbid policy inside a combinator expecting it to behave like an ordinary non-grant, change that local guard into a normal grant-style predicate and wrap it with `not()`:
+
+```rust,ignore
+let muted = PolicyBuilder::<Threads>::new("Muted")
+    .subjects(|member| member.muted)
+    .build();
+
+let collaborator_unless_muted = collaborator.and(muted.not());
+```
+
+Use `.forbid()` only when a match should actively veto every grant path in the composed decision.
+
+`not()` cannot cancel an active veto. A policy like `admin.or(blocked.not())` still denies if `blocked` returns `Forbidden`; this is the intended absolute-veto behavior. Similarly, `grant.and(forbid_only)` can never grant because a forbid-only child never satisfies AND's "all children grant" rule. For a scoped "grant unless blocked" condition, make `blocked` a normal allow-style predicate and compose `grant.and(blocked.not())`.
+
+## PolicyBuilder
+
+`PolicyBuilder` is now domain-parameterized:
+
+```rust,ignore
+// Before
+let owner = PolicyBuilder::<User, ReadAction, Document, RequestContext>::new("Owner")
+    .when(|user, _action, doc, _ctx| user.id == doc.owner_id)
+    .build();
+
+// After
+let owner = PolicyBuilder::<Documents>::new("Owner")
+    .when(|user, _action, doc, _ctx| user.id == doc.owner_id)
+    .build();
+```
+
+Use `.subjects`, `.actions`, `.resources`, and `.context` for single-axis predicates. Use `.when` when the predicate compares multiple inputs. The generated batch path evaluates subject, action, and context predicates once per batch and resource / cross-axis predicates per item.
+
+## Checker calls
+
+The old API had several entry points:
+
+```rust,ignore
+checker.check(&user, &Read, &document, &request_context).await;
+
+checker
+    .evaluate_in_session(&session, &user, &Read, &document, &request_context)
+    .await;
+
+checker
+    .filter_authorized_in_session_by_resource(
+        &session,
+        &user,
+        &Read,
+        documents,
+        &request_context,
+        |document| document,
+    )
+    .await;
+```
+
+The new API binds request-wide inputs once:
+
+```rust,ignore
+let session = EvaluationSession::empty();
+let bound = checker.bind(&session, &user, &Read, &request_context);
+
+let decision = bound.check(&document).await;
+let decisions = bound.evaluate(documents.clone()).await;
+let visible = bound.filter(documents).await;
+```
+
+When the list item is a wider row than the authorization resource, use the extractor variants and keep returning the original rows:
+
+```rust,ignore
+let decisions = bound
+    .evaluate_by(invoice_rows.clone(), |row| &row.authz_resource)
+    .await;
+
+let visible_rows = bound
+    .filter_by(invoice_rows, |row| &row.authz_resource)
+    .await;
+```
+
+For fact-backed policies, create the session from a registry:
+
+```rust,ignore
+let registry = FactRegistry::builder()
+    .with_arc::<RelationshipQuery<UserId, DocumentId, Relation>>(relationships)
+    .build();
+
+let session = registry.session();
+let decision = checker
+    .bind(&session, &user, &Read, &request_context)
+    .check(&document)
+    .await;
+```
+
+`EvaluationSession::empty()` and `EvaluationSession::shared_empty()` remain available for fact-free policy stacks, but every evaluation now receives a session explicitly. This removes the old "fact-backed checker accidentally used the no-session `check` path" footgun.
+
+## Batch evaluation
+
+`BoundEvaluator::evaluate` and `BoundEvaluator::filter` accept caller-owned resources. Items only need to borrow as `D::Resource`:
+
+```rust,ignore
+let results: Vec<(Document, AccessEvaluation)> = bound.evaluate(documents).await;
+```
+
+If you constructed `BatchEvalCtx` directly in tests or custom combinators, note the shape changed:
+
+```rust,ignore
+let items = docs
+    .iter()
+    .map(|resource| PolicyBatchItem::<Documents> { resource })
+    .collect::<Vec<_>>();
+
+let ctx = BatchEvalCtx {
+    session: &session,
+    subject: &user,
+    action: &Read,
+    context: &request_context,
+    items: &items,
+    policy_type: policy.policy_type(),
+};
+```
+
+`PolicyBatchItem` no longer carries a per-item context. Batch evaluation is one subject, one action, one request context, and many resources. If you need different contexts, group the inputs and evaluate one bound batch per context.
+
+## Long-lived streams
+
+`EvaluationSession` is still scoped to one authorization pass. For SSE, WebSocket, and other long-lived streams, do not keep one fact-backed session for the stream lifetime.
+
+If your product contract authorizes once at stream open, create a fresh session, compute the visible ID set with `filter` / `filter_by`, drop the session, and only emit frames for that set. If the stream must observe mid-stream permission revocation, run periodic reauthorization with a fresh `registry.session()` each tick and re-bind the checker for that pass.
+
+## Lookup APIs
+
+`LookupSource` is now domain-parameterized:
+
+```rust,ignore
+#[async_trait]
+impl LookupSource<Documents> for DocumentLookup {
+    type Id = DocumentId;
+    type Error = LookupError;
+
+    async fn lookup_page(
+        &self,
+        subject: &User,
+        action: &ReadAction,
+        context: &RequestContext,
+        cursor: Option<&[u8]>,
+        limit: NonZeroUsize,
+    ) -> Result<LookupPage<DocumentId>, LookupError> {
+        // ...
+    }
+}
+```
+
+Call lookup through the bound evaluator:
+
+```rust,ignore
+let page = checker
+    .bind(&session, &user, &Read, &request_context)
+    .lookup_page(&lookup, &hydrator, cursor.as_deref(), limit)
+    .await?;
+```
+
+The lookup source still must enumerate a superset of every resource any policy could grant. Gatehouse only narrows and authorizes the hydrated subset; it does not discover grant paths the lookup source omitted.
+
+## Built-in policy changes
+
+### RbacPolicy
+
+`RbacPolicy` now takes the domain as its first generic parameter:
+
+```rust,ignore
+let policy = RbacPolicy::<Documents, _, _>::new(required_roles, subject_roles);
+```
+
+Inference often fills the closure types once the policy is added to a `PermissionChecker<Documents>`.
+
+### RebacPolicy
+
+`RebacPolicy` also takes the domain:
+
+```rust,ignore
+let policy = RebacPolicy::<Documents, UserId, DocumentId, Relation>::new(
+    |user| user.id,
+    |document| document.id,
+    Relation::Viewer,
+);
+```
+
+Relationship facts are still loaded through `RelationshipQuery<UserId, DocumentId, Relation>` registered in the request session.
+
+### DelegatingPolicy
+
+`DelegatingPolicy` maps from one domain to another:
+
+```rust,ignore
+let delegate = DelegatingPolicy::<Comments, Documents>::new(
+    "DocumentEditAllowsCommentModeration",
+    document_checker,
+    |comment_user| comment_user.clone(),
+    |_action| DocumentAction::Edit,
+    |_subject, _action, comment, _ctx| comment.document.clone(),
+    |_subject, _action, ctx| ctx.document_context.clone(),
+);
+```
+
+The context mapper runs once per bound batch. The resource mapper still runs per resource.
+
+## AbacPolicy removal
+
+`AbacPolicy` is removed. Use `PolicyBuilder::when` for synchronous attribute-style checks:
+
+```rust,ignore
+let owner = PolicyBuilder::<Documents>::new("Owner")
+    .when(|user, _action, document, _ctx| user.id == document.owner_id)
+    .build();
+```
+
+Use a hand-written `Policy<Domain>` when the rule needs async work, custom batching, custom telemetry metadata, or explicit forbid behavior.
+
+## Tests and assertions
+
+Tests that asserted policy-level denials should now assert not-applicability:
+
+```rust,ignore
+evaluation.assert_not_applicable_by("Owner");
+```
+
+Use `assert_forbidden_by` for active vetoes and `assert_denied` / `assert_denied_with_reason_containing` for final access denials.
+
+## Public enum matching
+
+Public gatehouse enums are now `#[non_exhaustive]`, including `AccessEvaluation`, `PolicyEvalResult`, `Effect`, `FactLoadResult`, `FactLoadError`, and lookup errors. Add wildcard arms and fail closed for unknown access decisions:
+
+```rust,ignore
+match evaluation {
+    AccessEvaluation::Granted { .. } => Ok(()),
+    AccessEvaluation::Denied { reason, .. } => Err(reason),
+    _ => Err("unknown access decision".into()),
+}
+```
+
+## Dependency changes
+
+`uuid` moved out of normal dependencies; it is only used by examples, tests, and doctests. If your application used gatehouse's transitive `uuid`, add `uuid` to your own `Cargo.toml`.
+
+The new optional `serde` feature derives `Serialize` for decision and trace types (`AccessEvaluation`, `EvalTrace`, `PolicyEvalResult`, `FactProvenance`, and related value enums) for audit logging pipelines.
+
+## Mechanical search hints
+
+These searches catch most migration work:
+
+```shell
+rg "Policy<[^>]*,[^>]*,[^>]*,[^>]*"
+rg "PolicyBuilder::<[^>]*,[^>]*,[^>]*,[^>]*"
+rg "EvalCtx<'_, [^>]*,[^>]*"
+rg "ctx\\.deny|PolicyEvalResult::Denied|PolicyEvalResult::denied"
+rg "evaluate_in_session|filter_authorized|lookup_authorized|\\.check\\(&"
+rg "AbacPolicy|Effect::Deny"
+rg "AccessEvaluation::|PolicyEvalResult::|FactLoadResult::|LookupAuthorizedError::"
+```
+
+---
