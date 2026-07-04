@@ -1,0 +1,928 @@
+# EvoHarness
+
+Source: https://github.com/ryanli-me/evoharness/blob/main/README.md
+
+# EvoHarness
+
+**Evolution Tree Search for Agent Harness Optimization**
+
+[Website & Research Report](https://evo-harness.vercel.app/)
+
+![Results](docs/results.png)
+
+EvoHarness is a working framework that automatically evolves LLM agent harnesses.
+It starts from a baseline agent, runs it on a benchmark, reads the execution traces
+to diagnose failures, proposes targeted changes, and evaluates them — iterating
+until the harness improves.
+
+Built on [Meta-Harness](https://yoonholee.com/meta-harness/) (Lee et al.) and
+[better-harness](https://blog.langchain.com/better-harness-a-recipe-for-harness-hill-climbing-with-evals/) (LangChain).
+Replaces linear hill climbing with evolution tree search.
+
+```
+Meta-Harness:  baseline → reject → reject → reject → reject → reject → reject → ACCEPT → neutral
+               8 iterations, 1 useful change, ~$2,400
+
+EvoHarness:    baseline ─┬─ branch A (prompt) ──── 9 tasks flipped ✓
+                          └─ branch B (bootstrap) ─ 1 additional flip ✓
+                          └─ merge(A+B) ─────────── testing...
+               2 iterations, 2 useful changes, ~$400
+```
+
+---
+
+## What's in this repo
+
+```
+.
+├── agent.py                    # The inner agent (KIRA + env bootstrap)
+├── anthropic_caching.py        # Prompt caching utility
+├── prompt-templates/
+│   └── terminus-kira.txt       # System prompt (editable surface)
+├── pyproject.toml
+│
+├── meta/                       # The EvoHarness framework
+│   ├── __main__.py             # CLI: python -m meta {demo,run,surfaces,import}
+│   ├── core.py                 # Tree search loop with Thompson sampling
+│   ├── surfaces.py             # Surface decomposition + fragility tracking
+│   ├── traces.py               # Trace store with indexed access
+│   ├── proposer.py             # Claude Code agent proposer
+│   ├── runner.py               # Harbor runner (real + mock)
+│   ├── notebook.py             # Research notebook (findings + dead ends)
+│   ├── run_iteration.py        # Single iteration runner
+│   ├── import_job.py           # Import Harbor results into trace store
+│   └── config.py               # TOML config loader
+│
+├── docs/
+│   └── index.html              # Research report website
+│
+└── results/                    # Experiment artifacts
+    ├── baseline/               # Pass/fail map for 89 tasks
+    ├── iter_001/               # Proposal + modified prompt + eval results
+    ├── iter_002/               # Proposal + modified agent.py + eval results
+    └── notebook/               # Accumulated findings and dead ends
+```
+
+---
+
+## Quick Start
+
+### 1. Run the baseline agent
+
+```bash
+# Install
+pip install harbor
+
+# Set your API key
+echo "ANTHROPIC_API_KEY=sk-ant-..." > .env
+
+# Run the baseline harness on TerminalBench-2
+harbor run \
+  --agent-import-path agent:AgentHarness \
+  -d terminal-bench@2.0 \
+  -m anthropic/claude-opus-4-6 \
+  -e modal -k 1 -n 89 \
+  -o jobs/baseline --job-name baseline \
+  -y --env-file .env
+```
+
+This runs the KIRA agent on all 89 tasks. Takes ~30 min on Modal with 89 concurrent.
+
+### 2. Import results into EvoHarness
+
+```bash
+python -m meta import jobs/baseline/baseline --output runs/experiment
+```
+
+This parses Harbor's output and creates:
+```
+runs/experiment/
+  baseline_summary.json    # 61 passed, 27 failed
+  task_cases.json           # All 89 tasks with difficulty/category
+  traces/                   # Full execution traces indexed for search
+  notebook/                 # Empty notebook (ready for iteration)
+```
+
+### 3. Evolve the harness
+
+```bash
+# Run a single iteration: propose → apply → eval
+python -m meta.run_iteration \
+  --experiment-dir runs/experiment \
+  --iteration 1 \
+  --parent-variant baseline \
+  --proposer-model sonnet \
+  --eval-env modal
+```
+
+What happens:
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                                                                     │
+│  1. PROPOSER (Claude Code agent, local)                             │
+│     Reads traces of 27 failing tasks                                │
+│     Greps for common patterns across traces                         │
+│     Writes proposal.json with ONE surface change                    │
+│                                                                     │
+│  2. APPLY                                                           │
+│     Creates a complete harness directory:                            │
+│     runs/experiment/iter_001/harness/                                │
+│       agent.py                  (original or modified)               │
+│       prompt-templates/         (original or modified)               │
+│       pyproject.toml            (always copied)                      │
+│       anthropic_caching.py      (always copied)                      │
+│                                                                     │
+│  3. EVAL (Harbor on Modal)                                          │
+│     Runs the modified harness on all failing tasks                   │
+│     Checks how many flip from fail → pass                            │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### 4. Check results
+
+```bash
+# Which tasks flipped?
+for d in jobs/iter1/iter1/*/; do
+  name=$(basename $d | sed 's/__.*//') 
+  reward=$(cat $d/verifier/reward.txt 2>/dev/null || echo "?")
+  echo "$name: $reward"
+done | sort
+```
+
+### 5. Run another branch in parallel
+
+```bash
+# Target a different surface
+python -m meta.run_iteration \
+  --experiment-dir runs/experiment \
+  --iteration 2 \
+  --parent-variant iter_001 \
+  --proposer-model sonnet \
+  --focus-surface env_bootstrap \
+  --eval-env modal
+```
+
+### 6. Validate on leaderboard conditions
+
+```bash
+# Run best harness on all 89 tasks, default resources, 5 trials
+cd runs/experiment/iter_001/harness
+harbor run -d terminal-bench@2.0 -m anthropic/claude-opus-4-6 -k 5
+```
+
+---
+
+## How the Evolution Works
+
+### The Evolution Tree
+
+```
+                         baseline (69%)
+                             │
+              ┌──────────────┼──────────────┐
+              │              │              │
+         ┌────▼────┐   ┌────▼────┐   ┌────▼────┐
+         │Branch 1 │   │Branch 2 │   │Branch 3 │
+         │ prompt  │   │bootstrap│   │  tools  │
+         │ change  │   │ change  │   │ change  │
+         └────┬────┘   └────┬────┘   └────┬────┘
+              │              │              │
+         prescreen 3    prescreen 3    prescreen 3
+         tasks ($9)     tasks ($9)     tasks ($9)
+              │              │              │
+         9 flipped      1 flipped       0 flipped
+         ACCEPT ✓       ACCEPT ✓        PRUNE ✗
+              │              │
+              └──────┬───────┘
+                     │
+               ┌─────▼─────┐
+               │  MERGE     │
+               │ prompt +   │
+               │ bootstrap  │
+               └─────┬──────┘
+                     │
+              full eval (89 tasks)
+              check regressions
+                     │
+                     ▼
+               next iteration
+```
+
+### What the Proposer Sees
+
+The proposer is a Claude Code agent with a structured workspace:
+
+```
+proposer_workspace/
+│
+├── TASK.md                         # Instructions
+│   "Investigate traces, propose ONE change to ONE surface"
+│
+├── surfaces/
+│   ├── manifest.json               # Risk ratings per surface
+│   │   {
+│   │     "system_prompt": {
+│   │       "risk": "LOW",
+│   │       "fragility": 0.0,
+│   │       "description": "12-line prompt template..."
+│   │     },
+│   │     "completion_logic": {
+│   │       "risk": "HIGH",
+│   │       "fragility": 0.75,          ← auto-tracked
+│   │       "description": "..."
+│   │     }
+│   │   }
+│   ├── system_prompt.txt           # Current prompt value
+│   ├── env_bootstrap.py            # Current bootstrap code
+│   └── tool_definitions.py         # Current tool schemas
+│
+├── traces/                         # Full traces for FAILING tasks
+│   ├── build-pmars/
+│   │   └── trial_0.json           # Every command, output, error
+│   │       {
+│   │         "steps": [
+│   │           {"step_id": 1, "command": "ls /app/", "output": "..."},
+│   │           {"step_id": 2, "command": "make", "error": "gcc: not found"},
+│   │           ...
+│   │           {"step_id": 15, "tool_name": "task_complete"}  ← gave up
+│   │         ]
+│   │       }
+│   ├── cancel-async-tasks/
+│   │   ├── trial_0.json
+│   │   └── differential.json      # Compare passing vs failing run
+│   └── ...
+│
+└── notebook/                       # Memory across iterations
+    ├── findings.md                 # "Verification protocol works"
+    ├── dead_ends.md                # "Don't modify completion_logic"
+    └── surface_risk.md             # "completion_logic: HIGH risk"
+```
+
+The proposer can **grep**, **cat**, **read** any file — it investigates
+like a researcher, not a slot machine.
+
+### The Gatekeeper
+
+Every proposal goes through a strict evaluation pipeline:
+
+```
+  Proposal
+     │
+     ▼
+  ┌──────────────────────────────────────┐
+  │ PRESCREEN: 3 failing tasks ($9)      │
+  │ Any flip? ──── No ──── PRUNE         │
+  │     │                   (cost: $9)    │
+  │    Yes                                │
+  │     │                                 │
+  │ EVAL: all failing tasks + 5 canaries  │
+  │ ($75)                                 │
+  │     │                                 │
+  │ Regressions > 1? ── Yes ── REJECT    │
+  │     │                   │             │
+  │    No                   ▼             │
+  │     │            dead_ends.md updated │
+  │     │            fragility increases  │
+  │     ▼                                 │
+  │ Pass count improved? ── No ── REJECT │
+  │     │                                 │
+  │    Yes                                │
+  │     ▼                                 │
+  │   ACCEPT                              │
+  │   findings.md updated                 │
+  │   new branch in tree                  │
+  └──────────────────────────────────────┘
+```
+
+### Surface Fragility Tracking
+
+Each surface has an auto-updated fragility score:
+
+```
+  Edit 1: system_prompt change → ACCEPTED
+    fragility: 0.0 (1 edit, 0 rejections)
+
+  Edit 2: system_prompt change → REJECTED (3 regressions)
+    fragility: 0.5 (2 edits, 1 rejection) → MEDIUM risk
+
+  Edit 3: system_prompt change → REJECTED (timeout issues)
+    fragility: 0.67 (3 edits, 2 rejections) → HIGH risk
+
+  Proposer sees: "system_prompt [HIGH risk, fragility=0.67]"
+  → Switches to a different surface
+```
+
+Meta-Harness tried `completion_logic` 3 times, regressing each time,
+with no mechanism to stop. EvoHarness would have flagged it HIGH after
+the first rejection.
+
+### The Research Notebook
+
+Persistent memory across iterations:
+
+```
+findings.md:
+  - Iter 1: verification protocol flipped 9 tasks
+  - Iter 2: expanded bootstrap flipped dna-assembly
+
+dead_ends.md:
+  - Iter 3: error recovery in prompt caused 3 regressions
+    (agent spent too many turns retrying on simple tasks)
+  - Iter 4: modifying completion_logic caused regression
+    (double-confirmation is fragile, don't touch)
+
+surface_risk.md:
+  - system_prompt    [LOW,  0.00] — safe to modify
+  - env_bootstrap    [LOW,  0.00] — safe to modify
+  - tool_definitions [LOW,  0.00] — untested
+  - completion_logic [HIGH, 0.75] — DO NOT MODIFY
+```
+
+Each new proposer reads this before investigating. No wasted iterations
+repeating failed approaches.
+
+---
+
+## Editable Surfaces
+
+The agent harness is decomposed into 4 independently-editable surfaces:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                                                                 │
+│  SYSTEM PROMPT  (prompt-templates/terminus-kira.txt)            │
+│  ─────────────                                                  │
+│  12 lines. Task instructions + verification guidance.           │
+│  Risk: LOW. Most room for improvement.                          │
+│                                                                 │
+│  "You are an AI assistant tasked with solving command-line       │
+│   tasks in a Linux environment..."                              │
+│                                                                 │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  TOOL DEFINITIONS  (agent.py::tool_definitions)                 │
+│  ────────────────                                               │
+│  3 tool schemas: execute_commands, task_complete, image_read.   │
+│  Risk: LOW. Descriptions are the main lever.                    │
+│                                                                 │
+│  execute_commands(analysis, plan, commands[{keystrokes, dur}])  │
+│  task_complete()                                                │
+│  image_read(file_path, instruction)                             │
+│                                                                 │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  ENV BOOTSTRAP  (agent.py::env_bootstrap)                       │
+│  ─────────────                                                  │
+│  Gathers environment snapshot before agent loop.                │
+│  Risk: LOW. Additive changes are safe.                          │
+│                                                                 │
+│  Currently detects: pwd, ls /app/, python3, gcc, node, java,    │
+│  rustc, go, pip, apt-get, memory                                │
+│                                                                 │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  COMPLETION LOGIC  (agent.py::completion_logic)                 │
+│  ────────────────                                               │
+│  Double-confirmation checklist before task_complete.             │
+│  Risk: HIGH (fragility 0.75). Meta-Harness regressed 3/4.      │
+│                                                                 │
+│  ⚠ DO NOT MODIFY unless you have strong evidence.               │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Reproducible Experiments
+
+Every iteration produces a **self-contained, runnable harness directory**:
+
+```
+runs/experiment/
+│
+├── iter_001_branch_001/
+│   ├── harness/                        # Drop-in replacement
+│   │   ├── agent.py                    # Original (unchanged)
+│   │   ├── anthropic_caching.py
+│   │   ├── prompt-templates/
+│   │   │   └── terminus-kira.txt       # ← MODIFIED
+│   │   └── pyproject.toml
+│   ├── proposal.json                   # What was proposed and why
+│   └── variant.json                    # Which surfaces changed
+│
+├── iter_001_branch_002/
+│   ├── harness/                        # Different modification
+│   │   ├── agent.py                    # ← MODIFIED (env_bootstrap)
+│   │   ├── anthropic_caching.py
+│   │   ├── prompt-templates/
+│   │   │   └── terminus-kira.txt       # ← ALSO MODIFIED (from branch 1)
+│   │   └── pyproject.toml
+│   └── proposal.json
+│
+└── iter_002_base/
+    └── harness/                        # Merged (both changes)
+
+# Run ANY iteration independently:
+cd runs/experiment/iter_001_branch_001/harness
+harbor run -d terminal-bench@2.0 -m anthropic/claude-opus-4-6 -k 5
+```
+
+No file swapping. No environment setup. Each harness is complete and runnable.
+
+---
+
+## Comparison with Prior Work
+
+|                          | Meta-Harness | better-harness | EvoHarness |
+|--------------------------|:----------:|:-----------:|:----------:|
+| Search strategy          | Linear     | Linear      | **Evolution tree** |
+| Proposals per iteration  | 1          | 1           | **N parallel** |
+| Pre-screening            | No ($267/reject) | No   | **Yes ($9/reject)** |
+| Branch merging           | No         | No          | **Yes** |
+| Proposer                 | Claude Code | Deep Agent  | **Claude Code** |
+| Trace access             | Raw filesystem | Summaries | **Structured + full** |
+| Surface fragility        | Manual (6 failures) | No | **Auto-tracked** |
+| Dead ends memory         | No         | Accept/reject | **Full notebook** |
+| Reproducible iterations  | Output only | Framework  | **Self-contained harnesses** |
+| TerminalBench-2 results  | 76.4%      | N/A         | **In progress** |
+
+---
+
+## First Results
+
+Starting from KIRA + env bootstrap baseline (same as Meta-Harness):
+
+| Branch | Surface | Tasks Flipped | Cost |
+|--------|---------|:------------:|-----:|
+| Baseline | — | 61/88 passed | $267 |
+| Branch 1 | system_prompt | **+9** | $70 |
+| Branch 2 | env_bootstrap | **+1** (unique) | $70 |
+| **Total** | | **+10 tasks** | **$407** |
+
+Meta-Harness found **+1 change** in **8 iterations** for **~$2,400**.
+EvoHarness found **+2 changes** in **2 iterations** for **~$407**.
+
+---
+
+## License
+
+MIT
+
+---
+
+# Meta-Harness: Tree Search for Automated Harness Optimization
+
+Source: https://github.com/ryanli-me/evoharness/blob/main/DESIGN.md
+
+# Meta-Harness: Tree Search for Automated Harness Optimization
+
+## The Problem
+
+Agent harnesses (prompts, tools, bootstrapping code) are manually engineered.
+Meta-Harness showed an LLM can optimize these, but used linear hill climbing:
+8 iterations, 7 wasted, 1 useful change found.
+
+## Our Approach: Tree Search with Parallel Proposals
+
+```
+                         ┌──────────────┐
+                         │   BASELINE   │
+                         │  75% pass    │
+                         │  20 failing  │
+                         └──────┬───────┘
+                                │
+                    ┌───────────┼───────────┐
+                    ▼           ▼           ▼
+              ┌──────────┐ ┌──────────┐ ┌──────────┐
+              │Proposer A│ │Proposer B│ │Proposer C│   ← 3 Claude Code
+              │(sonnet)  │ │(sonnet)  │ │(sonnet)  │     agents in parallel
+              │reads     │ │reads     │ │reads     │     each reads traces,
+              │traces,   │ │traces,   │ │traces,   │     greps for patterns,
+              │diagnoses │ │diagnoses │ │diagnoses │     proposes 1 change
+              └────┬─────┘ └────┬─────┘ └────┬─────┘
+                   │            │            │
+                   ▼            ▼            ▼
+              ┌──────────┐ ┌──────────┐ ┌──────────┐
+              │Prescreen │ │Prescreen │ │Prescreen │   ← Run each proposal
+              │3 failing │ │3 failing │ │3 failing │     on 3 failing tasks
+              │tasks     │ │tasks     │ │tasks     │     (cheap filter)
+              └────┬─────┘ └────┬─────┘ └────┬─────┘
+                   │            │            │
+                   ▼            ▼            ▼
+              1/3 pass     0/3 pass     2/3 pass
+              ┌──────┐     ┌──────┐     ┌──────┐
+              │MAYBE │     │PRUNE │     │ BEST │        ← Pick best prescreen
+              └──────┘     └──────┘     └──┬───┘
+                                           │
+                                           ▼
+                                    ┌──────────────┐
+                                    │  Full eval    │   ← Run on ALL 20
+                                    │  20 failing   │     failing tasks
+                                    │  + 5 canaries │     + 5 passing canaries
+                                    └──────┬───────┘
+                                           │
+                                           ▼
+                                    ┌──────────────┐
+                                    │  Gatekeeper   │   ← Accept if:
+                                    │  pass↑ reg≤1  │     more tasks pass AND
+                                    └──────┬───────┘     regressions ≤ 1
+                                           │
+                                    ┌──────┴──────┐
+                                    ▼             ▼
+                              ┌──────────┐  ┌──────────┐
+                              │ ACCEPT   │  │ REJECT   │
+                              │ new      │  │ dead end │
+                              │ branch   │  │ logged   │
+                              └──────────┘  └──────────┘
+```
+
+## After Multiple Iterations: The Search Tree
+
+```
+baseline (75%)
+├── branch_001: system_prompt + error recovery (77%) ✓ ACCEPTED
+│   └── branch_004: + budget awareness (78%) ✓ ACCEPTED
+├── branch_002: env_bootstrap + read README (76%) ✓ ACCEPTED
+├── branch_003: tool_definitions change → PRUNED at prescreen
+└── merge(001, 002): error recovery + read README (79%) ✓ MERGED
+
+Best variant: merge_006 (79%)
+```
+
+## Key Innovation: Why Tree > Linear
+
+```
+Meta-Harness (linear):
+  baseline → reject → reject → reject → reject → reject → reject → ACCEPT → neutral
+  Cost: 8 full evals. Found: 1 improvement.
+
+Our framework (tree):
+  baseline ─┬─ branch A (prescreen 3 tasks) → PRUNE (cost: 3 tasks)
+            ├─ branch B (prescreen 3 tasks) → promising → full eval → ACCEPT
+            ├─ branch C (prescreen 3 tasks) → PRUNE (cost: 3 tasks)
+            └─ branch D (prescreen 3 tasks) → promising → full eval → ACCEPT
+            └─ merge(B,D) → full eval → ACCEPT
+  Cost: 4×3 + 3×20 = 72 task evals. Found: 3 improvements.
+```
+
+## Components
+
+### 1. Surfaces (what we can edit)
+
+```
+┌─────────────────────────────────────────────────────────┐
+│ system_prompt          [LOW risk]                        │
+│ "You are an AI assistant tasked with solving..."         │
+│ 12 lines, very minimal. Most room for improvement.      │
+├─────────────────────────────────────────────────────────┤
+│ tool_definitions       [LOW risk]                        │
+│ execute_commands, task_complete, image_read               │
+│ 3 tool schemas + description strings.                    │
+├─────────────────────────────────────────────────────────┤
+│ env_bootstrap          [LOW risk]                        │
+│ _gather_env_snapshot() — pwd, ls, language versions       │
+│ Could detect project type, read README, etc.             │
+├─────────────────────────────────────────────────────────┤
+│ completion_logic       [HIGH risk — 3/4 regressions]     │
+│ Double-confirmation checklist before task_complete.       │
+│ Meta-Harness tried 3 times, regressed each time.         │
+└─────────────────────────────────────────────────────────┘
+```
+
+### 2. Proposer (Claude Code agent)
+
+Each proposer gets a workspace:
+```
+proposer_workspace/
+  TASK.md              ← Instructions: investigate, hypothesize, propose
+  surfaces/            ← Current surface values + risk ratings
+  results/             ← Pass/fail summary, failing task list
+  traces/              ← FULL execution traces for every failing task
+    task_name/
+      trial_0.json     ← Every command, output, error, LLM reasoning
+      differential.json ← Passing vs failing comparison
+  notebook/            ← Accumulated knowledge from prior iterations
+    findings.md        ← What works
+    dead_ends.md       ← What doesn't (DO NOT REPEAT)
+    surface_risk.md    ← Which surfaces are safe to edit
+```
+
+The proposer can grep, cat, read any file — full investigation before proposing.
+
+### 3. Research Notebook (memory across iterations)
+
+```
+Iteration 1: Tried adding error recovery to prompt → ACCEPTED (+2 tasks)
+Iteration 2: Tried verification protocol → PRUNED (prescreen 0/3)
+Iteration 3: Tried modifying completion logic → REJECTED (2 regressions)
+             → completion_logic fragility: 0.75 → HIGH risk
+
+findings.md:
+  - Error recovery guidance in prompt helps (iter 1)
+
+dead_ends.md:
+  - Verification protocol doesn't help failing tasks (iter 2)
+  - Modifying completion logic causes regressions (iter 3)
+
+surface_risk.md:
+  - system_prompt [LOW risk] — 1 accepted / 1 rejected
+  - completion_logic [HIGH risk] — 0 accepted / 1 rejected
+```
+
+### 4. Incremental Eval (cost optimization)
+
+```
+Full eval:     89 tasks × $3/task = $267 per iteration
+Our approach:  20 failing + 5 canaries × $3/task = $75 per iteration
+                                                    ↓
+                                               3.6x cheaper
+```
+
+Only re-run failing tasks. Carry forward passing results.
+If a canary (previously passing task) fails → regression detected.
+
+### 5. Thompson Sampling (branch selection)
+
+Each branch has a Beta(passed, failed) distribution.
+Sample from each, pick the highest → balances exploration vs exploitation.
+
+```
+baseline:    Beta(60, 20) → sample ~0.74
+branch_001:  Beta(62, 18) → sample ~0.78  ← likely picked
+branch_002:  Beta(61, 19) → sample ~0.71
+```
+
+New branches with few evals have high variance → get explored.
+Strong branches get exploited. Weak branches naturally die out.
+
+## Prior Art Comparison
+
+| | Meta-Harness | better-harness | AutoHarness | Ours |
+|--|-------------|----------------|-------------|------|
+| Search | Linear hill climb | Linear hill climb | Thompson tree | Thompson tree + parallel |
+| Proposer | Claude Code agent | LangChain Deep Agent | Gemini + critic | Claude Code agent |
+| Pre-screening | No | No | 10 envs × 1000 steps | 3 tasks (cheap) |
+| Branch merging | No | No | No | Yes |
+| Fragility tracking | No | No | No | Yes |
+| Dead ends memory | No | Accept/reject only | No | Full notebook |
+| Incremental eval | No (full 89 tasks) | No | N/A | Yes (failing + canaries) |
+| Cost per iteration | ~$267 | ~$267 | N/A | ~$75 |
+
+---
+
+# The Process: How an Iteration Should Work
+
+Source: https://github.com/ryanli-me/evoharness/blob/main/PROCESS.md
+
+# The Process: How an Iteration Should Work
+
+## The Correct Flow
+
+```
+Step 1: BASELINE (once)
+  Run all 89 tasks × 1 trial, DEFAULT resources
+  → Get pass/fail map + full traces
+  → This is our ground truth
+
+Step 2: PROPOSE
+  Claude Code agent reads failing traces + notebook
+  → Proposes ONE change to ONE surface
+  → Writes proposal.json
+
+Step 3: APPLY
+  apply_variant_to_harness() creates a complete harness directory
+  → Self-contained, runnable with `harbor run`
+
+Step 4: PRESCREEN (cheap filter)
+  Run proposal on 3 randomly-selected FAILING tasks, DEFAULT resources
+  → If 0/3 flip → PRUNE. Cost: $9. Done.
+  → If 1+ flip → proceed to Step 5
+
+Step 5: EVAL FAILING TASKS
+  Run proposal on ALL failing tasks (~20), DEFAULT resources
+  → Count how many flip
+
+Step 6: EVAL CANARIES (regression check)
+  Run proposal on 5 randomly-selected PASSING tasks, DEFAULT resources
+  → If any canary fails → likely regression
+
+Step 7: GATEKEEPER
+  Compare: flips vs regressions
+  → ACCEPT if: pass_count improves AND regressions ≤ tolerance (1)
+  → REJECT otherwise
+
+Step 8: UPDATE
+  If ACCEPTED:
+    → notebook/findings.md: what worked
+    → surface fragility stays low
+    → This variant becomes the new parent for next iteration
+
+  If REJECTED:
+    → notebook/dead_ends.md: what failed and WHY
+    → surface fragility increases
+    → Parent variant unchanged, try different approach
+
+Step 9: REPEAT from Step 2
+```
+
+## What We Did Wrong in Our Experiment
+
+```
+✗ Baseline ran on OVERRIDDEN resources (8 CPU, 16GB)
+  → Should have been DEFAULT (1 CPU, 2GB)
+
+✗ Branch evals only ran on failing tasks, no canaries
+  → Missed 8 regressions that showed up later
+
+✗ Both proposals auto-accepted without regression check
+  → Should have run canaries before accepting
+
+✗ Ran proposer + eval manually instead of through the loop
+  → Bypassed gatekeeper, notebook updates, fragility tracking
+```
+
+## What Would Have Happened With the Correct Process
+
+```
+Step 1: Baseline (all 89, default resources)
+  → 61 passed, 28 failed
+
+Step 2-3: Proposer → verification protocol for system_prompt
+
+Step 4: Prescreen (3 failing tasks, default resources)
+  → 1/3 flip → proceed
+
+Step 5: Eval failing (28 tasks, default resources)
+  → Some flip (maybe 5-7 on default resources, not 9)
+
+Step 6: Canaries (5 passing tasks, default resources)
+  → Maybe 1 fails → regression detected
+
+Step 7: Gatekeeper
+  → If 6 flips, 1 regression → net +5 → ACCEPT
+  → If 3 flips, 2 regressions → net +1 but over tolerance → REJECT
+     → notebook records: "verification protocol too aggressive,
+        causes timeout on simple tasks"
+     → proposer next iteration: make it conditional
+
+Step 8: If rejected, proposer reads dead_ends.md
+  → Proposes softer version: "only verify if task provides test command"
+  → This targeted version might flip 5 tasks with 0 regressions
+```
+
+## Key Principle
+
+**Every eval must be on DEFAULT resources.** Otherwise you're optimizing
+for a phantom benchmark that doesn't match the leaderboard. Our 9 flips
+on big resources became 7 flips + 8 regressions on default — the change
+was net negative.
+
+## The Loop in Code
+
+This is what `python -m meta run` does automatically:
+
+```python
+for iteration in range(max_iterations):
+    # Select branch (Thompson sampling)
+    parent = tree.select_branch()
+
+    # N proposers in parallel
+    proposals = await gather([propose(parent) for _ in range(N)])
+
+    # Prescreen all (3 tasks each, parallel)
+    for proposal in proposals:
+        prescreen = await eval(proposal, 3_failing_tasks)
+        if prescreen.pass_count == 0:
+            prune(proposal)  # $9 wasted, not $267
+
+    # Full eval on best surviving proposal
+    best = pick_best_prescreen(proposals)
+    result = await eval(best, all_failing + 5_canaries)
+
+    # Gatekeeper
+    if result.pass_count > parent.pass_count and regressions <= 1:
+        accept(best)  # new branch in tree
+        notebook.add_finding(...)
+    else:
+        reject(best)  # dead end
+        notebook.add_dead_end(...)
+        surface.fragility += 1
+
+    # Periodically merge top branches
+    if iteration % 3 == 0:
+        merge(branch_a, branch_b)
+```
+
+## For the Final Submission
+
+```bash
+# Run best harness on official conditions
+cd runs/experiment/best_variant/harness
+harbor run -d terminal-bench@2.0 -m anthropic/claude-opus-4-6 -k 5
+# No overrides. This is the real score.
+```
+
+---
+
+# Meta-Harness Runbook
+
+Source: https://github.com/ryanli-me/evoharness/blob/main/RUNBOOK.md
+
+# Meta-Harness Runbook
+
+## Goal
+Automatically discover harness improvements over KIRA+env_bootstrap (76.4%) on TerminalBench-2.
+
+## Steps
+
+### Step 1: Baseline Eval
+Run all 89 tasks × 1 trial to get pass/fail map + traces.
+
+```bash
+source .env && harbor run \
+  --agent-import-path agent:AgentHarness \
+  -d terminal-bench@2.0 \
+  -m anthropic/claude-opus-4-6 \
+  -e modal \
+  -k 1 -n 89 \
+  --override-cpus 8 --override-memory-mb 16384 \
+  --timeout-multiplier 3.0 \
+  -o jobs/baseline-modal --job-name baseline \
+  -y --env-file .env
+```
+
+**Status**: RUNNING (PID 79270)
+**Expected**: ~76% pass rate, ~20 failing tasks, ~30 min on Modal
+
+### Step 2: Import Traces
+Parse Harbor job output into our TraceStore so the proposer can read them.
+
+```bash
+python -m meta import jobs/baseline-modal/baseline --output runs/experiment
+```
+
+**TODO**: Write the import script (`meta/import_job.py`)
+
+### Step 3: Tree Search Loop
+Run the optimization loop with parallel proposals.
+
+```bash
+python -m meta run meta/configs/kira_tbench2.toml
+```
+
+What happens per iteration:
+1. Thompson sampling selects N branches to extend
+2. N Claude Code proposers spawn in parallel, each reading traces
+3. Each proposes ONE surface change with hypothesis
+4. All candidates pre-screened on 3 failing tasks (parallel, on Modal)
+5. Best candidate gets full incremental eval (failing + 5 canaries)
+6. Gatekeeper accepts/rejects
+7. Notebook updated with findings/dead ends
+8. Every 3 iterations: try merging top 2 accepted branches
+
+**Config**: 10 iterations, 3 parallel proposals, 3 prescreen tasks
+
+### Step 4: Final Eval
+Run best variant on all 89 tasks × 5 trials for official score.
+
+```bash
+source .env && harbor run \
+  --agent-import-path agent:AgentHarness \
+  -d terminal-bench@2.0 \
+  -m anthropic/claude-opus-4-6 \
+  -e modal \
+  -k 5 -n 89 \
+  --override-cpus 8 --override-memory-mb 16384 \
+  --timeout-multiplier 3.0 \
+  -o jobs/final --job-name final \
+  -y --env-file .env
+```
+
+Uses the modified harness from Step 3 (best variant applied).
+
+### Step 5: Compare
+- Baseline score (Step 1) vs Final score (Step 4)
+- What surfaces changed, what hypotheses were confirmed
+- Full report in `runs/experiment/report.md`
+
+## Cost Estimate
+
+| Step | Tasks | Trials | Est. Cost |
+|------|-------|--------|-----------|
+| Baseline | 89 | 1 | ~$250 |
+| Per search iteration | ~25 (failing+canaries) | 1 | ~$75 |
+| 10 iterations | ~250 total | 1 | ~$750 |
+| Final eval | 89 | 5 | ~$1,250 |
+| Proposer (10 iter × 3 parallel) | — | — | ~$30 |
+| **Total** | | | **~$2,280** |
+
+## Immediate TODOs
+
+- [ ] Wait for baseline to finish (Step 1)
+- [ ] Write import script to parse Harbor → TraceStore
+- [ ] Update config to use Modal + correct concurrency
+- [ ] Run the loop
+
+---
