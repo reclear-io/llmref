@@ -1,0 +1,1031 @@
+# turbo-quant
+
+Source: https://github.com/recursiveintell/turbo-quant/blob/main/README.md
+
+# turbo-quant
+
+`turbo-quant` is an experimental Rust crate for **derived vector-compression sidecars** inspired by TurboQuant, PolarQuant, and Quantized Johnson-Lindenstrauss (QJL) style sketches.
+
+It is designed for systems that keep canonical vectors elsewhere, then use compact sidecars for candidate generation, memory accounting, compression experiments, and exact-rerank workflows. It is not a canonical vector store, not a replacement for exact vectors, and approximate scores are not ground truth.
+
+## What this crate is
+
+- A deterministic vector sidecar codec for embedding/search experiments.
+- A PolarQuant-style compressor with optional QJL residual sketches.
+- A compact sidecar index that returns approximate candidates plus an explicit search receipt.
+- A KV-cache shadow-mode experiment surface for measuring compressed key/value behavior.
+- A source-compatible update over the original `0.1.x` API surface.
+
+## What this crate is not
+
+- It is **not** a canonical vector store.
+- It is **not** a replacement for exact vectors in correctness-sensitive retrieval.
+- It is **not** a reversible compression library.
+- It does **not** guarantee quality for every corpus, model, embedding distribution, or KV-cache workload.
+- It should not be promoted into a production retrieval path without local benchmark gates and exact fallback.
+
+The safe integration pattern is:
+
+```text
+canonical vectors / raw KV state
+        +
+derived turbo-quant sidecars
+        -> approximate candidate generation
+        -> exact rerank / exact fallback
+        -> measured promotion decision
+```
+
+## Installation
+
+```toml
+[dependencies]
+turbo-quant = "0.2"
+```
+
+Minimum supported Rust version: **1.75**.
+
+## Quick start: encode and score one vector
+
+```rust
+use turbo_quant::TurboQuantizer;
+
+fn main() -> turbo_quant::Result<()> {
+    let dim = 64;
+    let quantizer = TurboQuantizer::new(dim, 8, 16, 42)?;
+
+    let database_vector = vec![0.1_f32; dim];
+    let query_vector = vec![0.1_f32; dim];
+
+    let code = quantizer.encode(&database_vector)?;
+    let score = quantizer.inner_product_estimate(&code, &query_vector)?;
+
+    println!("approximate score: {score}");
+    println!("encoded bytes: {}", code.encoded_bytes());
+    Ok(())
+}
+```
+
+## Sidecar candidate search
+
+`TurboSidecarIndex` is intentionally a sidecar index. It returns approximate candidates and a receipt that declares exact rerank is required.
+
+```rust
+use turbo_quant::{SearchOptions, TurboQuantizer, TurboSidecarIndex};
+
+fn main() -> turbo_quant::Result<()> {
+    let dim = 64;
+    let quantizer = TurboQuantizer::new(dim, 8, 16, 42)?;
+    let mut index = TurboSidecarIndex::new(quantizer);
+
+    index.add("doc-a", &vec![0.10; dim], Some("source:doc-a".into()))?;
+    index.add("doc-b", &vec![0.20; dim], Some("source:doc-b".into()))?;
+
+    let query = vec![0.12; dim];
+    let (candidates, receipt) = index.search(
+        &query,
+        SearchOptions {
+            top_k: 1,
+            oversample: 4,
+        },
+    )?;
+
+    assert!(receipt.approximate_only);
+    assert!(receipt.exact_rerank_required);
+    println!("top approximate candidate: {:?}", candidates.first());
+    Ok(())
+}
+```
+
+After candidate generation, rerank candidates against caller-owned exact vectors or a trusted exact scorer.
+
+## KV-cache shadow mode
+
+KV-cache compression is exposed as an experiment surface. Keep exact shadows while measuring quality before promotion.
+
+```rust
+use turbo_quant::{KvCacheCompressor, KvQuantPolicy, KvRuntimeConfig};
+
+fn main() -> turbo_quant::Result<()> {
+    let dim = 64;
+    let mut cache = KvCacheCompressor::new_runtime(KvRuntimeConfig {
+        head_dim: dim,
+        key_policy: KvQuantPolicy::quantized(8, 16),
+        value_policy: KvQuantPolicy::Exact,
+        seed: 42,
+        keep_exact_shadow: true,
+    })?;
+
+    cache.compress_token(&vec![0.1; dim], &vec![0.2; dim])?;
+
+    let query = vec![0.15; dim];
+    let approximate_scores = cache.attention_scores(&query)?;
+    let shadow_scores = cache.shadow_scores(&query)?;
+
+    println!("approximate scores: {approximate_scores:?}");
+    println!("shadow comparison: {shadow_scores:?}");
+    Ok(())
+}
+```
+
+## API compatibility
+
+`0.2.x` preserves the original public compatibility surface from `0.1.x` while adding new sidecar, wire, receipt, and runtime-policy APIs.
+
+Compatibility-preserved examples include:
+
+- `PolarCode { dim, bits, radii, angle_indices }`
+- `QjlSketch { dim, projections, signs }`
+- `TurboCode { polar_code, residual_sketch }`
+- `KvCacheConfig { head_dim, bits, projections, seed }`
+- `CompressedToken { compressed_key, compressed_value }`
+- legacy constructors such as `PolarQuantizer::new`, `QjlQuantizer::new`, `TurboQuantizer::new`, and `KvCacheCompressor::new`
+
+The new APIs are additive and should be treated as the preferred integration surface for measured sidecar workflows.
+
+## Release honesty
+
+Compressed codes are derived artifacts. Any quality-sensitive use should preserve:
+
+1. the source vector or exact KV state,
+2. the codec profile,
+3. benchmark receipts for the target workload,
+4. exact rerank or exact fallback, and
+5. clear degradation behavior when approximation is insufficient.
+
+Do not treat approximate scores as ground truth.
+
+## Testing before release
+
+The release gate for this crate is intentionally strict:
+
+```bash
+cargo fmt --all -- --check
+cargo check --all-targets --all-features --locked
+cargo test --all-targets --all-features --locked
+cargo test --doc --all-features --locked
+cargo clippy --all-targets --all-features --locked -- -D warnings
+cargo doc --all-features --no-deps --locked
+cargo semver-checks --baseline-version 0.1.0 --manifest-path Cargo.toml
+cargo package --list --locked
+cargo package --locked
+cargo publish --dry-run --locked
+```
+
+This repository includes release helper scripts under `scripts/` that run these gates, validate this README, validate crates.io package scope, and write local release receipts.
+
+## Feature and design notes
+
+- Rotation/profile selection is deterministic from explicit parameters.
+- Packed/wire representations are acceleration artifacts, not truth-bearing storage.
+- `SearchReceiptV1` makes approximate-only candidate generation explicit.
+- `CompressionReceiptV1` records byte accounting and warnings for derived sidecars.
+- KV-cache support is shadow-mode-first and should remain benchmark-gated.
+
+## License
+
+MIT
+
+---
+
+# AGENTS.md P26 patch for turbo-quant
+
+Source: https://github.com/recursiveintell/turbo-quant/blob/main/AGENTS.md
+
+# AGENTS.md P26 patch for turbo-quant
+
+Append this to repo-root `AGENTS.md` for the P26 pass, or merge it into the existing repo guidance.
+
+## P26 release-hardening rules
+
+This repository is `turbo-quant`, a codec/compression crate. It is not semantic-memory, not a database, not a canonical vector store, and not a full RAG/retrieval system.
+
+### Source-of-truth ownership
+
+- `turbo-quant` owns codec profiles, quantizers, packed payloads, wire formats, approximate scoring, sidecar candidate generation, compression/search/KV receipts, and benchmark harnesses.
+- `semantic-memory` owns mature vector indexing/retrieval semantics, raw-vector authority, exact rerank truth, document/source/chunk identity, and memory/retrieval product behavior.
+- The P26 harness may read and compile against `~/Coding/Libraries/semantic-memory`, but core `src/` must not depend on or copy semantic-memory internals.
+
+### API compatibility law
+
+The public API from the crates.io `0.1.0` release must keep compiling unless a breaking change is intentionally versioned and documented. For this pass, assume no old public API break is allowed.
+
+Do not mutate all-public legacy structs to add/remove/rename fields. Preserve:
+
+```rust
+PolarCode { dim, bits, radii, angle_indices }
+QjlSketch { dim, projections, signs }
+TurboCode { polar_code, residual_sketch }
+KvCacheConfig { head_dim, bits, projections, seed }
+CompressedToken { compressed_key, compressed_value }
+```
+
+Add new capabilities through additive new types, for example:
+
+```rust
+PackedPolarCode
+PackedQjlSketch
+PackedTurboCode
+TurboSidecarCode
+TurboSidecarIndex
+KvRuntimeConfig
+KvShadowToken
+SearchReceiptV1
+SemanticMemoryProofReceiptV1
+RadiusCodecProfileV1
+```
+
+### Release claim law
+
+Forbidden in README, docs, rustdoc, crate description, and release notes unless explicitly scoped to external paper claims or local receipt evidence:
+
+- zero accuracy loss
+- zero overhead
+- production KV cache runtime
+- drop-in replacement
+- better than semantic-memory
+- proven deployment quality
+- no dataset-specific calibration as a crate guarantee
+
+Allowed safe framing:
+
+- experimental codec substrate
+- derived sidecar
+- approximate scoring
+- exact fallback/rerank required
+- workload-specific benchmark receipts required
+- semantic-memory reference harness validates retrieval drift locally
+
+### Required final proof
+
+No publish recommendation unless these exist and pass:
+
+- `examples/compat_0_1_smoke.rs`
+- `scripts/assert_p26_invariants.py`
+- `tools/semantic_memory_harness/`
+- `docs/codex-runs/P26/SEMANTIC_MEMORY_PROOF_RECEIPT.json`
+- `docs/codex-runs/P26/VALIDATION_RECEIPT.json`
+- `docs/codex-runs/P26/AUDITOR_HANDOFF.md`
+- `cargo package`
+- `cargo publish --dry-run`
+
+---
+
+# turbo-quant release agent rules
+
+Source: https://github.com/recursiveintell/turbo-quant/blob/main/AGENTS.release.md
+
+# turbo-quant release agent rules
+
+This repository contains an experimental vector-compression sidecar crate.
+
+## Release law
+
+- Do not publish without `cargo publish --dry-run --locked` passing.
+- Do not publish from a dirty git tree.
+- Do not publish while README contains Codex/run-bundle/stale-alpha/lossless/universal-quality claims.
+- Do not publish if `cargo package --list --locked` includes Codex artifacts, local release evidence, context zips, prompts, target dirs, or local harness tooling.
+- Do not treat compressed sidecars as canonical vectors.
+- Do not claim production readiness or benchmark superiority without local receipts.
+
+## Required release commands
+
+Use:
+
+```bash
+python3 scripts/tq_release_gate.py --version 0.2.0
+```
+
+Then, only when the operator explicitly approves upload:
+
+```bash
+export TQ_RELEASE_I_UNDERSTAND=publish-turbo-quant-0.2.0
+python3 scripts/tq_publish_crates_io.py --version 0.2.0 --execute
+```
+
+## Final report required
+
+Changed files, commands run, test/lint/doc results, README gate, package gate, dry-run gate, publish status, receipt paths, and rollback/yank notes.
+
+---
+
+# API Target
+
+Source: https://github.com/recursiveintell/turbo-quant/blob/main/docs/API_TARGET.md
+
+# API Target
+
+## Additive Public Types
+
+- `CodecProfileV1`
+- `CompressionPolicyV1`
+- `CompressionReceiptV1`
+- `CompressionEvalV1`
+- `BenchmarkReceiptV1`
+- `TurboMode`
+- `KvQuantPolicy`
+- `KvRuntimeConfig`
+- `KvShadowToken`
+- `SearchReceiptV1`
+- `PackedPolarCode`
+- `PackedQjlSketch`
+- `PackedTurboCode`
+- `QjlSketchProvenanceV1`
+
+## Public Modules
+
+- `bitpack`
+- `profile` or `codec`
+- `codebook`
+- `eval`
+- `index`
+- `packed`
+- `radius`
+- `wire`
+
+## Compatibility
+
+Legacy constructors remain available:
+
+- `PolarQuantizer::new(dim, bits, seed)`
+- `QjlQuantizer::new(dim, projections, seed)`
+- `TurboQuantizer::new(dim, bits, projections, seed)`
+
+Any future behavior change must be documented in `CHANGELOG.md` and versioned.
+
+## Default-off advanced behavior
+
+- QJL residual correction should be explicit.
+- KV-cache compression policies should be explicit.
+- semantic-memory integration belongs in the external harness, not core `src/`.
+
+---
+
+# Benchmarking
+
+Source: https://github.com/recursiveintell/turbo-quant/blob/main/docs/BENCHMARKING.md
+
+# Benchmarking
+
+Use `examples/bench_embeddings.rs` to generate a machine-readable `BenchmarkReceiptV1`:
+
+```bash
+cargo run --example bench_embeddings --all-features -- \
+  --dim 128 --db-size 512 --queries 16 --bits 4 \
+  --projections 64 --seed 42 --top-k 10 \
+  --out target/turbo-quant/p24-bench.json
+```
+
+By default the example uses `RotationKind::Auto`, which resolves to FastHadamard for power-of-two dimensions and adds a Stored QR comparison in the `comparisons` array. Use `--rotation stored` to benchmark the dense reference path directly, or `--rotation fast` to require FastHadamard and fail on unsupported dimensions.
+
+The example uses synthetic standard-normal vectors and reports recall@k plus mean absolute score error against exact inner products. Treat the output as a reproducibility receipt only. Real promotion requires representative corpora, workload-specific recall/rank gates, and exact fallback.
+
+---
+
+# Compatibility
+
+Source: https://github.com/recursiveintell/turbo-quant/blob/main/docs/COMPATIBILITY.md
+
+# Compatibility
+
+## Source Of Truth
+
+`turbo-quant` compressed codes are derived sidecars. Canonical `f32` vectors, source documents, evidence records, and retrieval ownership stay in the caller system.
+
+## semantic-memory
+
+Use compressed codes only as optional sidecars. Exact vectors remain mandatory for rerank, audit, and evidence lookup.
+
+## Gloss
+
+Use compressed retrieval in shadow mode: compute exact and compressed scores, record the delta, and keep exact fallback available.
+
+## Recall / AiDENs
+
+Pass `CodecProfileV1`, `CompressionPolicyV1`, `CompressionReceiptV1`, and benchmark receipts across runtime boundaries. Do not infer runtime readiness from crate-level unit tests.
+
+## ClaimLedger
+
+Attach benchmark receipt paths and profile digests to any claim. Synthetic receipts are reproducibility receipts, not deployment evidence.
+
+## Workspace Note
+
+This crate declares its own workspace root so validation runs against this crate
+without inheriting an ambient parent workspace.
+
+---
+
+# Compatibility matrix
+
+Source: https://github.com/recursiveintell/turbo-quant/blob/main/docs/COMPATIBILITY_MATRIX.md
+
+# Compatibility matrix
+
+| Project | Relationship to turbo-quant | Allowed integration | Forbidden integration |
+|---|---|---|---|
+| semantic-memory | canonical vector/retrieval owner | compressed sidecar, candidate generation, exact rerank, receipts | replacing exact vector authority |
+| Gloss | user-facing notebook/RAG product | shadow-mode demo with drift and top-k overlap | silent compressed retrieval |
+| Recall | runtime memory/assistant layer | receipt-bearing derived memory acceleration | hidden truth store or unreceipted fallback |
+| ClaimLedger | claim/evidence tracker | benchmark claims and receipts | storing marketing claims as facts |
+| AiDENs | future orchestration/governor | policy selection and fallback through receipts | codec-specific hidden control plane |
+| fib-quant | sibling algorithm crate | shared schemas, profile names, benchmark receipt compatibility | merging source into turbo-quant |
+| AgentSecurity | scanner/admission layer | static review of generated codec code and dependencies | network/runtime assumptions without evidence |
+
+---
+
+# Expected Public File Tree
+
+Source: https://github.com/recursiveintell/turbo-quant/blob/main/docs/EXPECTED_FILE_TREE.md
+
+# Expected Public File Tree
+
+Expected additions or modifications:
+
+```text
+Cargo.toml
+README.md
+CHANGELOG.md
+RELEASE_NOTES.md
+src/error.rs
+src/lib.rs
+src/bitpack.rs
+src/profile.rs
+src/codebook.rs
+src/eval.rs
+src/polar.rs
+src/qjl.rs
+src/rotation.rs
+src/turbo.rs
+src/kv.rs
+examples/profile_receipt.rs
+examples/bench_embeddings.rs
+examples/kv_shadow.rs
+tests/bitpack.rs
+tests/encoded_size.rs
+tests/profile_receipt.rs
+tests/invalid_inputs.rs
+tests/query_workspace.rs
+tests/kv_policy.rs
+tests/serialization.rs
+tests/determinism.rs
+tests/inner_product.rs
+docs/RESEARCH_ALIGNMENT.md
+docs/BENCHMARKING.md
+docs/COMPATIBILITY.md
+docs/FIB_QUANT_INTEROP.md
+docs/SEMANTIC_MEMORY_GLOSS_SHADOW_MODE.md
+docs/RELEASE_GATE.md
+docs/release-evidence/v0.2.0/*
+```
+
+Forbidden leftovers:
+
+```text
+unqualified zero-loss claims
+unscoped KV runtime claims
+silent compatibility shims
+generated benchmark claims without JSON receipts
+path dependency on fib-quant unless explicitly approved
+```
+
+---
+
+# FibQuant Interop
+
+Source: https://github.com/recursiveintell/turbo-quant/blob/main/docs/FIB_QUANT_INTEROP.md
+
+# FibQuant Interop
+
+FibQuant is a separate crate and algorithm family. This crate does not merge
+FibQuant source into `turbo-quant`.
+
+Shared interop names:
+
+- `CodecProfileV1`
+- `CompressionPolicyV1`
+- `CompressionReceiptV1`
+- `CompressionEvalV1`
+- `BenchmarkReceiptV1`
+
+Compatibility plan:
+
+- Compare profile digest rules across crates.
+- Keep benchmark receipt fields stable enough for ClaimLedger-style attachment.
+- Define future governor traits outside both algorithm crates.
+- Preserve canonical vectors and exact fallback in caller systems.
+
+Known gaps:
+
+- No sibling `fib-quant` source was modified.
+- No cross-crate test is required for publishing this crate.
+- Digest compatibility is deterministic within this crate but not yet standardized as a cryptographic profile hash.
+
+---
+
+# FibQuant interop plan
+
+Source: https://github.com/recursiveintell/turbo-quant/blob/main/docs/FIB_QUANT_INTEROP_PLAN.md
+
+# FibQuant interop plan
+
+## Standing decision
+
+`fib-quant` is already its own crate. Do not merge it into `turbo-quant`.
+
+## Shared semantic layer
+
+The crates should converge on compatible names and schema shapes:
+
+- `CodecProfileV1`
+- `CompressionPolicyV1`
+- `CompressionReceiptV1`
+- `CompressionEvalV1`
+- `BenchmarkReceiptV1`
+- `ProfileDigest`
+- `source_digest`
+- `codebook_digest`
+- `storage_layout`
+- `score_semantics`
+
+## Ownership split
+
+### turbo-quant owns
+
+- TurboQuant_mse/prod-style codecs
+- PolarQuant-style angle/radius encoding
+- QJL residual sketching
+- TurboQuant KV policy experiments
+- bitpacked scalar/code paths
+
+### fib-quant owns
+
+- FibQuant radial/angular vector codebooks
+- Beta-quantile radii
+- Fibonacci/Roberts-Kronecker directions
+- FibQuant-specific Lloyd-Max refinement
+- fractional/sub-one-bit codebook semantics
+
+### future quant-governor owns
+
+- codec selection
+- drift thresholds
+- exact fallback
+- corpus-specific promotion
+- cross-codec benchmark comparison
+- policy decisions
+
+## Interop Action
+
+- Inspect `fib-quant` read-only if available.
+- Align naming in docs and schemas.
+- Do not add a path dependency on `fib-quant`.
+- Add a future interop note for a common `quant-codec-core` crate only if justified.
+
+---
+
+# turbo-quant 0.2.0 crates.io release runbook
+
+Source: https://github.com/recursiveintell/turbo-quant/blob/main/docs/release/CRATES_IO_0_2_0_RUNBOOK.md
+
+# turbo-quant 0.2.0 crates.io release runbook
+
+This runbook is the operator-facing path for testing and publishing `turbo-quant` `0.2.0`.
+
+## Non-negotiable rule
+
+Do not run `cargo publish` until:
+
+- the README gate passes,
+- the package scope gate passes,
+- `cargo publish --dry-run --locked` passes,
+- the release receipt reports `recommendation: publish`, and
+- the git tree is clean except for deliberate release receipt artifacts that have been committed or intentionally excluded.
+
+Cargo's publish command creates a `.crate` package, uploads it to the registry, and the server performs additional checks. `--dry-run` performs all checks without uploading. Use the dry run as the final gate before publish.
+
+## One-time setup
+
+```bash
+cd ~/Coding/Libraries/turbo-quant
+cargo install cargo-semver-checks --locked
+cargo login
+```
+
+Do not put crates.io tokens into scripts, shell history, receipts, or prompts. Use `cargo login` or a short-lived `CARGO_REGISTRY_TOKEN` in your local shell.
+
+## Install this release pack
+
+From this bundle root:
+
+```bash
+./INSTALL.sh ~/Coding/Libraries/turbo-quant
+```
+
+The installer backs up replaced files under `.release-pack-backups/`.
+
+## Full validation gate
+
+```bash
+cd ~/Coding/Libraries/turbo-quant
+python3 scripts/tq_release_gate.py --version 0.2.0
+```
+
+This creates/updates:
+
+```text
+docs/release-evidence/v0.2.0/logs/
+docs/release-evidence/v0.2.0/package-list.txt
+docs/release-evidence/v0.2.0/release_receipt.json
+docs/release-evidence/v0.2.0/release_receipt.md
+```
+
+## Publish gate
+
+After the full validation gate passes, publish with an explicit two-part confirmation:
+
+```bash
+export TQ_RELEASE_I_UNDERSTAND=publish-turbo-quant-0.2.0
+python3 scripts/tq_publish_crates_io.py --version 0.2.0 --execute
+```
+
+Without `--execute`, the publish script stops after the dry-run gate.
+
+## Post-publish verification
+
+```bash
+cargo search turbo-quant
+cargo info turbo-quant
+```
+
+Then check:
+
+- crates.io page renders the README correctly,
+- docs.rs build starts/succeeds,
+- version is `0.2.0`,
+- no stale `P26`, `Codex`, `alpha`, `release-evidence`, or local-path language appears in public package content.
+
+## Rollback/yank
+
+If the wrong package is published:
+
+```bash
+cargo yank --version 0.2.0 turbo-quant
+```
+
+Then create a postmortem and release `0.2.1` only after the full gate passes again.
+
+---
+
+# turbo-quant README quality standard
+
+Source: https://github.com/recursiveintell/turbo-quant/blob/main/docs/release/README_QUALITY_STANDARD.md
+
+# turbo-quant README quality standard
+
+The README is the crates.io front door. It must be accurate, measured, and useful.
+
+## Required sections
+
+- `# turbo-quant`
+- `What this crate is`
+- `What this crate is not`
+- `Installation`
+- `Quick start`
+- `Sidecar candidate search`
+- `KV-cache shadow mode`
+- `API compatibility`
+- `Release honesty`
+- `Testing before release`
+- `License`
+
+## Forbidden README claims
+
+The README must not contain:
+
+- `zero accuracy loss`
+- `lossless`
+- `perfect`
+- `guaranteed quality`
+- `production-ready`
+- `drop-in replacement for vectors`
+- `all workloads`
+- `P26`
+- `Codex`
+- `0.2.0-alpha`
+- `alpha.1`
+- `release-evidence`
+
+## Required claim boundaries
+
+The README must say, in plain language, that:
+
+- compressed codes are derived sidecars,
+- exact vectors or exact KV state remain canonical,
+- approximate scores are not ground truth,
+- exact rerank or exact fallback is required for correctness-sensitive retrieval,
+- benchmark gates are workload-specific.
+
+## Required examples
+
+The README must include:
+
+- a `TurboQuantizer` encode/score example,
+- a `TurboSidecarIndex` candidate-generation example,
+- a `KvCacheCompressor::new_runtime` shadow-mode example.
+
+---
+
+# Release Gate
+
+Source: https://github.com/recursiveintell/turbo-quant/blob/main/docs/RELEASE_GATE.md
+
+# Release Gate
+
+## Hard block
+
+Block release if any are true:
+
+- public docs claim lossless retrieval accuracy for approximate codecs
+- public docs claim no added overhead for approximate codecs
+- encoded bytes are theoretical only
+- angle indices are not bitpacked
+- QJL signs are not bitpacked
+- QJL is unconditional for KV attention
+- dense QR is claimed as production runtime path
+- benchmark receipt example missing
+- `cargo publish --dry-run` failed
+- evidence docs missing
+- semantic-memory/Gloss docs imply compressed truth authority
+- FibQuant is merged or path-dependent without explicit authorization
+
+## Stable Release Requirements
+
+Stable release may be acceptable only if:
+
+- packed storage works
+- profile/receipt APIs work
+- docs are honest
+- benchmark receipts exist
+- KV runtime claims remain explicitly experimental and shadow-mode scoped
+- `cargo package` passes
+- `cargo publish --dry-run` passes without `--allow-dirty`
+- semantic-memory harness receipt exists and passes
+
+## Publish recommendation format
+
+Use exactly one:
+
+- `do not publish`
+- `publish 0.2.0`
+
+---
+
+# Research Source Map
+
+Source: https://github.com/recursiveintell/turbo-quant/blob/main/docs/RESEARCH_SOURCE_MAP.md
+
+# Research Source Map
+
+Use these as context, not as unverified crate claims.
+
+## TurboQuant
+
+- Google Research blog: TurboQuant is presented as a family of quantization algorithms for LLM compression and vector search.
+- arXiv 2504.19874: describes online vector quantization, TurboQuant_mse, TurboQuant_prod, random rotation, scalar quantization, and QJL residual correction.
+
+## Current systems direction
+
+- vLLM TurboQuant documentation describes Hadamard rotation followed by Lloyd-Max scalar quantization for keys and uniform quantization for values.
+- vLLM issue discussions and other implementations show active interest in bitpacking and KV-cache compression.
+
+## FibQuant
+
+- arXiv 2605.11478: FibQuant targets random-access KV-cache compression with radial/angular codebooks, Beta-quantile radii, Fibonacci/Roberts-Kronecker directions, and Lloyd-Max refinement.
+- FibQuant must remain a separate crate. Shared profiles, receipts, and
+  evaluation schemas can be aligned without merging implementations.
+
+## Engineering interpretation
+
+TurboQuant and FibQuant should become sibling algorithm crates beneath a future `quant-governor`, not one monolithic crate.
+
+---
+
+# Risk Register
+
+Source: https://github.com/recursiveintell/turbo-quant/blob/main/docs/RISK_REGISTER.md
+
+# Risk Register
+
+| Risk | Severity | Mitigation |
+|---|---:|---|
+| Overclaiming paper results as crate results | Critical | claim scanner, README rewrite, release gate |
+| `encoded_bytes()` counts theoretical bits | Critical | packed storage tests, serialized byte tests |
+| QJL hurts KV attention but remains default | High | `TurboMode`, KV policy, benchmark gate |
+| Dense QR creates false production readiness | High | mark reference-only, add Hadamard/SRHT or remaining delta |
+| Lloyd-Max is named but not implemented | High | codebook naming discipline |
+| FibQuant gets merged into TurboQuant | High | interop docs, no path dependency |
+| semantic-memory source-of-truth drift | Critical | sidecar-only docs and exact rerank requirement |
+| weak tests pass despite broken math | High | metrics-based eval, benchmark receipts |
+| release without dry-run proof | Critical | final gate |
+| hidden cross-repo edits | High | fib-quant read-only inspection script |
+
+---
+
+# Rollback and quarantine plan
+
+Source: https://github.com/recursiveintell/turbo-quant/blob/main/docs/ROLLBACK_AND_QUARANTINE.md
+
+# Rollback and quarantine plan
+
+## Before editing
+
+Record:
+
+```bash
+git status --short
+git rev-parse --short HEAD || true
+```
+
+## If phase fails
+
+1. Stop.
+2. Record the failure in `docs/release-evidence/v0.2.0/validation_results.md`.
+3. Add unresolved item to the final audit report.
+4. Revert unsafe file or quarantine experimental code behind a feature.
+5. Re-run targeted tests.
+6. Do not weaken the acceptance gate.
+
+## Rollback commands
+
+If a branch was created:
+
+```bash
+git diff > docs/release-evidence/v0.2.0/failed.diff
+git restore .
+git clean -fd
+```
+
+If not using git, copy changed-file list and restore from the preflight package/backup.
+
+## Release rollback
+
+No actual publish should happen. If publish was accidentally run, record the exact command and crate version immediately.
+
+---
+
+# semantic-memory and Gloss integration plan
+
+Source: https://github.com/recursiveintell/turbo-quant/blob/main/docs/SEMANTIC_MEMORY_GLOSS_PLAN.md
+
+# semantic-memory and Gloss integration plan
+
+## semantic-memory
+
+Source-of-truth rule:
+
+- SQLite/canonical vector store remains authoritative.
+- Raw/canonical f32 vectors must not be deleted or replaced by compressed codes.
+- TurboQuant codes are derived sidecars.
+- Approximate scores are candidate-generation evidence only.
+- Exact f32 rerank is required before final retrieval output.
+
+Required future artifacts:
+
+- `RetrievalWitness`
+- `CompressionReceiptV1`
+- `BenchmarkReceiptV1`
+- `DriftReport`
+- `PromotionReport`
+
+## Gloss
+
+Gloss should expose TurboQuant through shadow mode first:
+
+- exact retrieval result
+- compressed candidate result
+- top-k overlap
+- score drift
+- encoded bytes
+- codec profile digest
+- warnings/limitations
+
+No silent feature flip.
+
+## Promotion gate
+
+Do not make TurboQuant default unless:
+
+- exact rerank exists
+- answer-evidence parity passes
+- recall@k threshold is met on representative corpora
+- receipts are persisted
+- rollback path exists
+
+---
+
+# Storage and Wire Format
+
+Source: https://github.com/recursiveintell/turbo-quant/blob/main/docs/STORAGE_WIRE_FORMAT.md
+
+# Storage and Wire Format
+
+## Problem
+
+Legacy public structs keep logical fields for compatibility. Packed payload and
+wire APIs must report actual serialized bytes rather than theoretical bit counts.
+
+## Packed indices
+
+Angle indices:
+
+- valid bits: 1..=16
+- index must be `< 2^bits`
+- packed little-endian bit order
+- serialized as `Vec<u8>`
+- count and bit width must be included in code/profile
+
+## Packed signs
+
+QJL signs:
+
+- logical values: -1 or +1
+- packed as bits
+- sign convention documented:
+  - `0 => -1`
+  - `1 => +1`
+- projection count included in code/profile
+
+## encoded_bytes
+
+Must count serialized packed payload, including necessary metadata if the code object claims serialized size.
+
+Do not count:
+- ideal mathematical bit count only
+- heap capacity
+- Rust struct overhead unless explicitly labeled as in-memory overhead
+
+## Receipts
+
+Every receipt should include:
+
+- encoded bytes
+- fp16 baseline bytes
+- fp32 baseline bytes
+- compression ratios
+- profile digest
+- storage layout
+
+---
+
+# Test Matrix
+
+Source: https://github.com/recursiveintell/turbo-quant/blob/main/docs/TEST_MATRIX.md
+
+# Test Matrix
+
+| Test file | Required checks |
+|---|---|
+| `tests/bitpack.rs` | 1..=16 roundtrip, crossing byte boundaries, invalid values, truncation |
+| `tests/encoded_size.rs` | packed bytes match formulas, lower bits use fewer bytes |
+| `tests/profile_receipt.rs` | digest stability, serde roundtrip, compression ratio math |
+| `tests/invalid_inputs.rs` | NaN/Inf, zero dimensions, odd dims, bad bits, bad indexes |
+| `tests/query_workspace.rs` | batch vs per-code score parity, workspace reuse |
+| `tests/kv_policy.rs` | asymmetric K/V policy, exact fallback, index errors, shadow report |
+| `tests/serialization.rs` | packed code serde roundtrip, profile/receipt schema stability |
+| `tests/determinism.rs` | update for packed storage and digest determinism |
+| `tests/inner_product.rs` | real accuracy trends, not just non-panic smoke |
+
+---
+
+# Release Notes: 0.2.0
+
+Source: https://github.com/recursiveintell/turbo-quant/blob/main/RELEASE_NOTES.md
+
+# Release Notes: 0.2.0
+
+`turbo-quant` 0.2.0 is a compatibility-preserving hardening release for the
+experimental codec substrate.
+
+## Added
+
+- Additive packed payload types for polar, QJL, and TurboQuant codes.
+- Deterministic TurboCode wire encoding and validation.
+- Codec profiles, compression receipts, benchmark receipts, and byte accounting.
+- Sidecar candidate index APIs that mark exact rerank as caller responsibility.
+- KV shadow-mode runtime configuration and score comparison helpers.
+- Explicit QJL source-norm provenance APIs for transport-stable scoring when
+  callers persist QJL norm evidence.
+- Compatibility smoke example for the 0.1.0 public struct shapes.
+
+## Compatibility
+
+The legacy public fields remain available for `PolarCode`, `QjlSketch`,
+`TurboCode`, `KvCacheConfig`, and `CompressedToken`. New capabilities are exposed
+through additive types rather than mutating those legacy structs.
+
+## Operational Notes
+
+Compressed codes are derived sidecars. Exact vectors remain caller-owned for
+exact rerank, audit evidence, and authoritative retrieval behavior. Benchmark
+and semantic-memory harness receipts are workload-local evidence only.
+
+---
