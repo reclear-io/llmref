@@ -1,0 +1,599 @@
+# Dispatch
+
+Source: https://github.com/opusnano/dispatch/blob/main/README.md
+
+# Dispatch
+
+Bespoke OpenRouter-only complexity router for OpenCode.
+
+Classifies chat completion requests into four levels (easy, medium, hard, critical) and routes to configured OpenRouter models. Uses evidence-based complexity routing with active task frame extraction to prevent context contamination.
+
+## Quick Start
+
+```bash
+# Clone and prepare
+git clone <repo>
+cd dispatch
+
+# Create and edit the env file with your OpenRouter API key
+cp .env.example .env
+# Use cp (not mv) so .env.example stays in the working tree
+$EDITOR .env
+
+# Build and run (config auto-generates on first start)
+docker compose up -d --build
+```
+
+The API key is loaded from `.env` via Docker Compose `env_file`. There is no host-export step. `.env` is gitignored — your key stays local.
+
+The router automatically generates `/config/router.yaml`, `/config/DISPATCH.md`, and `/config/exemplars.yaml` on first run. Config changes are auto-reloaded without restart.
+
+**API key hot reload:** `.env` is mounted into the container at `/dispatch.env` (read-only, outside `/config`). Edit your host `.env` to change the API key — Dispatch hot-reloads it within the poll interval (default 3 s). No container restart needed for key rotation. The previous working key stays active if the new file is invalid. Docker process env never changes; Dispatch reads the mounted file directly. `/config` contains only generated config/docs, never secrets.
+
+**Warnings:**
+- The router listens on **plain HTTP** (`:18087`). For production, place it behind a TLS-terminating reverse proxy.
+- Never put your API key in the config file. Always use the `OPENROUTER_API_KEY` environment variable via `.env`.
+- Prompt text is **not logged** by default (`log_prompts: false`). Only enable it if you understand the privacy impact.
+- Trace mode (`trace_requests: false`) is metadata-only — it never logs prompt content.
+- **Optional security hardening**: To run as a non-root user, add `user: "65532:65532"` to `docker-compose.yml` and run `chown 65532:65532 ./config`.
+
+## OpenCode Setup
+
+Configure OpenCode to use Dispatch:
+
+| Setting    | Value                           |
+|------------|---------------------------------|
+| Base URL   | `http://localhost:18087/v1`     |
+| API Key    | `placeholder` (key is server-side) |
+| Model      | `dispatch/auto`                  |
+
+OpenCode may display only `dispatch/auto` — the final model selection happens inside the router and is **not** part of the model list. The selected model is visible via:
+- Response header `X-Dispatch-Model`
+- Structured log output (stderr)
+- `GET /debug/stats` endpoint
+- `GET /debug/request?id=<request_id>` metadata lookup
+
+### Optional Session/Task Headers
+
+If your client can send `X-Dispatch-Session-Id` and `X-Dispatch-Task-Id` headers, Dispatch will use them for task-scoped session escalation. If not, Dispatch derives task keys from the active task frame. **OpenCode does not need to send custom headers — routing works without them.**
+
+## Active Task Frame Routing
+
+Dispatch does **not** classify the full conversation. Each request is classified using only the **active task frame**:
+
+- **New standalone user turn** → frame starts at the latest user message. Old hard debugging context, old stack traces, old tool outputs are excluded.
+- **Continuation detected** (e.g., "same error still happens", "try again", "tests still failing") → frame extends back to the original task boundary.
+- **No new user turn after tool results** → frame includes the last user instruction and all tool results after it.
+
+This prevents a long hard debugging session from contaminating an unrelated easy question in the same chat.
+
+### Manual Overrides
+
+- Model alias: `dispatch/easy`, `dispatch/medium`, `dispatch/hard`, `dispatch/critical`, `dispatch/auto`
+- Header: `X-Dispatch-Level: easy|medium|hard|critical`
+- Precedence: **Header** > Model alias > Auto classification
+
+## Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/v1/chat/completions` | POST | Route and forward to OpenRouter |
+| `/debug/route` | POST | Classify only (no upstream call), returns level/scores/reasons/frame |
+| `/debug/stats` | GET | In-memory stats: request counts, by-level, by-model, by-status, avg duration, uptime, reload count |
+| `/debug/request?id=<request_id>` | GET | Metadata lookup for a past request (no prompt text, bounded ring buffer) |
+| `/debug/feedback` | POST | Submit feedback (disabled by default) |
+| `/health` | GET | Health check (liveness). Returns 200 with `status: "ok"` when healthy, or 200 with `status: "degraded"` when config reload is failing. Includes reload error details. |
+| `/readyz` | GET | Strict readiness. Returns 200 when fully healthy, 503 when config reload is failing. |
+| `/version` | GET | Build info |
+
+### Debug Classification
+
+```bash
+curl -s -X POST http://localhost:18087/debug/route \
+  -H "Content-Type: application/json" \
+  -d '{"model":"dispatch/auto","messages":[{"role":"user","content":"write a function to sort an array"}]}' | jq
+```
+
+Response includes `level`, `model`, `scores`, `reasons`, `analysis`, `frame`, `request_id`.
+
+### Stats
+
+```bash
+curl -s http://localhost:18087/debug/stats | jq
+```
+
+### Request Metadata Lookup
+
+```bash
+curl -s "http://localhost:18087/debug/request?id=<request_id>" | jq
+```
+
+Returns metadata only — no prompt text, no tool output.
+
+### Feedback (disabled by default)
+
+Enable in config:
+```yaml
+debug:
+  feedback_enabled: true
+  feedback_path: "/config/feedback.jsonl"
+```
+
+Then:
+```bash
+curl -s -X POST http://localhost:18087/debug/feedback \
+  -H "Content-Type: application/json" \
+  -d '{"request_id":"abc123","expected_level":"hard","note":"should have been hard"}'
+```
+
+## Automatic Config Reload
+
+Edit `/config/router.yaml` and the router picks up changes automatically (default: every 3 seconds). No restart needed.
+
+- If reload succeeds, new requests use the new config. In-flight requests continue with the old config snapshot.
+- If reload fails (bad YAML, invalid config), the old config stays active and the error is logged.
+- API key is **not** reloaded from config — it stays env-driven.
+- `--check-config` remains available for manual validation.
+- Reload stats are visible at `/debug/stats` (`config_reload_count`, `last_config_reload_unix`).
+
+### Config Reload Resilience
+
+When a reload fails, Dispatch keeps the last valid config in memory and marks the runtime as **degraded**. The container stays alive so debug endpoints remain available.
+
+**By default (strict degraded mode), `/v1/chat/completions` returns a local 503 until the config is fixed.** This ensures users see an immediate error in OpenCode when `router.yaml` breaks, rather than silently continuing with an old config.
+
+When degraded:
+
+- `/health` returns 200 with `"status": "degraded"` and reload error details.
+- `/readyz` returns 503 (`"status": "not_ready"`).
+- `/debug/stats` shows explicit reload failure state (`active_config_state`, `config_reload_failure_count`, `last_config_reload_error_truncated`, `degraded_blocked_total`, etc.).
+- All responses include `X-Dispatch-Config-State: degraded` and `X-Dispatch-Config-Reload-Error: see /health or /debug/stats`.
+- Degraded state clears automatically on next successful reload.
+- Blocked requests do **not** count as upstream errors. They count as local config/degraded errors.
+
+**Opt-in lenient mode:** To serve the last valid config during reload failures (old behavior), set:
+
+```yaml
+config_reload:
+  fail_requests_when_degraded: false
+```
+
+In lenient mode, requests forward as normal, the degraded headers are set, and health/readyz/stats still reflect the degraded state.
+
+**Why the container does not exit:** Restart loops against a broken config make diagnosis harder (debug endpoints are gone). Startup with an invalid config still fails fast — this only applies to hot-reload failures.
+
+**Diagnose reload issues:**
+
+```bash
+curl -s http://localhost:18087/health | jq
+curl -s http://localhost:18087/readyz | jq
+curl -s http://localhost:18087/debug/stats | jq '{active_config_state, config_reload_failure_count, last_config_reload_error_truncated}'
+```
+
+**Validate config before editing:**
+
+```bash
+dispatch --check-config --config /config/router.yaml
+```
+
+**No prompt/request mutation**: Reload diagnostics live only in logs, `/health`, `/readyz`, `/debug/stats`, and optional Dispatch response headers. They never affect the upstream request body, model selection, provider config, or OpenRouter cache behavior.
+
+## Architecture
+
+```
+OpenCode → Dispatch (classify active task frame) → OpenRouter
+                 ↓
+            POST /v1/chat/completions
+            POST /debug/route
+            GET  /debug/stats
+            GET  /debug/request?id=...
+            POST /debug/feedback
+            GET  /health
+            GET  /version
+```
+
+## Levels & Models
+
+| Level    | Default Model               |
+|----------|-----------------------------|
+| easy     | deepseek/deepseek-v4-flash  |
+| medium   | deepseek/deepseek-v4-flash  |
+| hard     | deepseek/deepseek-v4-pro    |
+| critical | z-ai/glm-5.2                |
+
+## Configuration
+
+Edit `/config/router.yaml`. See `/config/DISPATCH.md` for full documentation.
+
+```yaml
+openrouter:
+  base_url: "https://openrouter.ai/api/v1"
+  api_key_env: "OPENROUTER_API_KEY"
+  http_referer: "https://github.com/OpusNano/dispatch"
+  site_title: "Dispatch"
+
+server:
+  listen: ":18087"
+  max_body_size: 26214400  # 25 MiB
+
+model_profiles:
+  deepseek_flash:
+    id: "deepseek/deepseek-v4-flash"
+    provider:
+      data_collection: "deny"
+  deepseek_pro:
+    id: "deepseek/deepseek-v4-pro"
+    provider:
+      data_collection: "deny"
+  glm_52:
+    id: "z-ai/glm-5.2"
+    provider:
+      data_collection: "deny"
+
+levels:
+  easy:
+    use: deepseek_flash
+  medium:
+    use: deepseek_flash
+  hard:
+    use: deepseek_pro
+  critical:
+    use: glm_52
+
+debug:
+  log_decisions: true
+  log_prompts: false
+  trace_requests: false
+  request_index_enabled: true
+  request_index_size: 500
+  feedback_enabled: false
+
+config_reload:
+  enabled: true
+  poll_interval_seconds: 3
+  fail_requests_when_degraded: true
+```
+
+## Development
+
+```bash
+# Tests
+go test ./...
+
+# Lint
+go vet ./...
+
+# Build
+go build -o dispatch ./cmd/dispatch
+
+# Check config
+./dispatch --check-config --config /path/to/router.yaml
+
+# Run
+OPENROUTER_API_KEY=sk-or-... ./dispatch --config /path/to/router.yaml
+```
+
+## Response Headers
+
+| Header | Description |
+|--------|-------------|
+| `X-Dispatch-Request-Id` | Unique request ID for log correlation |
+| `X-Dispatch-Level` | Selected level |
+| `X-Dispatch-Model` | Routed model ID |
+| `X-Dispatch-Score-Total` | Composite score |
+| `X-Dispatch-Score-Complexity` | Complexity sub-score |
+| `X-Dispatch-Score-Risk` | Risk sub-score |
+| `X-Dispatch-Score-Agent-Pressure` | Agent pressure sub-score |
+| `X-Dispatch-Reasons` | Classification reasons (truncated) |
+| `X-Dispatch-Upstream-Status` | Upstream HTTP status (when >= 400) |
+| `X-Dispatch-Upstream-Error-Code` | Upstream error code from OpenRouter JSON |
+| `X-Dispatch-Upstream-Error-Type` | Typed error code (e.g. rate_limit_exceeded) |
+| `X-Dispatch-Upstream-Provider` | Provider name from error metadata |
+| `X-Dispatch-Upstream-Provider-Code` | Upstream provider error code |
+| `X-Dispatch-Upstream-Retry-After` | Retry-After value from upstream |
+| `X-Dispatch-Upstream-Retryable` | Heuristic: true/false/unknown |
+
+## Security
+
+- API key from env var only, never in config files.
+- Prompts not logged by default. Do not enable `log_prompts` unless you accept the privacy risk.
+- Trace mode is metadata-only — logs message structure, not content.
+- Request metadata index stores hashes and metadata, never prompt text.
+- Request body size capped.
+- Streaming responses not buffered.
+- Client headers not forwarded upstream.
+- Request ID in response header and logs for correlation.
+- **Messages never modified**: The upstream request forwarded to OpenRouter preserves the original `messages`, `tools`, `response_format`, and all unknown fields. Dispatch only changes `model` and configured `provider` fields. Debug information is never injected into message content.
+
+## Content Preservation Guarantee
+
+Dispatch classifies requests using the active task frame for **routing decisions only**. The upstream request forwarded to OpenRouter is a byte-preserving modification of the original:
+
+| Field | Modified? | Details |
+|-------|:---------:|---------|
+| `model` | Yes | Replaced with the selected level's model ID |
+| `provider` | Yes | Merged with level config (order, only, ignore, data_collection, allow_fallbacks) |
+| `messages` | **Never** | All roles, content, tool_calls, tool_call_id, content arrays preserved |
+| `tools` | **Never** | All tool definitions preserved |
+| `tool_choice` | **Never** | Preserved as-is |
+| `response_format` | **Never** | Preserved as-is |
+| `stream` | **Never** | Preserved as-is |
+| `temperature`, `max_tokens`, `top_p`, etc | **Never** | All unknown fields preserved |
+| `X-Dispatch-*` headers, `request_id`, debug text | **Never injected** | Debug info stays in response headers, logs, and `/debug` endpoints |
+
+## Smoke Test
+
+```bash
+# Start Dispatch locally, then:
+./scripts/smoke.sh
+# Or against a different host:
+./scripts/smoke.sh http://localhost:18087
+```
+
+## Troubleshooting
+
+### Port already in use
+Change `server.listen` in router.yaml, update the Docker port mapping (`-p`), and restart.
+
+### Config dir permission denied
+```
+dispatch: cannot write /config/router.yaml: permission denied
+```
+The `./config` directory needs write access. If you're using non-root mode (`user: "65532:65532"`), fix with:
+```bash
+chown 65532:65532 ./config
+```
+
+### Missing API key
+```
+dispatch: OPENROUTER_API_KEY environment variable not set
+```
+Set it via `.env` file or `-e OPENROUTER_API_KEY=sk-or-...`.
+
+If `api_key_file` is configured (default `/dispatch.env`), Dispatch also
+reads the key from that file at startup. File value wins when valid.
+If both env var and file are missing/empty, Dispatch exits.
+
+### API key hot reload
+
+With default config, `.env` is mounted at `/dispatch.env` (read-only, outside
+`/config`). Edit the host `.env` file and Dispatch picks up the new key within
+3 seconds. No container restart needed.
+
+If the file is deleted, unreadable, or contains an empty key, Dispatch keeps
+the previous working key and logs a warning. Docker's process env never
+changes — Dispatch reads the mounted file directly.
+
+`/config` is for generated config/docs only — never place secrets there.
+If an older experimental run created `config/.env`, delete it: `rm -f config/.env`.
+
+Verify reload success via `/debug/stats`:
+```bash
+curl -s http://localhost:18087/debug/stats | jq '{api_key_present, api_key_prefix_valid, api_key_length, api_key_reload_count, last_api_key_reload_unix}'
+```
+
+- `api_key_reload_count` increments on each successful reload.
+- `last_api_key_reload_unix` is the timestamp of the last reload.
+- The actual key value is never exposed in stats, logs, or headers.
+
+### Upstream 401
+
+The OpenRouter API key is invalid, expired, or has no credits. Check your key at https://openrouter.ai/keys.
+
+If the error body says `"Missing Authentication header"`, it means **Dispatch did not send the Authorization header upstream**. Verify:
+
+1. **Check container env** (from host):
+   ```bash
+   docker inspect dispatch --format '{{range .Config.Env}}{{println .}}{{end}}' | grep -q '^OPENROUTER_API_KEY=' && echo "set" || echo "missing"
+   ```
+   Scratch containers do not have `printenv`. Use `docker inspect`, not `docker exec printenv`.
+
+2. **Verify router.yaml matches**: `openrouter.api_key_env` must be `"OPENROUTER_API_KEY"` (the env var name, not the key value). The generated config has this by default.
+
+3. **Check docker-compose.yml**: the `dispatch` service should have `env_file: .env` **only**. If there is an explicit `environment: OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}` line, remove it. The `${VAR}` substitution resolves from the host and can override the `.env` file with an empty string.
+
+4. **Check startup log**: Dispatch logs `api_key_present: true`, `api_key_prefix_valid: true`, and `api_key_length` on successful startup. The key itself is never logged.
+
+5. **Check /debug/stats**: `api_key_present` field shows whether Dispatch has an API key loaded.
+
+6. **If env exists and error persists**: this is a Dispatch bug/regression — report with the startup log output.
+
+If the error is `"User not found."` or `"Invalid API key"` instead: **auth IS working**. The Authorization header was sent, but the API key in `.env` is invalid or expired. Check your OpenRouter dashboard.
+
+Do not use `docker exec printenv dispatch` — scratch containers have no shell.
+
+### Upstream 429
+OpenRouter rate limiting. Reduce request volume or upgrade your plan.
+
+### OpenRouter shows App = Unknown
+OpenRouter requires both `http_referer` and `site_title` to be non-empty for app attribution. Edit `/config/router.yaml`:
+```yaml
+openrouter:
+  http_referer: "https://github.com/OpusNano/dispatch"
+  site_title: "Dispatch"
+```
+Changes auto-reload in 3 seconds. Only new requests are affected. Run `dispatch --check-config` to see warnings if either field is empty.
+
+### "Provider returned error" / rate-limited upstream / 502 / 503
+
+Dispatch **does not retry internally** and **does not switch providers internally**. OpenRouter owns provider fallback behavior. Dispatch passes OpenRouter errors through unchanged so OpenCode's retry logic can work.
+
+If you see errors like `Provider returned error` or `rate-limited upstream`:
+
+1. **Check provider config** in `/config/router.yaml`:
+   - `provider.order: []` lets OpenRouter choose providers freely (most reliable)
+   - `provider.order: ["baidu/fp8"]` with `allow_fallbacks: true` — specific preference, fallback to others if unavailable
+   - `provider.order: ["baidu/fp8"]` with `allow_fallbacks: false` — **strict pinning**, no fallback, hard-fails on provider issues
+
+2. **Diagnose via debug endpoints**:
+   ```bash
+   # See aggregated error stats
+   curl -s http://localhost:18087/debug/stats | jq '{upstream_errors, by_upstream_provider, by_upstream_error_type, upstream_429_total, upstream_502_total, upstream_503_total}'
+
+   # Look up a specific request by its X-Dispatch-Request-Id
+   curl -s "http://localhost:18087/debug/request?id=<request_id>" | jq '{status, upstream_provider, upstream_error_type, upstream_provider_code, upstream_retryable, upstream_raw_truncated}'
+   ```
+
+3. **Common fixes**:
+   - Set `allow_fallbacks: true` or use empty `provider.order: []` to let OpenRouter route around problematic providers
+   - Remove strict provider pinning if the provider is frequently rate-limited or down
+   - Check `upstream_rate_limits_total` in stats to see if rate limits are the pattern
+
+4. **Common OpenRouter errors Dispatch passes through**:
+
+| Status | Meaning | Retryable |
+|--------|---------|:---------:|
+| 400 | Invalid request / content policy / context length | No |
+| 401 | Invalid API key / authentication | No |
+| 402 | Insufficient credits | No |
+| 403 | Forbidden / guardrail / moderation | No |
+| 408 | Timeout | Yes |
+| 429 | Rate limited (check Retry-After header) | Yes |
+| 502 | Provider unavailable / invalid response | Yes |
+| 503 | No provider available / overloaded | Yes |
+| 504 | Gateway timeout | Yes |
+
+When OpenRouter returns `Retry-After`, Dispatch passes it through unchanged. OpenCode reads it and handles retry timing.
+
+### OpenCode only shows dispatch/auto
+This is expected. The router selects the actual model internally per request. Check the `X-Dispatch-Model` response header or container logs to see which model was used.
+
+### Config reload failed
+If you save a bad config, the router keeps the old config active and logs the error. Check stderr logs for "config reload: validation failed, keeping old config".
+
+**By default**, `/v1/chat/completions` responds with a local 503 until the config is fixed. The error response is OpenAI-compatible:
+
+```json
+{
+  "error": {
+    "message": "Dispatch config reload failed; current router.yaml is invalid. Fix the config or check /health and /debug/stats.",
+    "code": 503,
+    "type": "dispatch_config_degraded"
+  }
+}
+```
+
+**The reload failure is visible in:**
+- `/health` — returns `"status": "degraded"` with error details.
+- `/readyz` — returns 503.
+- `/debug/stats` — `active_config_state: "degraded_using_last_valid"`, failure counters, error text.
+- Response headers — `X-Dispatch-Config-State: degraded`.
+- Container logs — rate-limited (first failure logged immediately, repeated identical failures logged every 5 minutes).
+
+**Common causes:**
+- YAML syntax error (indentation, unquoted colons, etc.)
+- Duplicate pattern IDs
+- Invalid regex in a pattern rule
+- Threshold ordering violation
+- Missing required fields
+
+**Fix:** Edit `/config/router.yaml` to fix the issue. On next poll (default 3 seconds), Dispatch detects the change, reloads successfully, and clears the degraded state. No restart needed.
+
+Run `dispatch --check-config --config /config/router.yaml` before or after editing to validate. Exits 0 if valid, 1 with details if invalid.
+
+To allow requests to continue during reload failures (lenient mode), set:
+
+```yaml
+config_reload:
+  fail_requests_when_degraded: false
+```
+
+The container never exits on hot-reload failure so that `/health`, `/readyz`, and `/debug/stats` remain available for diagnosis. A start-up invalid config still fails fast.
+
+---
+
+# Release Checklist
+
+Source: https://github.com/opusnano/dispatch/blob/main/RELEASE_CHECKLIST.md
+
+# Release Checklist
+
+## Build
+
+```bash
+go build -o dispatch ./cmd/dispatch
+```
+
+## Test
+
+```bash
+go test -count=1 -timeout=60s ./...
+```
+
+## Docker Build
+
+```bash
+docker build -t dispatch:rc .
+```
+
+## Run
+
+### Docker
+```bash
+mkdir -p ./config
+docker run -d --name dispatch \
+  -p 18087:18087 \
+  -e OPENROUTER_API_KEY=sk-or-... \
+  -v ./config:/config \
+  dispatch:rc
+```
+
+(Optional non-root: add `--user 65532:65532` and `chown 65532:65532 ./config`.)
+
+### Docker Compose
+```bash
+cp .env.example .env
+# Edit .env with your OpenRouter API key
+$EDITOR .env
+docker compose up -d --build
+```
+
+`env_file: .env` in `docker-compose.yml` loads the key into the container. No host-export step is needed. `.env` is gitignored.
+
+### Plain Binary
+```bash
+OPENROUTER_API_KEY=sk-or-... ./dispatch --config /path/to/router.yaml
+```
+
+## OpenCode Settings
+
+| Setting  | Value                       |
+|----------|-----------------------------|
+| Base URL | http://localhost:18087/v1   |
+| API Key  | placeholder (server-side)   |
+| Model    | dispatch/auto                |
+
+## Verification
+
+```bash
+# Smoke test (no API key needed)
+./scripts/smoke.sh http://localhost:18087
+
+# Health check
+curl http://localhost:18087/health
+
+# Debug classification
+curl -s -X POST http://localhost:18087/debug/route \
+  -H "Content-Type: application/json" \
+  -d '{"model":"dispatch/auto","messages":[{"role":"user","content":"write a function"}]}'
+
+# Stats
+curl -s http://localhost:18087/debug/stats | jq
+```
+
+## Common Troubleshooting
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| `permission denied` on first run | `/config` not owned by UID 65532 | `chown 65532:65532 ./config` |
+| `OPENROUTER_API_KEY environment variable not set` | Missing API key | Set `-e OPENROUTER_API_KEY=...` or use `.env` |
+| Upstream 401 | Invalid/expired API key | Check key at openrouter.ai/keys |
+| Upstream 401 ("Missing Authentication header") | Dispatch not sending Authorization; env var missing or config mismatch | docker inspect env, check api_key_env in router.yaml, check api_key_present in /debug/stats and startup log |
+| Upstream 429 | Rate limited | Wait or upgrade plan |
+| "Provider returned error" | Provider rate-limited/down, fallbacks disabled | Enable `allow_fallbacks: true` or empty `provider.order: []` |
+| 502/503 from OpenRouter | Provider unavailable | Let OpenRouter fallback; check `/debug/stats` for patterns |
+| Port 18087 in use | Conflicting service | Change `server.listen` and port mapping |
+| OpenCode shows only `dispatch/auto` | Expected behavior | Check `X-Dispatch-Model` header for actual model |
+| OpenRouter shows App = Unknown | Empty http_referer/site_title | Set both in config; see README troubleshooting |
+
+---
