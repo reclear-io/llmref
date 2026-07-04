@@ -1,0 +1,1433 @@
+# README.md
+
+Source: https://github.com/modern-python/faststream-redis-timers/blob/main/README.md
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)"  srcset="https://raw.githubusercontent.com/modern-python/.github/main/brand/projects/faststream-redis-timers/lockup-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/modern-python/.github/main/brand/projects/faststream-redis-timers/lockup-light.svg">
+    <img alt="faststream-redis-timers" src="https://raw.githubusercontent.com/modern-python/.github/main/brand/projects/faststream-redis-timers/lockup.png" width="420">
+  </picture>
+</p>
+
+
+`faststream-redis-timers` is a [FastStream](https://faststream.airt.ai) broker integration for Redis-backed distributed timer scheduling.
+
+Schedule messages to be delivered to subscribers at a future point in time, with **at-least-once** delivery across multiple workers.
+
+> **Already using Postgres?** Prefer [`faststream-outbox`](https://github.com/modern-python/faststream-outbox), which also supports
+> [timers](https://faststream-outbox.readthedocs.io/en/latest/usage/timers/) and lets you schedule a timer in the **same SQLAlchemy
+> transaction** as the domain write — no dual-write between your DB and Redis. Reach for `faststream-redis-timers` when your stack
+> doesn't include Postgres, or when you want timer scheduling decoupled from your relational store.
+
+```python
+from datetime import timedelta
+from faststream import FastStream
+from faststream_redis_timers import TimersBroker
+from redis.asyncio import Redis
+
+client = Redis.from_url("redis://localhost:6379")
+broker = TimersBroker(client)
+app = FastStream(broker)
+
+@broker.subscriber("invoices")
+async def handle_invoice(invoice_id: str) -> None:
+    print(f"Invoice {invoice_id} is due!")
+
+@app.after_startup
+async def schedule() -> None:
+    await broker.publish(
+        "INV-001",
+        topic="invoices",
+        activate_in=timedelta(days=30),
+    )
+```
+
+Schedule at an absolute time with `activate_at` instead. `publish()` returns the
+resolved `timer_id` so you can keep it for cancellation:
+
+```python
+from datetime import UTC, datetime
+
+timer_id = await broker.publish(
+    "INV-001",
+    topic="invoices",
+    activate_at=datetime(2026, 6, 1, 9, tzinfo=UTC),
+)
+```
+
+## How it works
+
+Timers are stored in Redis as two keys **per topic**:
+
+- A **sorted set** (`timers_timeline:{topic}`) with the activation timestamp as score
+- A **hash** (`timers_payloads:{topic}`) with the serialized message body
+
+So a timer on the `invoices` topic lives under `timers_timeline:invoices` and `timers_payloads:invoices` — handy when poking around in `redis-cli`. A `TimersRouter(prefix="my-service:")` extends the suffix to `my-service:invoices`.
+
+A polling loop checks for due timers and atomically claims each one via a Lua
+script that pushes its score forward by `lease_ttl` seconds — granting the
+worker a lease. The timer is removed from Redis only **after** the handler
+completes successfully. If the worker crashes mid-handler or the handler
+raises, the lease eventually expires and another worker re-claims the timer.
+
+This is the standard SQS-style **visibility-timeout** pattern: at-least-once
+delivery with no data loss on crash, at the cost of requiring **idempotent
+handlers**.
+
+## Cancellation
+
+```python
+timer_id = await broker.publish("INV-001", topic="invoices", activate_in=timedelta(days=30))
+await broker.cancel_timer("invoices", timer_id)
+```
+
+## Tracing & headers
+
+`publish()` accepts `correlation_id` and `headers` — both round-trip to the handler via the standard FastStream `StreamMessage`:
+
+```python
+await broker.publish(
+    {"order_id": 42},
+    topic="orders",
+    correlation_id="trace-abc-123",
+    headers={"x-tenant": "acme", "x-priority": "high"},
+)
+```
+
+Inside the handler:
+
+```python
+from faststream import Context
+
+@broker.subscriber("orders")
+async def handle(
+    body: dict,
+    correlation_id: str = Context("message.correlation_id"),
+    tenant: str = Context("message.headers.x-tenant"),
+) -> None:
+    ...
+```
+
+## Connection ownership
+
+`TimersBroker` does **not** close the Redis client you pass in — the caller owns
+its lifecycle. The same client can be shared across multiple brokers, so closing
+it from one broker would surprise the others. Manage the client with `async with`
+or a `try/finally`:
+
+```python
+async with Redis.from_url("redis://localhost:6379") as client:
+    broker = TimersBroker(client)
+    app = FastStream(broker)
+    await app.run()
+```
+
+## Tuning
+
+Per-subscriber knobs (passed to `@broker.subscriber("topic", ...)`):
+
+- `lease_ttl` (default `30` seconds) — how long a worker holds the lease while
+  processing. Handlers must complete within this window or another worker may
+  re-deliver the timer (duplicate). Increase if your handlers are slow.
+- `polling_interval` (default `0.05` s) — base poll interval used when the queue
+  has work or just transitioned from idle. Doubles on each consecutive empty
+  cycle, capped at `max_polling_interval`, with ±50% jitter applied each sleep.
+- `max_polling_interval` (default `5.0` s) — ceiling for the adaptive idle
+  backoff. Lower it for tighter delivery latency on idle queues; raise it to
+  reduce Redis load on workloads with long idle stretches.
+- `max_concurrent` (default `5`) — maximum number of handlers running in
+  parallel per subscriber. Also caps the fetch batch size per poll cycle.
+  Handlers must be safe under concurrency in addition to being idempotent.
+
+## Failure modes
+
+- **Handlers must be idempotent.** A handler that ran successfully but whose
+  ack failed to land in Redis (network blip) will be retried; a handler that
+  takes longer than `lease_ttl` may be re-delivered to another worker.
+- **Buggy handler retries forever.** If a handler always raises, the timer is
+  retried every `lease_ttl` seconds indefinitely — there is no built-in
+  attempt counter. Raise `faststream.exceptions.RejectMessage` from your
+  handler to drop a poison-pill timer permanently, or track attempts in your
+  own state if you need a hard cap.
+
+## High availability
+
+Run multiple `TimersBroker` processes against the same Redis keys. The Lua
+claim script ensures each due timer is leased by exactly one worker at a
+time; failover is automatic via lease expiry.
+
+Supports single-primary Redis, including Sentinel-managed primary/replica
+setups. Redis Cluster is **not** supported: each topic's timeline and
+payload keys must live on the same node, and the broker raises a
+`TypeError` if constructed with a `RedisCluster` client.
+
+```python
+broker = TimersBroker(
+    Redis.from_url("redis://..."),
+    timeline_key="my_timeline",
+    payloads_key="my_payloads",
+)
+```
+
+## 📚 [Documentation](https://faststream-redis-timers.modern-python.org)
+
+## 📦 [PyPI](https://pypi.org/project/faststream-redis-timers)
+
+## 📝 [License](LICENSE)
+
+## Part of `modern-python`
+
+Browse the full list of templates and libraries in
+[`modern-python`](https://github.com/modern-python) — see the org profile for the categorized index.
+
+---
+
+# faststream-redis-timers
+
+Source: https://github.com/modern-python/faststream-redis-timers/blob/main/CLAUDE.md
+
+# faststream-redis-timers
+
+FastStream broker integration for Redis-backed distributed timer scheduling.
+
+## Commands
+
+`just` (task runner) + `uv` (package manager); the [`Justfile`](Justfile) is the
+source of truth for recipes — run `just --list` or read it. The non-obvious bits:
+
+- `just test [args]` — full suite in docker compose (spins up Redis). Args
+  forward to pytest. `tests/test_unit.py` + `tests/test_fake.py` need no Redis;
+  the rest (the integration suites) do.
+- `just lint` / `just lint-ci` — autofix vs non-mutating; `lint-ci` also runs the
+  planning-bundle validator (`planning/index.py --check`).
+- Verifying a Python-version / interpreter-compat change: run the **full** suite
+  on the target interpreter (the CI matrix, or `just test` in docker), not just
+  the no-Redis subset. An integration-only failure — e.g. a broker-shutdown hang
+  that only bites under a specific interpreter's async timing — won't surface in
+  `test_unit.py` / `test_fake.py` alone.
+
+## Workflow
+
+Planning uses a portable convention — `architecture/` (repo root) is the living
+**truth home** and promotion target; `planning/changes/` holds the per-change
+bundles. Start at the
+[Quick path](planning/README.md#quick-path-start-here) in
+[`planning/README.md`](planning/README.md) (the authoritative spec) to pick a
+lane — **Full** (`design.md` + `plan.md`), **Lightweight** (single `change.md`),
+or **Tiny** (just a commit) — and ship. `just check-planning` validates bundles;
+`just index` prints the change + decision listing; `planning/_templates/` are
+copy-and-fill starting points.
+
+## Architecture
+
+[`architecture/`](architecture/) is the living per-capability truth home.
+**When a change alters a capability's behavior, update the matching
+`architecture/<capability>.md` in the same PR** — that promotion keeps
+`architecture/` true. Capability pages are authored over time; see
+[`architecture/README.md`](architecture/README.md).
+
+---
+
+# faststream-redis-timers
+
+Source: https://github.com/modern-python/faststream-redis-timers/blob/main/docs/index.md
+
+# faststream-redis-timers
+
+Welcome to the `faststream-redis-timers` documentation!
+
+`faststream-redis-timers` is a [FastStream](https://faststream.airt.ai) broker integration for Redis-backed distributed timer scheduling.
+
+Schedule messages to be delivered to subscribers at a future point in time, with **at-least-once** delivery across multiple workers.
+
+!!! tip "Already using Postgres? Prefer `faststream-outbox`"
+    [`faststream-outbox`](https://github.com/modern-python/faststream-outbox) also supports
+    [timers](https://faststream-outbox.readthedocs.io/en/latest/usage/timers/) and lets you schedule a timer in the
+    **same SQLAlchemy transaction** as the domain write — no dual-write between your DB and Redis. Reach for
+    `faststream-redis-timers` when your stack doesn't include Postgres, or when you want timer scheduling decoupled
+    from your relational store.
+
+---
+
+- [Installation](introduction/installation.md)
+- [How it works](introduction/how-it-works.md)
+- [Basic usage](usage/basic.md)
+- [Subscriber](usage/subscriber.md)
+- [Publisher](usage/publisher.md)
+- [Router](usage/router.md)
+- [Testing](usage/testing.md)
+
+---
+
+# How it works
+
+Source: https://github.com/modern-python/faststream-redis-timers/blob/main/docs/introduction/how-it-works.md
+
+# How it works
+
+## Redis data structures
+
+`faststream-redis-timers` uses two Redis keys **per topic** to store scheduled timers:
+
+| Key pattern | Type | Purpose |
+|-------------|------|---------|
+| `timers_timeline:{topic}` | Sorted set | Maps each `timer_id` to its activation Unix timestamp (score) |
+| `timers_payloads:{topic}` | Hash | Maps each `timer_id` to its serialized message body |
+
+When you publish a timer for topic `invoices` with `timer_id` `abc-123`, both keys are written atomically using a Redis pipeline:
+
+```
+ZADD timers_timeline:invoices <activation_ts> abc-123
+HSET timers_payloads:invoices abc-123 <encoded_envelope>
+```
+
+The envelope is FastStream's `BinaryMessageFormatV1` — a binary-safe wire format that carries the message body alongside `correlation_id`, `content-type`, `reply_to`, and any user-supplied headers. The same format is used by FastStream's built-in Redis broker.
+
+## Polling loop
+
+Each subscriber runs a background polling loop that:
+
+1. Calls `ZRANGEBYSCORE timers_timeline:{topic} -inf <now> LIMIT 0 <free>` (where `<free>` is the unused capacity from the per-subscriber concurrency limiter) to find due timers
+2. For each due timer, spawns a task that — bounded by the `max_concurrent` capacity limiter — runs an atomic Lua **claim** script that:
+    - Verifies the timer is still due (score ≤ now)
+    - Pushes its score forward by `lease_ttl` seconds — granting the worker a lease
+    - Returns the payload
+3. Delivers the payload to the user handler
+4. On handler success, runs an atomic Lua **commit** script (`ZREM` + `HDEL`) to remove the timer from Redis
+5. On handler exception, leaves the timer in place — the lease eventually expires and another worker re-claims it
+
+This is the standard SQS-style **visibility-timeout** pattern. The timer's own score in the sorted set acts as the lease deadline — there is no separate lock primitive.
+
+## At-least-once delivery
+
+The lease ensures each due timer is processed by exactly one worker at a time. Because the timer is removed from Redis only after the handler completes successfully, **no timer is lost on crash** — if the worker dies mid-handler, the lease expires and the timer is re-delivered.
+
+The trade-off: handlers that take longer than `lease_ttl`, or workers that crash after the handler ran but before the commit landed, may see the timer delivered more than once. Handlers must therefore be **idempotent**.
+
+## Ack / Nack / Reject
+
+| Action | Effect |
+|--------|--------|
+| `ack` | Atomically removes the timer from `timers_timeline` and `timers_payloads` |
+| `nack` | No-op — the lease expires and another worker re-claims the timer |
+| `reject` | Same as `ack` — permanently removes the timer (use for poison-pill messages) |
+
+The default ack policy is `NACK_ON_ERROR`: the timer is acknowledged on success, and left for retry on any unhandled exception.
+
+## Key configuration
+
+### Broker constructor (`TimersBroker(...)`)
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `timeline_key` | `timers_timeline` | Prefix for sorted set keys (`{timeline_key}:{topic}`) |
+| `payloads_key` | `timers_payloads` | Prefix for hash keys (`{payloads_key}:{topic}`) |
+| `start_timeout` | `3.0` s | Max wait for the first Redis ping during startup |
+
+### Per-subscriber (`@broker.subscriber("topic", ...)`)
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `polling_interval` | `0.05` s | Base poll interval used when the queue has work or just transitioned from idle |
+| `max_polling_interval` | `5.0` s | Ceiling for the adaptive idle backoff — `polling_interval` doubles up to this value on consecutive empty polls. Worst-case delivery latency on a previously-idle queue is `max_polling_interval × 1.5` (with ±50% jitter) |
+| `max_concurrent` | `5` | Max handlers running concurrently per subscriber; also bounds fetch batch size |
+| `lease_ttl` | `30` s | How long a worker holds the lease before another worker may re-claim. Set to ~3–5× the P99 handler runtime: lower values speed up recovery from worker death, higher values tolerate handler GC pauses and clock skew |
+
+## Operational requirements
+
+`faststream-redis-timers` is designed for a **single-primary Redis** (Sentinel-managed primary/replica setups are supported; Redis Cluster is not — see the broker constructor docstring).
+
+Multiple brokers polling the same Redis derive timer due-times and lease deadlines from each broker's local wall clock. Keep all broker hosts NTP-synchronised: clock skew larger than `lease_ttl` between brokers can cause a clock-fast broker to re-lease a timer that another broker is still actively processing, producing duplicate delivery to handlers. The default `lease_ttl=30s` tolerates seconds of NTP drift; tune `lease_ttl` upward if your environment cannot guarantee sub-second sync.
+
+---
+
+# Installation
+
+Source: https://github.com/modern-python/faststream-redis-timers/blob/main/docs/introduction/installation.md
+
+# Installation
+
+## Install `faststream-redis-timers`
+
+=== "uv"
+
+    ```bash
+    uv add faststream-redis-timers
+    ```
+
+=== "pip"
+
+    ```bash
+    pip install faststream-redis-timers
+    ```
+
+=== "poetry"
+
+    ```bash
+    poetry add faststream-redis-timers
+    ```
+
+## Requirements
+
+- Python 3.13+
+- Redis 5.0+
+- A running Redis instance
+
+## Redis
+
+If you don't have a Redis instance, you can start one with Docker:
+
+```bash
+docker run -d -p 6379:6379 redis:latest
+```
+
+---
+
+# Python 3.11/3.12 Support Implementation Plan
+
+Source: https://github.com/modern-python/faststream-redis-timers/blob/main/docs/superpowers/plans/2026-06-29-python-3.11-3.12-support.md
+
+# Python 3.11/3.12 Support Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Lower the supported-Python floor from 3.13 to 3.11 so the package installs and runs on 3.11, 3.12, 3.13, and 3.14.
+
+**Architecture:** Pure-Python library, no compiled extensions. Two source constructs require 3.12+ (`type` statement and `typing.override`); both are backported via `typing_extensions` (declared as a direct runtime dependency, no `sys.version_info` gating). The rest is metadata (`requires-python`, classifiers, ruff target) and a wider CI matrix.
+
+**Tech Stack:** Python, faststream 0.7, redis 8, anyio, `typing_extensions`, uv (package manager), just (task runner), ruff + ty (lint/type-check), pytest, docker compose (integration suite + Redis).
+
+## Global Constraints
+
+- New Python floor: `requires-python = ">=3.11,<4"`. All edits must remain valid on CPython 3.11 through 3.14.
+- `typing_extensions` floor is `>=4.12.0` (matches faststream's existing transitive pin; `override` has existed there since 4.4.0).
+- `import` statements live at module level only — never inside function bodies.
+- Type-checker suppressions use `# ty: ignore[...]`, never `# type: ignore`.
+- `uv.lock` is git-ignored — do not commit it. Regenerating it locally is still required so local runs resolve.
+- Coverage gate is 100% (`--cov-fail-under=100`); the full suite enforces it. Local 3.11 subset runs use `--no-cov` to bypass the gate (they are an import/runtime smoke check, not the coverage gate).
+- `typing.Self` (`broker.py:155`) stays as-is — it exists in the 3.11 stdlib.
+
+---
+
+### Task 1: Make the package compatible with Python 3.11/3.12
+
+Lowers the floor, adds the `typing_extensions` dependency, and rewrites the two incompatible constructs. The pyproject floor change and the source fixes are inseparable: the `override` fix can only be proven by importing on a real 3.11 interpreter, which uv refuses until `requires-python` is lowered; and the ruff `target-version` must move to `py311` alongside the `configs.py` edit or `ruff --fix` (UP040) will revert it.
+
+**Files:**
+- Modify: `pyproject.toml` (dependencies, `requires-python`, classifiers, `[tool.ruff] target-version`)
+- Modify: `faststream_redis_timers/configs.py:17`
+- Modify: `faststream_redis_timers/registrator.py:3`
+- Modify: `faststream_redis_timers/broker.py` (import block + decorators at 150/154/159/164)
+- Modify: `faststream_redis_timers/subscriber/usecase.py` (import block + decorators at 69/164/169)
+- Regenerate (do not commit): `uv.lock`
+
+**Interfaces:**
+- Consumes: nothing from earlier tasks.
+- Produces: a package importable on 3.11; the public `RedisClient` type alias keeps its name and meaning (`"Redis[bytes] | Redis[str]"`). No public API names change.
+
+- [ ] **Step 1: Confirm the current break on 3.11 (RED)**
+
+Use the local uv-managed 3.11 interpreter to show `configs.py` does not even parse on 3.11:
+
+```bash
+PY311=/Users/kevinsmith/.local/share/uv/python/cpython-3.11.9-macos-aarch64-none/bin/python3.11
+$PY311 -m py_compile faststream_redis_timers/configs.py
+```
+
+Expected: FAIL with `SyntaxError: invalid syntax` (the PEP 695 `type` statement at line 17). This is the failing state the task fixes. (The `override` import break in the other files is an `ImportError`, not a `SyntaxError`, so it is proven later by the runtime test in Step 8, not here.)
+
+- [ ] **Step 2: Edit `pyproject.toml` — dependency, floor, classifiers, ruff target (all together)**
+
+In `[project]`, change the dependencies block from:
+
+```toml
+dependencies = [
+    "faststream>=0.7.1,<0.8",
+    "redis>=5.0",
+]
+```
+
+to:
+
+```toml
+dependencies = [
+    "faststream>=0.7.1,<0.8",
+    "redis>=5.0",
+    "typing-extensions>=4.12.0",
+]
+```
+
+Change the floor from:
+
+```toml
+requires-python = ">=3.13,<4"
+```
+
+to:
+
+```toml
+requires-python = ">=3.11,<4"
+```
+
+In the `classifiers` list, change:
+
+```toml
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+```
+
+to (add 3.11 and 3.12 above 3.13):
+
+```toml
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+```
+
+In `[tool.ruff]`, change:
+
+```toml
+target-version = "py313"
+```
+
+to:
+
+```toml
+target-version = "py311"
+```
+
+- [ ] **Step 3: Regenerate the lock and sync**
+
+Run: `uv lock --upgrade && uv sync --all-extras --all-groups`
+Expected: resolves cleanly; `typing-extensions` appears in the lock (it was already present transitively). Do NOT `git add uv.lock` — it is git-ignored.
+
+- [ ] **Step 4: Fix `configs.py` — replace the PEP 695 `type` statement**
+
+Change line 17 from:
+
+```python
+type RedisClient = "Redis[bytes] | Redis[str]"
+```
+
+to:
+
+```python
+RedisClient: TypeAlias = "Redis[bytes] | Redis[str]"
+```
+
+Add the import at the top of `configs.py`. The current first import line is `import typing`; add after it:
+
+```python
+from typing_extensions import TypeAlias
+```
+
+Leave the explanatory comment block immediately above the alias untouched.
+
+- [ ] **Step 5: Fix `registrator.py` — import `override` from `typing_extensions`**
+
+Change line 3 from:
+
+```python
+from typing import Any, override
+```
+
+to two lines:
+
+```python
+from typing import Any
+from typing_extensions import override
+```
+
+The `@override` decorator usages at lines 18 and 63 (and their `# ty: ignore[invalid-method-override]` comments) are unchanged.
+
+- [ ] **Step 6: Fix `broker.py` — import `override` from `typing_extensions`, swap decorators**
+
+`broker.py` uses `import typing` (line 2) and references `@typing.override` four times plus `typing.Self` once. Keep `import typing` (still needed for `typing.Self` and other `typing.*` uses). Add this import to the top-of-file import block (after the existing `import typing`):
+
+```python
+from typing_extensions import override
+```
+
+Then replace every `@typing.override` with `@override` (4 occurrences: lines 150, 154, 159, 164). Do NOT touch `async def __aenter__(self) -> typing.Self:` at line 155 — `typing.Self` stays.
+
+- [ ] **Step 7: Fix `subscriber/usecase.py` — import `override` from `typing_extensions`, swap decorators**
+
+This file uses `import typing` (line 3) and `@typing.override` three times. Add to the top-of-file import block (after `import typing`):
+
+```python
+from typing_extensions import override
+```
+
+Then replace every `@typing.override` with `@override` (3 occurrences: lines 69, 164, 169). Keep `import typing` (other `typing.*` uses remain).
+
+- [ ] **Step 8: Verify the package imports and the unit/fake suites pass on real 3.11 (GREEN)**
+
+These suites need no Redis. Run them on a true 3.11 interpreter via uv (now permitted because the floor is `>=3.11`):
+
+```bash
+uv run --python 3.11 pytest tests/test_unit.py tests/test_fake.py --no-cov -v
+```
+
+Expected: PASS. This proves both fixes at runtime on 3.11 — the `configs.py` parse fix and that `typing_extensions.override` imports cleanly where `typing.override` would have raised `ImportError`.
+
+If `uv run --python 3.11` is awkward in the environment, the fallback is an explicit ephemeral env:
+
+```bash
+uv venv --python 3.11 /private/tmp/claude-501/-Users-kevinsmith-src-pypi-faststream-redis-timers/b6781fe7-4d7e-4081-b268-8696cf7ad9e6/scratchpad/v311
+VIRTUAL_ENV=/private/tmp/claude-501/-Users-kevinsmith-src-pypi-faststream-redis-timers/b6781fe7-4d7e-4081-b268-8696cf7ad9e6/scratchpad/v311 uv sync --all-extras --all-groups
+VIRTUAL_ENV=/private/tmp/claude-501/-Users-kevinsmith-src-pypi-faststream-redis-timers/b6781fe7-4d7e-4081-b268-8696cf7ad9e6/scratchpad/v311 uv run --no-sync pytest tests/test_unit.py tests/test_fake.py --no-cov -v
+```
+
+- [ ] **Step 9: Lint against the new floor**
+
+Run: `just lint-ci`
+Expected: PASS. Specifically confirms (a) ruff under `target-version = "py311"` accepts `RedisClient: TypeAlias = ...` and does NOT flag it for conversion back to the `type` statement (UP040 only fires at py312+), and (b) `ty` accepts `typing_extensions.override` and `typing.Self`.
+
+- [ ] **Step 10: Run the full suite (no regression on 3.13 + 100% coverage)**
+
+Run: `just test`
+Expected: PASS, coverage 100%. This is the docker integration run (Redis on 3.13); confirms the source changes did not regress the existing platform.
+
+- [ ] **Step 11: Commit**
+
+```bash
+git add pyproject.toml faststream_redis_timers/configs.py faststream_redis_timers/registrator.py faststream_redis_timers/broker.py faststream_redis_timers/subscriber/usecase.py
+git commit -m "feat: support Python 3.11 and 3.12
+
+Backport the PEP 695 type alias and typing.override via typing_extensions,
+lower requires-python to >=3.11, add 3.11/3.12 classifiers and ruff target.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
+```
+
+---
+
+### Task 2: Add 3.11 and 3.12 to the CI test matrix
+
+The pytest job in CI currently runs only 3.13 and 3.14. Extend it so the new floor is exercised on every PR.
+
+**Files:**
+- Modify: `.github/workflows/_checks.yml` (the `pytest` job's `strategy.matrix.python-version`)
+
+**Interfaces:**
+- Consumes: the 3.11-compatible package from Task 1.
+- Produces: nothing consumed by later tasks (terminal task).
+
+- [ ] **Step 1: Edit the matrix**
+
+In the `pytest` job, change:
+
+```yaml
+        python-version:
+          - "3.13"
+          - "3.14"
+```
+
+to:
+
+```yaml
+        python-version:
+          - "3.11"
+          - "3.12"
+          - "3.13"
+          - "3.14"
+```
+
+Leave the `lint` job (which runs `uv python install 3.13`) unchanged — linting against one interpreter is sufficient and ruff's `target-version` already enforces the floor.
+
+- [ ] **Step 2: Validate the workflow YAML parses**
+
+Run: `uv run python -c "import yaml; yaml.safe_load(open('.github/workflows/_checks.yml')); print('yaml ok')"`
+Expected: prints `yaml ok` with no exception. (`pyyaml` is available transitively via the dev tooling; if it is not, `python -c "import yaml"` will fail and you can skip this step — the edit is a 2-line list addition.)
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add .github/workflows/_checks.yml
+git commit -m "ci: run pytest matrix on Python 3.11 and 3.12
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
+```
+
+---
+
+## Notes for the finish
+
+- `Dockerfile` stays on `python:3.13-slim` — it is the dev/test image, not a supported-version gate; no change.
+- No `architecture/` page or doc references the version floor, so no capability promotion is required (verified during planning).
+- After both tasks: push the branch and open a PR (do not local-merge); watch CI — the new 3.11/3.12 matrix legs are the real cross-version proof.
+
+---
+
+# Support Python 3.11 and 3.12
+
+Source: https://github.com/modern-python/faststream-redis-timers/blob/main/docs/superpowers/specs/2026-06-29-python-3.11-3.12-support-design.md
+
+# Support Python 3.11 and 3.12
+
+**Date:** 2026-06-29
+**Status:** Approved design
+
+## Goal
+
+Lower the supported-Python floor from 3.13 to 3.11, so the package installs and
+runs on 3.11, 3.12, 3.13, and 3.14. The package is a pure-Python library with no
+compiled extensions, so this is a source-compatibility and metadata change.
+
+## Background / constraints (verified)
+
+All facts below were verified empirically against real CPython 3.11.9 / 3.12.13
+interpreters and installed dependency metadata, not from memory.
+
+Two constructs in the source require Python 3.12+ and break on 3.11:
+
+| Construct | Location | 3.12 | 3.11 |
+|-----------|----------|------|------|
+| `type RedisClient = "..."` (PEP 695 alias) | `configs.py:17` | OK | `SyntaxError` |
+| `override` imported from `typing` | `registrator.py:3`, `broker.py` (`typing.override` ×4), `subscriber/usecase.py` (`typing.override` ×3) | OK | `ImportError` |
+
+Confirmed non-issues:
+
+- `typing.Self` (`broker.py:155`) exists in the 3.11 stdlib — no change needed.
+- `typing.TypeAlias` works on 3.11 (added in 3.10).
+- `datetime.UTC` (`response.py`) was added in Python 3.11, so it is valid at
+  exactly the new floor — no change needed. (Noted because it is the one
+  floor-sensitive stdlib API in the source; it would break below 3.11, which
+  confirms 3.11 as the correct floor.)
+- Upstream deps all support 3.11: faststream, redis, and anyio each declare
+  `requires-python >=3.10`.
+- `typing-extensions` is already a transitive dependency (faststream pins
+  `>=4.12.0`; resolves to 4.15 today). `override` has been in `typing_extensions`
+  since 4.4.0, so a `>=4.12.0` floor amply covers it.
+
+## Decision: backport via typing_extensions
+
+Use `typing_extensions` (declared as a direct runtime dependency) for both
+constructs, with no `sys.version_info` gating. Rationale: it is already present
+transitively, the unconditional import is the simplest correct form, and it
+preserves the static `@override` checking that `ty` relies on.
+
+Alternatives rejected:
+- **Version-gated stdlib imports** — more code, still needs typing_extensions on
+  3.11, no benefit.
+- **Drop `@override`** — loses override-mismatch checking; avoided.
+
+## Changes
+
+### 1. `pyproject.toml`
+
+- `requires-python`: `>=3.13,<4` → `>=3.11,<4`
+- `dependencies`: add `typing-extensions>=4.12.0` (matches faststream's existing
+  pin rather than an artificially lower floor)
+- `classifiers`: add
+  `Programming Language :: Python :: 3.11` and `Programming Language :: Python :: 3.12`
+- `[tool.ruff] target-version`: `py313` → `py311` (lints against the floor so
+  PEP 695 syntax cannot reappear)
+
+### 2. Source
+
+- `configs.py:17`:
+  ```python
+  type RedisClient = "Redis[bytes] | Redis[str]"
+  ```
+  becomes
+  ```python
+  from typing_extensions import TypeAlias
+  RedisClient: TypeAlias = "Redis[bytes] | Redis[str]"
+  ```
+  (Comment block above the alias is preserved.)
+- `registrator.py:3`: import `override` from `typing_extensions` instead of `typing`.
+- `broker.py` (lines 150/154/159/164) and `subscriber/usecase.py`
+  (lines 69/164/169): replace `@typing.override` with `@override` imported from
+  `typing_extensions`. `typing.Self` at `broker.py:155` is left unchanged.
+- The existing `# ty: ignore[invalid-method-override]` comments at
+  `registrator.py:18/63` are unrelated to this change and are left as-is unless
+  they break.
+
+### 3. CI — `.github/workflows/_checks.yml`
+
+- `pytest` matrix `python-version`: `["3.13","3.14"]` →
+  `["3.11","3.12","3.13","3.14"]` (each job already gets the Redis service).
+- `lint` job stays on 3.13 (unchanged).
+
+### 4. Unchanged
+
+- `Dockerfile` — stays on `python:3.13-slim`; it is the dev/test image, not a
+  supported-version gate.
+- `uv.lock` — regenerated by `uv sync` after the dependency edit.
+- Docs / `architecture/` — no version-specific content references the floor, so
+  no promotion is required.
+
+## Testing
+
+No new tests. This is a compatibility-surface change; the existing
+100%-coverage suite running across the expanded CI matrix is the verification.
+
+Local verification before pushing (uv has a real 3.11.9 interpreter available):
+1. `just lint-ci` — confirms ruff (now `py311`) and `ty` accept the
+   `typing_extensions` imports.
+2. Run the unit/fake suites (`tests/test_unit.py`, `tests/test_fake.py`, which
+   need no Redis) on the local 3.11 interpreter to confirm the source imports
+   cleanly under the new floor.
+3. `just test` — full suite in docker (Redis on 3.13) as the integration check.
+
+## Out of scope
+
+- Lowering below 3.11.
+- Any runtime/behavior change beyond version-compatibility.
+- Refactoring unrelated to the floor change.
+
+---
+
+# Basic usage
+
+Source: https://github.com/modern-python/faststream-redis-timers/blob/main/docs/usage/basic.md
+
+# Basic usage
+
+## 1. Create a broker and app
+
+```python
+from faststream import FastStream
+from faststream_redis_timers import TimersBroker
+from redis.asyncio import Redis
+
+client = Redis.from_url("redis://localhost:6379")
+broker = TimersBroker(client)
+app = FastStream(broker)
+```
+
+## 2. Define a subscriber
+
+Subscribers work like any FastStream subscriber. Decorate a handler with `@broker.subscriber(topic)`:
+
+```python
+@broker.subscriber("reminders")
+async def handle_reminder(message: str) -> None:
+    print(f"Reminder fired: {message}")
+```
+
+## 3. Publish a timer
+
+Use `broker.publish()` with `activate_in` (relative delay) or `activate_at` (absolute time) to schedule delivery. `publish()` returns the resolved `timer_id` — keep it for cancellation or inspection.
+
+```python
+from datetime import UTC, datetime, timedelta
+
+@app.after_startup
+async def schedule_reminder() -> None:
+    # Relative — fire 24 hours from now
+    await broker.publish(
+        "Call dentist",
+        topic="reminders",
+        activate_in=timedelta(hours=24),
+    )
+
+    # Absolute — fire at a specific moment
+    await broker.publish(
+        "Quarterly review",
+        topic="reminders",
+        activate_at=datetime(2026, 6, 1, 9, tzinfo=UTC),
+    )
+```
+
+`activate_at` must be timezone-aware. Passing both `activate_in` and `activate_at` raises `ValueError`.
+
+The full example:
+
+```python
+from datetime import timedelta
+from faststream import FastStream
+from faststream_redis_timers import TimersBroker
+from redis.asyncio import Redis
+
+client = Redis.from_url("redis://localhost:6379")
+broker = TimersBroker(client)
+app = FastStream(broker)
+
+
+@broker.subscriber("reminders")
+async def handle_reminder(message: str) -> None:
+    print(f"Reminder fired: {message}")
+
+
+@app.after_startup
+async def schedule_reminder() -> None:
+    await broker.publish(
+        "Call dentist",
+        topic="reminders",
+        activate_in=timedelta(hours=24),
+    )
+```
+
+## Broker options
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `client` | _required for production_ | `redis.asyncio.Redis` client instance — the caller owns its lifecycle (the broker does not close it). The constructor accepts `None`, but a broker without a client raises `IncorrectState` on the first operation; `None` is the test-broker shape (see [Testing](./testing.md)). |
+| `timeline_key` | `timers_timeline` | Sorted set key name |
+| `payloads_key` | `timers_payloads` | Hash key name |
+| `start_timeout` | `3.0` | Seconds to wait for the subscriber's first Redis ping during startup |
+| `graceful_timeout` | `15.0` | Seconds to wait for in-flight timers on shutdown |
+
+`TimersBroker` does not call `.aclose()` on the supplied client — wrap it in
+`async with Redis.from_url(...) as client:` (or your own `try/finally`) so the
+connection is released when the application stops.
+
+## Timer IDs
+
+Each timer has a unique `timer_id`. If you don't provide one, a UUID is generated automatically. You can supply your own to make a timer idempotent — publishing the same `timer_id` twice will **overwrite the first** silently (no error, no warning). This is the right behavior for idempotent retry of `publish()` calls but a footgun if two unrelated callers pick the same ID. Namespace your IDs (e.g., `f"invoice-{invoice_id}-due"`) to avoid accidental collisions.
+
+```python
+await broker.publish(
+    "INV-001",
+    topic="invoices",
+    timer_id="invoice-INV-001-due",
+    activate_in=timedelta(days=30),
+)
+```
+
+## Past activation times fire immediately
+
+Both `activate_in=timedelta(seconds=-5)` and `activate_at=datetime.now(tz=UTC) - timedelta(seconds=5)` produce a timer scheduled in the past — the next subscriber poll picks it up and fires it immediately. No error is raised; this lets `activate_at` computations that take "marginally too long" still deliver instead of breaking. If you want strict scheduling, validate at the call site before publishing.
+
+## Cancelling timers
+
+Cancel a pending timer before it fires using `broker.cancel_timer(topic, timer_id)`. This is a no-op if the timer has already fired or does not exist. The `timer_id` returned from `publish()` is what you'd pass:
+
+```python
+timer_id = await broker.publish(
+    "INV-001",
+    topic="invoices",
+    activate_in=timedelta(days=30),
+)
+
+# Later — invoice was paid early, cancel the reminder
+await broker.cancel_timer("invoices", timer_id)
+```
+
+## Inspecting pending timers
+
+Three broker methods let you inspect or bulk-cancel timers without poking Redis directly:
+
+| Method | Returns | Use for |
+|--------|---------|---------|
+| `await broker.has_pending(topic, timer_id)` | `bool` | "is timer X still scheduled?" |
+| `await broker.get_pending_timers(topic, before=None)` | `list[str]` | List pending IDs on *topic* — optionally filter to those due by *before* (a timezone-aware `datetime`) |
+| `await broker.cancel_all(topic)` | `int` | Cancel every timer on *topic*; returns the number removed |
+
+```python
+from datetime import UTC, datetime, timedelta
+
+# Quick existence check
+if await broker.has_pending("invoices", "invoice-INV-001-due"):
+    ...
+
+# All pending timers on a topic
+pending = await broker.get_pending_timers("invoices")
+
+# Only those due in the next hour
+soon = await broker.get_pending_timers(
+    "invoices", before=datetime.now(tz=UTC) + timedelta(hours=1),
+)
+
+# Wipe a topic's queue (e.g., during a maintenance reset)
+removed = await broker.cancel_all("invoices")
+```
+
+These methods only inspect/cancel timers in the queue — handlers that have already started running are unaffected.
+
+### Leased timers still appear as pending
+
+Timers that have been claimed by a worker and are currently being processed have their score pushed forward by `lease_ttl` seconds (the visibility-timeout pattern — see [How it works](../introduction/how-it-works.md)). They are *still* in the sorted set, so:
+
+- `has_pending(topic, timer_id)` returns `True` while the handler is running.
+- `get_pending_timers(topic)` (no `before`) includes them.
+- `get_pending_timers(topic, before=datetime.now(tz=UTC))` excludes them — they are no longer due "by now" because their score is in the future.
+
+If you are polling `has_pending` to detect *"the timer fired and the handler finished"*, you will get false positives during the lease window. Pass `before=datetime.now(tz=UTC)` (or treat the timer as gone only after `has_pending` is `False`) to avoid this.
+
+### `cancel_all` race with executing handlers
+
+If `cancel_all(topic)` runs while a worker is mid-handler for a leased timer on that topic, the handler runs to completion. When it finishes, its commit (the `ZREM` + `HDEL` that normally removes the timer) becomes a no-op because `cancel_all` has already deleted both keys for the topic. The work is *not* rolled back — only the bookkeeping is skipped — so handlers that have side effects (sent emails, written rows) will have already done them. Use `cancel_all` for queue resets, not for "stop everything in flight."
+
+## Debug logging
+
+Set `log_level=logging.DEBUG` on `TimersBroker` to emit per-timer DEBUG lines: timers fetched per poll cycle, claim contested by another worker, and timer delivered to handler. Useful for diagnosing "my timer didn't fire".
+
+---
+
+# Publisher
+
+Source: https://github.com/modern-python/faststream-redis-timers/blob/main/docs/usage/publisher.md
+
+# Publisher
+
+Use `broker.publisher(topic)` to get a reusable publisher object. This is useful when you want to inject the publisher as a dependency or use it from inside a handler.
+
+## Creating a publisher
+
+```python
+from faststream_redis_timers import TimersBroker
+from redis.asyncio import Redis
+
+client = Redis.from_url("redis://localhost:6379")
+broker = TimersBroker(client)
+
+reminder_publisher = broker.publisher("reminders")
+```
+
+## Publishing from a handler
+
+```python
+from datetime import timedelta
+from faststream_redis_timers import TimersBroker
+from redis.asyncio import Redis
+
+client = Redis.from_url("redis://localhost:6379")
+broker = TimersBroker(client)
+reminder_publisher = broker.publisher("reminders")
+
+
+@broker.subscriber("orders")
+async def handle_order(order_id: str) -> None:
+    # Schedule a follow-up reminder 7 days after the order
+    await reminder_publisher.publish(
+        f"Follow up on order {order_id}",
+        activate_in=timedelta(days=7),
+    )
+```
+
+## Publisher options
+
+The `publish()` method on a publisher accepts the parameters below and returns the resolved `timer_id` (generated or provided):
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `message` | — | The message body (any serializable value) |
+| `timer_id` | auto UUID | Unique ID for the timer — use for idempotency |
+| `activate_in` | `timedelta(0)` | Delay before delivery (fires immediately if 0) |
+| `activate_at` | `None` | Absolute timezone-aware datetime to fire at. Mutually exclusive with `activate_in` |
+| `correlation_id` | same as `timer_id` | Correlation ID for tracing — round-trips to the handler. Defaults to the resolved `timer_id` (which is itself an auto UUID when not supplied) |
+| `headers` | `None` | `dict[str, Any]` of headers — round-trips to the handler |
+
+!!! note "`correlation_id` defaults to `timer_id`"
+    If you omit `correlation_id`, it falls back to the resolved `timer_id` —
+    not a fresh UUID. When `timer_id` is also auto-generated, the two end up
+    equal but each unique. When you supply your own `timer_id` (e.g.
+    `"invoice-INV-001-due"`) for idempotent retries, omitting `correlation_id`
+    means every retry of that timer carries the *same* correlation ID. Pass
+    `correlation_id` explicitly if your tracing pipeline needs per-publish
+    uniqueness.
+
+!!! note "Past activation times fire immediately"
+    `activate_in=timedelta(seconds=-5)` and `activate_at` set in the past both
+    schedule the timer at a negative-relative score — the next subscriber poll
+    picks it up and fires it. No error is raised; this lets `activate_at`
+    computations that take "marginally too long" still deliver. If you want
+    strict scheduling, validate at the call site before publishing.
+
+### Tracing & headers example
+
+```python
+from faststream import Context
+from faststream.message import StreamMessage
+
+pub = broker.publisher("orders")
+
+@broker.subscriber("orders")
+async def handle(
+    body: dict,
+    correlation_id: str = Context("message.correlation_id"),
+    tenant: str = Context("message.headers.x-tenant"),
+) -> None:
+    ...
+
+await pub.publish(
+    {"order_id": 42},
+    correlation_id="trace-abc-123",
+    headers={"x-tenant": "acme"},
+)
+```
+
+## Cancelling timers via a publisher
+
+Publishers expose a `cancel(timer_id)` method that cancels a pending timer on the same topic. This is a no-op if the timer has already fired or does not exist. Capture the `timer_id` from `publish()`:
+
+```python
+pub = broker.publisher("invoices")
+
+timer_id = await pub.publish("INV-001", activate_in=timedelta(days=30))
+
+# Later — cancel the timer via the publisher
+await pub.cancel(timer_id)
+```
+
+## Inspecting pending timers
+
+`fetch_redis_timers(dt)` returns all timers on this publisher's topic that are due by `dt` as a list of `(topic, timer_id)` tuples. This is useful in service tests to assert that timers were scheduled correctly without waiting for them to fire.
+
+```python
+from datetime import UTC, datetime, timedelta
+
+pub = broker.publisher("invoices")
+await pub.publish("INV-001", timer_id="invoice-INV-001-due", activate_in=timedelta(days=30))
+
+# Assert the timer is scheduled
+pending = await pub.fetch_redis_timers(datetime.now(tz=UTC) + timedelta(days=31))
+assert ("invoices", "invoice-INV-001-due") in pending
+
+# Timers not yet due are excluded
+pending_now = await pub.fetch_redis_timers(datetime.now(tz=UTC))
+assert pending_now == []
+```
+
+In `TestTimersBroker`, `fetch_redis_timers` always returns `[]` because messages are delivered immediately — there are no pending timers to inspect.
+
+---
+
+# Router
+
+Source: https://github.com/modern-python/faststream-redis-timers/blob/main/docs/usage/router.md
+
+# Router
+
+`TimersRouter` lets you define subscribers and publishers in separate modules and include them into the broker, the same as FastStream's built-in router pattern.
+
+## Creating a router
+
+```python
+from faststream_redis_timers import TimersRouter
+
+router = TimersRouter(prefix="my-service:")
+
+
+@router.subscriber("invoices")
+async def handle_invoice(invoice_id: str) -> None:
+    print(f"Invoice due: {invoice_id}")
+```
+
+## How `prefix` works
+
+The `prefix` you pass to `TimersRouter` is concatenated to every topic registered via that router — both subscribers and publishers. Given:
+
+```python
+router = TimersRouter(prefix="my-service:")
+
+@router.subscriber("invoices")
+async def handle_invoice(...): ...
+```
+
+…the subscriber listens on the full topic `my-service:invoices`, and Redis stores its timers under:
+
+- `timers_timeline:my-service:invoices`
+- `timers_payloads:my-service:invoices`
+
+This is the recommended way to isolate multiple services or environments that share one Redis instance — give each its own `TimersRouter` prefix and they will never collide on keys.
+
+### Publishing to a prefixed router
+
+`broker.publish(...)` does **not** know about the router's prefix — it only applies the broker's own prefix (empty by default). To target a prefixed subscriber from `broker.publish`, pass the full topic:
+
+```python
+await broker.publish("INV-001", topic="my-service:invoices", activate_in=...)
+```
+
+Or define a publisher inside the same router and use it — the router's prefix is applied automatically:
+
+```python
+publisher = router.publisher("invoices")
+await publisher.publish("INV-001", activate_in=...)  # lands on my-service:invoices
+```
+
+The same rule applies to `broker.cancel_timer`, `broker.has_pending`, `broker.get_pending_timers`, and `broker.cancel_all`: pass the prefixed topic, or call the equivalent methods through a router-scoped publisher.
+
+## Including a router in the broker
+
+```python
+from faststream import FastStream
+from faststream_redis_timers import TimersBroker
+from redis.asyncio import Redis
+
+from myapp.routers import router
+
+client = Redis.from_url("redis://localhost:6379")
+broker = TimersBroker(client)
+broker.include_router(router)
+app = FastStream(broker)
+```
+
+## Defining routes up-front with `TimersRoute`
+
+`TimersRoute` lets you declare handler + topic together without using decorators, which can be useful for code-gen or plugin patterns:
+
+```python
+from faststream_redis_timers import TimersRoute, TimersRouter
+
+
+async def handle_invoice(invoice_id: str) -> None:
+    print(f"Invoice due: {invoice_id}")
+
+
+router = TimersRouter(
+    handlers=[
+        TimersRoute(handle_invoice, topic="invoices"),
+    ],
+)
+```
+
+## Subscriber options per router
+
+You can configure polling behaviour per subscriber:
+
+```python
+@router.subscriber(
+    "high-priority",
+    polling_interval=0.01,    # poll every 10ms when the queue has work
+    max_polling_interval=0.5, # cap idle-backoff at 500ms (default 5s)
+    max_concurrent=20,        # up to 20 handlers may run in parallel
+    lease_ttl=60,             # hold lease for up to 60 seconds
+)
+async def handle_urgent(message: str) -> None: ...
+```
+
+All `@broker.subscriber` options are accepted by `@router.subscriber` and `TimersRoute` — see the [subscriber page](./subscriber.md) for the full list.
+
+---
+
+# Subscriber
+
+Source: https://github.com/modern-python/faststream-redis-timers/blob/main/docs/usage/subscriber.md
+
+# Subscriber
+
+Use `@broker.subscriber(topic)` to register a handler for a topic.
+
+## Basic example
+
+```python
+from faststream import FastStream
+from faststream_redis_timers import TimersBroker
+from redis.asyncio import Redis
+
+client = Redis.from_url("redis://localhost:6379")
+broker = TimersBroker(client)
+app = FastStream(broker)
+
+
+@broker.subscriber("reminders")
+async def handle_reminder(body: str) -> None:
+    print(f"Reminder fired: {body}")
+```
+
+## Body types
+
+FastStream deserializes the message body into the annotated type. Any JSON-serializable type works:
+
+```python
+from dataclasses import dataclass
+
+
+@dataclass
+class Order:
+    order_id: str
+    amount: float
+
+
+@broker.subscriber("orders")
+async def handle_order(body: Order) -> None:
+    print(f"Order {body.order_id} for {body.amount} is due")
+```
+
+## Accessing the timer ID
+
+The `timer_id` is available as the message's `message_id`. Inject it via `Context`:
+
+```python
+from faststream import Context
+from faststream_redis_timers import TimersBroker
+from redis.asyncio import Redis
+
+client = Redis.from_url("redis://localhost:6379")
+broker = TimersBroker(client)
+
+
+@broker.subscriber("invoices")
+async def handle_invoice(
+    body: str,
+    timer_id: str = Context("message.message_id"),
+) -> None:
+    print(f"Timer {timer_id} fired: {body}")
+```
+
+## Subscriber options
+
+Configure polling behaviour per subscriber:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `polling_interval` | `0.05` s | Base poll interval; the floor used when the queue has work |
+| `max_polling_interval` | `5.0` s | Cap for adaptive idle backoff (doubles per empty cycle, ±50% jitter) |
+| `max_concurrent` | `5` | Max handlers running in parallel; also caps fetch batch size per poll |
+| `lease_ttl` | `30` s | How long a worker holds the lease before another worker may re-claim |
+
+```python
+@broker.subscriber(
+    "high-priority",
+    polling_interval=0.01,        # poll every 10ms when busy
+    max_polling_interval=0.5,     # never sleep longer than 500ms when idle
+    max_concurrent=20,            # up to 20 handlers may run in parallel
+    lease_ttl=60,                 # hold lease for up to 60 seconds
+)
+async def handle_urgent(body: str) -> None: ...
+```
+
+The poll loop uses adaptive backoff: when there are no due timers, the next sleep doubles from `polling_interval` up to `max_polling_interval` and is multiplied by a random factor in `[0.5, 1.5]` to avoid thundering-herd bursts across worker fleets. The counter resets the moment a poll returns work. Worst-case delivery latency for a newly-published timer in a previously-idle queue is `max_polling_interval × 1.5`, plus any time spent waiting for the `max_concurrent` limiter when in-flight handlers are still holding capacity (back-pressure).
+
+!!! warning "Handlers must be idempotent and concurrency-safe"
+    A handler that runs longer than `lease_ttl`, or a worker that crashes after the handler ran but before the commit landed, may cause the timer to be delivered more than once. Design handlers to be safe under retry. Because `max_concurrent` invocations run in parallel, handlers must also be safe under concurrent execution (no unsynchronized shared state).
+
+    A handler that raises *every* time is also retried indefinitely — the lease score expires after `lease_ttl` seconds and the next poll re-claims the timer, so `lease_ttl` is the lower bound on the retry interval (e.g., the default `lease_ttl=30` retries a poison-pill handler about twice a minute). Raise `faststream.exceptions.RejectMessage` from your handler to permanently drop a timer that should never be retried.
+
+## Ack policy
+
+The default ack policy is `NACK_ON_ERROR`: the timer is acknowledged (removed from Redis) on success, and left for retry on any unhandled exception.
+
+| Outcome | Effect |
+|---------|--------|
+| Handler returns normally | Timer removed from Redis |
+| Handler raises an exception | Timer left in Redis for retry on next poll |
+
+To manually control acknowledgement, inject the `NoCast`-typed message:
+
+```python
+from faststream.message import StreamMessage
+from faststream_redis_timers.message import TimerMessage
+
+
+@broker.subscriber("invoices")
+async def handle_invoice(
+    body: str,
+    msg: StreamMessage[TimerMessage],
+) -> None:
+    try:
+        process(body)
+        await msg.ack()
+    except TransientError:
+        await msg.nack()   # retry later
+    except PermanentError:
+        await msg.reject() # discard permanently
+```
+
+---
+
+# Testing
+
+Source: https://github.com/modern-python/faststream-redis-timers/blob/main/docs/usage/testing.md
+
+# Testing
+
+`faststream-redis-timers` provides `TestTimersBroker` — a test context manager that replaces the Redis producer with an in-memory fake that delivers messages synchronously. No Redis connection required.
+
+## Basic test
+
+```python
+import pytest
+from faststream_redis_timers import TestTimersBroker, TimersBroker
+
+
+@pytest.mark.asyncio
+async def test_reminder_handler() -> None:
+    broker = TimersBroker()
+    received: list[str] = []
+
+    @broker.subscriber("reminders")
+    async def handler(body: str) -> None:
+        received.append(body)
+
+    async with TestTimersBroker(broker) as tb:
+        await tb.publish("hello", topic="reminders")
+
+    assert received == ["hello"]
+```
+
+## Testing publishers
+
+```python
+import pytest
+from faststream_redis_timers import TestTimersBroker, TimersBroker
+
+
+@pytest.mark.asyncio
+async def test_publisher() -> None:
+    broker = TimersBroker()
+    received: list[str] = []
+
+    @broker.subscriber("reminders")
+    async def handler(body: str) -> None:
+        received.append(body)
+
+    pub = broker.publisher("reminders")
+
+    async with TestTimersBroker(broker):
+        await pub.publish("world")
+
+    assert received == ["world"]
+```
+
+## Inspecting scheduled timers
+
+`TestTimersBroker.scheduled_timers` records every `publish()` call as a `ScheduledTimer` — useful for asserting that a unit of work scheduled the right follow-up without actually waiting for it.
+
+```python
+from datetime import UTC, datetime, timedelta
+from faststream_redis_timers import TestTimersBroker, TimersBroker
+
+
+async def test_order_schedules_reminder() -> None:
+    broker = TimersBroker()
+
+    @broker.subscriber("reminders")
+    async def reminder_handler(body: str) -> None: ...
+
+    test_broker = TestTimersBroker(broker)
+    async with test_broker:
+        await broker.publish(
+            "follow up on order 42",
+            topic="reminders",
+            timer_id="order-42-followup",
+            activate_at=datetime.now(tz=UTC) + timedelta(days=7),
+        )
+
+    assert len(test_broker.scheduled_timers) == 1
+    record = test_broker.scheduled_timers[0]
+    assert record.topic == "reminders"
+    assert record.timer_id == "order-42-followup"
+    assert record.body == "follow up on order 42"
+```
+
+Each `ScheduledTimer` has `topic`, `timer_id`, `activate_at`, `body`, `correlation_id`, and `headers`. Hold a reference to the `TestTimersBroker` outside the `async with` so the recorded list survives context exit.
+
+## Notes
+
+- `activate_at` / `activate_in` are **ignored** in tests — messages are delivered immediately. The intended firing time is preserved on `scheduled_timers[i].activate_at` for assertions.
+- `timer_id` is passed through normally and available in the handler via the message.
+- `cancel_timer` / `publisher.cancel()` are no-ops in tests — since messages are delivered immediately, by the time you'd cancel, the handler has already run.
+- `publisher.fetch_redis_timers()` always returns `[]` in tests — timers are delivered instantly, so there are never any pending entries.
+- The inspection / bulk-cancel methods follow the same "nothing pending" contract: `broker.has_pending(...)` returns `False`, `broker.get_pending_timers(...)` returns `[]`, and `broker.cancel_all(...)` returns `0`. Use `TestTimersBroker.scheduled_timers` to assert *what was published*; the inspection API is for production introspection.
+- The fake producer uses the same envelope format as the real one, so all serialization paths are exercised.
+- `lease_ttl` and re-delivery are **not** simulated — handlers that exceed the configured TTL in production may be re-delivered to another worker, but tests will only invoke the handler once. Idempotency must be verified separately.
+
+## pytest-asyncio configuration
+
+Add to `pyproject.toml`:
+
+```toml
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+```
+
+---
