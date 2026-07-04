@@ -1,0 +1,383 @@
+# FlashMLA
+
+Source: https://github.com/deepseek-ai/flashmla/blob/main/README.md
+
+# FlashMLA
+
+## Introduction
+
+FlashMLA is DeepSeek's library of optimized attention kernels, powering the [DeepSeek-V3](https://github.com/deepseek-ai/DeepSeek-V3) and [DeepSeek-V3.2-Exp](https://github.com/deepseek-ai/DeepSeek-V3.2-Exp) models. This repository contains the following implementations:
+
+**Sparse Attention Kernels**
+
+*These kernels power DeepSeek Sparse Attention (DSA), as introduced in [this paper](https://github.com/deepseek-ai/DeepSeek-V3.2-Exp).*
+
+- Token-level sparse attention for the prefill stage
+- Token-level sparse attention for the decoding stage, with FP8 KV cache
+
+**Dense Attention Kernels**
+
+- Dense attention for the prefill stage
+- Dense attention for the decoding stage
+
+## News
+
+- **2025.09.29 Release of Sparse Attention Kernels**: With the launch of [DeepSeek-V3.2](https://github.com/deepseek-ai/DeepSeek-V3.2-Exp), we are releasing the corresponding token-level sparse attention kernels. These kernels power the model's DeepSeek Sparse Attention (DSA) and achieve up to 640 TFlops during prefilling and 410 TFlops during decoding. We also release a deep-dive blog for our new FP8 sparse decoding kernel. Check it out [here](docs/20250929-hopper-fp8-sparse-deep-dive.md).
+- **2025.08.01 Kernels for MHA on SM100**: Thanks to [NVIDIA's PR](https://github.com/deepseek-ai/FlashMLA/pull/76) for MHA forward / backward kernels on SM100!
+- **2025.04.22 Deep-Dive Blog**: We'd love to share the technical details behind the new FlashMLA kernel! Check out our deep-dive write-up [here](docs/20250422-new-kernel-deep-dive.md).
+- **2025.04.22 Performance Update**: We're excited to announce the new release of Flash MLA, which delivers 5% ~ 15% performance improvement for compute-bound workloads, achieving up to 660 TFlops on NVIDIA H800 SXM5 GPUs. The interface of the new version is fully compatible with the old one. Simply upgrade to the new version for an immediate performance boost! 🚀🚀🚀
+
+## Performance
+
+#### Test & benchmark MLA decoding (Sparse & Dense):
+
+```bash
+python tests/test_flash_mla_dense_decoding.py
+python tests/test_flash_mla_sparse_decoding.py
+```
+
+The dense MLA decoding kernel achieves up to 3000 GB/s in memory-bound configuration and 660 TFLOPS in computation-bound configuration on H800 SXM5 with CUDA 12.8. The token-level sparse MLA decoding kernel (which uses an FP8 KV cache while performing the matrix multiplication in bfloat16) achieves 410 TFLOPS in compute-bound configuration on H800 SXM5 with CUDA 12.8, and achieves up to 350 TFlops on B200 (which is not really optimized yet).
+
+#### Test & benchmark MHA prefill (Dense):
+
+```bash
+python tests/test_fmha_sm100.py
+```
+
+It achieves up to 1460 TFlops in forward and 1000 TFlops in backward computation on B200, as reported by NVIDIA.
+
+#### Test & benchmark MLA prefill (Sparse):
+
+```bash
+python tests/test_flash_mla_sparse_prefill.py
+```
+
+It achieves up to 640 TFlops in forward computation on H800 SXM5 with CUDA 12.8, and achieves up to 1450 TFlops on B200, CUDA 12.9.
+
+## Requirements
+
+- SM90 / SM100 (See the support matrix below)
+- CUDA 12.8 and above (CUDA 12.9+ is required for SM100 kernels)
+- PyTorch 2.0 and above
+
+Support matrix:
+
+| Kernel | GPU Architecture | MLA Mode [2] | KVCache Format |
+| :---: | :---: | :---: | :---: |
+| Dense Decoding | SM90 | MQA | BF16 |
+| Sparse Decoding | SM90 & SM100 | MQA | FP8 [1] |
+| Dense Prefill | SM100 | MHA |  |
+| Sparse Prefill | SM90 & SM100 | MQA |  |
+
+[1]: For more details on using FP8 KV cache, see documents below.
+
+[2]: Here "MLA Mode" refers to the mode used for MLA calculation. MQA stands for Multi-Query Attention mode (i.e. `head_dim_k` =  576 with `head_dim_v` = 512), while MHA stands for Multi-Head Attention mode (i.e. `head_dim_k` = 192 / 128 with `head_dim_v` = 128). For a detailed explanation of these modes, please refer to the appendix of [DeepSeek V3.2's Paper](https://github.com/deepseek-ai/DeepSeek-V3.2-Exp).
+
+## Installation
+
+```bash
+git clone https://github.com/deepseek-ai/FlashMLA.git flash-mla
+cd flash-mla
+git submodule update --init --recursive
+pip install -v .
+```
+
+## Usage
+
+### MLA Decoding
+
+To use the MLA decoding kernels, call get_mla_metadata once before the decoding loop to get the tile scheduler metadata. Then, call flash_mla_with_kvcache in each decoding step. For example:
+
+```python
+from flash_mla import get_mla_metadata, flash_mla_with_kvcache
+
+tile_scheduler_metadata, num_splits = get_mla_metadata(
+    cache_seqlens,
+    s_q * h_q // h_kv,
+    h_kv,
+    h_q,
+    is_fp8,
+    topk,
+)
+
+for i in range(num_layers):
+    ...
+    o_i, lse_i = flash_mla_with_kvcache(
+        q_i, kvcache_i, block_table, cache_seqlens, dv,
+        tile_scheduler_metadata, num_splits,
+        is_causal, is_fp8_kvcache, indices,
+    )
+    ...
+```
+
+Where
+
+- `s_q` is the number of q tokens per q sequence. If MTP (speculative decoding) is disabled, it should be 1.
+- `h_kv` is the number of key-value heads.
+- `h_q` is the number of query heads.
+
+**FP8 KV Cache:**
+If `is_fp8_kvcache` is set to `True`, the kernel reads the KV cache in the "FP8 with scale" format (described below). It dequantizes the cache to bfloat16 and performs attention computation in bfloat16. The output is also in bfloat16.
+
+In the "FP8 with scale" format, each token's KV cache is 656 Bytes, structured as:
+-   **First 512 bytes:** The "quantized NoPE" part, containing 512 `float8_e4m3` values.
+-   **Next 16 bytes:** Scale factors, containing 4 `float32` values. The first `float32` is the scale for the first 128 `float8_e4m3` values, the second for the next 128, and so on.
+-   **Last 128 bytes:** The "RoPE" part, containing 64 `bfloat16` values. This part is not quantized for accuracy.
+
+See `tests/quant.py` for quantization and dequantization details.
+
+**Sparse Attention (`indices` tensor):**
+The `indices` tensor (if provided) enables token-level sparse attention by instructing the kernel to compute attention only for specified tokens.
+
+-   **Shape:** `indices` should be a 3D tensor of shape `(batch_size, seq_len_q, topk)`.
+-   **Format:** `indices_in_kvcache[i][j][k] = (the index of the page block where token t resides) * page_block_size + (the offset of token t within the page block)`, where `t` is the k-th token for the j-th query sequence in the i-th batch. Since the index of the page block has already been encoded into `indices_in_kvcache`, the kernel does not require the `block_table` parameter.
+-   **Invalid entries:** Set invalid indices to `-1`.
+
+**Return Values:**
+The kernel returns `(out, lse)`, where:
+-   `out` is the attention result.
+-   `lse` is the log-sum-exp value of the attention scores for each query head.
+
+See `tests/test_flash_mla_decoding.py` for a complete example.
+
+### Sparse MLA Prefill
+
+For the sparse MLA prefill kernel, call `flash_mla_sparse_fwd` directly with the following parameters:
+-   `q`: Query tensor of shape `[s_q, h_q, d_qk]`
+-   `kv`: Key-Value tensor of shape `[s_kv, h_kv, d_qk]`
+-   `indices`: Indices tensor of shape `[s_q, h_kv, topk]`
+-   `sm_scale`: A scalar value
+
+**Note on batching:** This kernel does not support a batch dimension. For multi-batch inference, reshape the input tensors and adjust the `indices` parameter to simulate batch processing.
+
+**Invalid indices:** Set invalid entries in `indices` to `-1` or any number `>= s_kv`.
+
+**Return Values and Equivalent PyTorch Code:**
+The kernel returns `(out, max_logits, lse)`. This is equivalent to the following PyTorch operations:
+
+```python
+Q: [s_q, h_q, d_qk], bfloat16
+kv: [s_kv, h_kv, d_qk], bfloat16
+indices: [s_q, h_kv, topk], int32
+
+kv = kv.squeeze(1)  # [s_kv, d_qk], h_kv must be 1
+indices = indices.squeeze(1)    # [s_q, topk]
+focused_kv = kv[indices]    # For the i-th sequence (s_q), the corresponding KV tokens are selected from the KV cache based on indices[i, :]. This operation results in a tensor of shape [s_q, topk, d_qk].
+
+P = (Q @ focused_kv.transpose(-1, -2)) * sm_scale * math.log2(math.e)    # [s_q, h_q, topk]
+max_logits = P.max(dim=-1) # [s_q, h_q]
+lse = log2sumexp2(P, dim=-1, base=2)   # [s_q, h_q]，"log2sumexp2" means that the exponentiation and logarithm are base-2
+S = exp2(P - lse)      # [s_q, h_q, topk]
+out = S @ focused_kv  # [s_q, h_q, d_qk]
+
+return (out, max_logits, lse)
+```
+
+See `tests/test_flash_mla_prefill.py` for a complete example.
+
+### Dense MHA Prefill
+
+This kernel implements the standard dense Multi-Head Attention (MHA) forward and backward operations. It can be called using:
+-   `flash_attn_varlen_func`
+-   `flash_attn_varlen_qkvpacked_func`
+-   `flash_attn_varlen_kvpacked_func`
+
+The usage is similar to the `flash_attn` package. See `tests/test_fmha_sm100.py` for a complete example.
+
+## Acknowledgement
+
+FlashMLA is inspired by [FlashAttention 2&3](https://github.com/dao-AILab/flash-attention/) and [cutlass](https://github.com/nvidia/cutlass) projects.
+
+## Community Support
+
+### MetaX
+For MetaX GPUs, visit the official website: [MetaX](https://www.metax-tech.com).
+
+The corresponding FlashMLA version can be found at: [MetaX-MACA/FlashMLA](https://github.com/MetaX-MACA/FlashMLA)
+
+
+### Moore Threads
+For the Moore Threads GPU, visit the official website: [Moore Threads](https://www.mthreads.com/).
+
+The corresponding FlashMLA version is available on GitHub: [MooreThreads/MT-flashMLA](https://github.com/MooreThreads/MT-flashMLA).
+
+
+### Hygon DCU
+For the Hygon DCU, visit the official website: [Hygon Developer](https://developer.sourcefind.cn/).
+
+The corresponding FlashMLA version is available here: [OpenDAS/MLAttention](https://developer.sourcefind.cn/codes/OpenDAS/MLAttention).
+
+
+### Intellifusion
+For the Intellifusion NNP, visit the official website: [Intellifusion](https://www.intellif.com).
+
+The corresponding FlashMLA version is available on Gitee: [Intellifusion/tyllm](https://gitee.com/Intellifusion_2025/tyllm/blob/master/python/tylang/flash_mla.py).
+
+
+### Iluvatar Corex
+For Iluvatar Corex GPUs, visit the official website: [Iluvatar Corex](https://www.iluvatar.com).
+
+The corresponding FlashMLA version is available on GitHub: [Deep-Spark/FlashMLA](https://github.com/Deep-Spark/FlashMLA/tree/iluvatar_flashmla)
+
+
+### AMD Instinct
+For AMD Instinct GPUs, visit the official website: [AMD Instinct](https://www.amd.com/en/products/accelerators/instinct.html).
+
+The corresponding FlashMLA version can be found at: [AITER/MLA](https://github.com/ROCm/aiter/blob/main/aiter/mla.py)
+
+## Citation
+
+```bibtex
+@misc{flashmla2025,
+      title={FlashMLA: Efficient Multi-head Latent Attention Kernels},
+      author={Jiashi Li, Shengyu Liu},
+      year={2025},
+      publisher = {GitHub},
+      howpublished = {\url{https://github.com/deepseek-ai/FlashMLA}},
+}
+```
+
+---
+
+# A Deep-Dive Into the New Flash MLA Kernel
+
+Source: https://github.com/deepseek-ai/flashmla/blob/main/docs/20250422-new-kernel-deep-dive.md
+
+# A Deep-Dive Into the New Flash MLA Kernel
+
+In the [previous version](https://github.com/deepseek-ai/FlashMLA/tree/b31bfe72a83ea205467b3271a5845440a03ed7cb) of the Flash MLA kernel, we have achieved impressive performance: 3000 GB/s in memory-intensive settings and 580 TFlops in compute-bound settings. Now, we're pushing these numbers even further, reaching up to 660 TFlops.
+
+In this blog, we present a deep dive into the new kernel, explaining the optimizations and techniques behind this performance boost. We'll first explain why the MLA kernel is compute-bound despite being a decoding-stage attention kernel, then discuss our high-level kernel schedule design, and finally cover the technical details of the new kernel.
+
+## A Theoretical Analysis of the MLA Algorithm
+
+GPU kernels can be classified as either compute-bound (limited by floating-point operations per second, FLOPs) or memory-bound (limited by memory bandwidth). To identify the kernel's bottleneck, we calculate the ratio of FLOPs to memory bandwidth (FLOPs/byte) and compare it with the GPU's capacity.
+
+Assume the number of q heads is $h_q$, the number of q tokens per request is $s_q$ (should be 1 if MTP / speculative decoding is disabled), the number of kv tokens per request is $s_k\ (s_k \gg h_q s_q)$, and the head dimensions of K and V are $d_k$ and $d_v$ respectively. The number of FLOPs is roughly $2 (h_q s_q \cdot d_k \cdot s_k + h_q s_q \cdot s_k \cdot d_v) = 2 h_q s_q s_k (d_k+d_v)$, and the memory access volume (in bytes) is $\mathop{\text{sizeof}}(\text{bfloat16}) \times (h_q s_q d_k + s_k d_k + h_q s_q d_v) \approx 2s_k d_k$. Thus, the compute-memory ratio is $h_q s_q \cdot \frac{d_k+d_v}{d_k} \approx 2 h_q s_q$.
+
+An NVIDIA H800 SXM5 GPU has a peak memory bandwidth of 3.35 TB/s and peak FLOPs of 990 TFlops. However, due to throttling (reducing to ~1600 MHz in our case), the practical peak FLOPs drops to ~865 TFlops. Therefore, when $h_qs_q \ge \frac{1}{2} \cdot \frac{865}{3.35} = 128$, the kernel is compute-bound; otherwise, it's memory-bound.
+
+According to [the overview of DeepSeek's Online Inference System](https://github.com/deepseek-ai/open-infra-index/blob/main/202502OpenSourceWeek/day_6_one_more_thing_deepseekV3R1_inference_system_overview.md), we don't use Tensor Parallel for decoding instances, meaning $h_q$ is 128 and the kernel is compute-bound. Thus, we need to optimize the kernel for compute-bound settings.
+
+## High-Level Design of the New Kernel
+
+To fully utilize GPU compute resources, we need to overlap CUDA Core operations with Tensor Core operations and memory access with computation, keeping the Tensor Core constantly busy. This requires redesigning the kernel's "schedule."
+
+[FlashAttention-3's paper](https://arxiv.org/abs/2407.08608) introduces ping-pong scheduling and intra-warpgroup GEMM-softmax pipelining to overlap block-wise matmul and CUDA Core operations. However, these techniques can't be directly applied here due to resource constraints. The output matrix (scaled and accumulated during each mainloop round, similar to [FlashAttention's algorithm](https://arxiv.org/abs/2205.14135)) must be stored in registers due to [WGMMA instruction](https://docs.nvidia.com/cuda/parallel-thread-execution/#asynchronous-warpgroup-level-matrix-instructions) requirements. Each $64 \times 512$ output matrix occupies 32,768 32-bit registers. With only 65,536 32-bit registers per SM, we can store only one output matrix per SM. This eliminates the possibility of having two output matrices and letting them use CUDA Core and Tensor Core in a interleaved manner. We need to find another clever way to overlap CUDA Core and Tensor Core computation.
+
+(You might pause here to ponder - perhaps you can find a better solution than ours!)
+
+Our solution involves an additional mathematical transformation beyond FlashAttention's online softmax and accumulation approach. In each step, we take two KV blocks (called $K_0$, $K_1$, $V_0$, and $V_1$). Since the output matrix occupies 32,768 registers (too many for one warpgroup), we split it vertically into $O_L$ and $O_R$ (each $64 \times 256$). We similarly split $V_0$ and $V_1$ into $V_{0L}$, $V_{0R}$, $V_{1L}$, and $V_{1R}$ (each $64 \times 256$). The output matrix is then computed as follows:
+
+0. Maintain a running max $m$ (initialized to $-\infty$, shared between the two warpgroups) and output matrices $\vec o_L, \vec o_R$ (initialized to 0).
+1. [0] Compute $`\vec p_0 = \vec q K_0^\intercal / qk\_scale`$.
+2. [1] Compute $`\vec p_1 = \vec q K_1^\intercal / qk\_scale`$.
+3. [0] Compute $mp_0 = \max(\vec p_0)$, $`m\_new_0 = \max(m, mp_0)`$, and $`scale_0 = \exp(m\_new_0 - m)`$. Update $`m \gets m\_new_0`$.
+4. [0] Perform softmax on $\vec p_0$: $`\vec p_0 \gets \exp(\vec p_0 - m\_new_0)`$.
+5. [0] Update $\vec o_L \gets \vec o_L \cdot scale_0 + \vec p_0 V_{0L}$.
+6. [1] Compute $mp_1 = \max(\vec p_1)$, $`m\_new_1 = \max(m, mp_1)`$, and $`scale_1 = \exp(m\_new_1 - m)`$. Update $`m \gets m\_new_1`$.
+7. [1] Perform softmax on $\vec p_1$: $`\vec p_1 \gets \exp(\vec p_1 - m\_new_1)`$.
+8. [1] Update $\vec o_R \gets \vec o_R \cdot (scale_0 \cdot scale_1) + \vec p_1 V_{1R}$.
+9. [0] Update $\vec p_0 \gets \vec p_0 \cdot scale_1$.
+10. [1] Update $\vec o_R \gets \vec o_R + \vec p_0 V_{0R}$.
+11. [0] Update $\vec o_L \gets \vec o_L \cdot scale_1 + \vec p_1 V_{1L}$.
+
+Note: We assume one q head for simplicity, so $\vec q$ and $\vec o$ are vectors. Bracketed numbers indicate the warpgroup performing the operation. Assume $\vec o_L$ resides in warpgroup 0's register and $\vec o_R$ resides in warpgroup 1's register.
+
+This schedule can be viewed as a "ping-pong" variant using one output matrix—we call it "seesaw" scheduling. It's mathematically equivalent to FlashAttention's online softmax algorithm. This schedule allows us to overlap CUDA Core and Tensor Core operations by interleaving the two warpgroups, and also allows us to overlap memory access with computation since we can launch the corresponding Tensor Memory Accelerator (TMA) instructions right after data is no longer needed.
+
+The complete schedule is shown below (remember that in MLA, $K$ and $V$ are the same with different names):
+
+![MLA Kernel Sched](assets/MLA%20Kernel%20Sched.drawio.svg)
+
+## Discussion of Technical Details
+
+This section covers technical details of the new kernel.
+
+First, although the kernel targets compute-bound scenarios (where memory bandwidth isn't the bottleneck), we can't ignore memory latency. If the data is not ready when we want to use it, we have to wait. To solve this problem, we employ the following techniques:
+
+- **Fine-grained TMA copy - GEMM pipelining:** For a $64 \times 576$ K block, we launch 9 TMA copies (each moving a $64 \times 64$ block). GEMM operations begin as soon as each TMA copy completes (When the first TMA copy is done, we can start the first GEMM operation, and so on), improving memory latency tolerance.
+- **Cache hints:** Using `cute::TMA::CacheHintSm90::EVICT_FIRST` for TMA copies improves L2 cache hit rates, as shown by experiments.
+
+These optimizations achieve up to 80% Tensor Core utilization (of the throttled theoretical peak) and 3 TB/s memory bandwidth on an H800 SXM5 GPU. While slightly slower (~2%) than the old ping-pong buffer version in memory-bound settings, this is acceptable.
+
+Other performance improvements include:
+- **Programmatic Dependent Launch.** We use [programmatic dependent launch](https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization) to overlap `splitkv_mla` and `combine` kernels.
+- **Tile Scheduler.** We implement a tile scheduler to allocate jobs (requests and blocks) to SMs. This ensures a balanced load across SMs.
+
+## Acknowledgements
+
+FlashMLA's algorithm and scheduling are inspired by [FlashAttention](https://github.com/dao-AILab/flash-attention/), [Flash-Decoding](https://crfm.stanford.edu/2023/10/12/flashdecoding.html), and [CUTLASS](https://github.com/nvidia/cutlass), as well as many projects behind them. We thank the authors for their great work.
+
+## Citation
+
+```bibtex
+@misc{flashmla2025,
+      title={FlashMLA: Efficient MLA decoding kernels},
+      author={Jiashi Li, Shengyu Liu},
+      year={2025},
+      publisher = {GitHub},
+      howpublished = {\url{https://github.com/deepseek-ai/FlashMLA}},
+}
+```
+
+---
+
+# A Deep Dive Into The Flash MLA FP8 Decoding Kernel on Hopper
+
+Source: https://github.com/deepseek-ai/flashmla/blob/main/docs/20250929-hopper-fp8-sparse-deep-dive.md
+
+# A Deep Dive Into The Flash MLA FP8 Decoding Kernel on Hopper
+
+With the release of DeepSeek-V3.2, we have doubled the context length of our models from 64K tokens to 128K tokens. This puts significant pressure on GPU memory (a single request with 128K tokens requires a KVCache of size $576 \times 2 \times 62 \times 128 \times 1024 = 8.72\ \mathrm{GiB}$), which can lead to out-of-memory (OOM) errors or under-utilized GPUs due to small batch sizes. To address this, we introduced FP8 KVCache for DeepSeek-V3.2.
+
+However, writing a high-performance decoding kernel is challenging due to the need for dequantization and its sparse memory access patterns. In this blog, we share the story behind our new FP8 sparse decoding kernel for Hopper GPUs. We will first explain our FP8 KVCache format, then provide a theoretical analysis of clock cycles, and finally detail the techniques used in our new kernel.
+
+## The FP8 KVCache Format
+
+Recall that the decoding phase of the Multi-head Latent Attention (MLA) algorithm operates similarly to Multi-Query Attention (MQA), with 128 query heads and 1 key head, where `head_dim_k = 576` and `head_dim_v = 512` respectively. To reduce the size of the KVCache while maintaining accuracy, we use a fine-grained quantization method. Specifically, we apply tile-level quantization (with a tile size of $1 \times 128$) to the first 512 elements in each token's KV Cache. This results in 512 `float8_e4m3` values and 4 `float32` scale factors. For the remaining 64 elements (the RoPE part), we do not apply quantization as they are sensitive to precision loss. Therefore, in GPU memory, each token's KVCache occupies 656 bytes, consisting of 512 `float8_e4m3`s, 4 `float32`s, and 64 `bfloat16`s.
+
+Inside the kernel, we first dequantize the 512 `float8_e4m3` values into 512 `bfloat16`s. We then concatenate them with the 64 original `bfloat16` values from the RoPE part. Finally, we perform the MQA calculation using matrix multiplication-add (MMA) operations in `bfloat16` precision (i.e., the inputs to the MMAs are in `bfloat16` and the outputs are in `float32`. This applies to both the QK gemm and the attention-score-V gemm).
+
+## Theoretical Analysis of Clock Cycles
+
+The main challenge is that Tensor Cores (which handle MMA calculations) are extremely fast, while the dequantization process, performed on CUDA Cores, struggles to keep up.
+
+The basic unit on an NVIDIA GPU is the Stream Multiprocessor (SM). You can think of each SM as an independent core on the GPU. For simplicity, let's focus on a single SM. Each SM can process 4096 MMA Flops per clock cycle (calculated as `989 TFlops / 1830 MHz / 132 SMs` on H800). In our kernel, each CTA runs on one SM, and each SM is only mapped to one CTA. If we assign each CTA (CUDA Thread Block) to process 64 query heads, it only requires $64 \times (576+512) \times 2 / 4096 \approx 34$ cycles for MMA operations per K/V token.
+
+However, because the H800 cannot directly cast `float8_e4m3` to `bfloat16`, dequantizing the KVCache for one token requires the following steps:
+1.  Convert `float8_e4m3` to `half`
+2.  Convert `half` to `float32`
+3.  Convert `float32` to `bfloat16`
+4.  Multiply the converted `bfloat16` value by the `float32` scale factor
+
+According to [NVIDIA's documentation](https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#throughput-of-native-arithmetic-instructions), we need at least $(\frac{1}{64} + \frac{1}{64} + \frac{1}{16} + \frac{1}{256}) \times 512 \approx 50$ cycles for dequantizing each token! This is significantly more than the 34 cycles required for the MMA operations, meaning the kernel is **dequantization-bound**. If left unaddressed, dequantization would become the performance bottleneck, leaving the powerful Tensor Cores underutilized.
+
+## Crossover
+
+Before we continue, it's important to note a key fact: every query head within the same query token attends to the same key heads, because this is Multi-Query Attention (MQA).
+
+Recall that each CTA processes 64 query heads, while DeepSeek-V3.2 has a total of 128 query heads. If we can find a way to "share" the dequantized K/V values between two CTAs that are processing different sets of query heads, then each CTA would only need to dequantize **half** of the KV cache – which is fantastic! We call this method "crossover", since the idea was actually inspired by [Chromosomal crossover](https://en.wikipedia.org/wiki/Chromosomal_crossover) during [Meiosis](https://en.wikipedia.org/wiki/Meiosis).
+
+The next question is, how do we implement this in CUDA? Before NVIDIA's Hopper architecture, the only options for data exchange between CTAs were global memory or the L2 cache, which are slow. However, the powerful Distributed Shared Memory gave us a new solution.
+
+## Distributed Shared Memory to the Rescue
+
+Distributed Shared Memory (DSM) is a new feature introduced with the Hopper architecture, alongside the CTA Cluster (thread block cluster). CTAs within the same cluster can directly access each other's shared memory. For more details, you can refer to [NVIDIA Hopper Architecture In-Depth](https://developer.nvidia.com/blog/nvidia-hopper-architecture-in-depth/).
+
+Here is how we use it: We launch CTAs in clusters of size 2. Each CTA within a cluster is responsible for 64 query heads from the same query token. Each CTA performs the following steps:
+1.  Loads *half* of the quantized K/V from global memory. We use a wide `__ldg` load with a width of 128 bits to improve performance.
+2.  Dequantizes its assigned half on the CUDA Cores.
+3.  Stores the dequantized K/V into its own shared memory.
+4.  Simultaneously uses `st.async` to write the dequantized K/V into the shared memory of the other CTA in the cluster.
+
+For synchronization between these operations, we rely on the [cluster transaction barrier](https://developer.nvidia.com/blog/nvidia-hopper-architecture-in-depth/), another powerful programming primitive available in CTA Clusters. After the data exchange is complete, each CTA has the *full* set of dequantized K and V values available in its own shared memory, which it can then use to perform the MMA operations.
+
+## Performance
+Using these techniques, we achieved 410 TFLOPS in a compute-bound configuration (batch_size=128, num_heads=128, s_q=2, topk=2048) on H800 SXM5 GPUs. This is a significant improvement over the 250 TFLOPS achieved by our previous FP8 sparse decoding kernel without the crossover technique. 
+
+Although this number is still below the 640 TFLOPS peak of our previous bfloat16 dense decoding kernel, one reason is that it's a **sparse** kernel, and its topk is only 2048. With a smaller topk, the relative overhead of the kernel's prologue and epilogue becomes larger compared with dense decoding with long context length. If we set topk to a larger value, such as 32768, this kernel can achieve up to 460 TFLOPS.
+
+From another perspective, the execution time of this kernel in the configuration mentioned above is comparable to that of the dense decoding kernel when the sequence length is around 3000. When the sequence length exceeds 3000, the performance advantage of our new kernel becomes even more significant. This also highlights the effectiveness of our DeepSeek Sparse Attention algorithm.
+
+---
