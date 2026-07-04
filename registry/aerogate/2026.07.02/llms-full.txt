@@ -1,0 +1,737 @@
+# AeroGate
+
+Source: https://github.com/vishnu0501/aerogate/blob/main/README.md
+
+# AeroGate
+
+A lightweight, high-performance API gateway that sits in front of backend microservices to handle routing, distributed rate limiting, authentication, and asynchronous traffic logging.
+
+```
+Client ──► AeroGate (port 8000) ──► Backend Services (8081, 8082, 8083...)
+               │
+               ├─ Auth (API key validation via Redis)
+               ├─ Rate Limiting (sliding window via Redis sorted sets)
+               ├─ Telemetry (async logging via Kafka)
+               └─ Dynamic Routing (real-time updates via Redis pub/sub)
+```
+
+## Features
+
+- **Dynamic Zero-Downtime Routing** — Routes are stored in PostgreSQL and cached in memory. Updates are broadcast instantly via Redis pub/sub across all gateway instances with no restarts required.
+- **Distributed Rate Limiting** — Sliding window log algorithm using Redis sorted sets. Tracks requests per API key across multiple gateway instances. Returns `429 Too Many Requests` when limits are breached.
+- **Centralized Authentication** — Validates hashed API keys against a Redis cache. Invalid or missing keys are rejected with `401 Unauthorized` before reaching any backend.
+- **Asynchronous Telemetry** — Captures request metadata (latency, status codes, endpoints) and fires payloads to Kafka without blocking client responses. A background worker batch-writes logs to PostgreSQL. Fail-open design: if Kafka is down, the gateway continues routing.
+
+## Tech Stack
+
+| Component | Technology |
+|-----------|------------|
+| Proxy Engine | Python 3.12, FastAPI, Uvicorn |
+| Database | PostgreSQL 16 |
+| Cache & Pub/Sub | Redis 7 |
+| Message Broker | Apache Kafka (Confluent 7.6) |
+| HTTP Client | httpx (async) |
+| Containerization | Docker, docker-compose |
+| CI/CD | GitLab CI |
+
+## Project Structure
+
+```
+AeroGate/
+├── app/
+│   ├── main.py                  # FastAPI app, lifespan, middleware wiring, catch-all route
+│   ├── config.py                # Pydantic settings loaded from .env
+│   ├── db/
+│   │   ├── models.py            # SQL schema + dataclasses (Tenant, ApiKey, Route, TrafficLog)
+│   │   ├── repository.py        # Database queries (routes, API keys, bulk log insert)
+│   │   └── session.py           # psycopg2 connection pool management
+│   ├── middleware/
+│   │   ├── auth.py              # API key authentication middleware
+│   │   ├── rate_limiter.py      # Sliding window rate limiting middleware
+│   │   └── telemetry.py         # Async Kafka telemetry middleware
+│   ├── proxy/
+│   │   ├── forwarder.py         # HTTP forwarding to upstream services via httpx
+│   │   └── router.py            # In-memory route table with prefix matching
+│   ├── schemas/
+│   │   └── routes.py            # Pydantic request/response models
+│   └── services/
+│       ├── kafka_producer.py    # Async Kafka producer (aiokafka)
+│       ├── redis_client.py      # Async Redis client (redis.asyncio)
+│       └── route_subscriber.py  # Redis pub/sub listener for live route updates
+├── worker/
+│   └── log_consumer.py          # Kafka consumer → PostgreSQL batch writer
+├── scripts/
+│   └── seed.py                  # Seeds DB with sample tenant, API key, and routes
+├── tests/
+│   ├── test_auth.py             # Auth middleware unit tests
+│   ├── test_proxy.py            # Route table + forwarder unit tests
+│   └── test_rate_limiter.py     # Rate limiter unit tests
+├── .env.example                 # Environment variable template
+├── .gitlab-ci.yml               # CI pipeline (lint, test, build, publish)
+├── docker-compose.yml           # Full stack orchestration
+├── Dockerfile                   # Gateway container image
+└── requirements.txt             # Python dependencies
+```
+
+## Quick Start
+
+### Prerequisites
+
+- Python 3.12+
+- PostgreSQL 16 running locally
+- Redis 7 running locally
+- Apache Kafka (optional — gateway works without it)
+
+### 1. Clone and install dependencies
+
+```bash
+git clone <repo-url> && cd AeroGate
+pip install -r requirements.txt
+```
+
+### 2. Configure environment
+
+```bash
+cp .env.example .env
+```
+
+Edit `.env` to match your local setup:
+
+```
+DATABASE_URL=postgresql://postgres:postgres@localhost:5432/aerogate
+REDIS_URL=redis://localhost:6379/0
+KAFKA_BOOTSTRAP_SERVERS=localhost:9092
+KAFKA_TOPIC_LOGS=aerogate.access_logs
+REDIS_PUBSUB_CHANNEL=aerogate:route_updates
+RATE_LIMIT_REQUESTS=100
+RATE_LIMIT_WINDOW_SECONDS=60
+```
+
+### 3. Create the database
+
+```bash
+psql -U postgres -c "CREATE DATABASE aerogate;"
+```
+
+### 4. Seed the database
+
+Creates tables, a sample tenant, an API key, and routes. Also caches the key in Redis.
+
+```bash
+python -m scripts.seed
+```
+
+Output:
+```
+Seeded tenant_id=1, api_key='aerogate-dev-key-001', key_hash=aba882be...
+Cached API key in Redis
+Published route events to Redis pub/sub
+```
+
+### 5. Start the gateway
+
+```bash
+uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+### 6. (Optional) Start the log worker
+
+In a separate terminal:
+
+```bash
+python -m worker.log_consumer
+```
+
+## Running with Docker
+
+Start the entire stack (PostgreSQL, Redis, Kafka, gateway, log worker) with one command:
+
+```bash
+# Create .env with Docker service names
+cat > .env << 'EOF'
+DATABASE_URL=postgresql://aerogate:aerogate@postgres:5432/aerogate
+REDIS_URL=redis://redis:6379/0
+KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+KAFKA_TOPIC_LOGS=aerogate.access_logs
+REDIS_PUBSUB_CHANNEL=aerogate:route_updates
+RATE_LIMIT_REQUESTS=100
+RATE_LIMIT_WINDOW_SECONDS=60
+EOF
+
+docker-compose up --build
+```
+
+Then seed the database:
+
+```bash
+docker-compose exec gateway python -m scripts.seed
+```
+
+## Testing the API
+
+### Health check (no auth required)
+
+```bash
+curl http://localhost:8000/health
+# {"status":"ok"}
+```
+
+### Request without auth
+
+```bash
+curl http://localhost:8000/api/users
+# 401 {"detail":"Missing or malformed Authorization header"}
+```
+
+### Authenticated request
+
+```bash
+curl -H "Authorization: Bearer aerogate-dev-key-001" http://localhost:8000/api/users
+# 502 {"detail":"Upstream service unreachable: http://localhost:8081"}
+# (expected — no backend running on port 8081)
+```
+
+### Rate limiting test
+
+Set `RATE_LIMIT_REQUESTS=5` in `.env`, re-seed (`python -m scripts.seed`), and restart the gateway:
+
+```bash
+# Send 10 requests rapidly
+for i in $(seq 1 10); do
+  curl -s -w " %{http_code}\n" \
+    -H "Authorization: Bearer aerogate-dev-key-001" \
+    http://localhost:8000/api/users
+done
+```
+
+Expected output — first 5 return 502 (routed, no backend), then 429 (rate limited):
+
+```
+{"detail":"Upstream service unreachable: http://localhost:8081"} 502
+{"detail":"Upstream service unreachable: http://localhost:8081"} 502
+{"detail":"Upstream service unreachable: http://localhost:8081"} 502
+{"detail":"Upstream service unreachable: http://localhost:8081"} 502
+{"detail":"Upstream service unreachable: http://localhost:8081"} 502
+{"detail":"Rate limit exceeded. Try again later."} 429
+{"detail":"Rate limit exceeded. Try again later."} 429
+{"detail":"Rate limit exceeded. Try again later."} 429
+{"detail":"Rate limit exceeded. Try again later."} 429
+{"detail":"Rate limit exceeded. Try again later."} 429
+```
+
+### Swagger UI
+
+Open [http://localhost:8000/docs](http://localhost:8000/docs) for an interactive API explorer.
+
+## Running Tests
+
+Tests use mocked Redis and httpx — no running infrastructure needed.
+
+```bash
+pytest tests/ -v
+```
+
+## Architecture
+
+```
+                    ┌─────────────────────────────────────┐
+                    │            AeroGate Gateway          │
+ Client Request ──► │  Auth ─► Rate Limit ─► Telemetry ─► │ ──► Backend Service
+                    │         Middleware Pipeline          │
+                    └────┬──────────┬──────────┬──────────┘
+                         │          │          │
+                    ┌────▼───┐ ┌────▼───┐ ┌───▼────┐
+                    │ Redis  │ │ Redis  │ │ Kafka  │
+                    │ Cache  │ │Sorted  │ │Producer│
+                    │(API    │ │Sets    │ │(async) │
+                    │ keys)  │ │(rate   │ └───┬────┘
+                    └────────┘ │limits) │     │
+                               └────────┘ ┌───▼──────┐
+                                          │Log Worker│
+                    ┌──────────┐          │(batches) │
+                    │PostgreSQL│◄──────────┴──────────┘
+                    │(routes,  │
+                    │ keys,    │
+                    │ logs)    │
+                    └──────────┘
+```
+
+**Request flow:**
+
+1. **Auth Middleware** — Extracts `Authorization: Bearer <key>`, hashes it with SHA-256, validates against Redis cache. Rejects with 401 if invalid.
+2. **Rate Limiter Middleware** — Uses Redis sorted sets (sliding window log algorithm) to count requests per API key within the configured window. Returns 429 if over limit.
+3. **Telemetry Middleware** — After the response is generated, fires request metadata (method, path, status, latency) to Kafka asynchronously. Never blocks the response.
+4. **Proxy Forwarder** — Resolves the target backend from the in-memory route table (longest prefix match) and forwards the request via httpx. Returns 502/504 if the upstream is down.
+
+**Route updates (zero-downtime):**
+
+1. Admin updates a route in PostgreSQL
+2. Publishes a JSON event to a Redis pub/sub channel
+3. All gateway instances receive the event and update their in-memory route table instantly
+
+## Configuration
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `DATABASE_URL` | PostgreSQL connection string | `postgresql://aerogate:aerogate@localhost:5432/aerogate` |
+| `REDIS_URL` | Redis connection string | `redis://localhost:6379/0` |
+| `KAFKA_BOOTSTRAP_SERVERS` | Kafka broker address | `localhost:9092` |
+| `KAFKA_TOPIC_LOGS` | Kafka topic for access logs | `aerogate.access_logs` |
+| `REDIS_PUBSUB_CHANNEL` | Redis channel for route updates | `aerogate:route_updates` |
+| `RATE_LIMIT_REQUESTS` | Max requests per API key per window | `100` |
+| `RATE_LIMIT_WINDOW_SECONDS` | Sliding window duration in seconds | `60` |
+
+## License
+
+MIT
+
+---
+
+# AeroGate Operations Guide
+
+Source: https://github.com/vishnu0501/aerogate/blob/main/docs/OPERATIONS_GUIDE.md
+
+# AeroGate Operations Guide
+
+Step-by-step instructions for managing API keys, tenants, routes, and rate limits.
+
+---
+
+## Table of Contents
+
+1. [How Authentication Works](#how-authentication-works)
+2. [Managing API Keys](#managing-api-keys)
+3. [Managing Tenants](#managing-tenants)
+4. [Managing Routes](#managing-routes)
+5. [Managing Rate Limits](#managing-rate-limits)
+6. [Verifying Everything Works](#verifying-everything-works)
+7. [Troubleshooting](#troubleshooting)
+
+---
+
+## How Authentication Works
+
+AeroGate never stores raw API keys. It stores a SHA-256 hash.
+
+```
+┌──────────────────────────────────────────────────────────┐
+│  1. You create a raw key:  "my-secret-api-key-001"       │
+│  2. SHA-256 hash it:       "a1b2c3d4e5f6..."             │
+│  3. Store the HASH in:     PostgreSQL (api_keys table)   │
+│                            Redis (apikey:<hash>)         │
+│  4. Give the RAW KEY to:   The client / developer        │
+│                                                          │
+│  At request time:                                        │
+│  5. Client sends:  Authorization: Bearer my-secret-...   │
+│  6. Gateway hashes it and checks Redis                   │
+│  7. Match → allow, No match → 401 Unauthorized           │
+└──────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Managing API Keys
+
+### Create a new API key (manual method)
+
+You need to do **3 things**: insert into PostgreSQL, cache in Redis, and give the raw key to the client.
+
+#### Step 1 — Choose a raw API key
+
+Pick any string. In production, generate a cryptographically random one:
+
+```python
+import secrets
+raw_key = f"ag_live_{secrets.token_hex(24)}"
+print(raw_key)
+# Example: ag_live_3f8a2b1c9d4e7f6a0b5c8d2e1f4a7b3c9d6e0f2a5b8c1d
+```
+
+For local dev, you can use any readable string:
+
+```
+my-app-api-key-001
+```
+
+#### Step 2 — Hash the key and insert into PostgreSQL
+
+Connect to PostgreSQL and run:
+
+```sql
+-- Connect to your database
+-- psql -U postgres -d aerogate
+
+-- First, make sure a tenant exists
+INSERT INTO tenants (name)
+VALUES ('my-company')
+ON CONFLICT (name) DO NOTHING;
+
+-- Get the tenant ID
+SELECT id FROM tenants WHERE name = 'my-company';
+-- Let's say it returns: 2
+
+-- Hash your raw key with SHA-256
+-- For the key "my-app-api-key-001", the SHA-256 hash is:
+-- You can compute it with: python -c "import hashlib; print(hashlib.sha256(b'my-app-api-key-001').hexdigest())"
+
+-- Insert the hash (NOT the raw key)
+INSERT INTO api_keys (tenant_id, key_hash, rate_limit)
+VALUES (
+    2,
+    '< paste the SHA-256 hash here >',
+    100  -- requests per window
+);
+```
+
+**Compute the hash** using Python:
+
+```bash
+python -c "import hashlib; print(hashlib.sha256(b'my-app-api-key-001').hexdigest())"
+# Output: e.g. 7f83b1657ff1fc53b92dc18148a1d65dfc2d4b1fa3d677284addd200126d9069
+```
+
+#### Step 3 — Cache the key in Redis
+
+The gateway reads from Redis for fast lookups. You must cache the key there too.
+
+Using `redis-cli`:
+
+```bash
+redis-cli
+
+# Replace <hash> with the actual SHA-256 hash from Step 2
+HSET apikey:<hash> tenant_id "2" rate_limit "100" is_active "1"
+```
+
+Using Python:
+
+```python
+import hashlib
+import redis
+
+r = redis.from_url("redis://localhost:6379/0", decode_responses=True)
+
+raw_key = "my-app-api-key-001"
+key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
+
+r.hset(f"apikey:{key_hash}", mapping={
+    "tenant_id": "2",
+    "rate_limit": "100",
+    "is_active": "1",
+})
+
+print(f"Cached. Use this key in requests:")
+print(f"  Authorization: Bearer {raw_key}")
+```
+
+#### Step 4 — Test the new key
+
+```bash
+curl -H "Authorization: Bearer my-app-api-key-001" http://localhost:8000/health
+# Should return: {"status":"ok"}
+```
+
+### Deactivate an API key
+
+To block an API key immediately:
+
+**In Redis** (takes effect instantly):
+
+```bash
+redis-cli HSET apikey:<hash> is_active "0"
+```
+
+**In PostgreSQL** (for persistence):
+
+```sql
+UPDATE api_keys SET is_active = false WHERE key_hash = '<hash>';
+```
+
+### Delete an API key
+
+```bash
+redis-cli DEL apikey:<hash>
+```
+
+```sql
+DELETE FROM api_keys WHERE key_hash = '<hash>';
+```
+
+### List all active API keys
+
+```sql
+SELECT ak.id, ak.key_hash, ak.rate_limit, ak.is_active, t.name AS tenant
+FROM api_keys ak
+JOIN tenants t ON t.id = ak.tenant_id
+WHERE ak.is_active = true;
+```
+
+---
+
+## Managing Tenants
+
+### Create a new tenant
+
+```sql
+INSERT INTO tenants (name) VALUES ('acme-corp');
+```
+
+### List all tenants
+
+```sql
+SELECT * FROM tenants;
+```
+
+### Deactivate a tenant
+
+```sql
+UPDATE tenants SET is_active = false WHERE name = 'acme-corp';
+```
+
+---
+
+## Managing Routes
+
+Routes map URL path prefixes to backend service addresses.
+
+### Add a new route
+
+**Step 1 — Insert into PostgreSQL:**
+
+```sql
+INSERT INTO routes (path_prefix, target_url)
+VALUES ('/api/payments', 'http://payments-service:8084');
+```
+
+**Step 2 — Notify running gateways via Redis pub/sub:**
+
+```bash
+redis-cli PUBLISH aerogate:route_updates '{"action":"add","path_prefix":"/api/payments","target_url":"http://payments-service:8084"}'
+```
+
+Or using Python:
+
+```python
+import json
+import redis
+
+r = redis.from_url("redis://localhost:6379/0", decode_responses=True)
+r.publish("aerogate:route_updates", json.dumps({
+    "action": "add",
+    "path_prefix": "/api/payments",
+    "target_url": "http://payments-service:8084"
+}))
+```
+
+The gateway picks this up instantly — no restart needed.
+
+### Update an existing route
+
+```sql
+UPDATE routes SET target_url = 'http://new-payments:9090' WHERE path_prefix = '/api/payments';
+```
+
+```bash
+redis-cli PUBLISH aerogate:route_updates '{"action":"update","path_prefix":"/api/payments","target_url":"http://new-payments:9090"}'
+```
+
+### Remove a route
+
+```sql
+UPDATE routes SET is_active = false WHERE path_prefix = '/api/payments';
+```
+
+```bash
+redis-cli PUBLISH aerogate:route_updates '{"action":"remove","path_prefix":"/api/payments"}'
+```
+
+### List all active routes
+
+```sql
+SELECT path_prefix, target_url, is_active, created_at FROM routes WHERE is_active = true;
+```
+
+---
+
+## Managing Rate Limits
+
+Each API key has its own rate limit (requests per window). The window duration is set globally via `.env`.
+
+### How rate limiting works
+
+```
+RATE_LIMIT_REQUESTS=100    ← max requests per API key
+RATE_LIMIT_WINDOW_SECONDS=60  ← within this time window (sliding)
+
+Example: 100 requests per 60 seconds per API key
+```
+
+The algorithm uses a **sliding window log** (Redis sorted sets), not a fixed window. This means there are no "reset" boundaries — the limit is always calculated over the last N seconds.
+
+### Change rate limit for a specific API key
+
+**Update PostgreSQL:**
+
+```sql
+UPDATE api_keys SET rate_limit = 50 WHERE key_hash = '<hash>';
+```
+
+**Update Redis cache:**
+
+```bash
+redis-cli HSET apikey:<hash> rate_limit "50"
+```
+
+### Change the global default rate limit
+
+Edit `.env`:
+
+```
+RATE_LIMIT_REQUESTS=200
+RATE_LIMIT_WINDOW_SECONDS=120
+```
+
+Restart the gateway for changes to take effect. This only affects API keys that don't have a per-key limit cached in Redis.
+
+### Reset rate limit counters for a key
+
+If a key is rate limited and you want to immediately reset its counter:
+
+```bash
+# Find the key hash
+python -c "import hashlib; print(hashlib.sha256(b'my-app-api-key-001').hexdigest())"
+
+# Delete the sorted set in Redis
+redis-cli DEL ratelimit:<hash>
+```
+
+### Check current request count for a key
+
+```bash
+redis-cli ZCARD ratelimit:<hash>
+# Returns the number of requests in the current window
+```
+
+---
+
+## Verifying Everything Works
+
+### Full end-to-end test
+
+```bash
+# 1. Health check (no auth)
+curl http://localhost:8000/health
+# Expected: {"status":"ok"}
+
+# 2. No auth → 401
+curl http://localhost:8000/api/users
+# Expected: {"detail":"Missing or malformed Authorization header"}
+
+# 3. Bad key → 401
+curl -H "Authorization: Bearer wrong-key" http://localhost:8000/api/users
+# Expected: {"detail":"Invalid or inactive API key"}
+
+# 4. Valid key → routes to backend (502 if no backend running)
+curl -H "Authorization: Bearer aerogate-dev-key-001" http://localhost:8000/api/users
+# Expected: {"detail":"Upstream service unreachable: http://localhost:8081"}
+
+# 5. Rate limiting → 429 after limit exceeded
+# (assumes RATE_LIMIT_REQUESTS=5 and re-seeded)
+for ($i=1; $i -le 10; $i++) {
+  curl.exe -s -w " %{http_code}`n" -H "Authorization: Bearer aerogate-dev-key-001" http://localhost:8000/api/users
+}
+# Expected: first 5 return 502, next 5 return 429
+```
+
+### Verify Redis state
+
+```bash
+# Check if an API key is cached
+redis-cli HGETALL apikey:<hash>
+# Should show: tenant_id, rate_limit, is_active
+
+# Check rate limit counter
+redis-cli ZCARD ratelimit:<hash>
+
+# Check all keys in Redis
+redis-cli KEYS "apikey:*"
+redis-cli KEYS "ratelimit:*"
+```
+
+### Verify PostgreSQL state
+
+```sql
+-- All tenants
+SELECT * FROM tenants;
+
+-- All API keys with tenant names
+SELECT ak.key_hash, ak.rate_limit, ak.is_active, t.name
+FROM api_keys ak JOIN tenants t ON t.id = ak.tenant_id;
+
+-- All routes
+SELECT path_prefix, target_url, is_active FROM routes;
+
+-- Recent traffic logs (if Kafka + log worker are running)
+SELECT method, path, status_code, latency_ms, timestamp
+FROM traffic_logs
+ORDER BY timestamp DESC
+LIMIT 20;
+```
+
+---
+
+## Troubleshooting
+
+### "Missing or malformed Authorization header" (401)
+
+The request doesn't have an `Authorization` header, or it doesn't start with `Bearer `.
+
+```bash
+# Wrong:
+curl http://localhost:8000/api/users
+curl -H "Authorization: my-key" http://localhost:8000/api/users
+
+# Correct:
+curl -H "Authorization: Bearer my-key" http://localhost:8000/api/users
+```
+
+### "Invalid or inactive API key" (401)
+
+The key hash isn't in Redis, or `is_active` is not `"1"`.
+
+```bash
+# Check if the key is cached in Redis
+python -c "import hashlib; print(hashlib.sha256(b'YOUR-KEY-HERE').hexdigest())"
+redis-cli HGETALL apikey:<hash>
+
+# If empty, re-run the seed or manually cache it (see Managing API Keys above)
+```
+
+### "Rate limit exceeded" (429)
+
+The API key has exceeded its request quota. Wait for the window to expire, or reset the counter:
+
+```bash
+redis-cli DEL ratelimit:<hash>
+```
+
+### "Upstream service unreachable" (502)
+
+The route matched, but the backend service isn't running. Check:
+
+```bash
+# What target is configured for this route?
+redis-cli KEYS "apikey:*"  # not route keys — check PostgreSQL
+psql -U postgres -d aerogate -c "SELECT path_prefix, target_url FROM routes WHERE is_active = true;"
+
+# Is the backend actually running?
+curl http://localhost:8081/  # or whatever target_url is
+```
+
+### Gateway won't start — Kafka connection error
+
+If you don't have Kafka running, the gateway will fail on startup. Either:
+- Start Kafka: `docker-compose up zookeeper kafka`
+- Or make Kafka optional by wrapping the Kafka start/stop in try/except in `app/main.py`
+
+---

@@ -1,0 +1,437 @@
+# README.md
+
+Source: https://github.com/beacon21m/adaptor_whatsapp/blob/main/README.md
+
+**Overview**
+- Minimal WhatsApp adaptor built with Bun + TypeScript that bridges WhatsApp to a generic Beacon Gateway API (https://github.com/beacon21m/beacon-gateway) via HTTP POST (inbound) and Server‑Sent Events (SSE) (outbound).
+- Supports readiness gating, SSE reconnect with backoff, and message de‑duplication using a lightweight payload‑hash cache with a persisted anchor.
+- Designed to be copied and adapted for other chat networks with small, well‑isolated changes.
+
+**Features**
+- Inbound: Receives WhatsApp messages and POSTs them to the Gateway API.
+- Outbound: Subscribes to SSE and sends messages to WhatsApp (DM or group), replying to a message when requested.
+- Dedupe: Prevents duplicate sends on reconnects or replay using a payload‑hash LRU, plus persisting the last sent hash.
+- Robustness: Handles QR auth, headless Chromium, SSE heartbeats/control frames, and exponential backoff on disconnect.
+
+**Setup**
+- Requirements:
+  - `bun` installed.
+  - A Chromium available for `whatsapp-web.js` (set `PUPPETEER_EXECUTABLE_PATH` or `CHROME_BIN` if needed).
+  - The Gateway server running and exposing the endpoints described below.
+- Install dependencies:
+  - `bun install`
+- Environment variables (create `.env`):
+  - `GATEWAY_API_BASE_URL` (e.g., `http://localhost`)
+  - `PORT` (e.g., `3080`)
+  - `BOT_TYPE` (e.g., `brain`)
+  - `BOT_ID` (e.g., `wa183`)
+  - `NETWORK_ID` (e.g., `whatsapp`)
+  - Optional runtime:
+    - `SESSION_DIR` (default `.wwebjs_auth`)
+    - `HEADLESS` (`true` by default; set `false` for visible browser)
+    - `NO_SANDBOX` (`true` when required by your container)
+    - `PUPPETEER_EXECUTABLE_PATH` or `CHROME_BIN` to force a Chromium path
+    - Dedupe tuning: `DEDUP_TTL_MS` (default `180000`), `DEDUP_MAX` (default `500`), `STATE_DIR` (default `.state`)
+- Start:
+  - `bun start`
+  - Scan the QR code printed in the terminal to authenticate the WhatsApp session.
+
+**Runtime Files**
+- WhatsApp session data: `.wwebjs_auth/` (ignored by git)
+- Dedupe state: `.state/last_out_${NETWORK_ID}_${BOT_ID}.json`
+
+**Gateway Contract**
+- Inbound POST (WhatsApp → Gateway):
+  - URL: `${GATEWAY_API_BASE_URL}:${PORT}/api/messages`
+  - Body JSON:
+    - `networkId`: `NETWORK_ID`
+    - `botId`: `BOT_ID`
+    - `botType`: `BOT_TYPE`
+    - `groupId?`: WhatsApp group JID (e.g., `xxxx@g.us`) when applicable
+    - `userId?`: WhatsApp user JID (e.g., `xxxx@c.us`)
+    - `messageId?`: provider message id (string)
+    - `message`: text content
+- Outbound SSE (Gateway → WhatsApp):
+  - URL: `${GATEWAY_API_BASE_URL}:${PORT}/api/messages/out/${NETWORK_ID}/${BOT_ID}`
+  - SSE semantics: single subscriber per channel, heartbeats and optional `retry:` control lines.
+  - Payload (data: lines contain JSON):
+    - `networkId`, `botId`, `botType`
+    - `groupId?`, `userId?` (target JIDs)
+    - `replyMessageId?` (quoted message id)
+    - `message` (text to send)
+    - `direction?`: when present, adaptor only sends if `direction === "out"` (avoids echoing inbound posts)
+
+**Message Flow**
+- Inbound (WA → Gateway):
+  - The adaptor listens to WhatsApp messages and constructs a POST payload using:
+    - `groupId = msg.from` when `@g.us`, otherwise undefined
+    - `userId = msg.author` for groups, otherwise `msg.from` for DMs
+    - `messageId = msg.id._serialized`
+    - `message = msg.body`
+  - Sends to `POST /api/messages`.
+- Outbound (Gateway → WA):
+  - Adaptor connects to SSE `.../api/messages/out/:networkId/:botId` and reads `event: message` data frames with JSON.
+  - For each payload:
+    - Optional filter: if `direction` exists and is not `out`, skip.
+    - Target `to = groupId || userId`.
+    - Reply if `replyMessageId` set.
+    - Send via `client.sendMessage(to, message, { quotedMessageId })`.
+
+**De‑Duplication**
+- Rationale: SSE reconnects, server replays, or at‑least‑once delivery may cause duplicates. The gateway now includes `eventId` (monotonic per channel) and `refId` in each payload.
+- Strategy (preferred):
+  - Primary: eventId checkpoint
+    - Read `payload.eventId` (fallback to numeric SSE `id:` header if needed).
+    - Keep `lastProcessedEventId` in memory and persist to `.state/sse_offset_${NETWORK_ID}_${BOT_ID}.json`.
+    - Skip any payload where `eventId <= lastProcessedEventId`.
+    - Send `Last-Event-ID` header on connect using the persisted value for seamless resume.
+  - Secondary: payload‑hash fallback (only when no `eventId` is present)
+    - Key = `${to}|${replyMessageId||''}|${message}` hashed by FNV‑1a.
+    - TTL window `DEDUP_TTL_MS` and LRU cap `DEDUP_MAX`.
+    - Optional persistence of the last seen hash to avoid re‑sending a single message across restarts.
+  - Do not dedupe based solely on text; identical messages with different `eventId` must both deliver.
+
+**Resilience**
+- WhatsApp readiness:
+  - Outbound sends are queued until the client emits `ready`, then flushed.
+- SSE robustness:
+  - Ignores heartbeats and control frames like `retry: 3000`.
+  - Reconnects with exponential backoff and minor jitter after disconnects (e.g., `ECONNRESET`).
+
+**Adapting For Other Networks**
+- Keep the project skeleton and replace only the transport‑specific parts:
+  - WhatsApp client bootstrapping and message extraction in `index.ts`:
+    - Replace `whatsapp-web.js` client with the respective SDK/client.
+    - Normalize inbound fields: `groupId`, `userId`, `messageId`, `message`.
+    - Implement outbound send with reply threading equivalent (if supported).
+  - Keep the gateway interface (POST and SSE) and the dedupe logic intact.
+- Suggested steps:
+  - Factor transport into a small adapter module (`src/adaptors/<network>.ts`) if multiple networks are supported.
+  - Reuse SSE subscription, dedupe, and readiness queue unchanged.
+
+**Run & Test**
+- Start adaptor: `bun start`
+- Verify SSE connectivity:
+  - `curl -N ${GATEWAY_API_BASE_URL}:${PORT}/api/messages/out/${NETWORK_ID}/${BOT_ID}`
+- Send a test outbound (Gateway → WA):
+  - `curl -X POST ${GATEWAY_API_BASE_URL}:${PORT}/api/messages -H 'content-type: application/json' -d '{"networkId":"whatsapp","botId":"wa183","botType":"brain","userId":"<jid@c.us>","message":"hello"}'`
+- Watch the adaptor logs for outbound sends and dedupe skips.
+
+**Project Files**
+- Entry: `index.ts` (end‑to‑end adaptor logic)
+- Config: `tsconfig.json`, `package.json` (`bun start`), `.gitignore`
+- State: `.state/` (dedupe), `.wwebjs_auth/` (WhatsApp session)
+
+**Limitations**
+- v1 only handles text messages (no media). Media can be added using `MessageMedia` and detecting `mediaBase64`/`mediaMime` fields from SSE payloads.
+- Single SSE subscriber per channel (per gateway design). Attaching a new subscriber closes the previous one.
+
+**Troubleshooting**
+- ECONNRESET on SSE: typically the server rotated or a second subscriber attached. The adaptor auto‑reconnects with backoff.
+- Not sending immediately after start: expected until WhatsApp client emits `ready`; outbound messages queue and then flush.
+- Invalid target: ensure JIDs end with `@c.us` (DM) or `@g.us` (group) and match your WhatsApp number format.
+
+---
+
+# CLAUDE.md
+
+Source: https://github.com/beacon21m/adaptor_whatsapp/blob/main/CLAUDE.md
+
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Commands
+
+### Development
+- **Run the adapter**: `bun start` (production) or `bun --hot run index.ts` (development with hot reload)
+- **Build TypeScript**: `bun run build` or `tsc -p tsconfig.json`
+- **Install dependencies**: `bun install`
+
+### Testing  
+No test suite is configured. Manual testing requires:
+1. A running Gateway server at `GATEWAY_API_BASE_URL:PORT`
+2. WhatsApp authentication via QR code scan
+3. Test commands from README.md lines 111-114
+
+## Architecture
+
+### Core Design
+This is a WhatsApp-to-Gateway bridge adapter using an event-driven architecture:
+- **Inbound flow**: WhatsApp messages → HTTP POST to Gateway API
+- **Outbound flow**: SSE subscription from Gateway → WhatsApp message sending
+- **State management**: SQLite for durable message queue, file-based for deduplication state
+
+### Key Components
+
+#### Message Processing (index.ts)
+- **WhatsApp Client**: Uses `whatsapp-web.js` with Puppeteer for browser automation
+- **Inbound Handler** (line 122): Converts WhatsApp messages to gateway format, handles group vs DM logic
+- **Outbound SSE** (line 433): Maintains persistent SSE connection with exponential backoff reconnection
+- **Deduplication**: Two-tier strategy using eventId checkpoints (primary) and payload hashing (fallback)
+- **SQLite Outbox** (line 249+): Durable queue for outbound messages with retry logic and state tracking
+
+#### State Persistence
+- **Session**: `.wwebjs_auth/` - WhatsApp authentication data
+- **Dedup State**: `.state/` - Last processed eventId and hash cache
+- **SQLite DB**: `.state/state.sqlite` - Outbound message queue with states: queued → sending → sent/failed
+
+#### Resilience Features
+- **Queue on Not Ready**: Outbound messages queue until WhatsApp client emits 'ready'
+- **SSE Health Check**: Monitors connection staleness, auto-reconnects after 10s inactivity
+- **Exponential Backoff**: SSE reconnection with jitter (1.5s → 30s max)
+- **Concurrent Dispatch**: Configurable parallel sending (default: 3 concurrent)
+- **Idempotency**: RefId-based deduplication prevents duplicate sends
+
+### Environment Configuration
+Required variables (see .env_example):
+- `GATEWAY_API_BASE_URL`: Gateway server base URL
+- `PORT`: Gateway server port  
+- `BOT_TYPE`: Bot classification (e.g., 'brain')
+- `BOT_ID`: Unique bot identifier
+- `NETWORK_ID`: Network type (always 'whatsapp' for this adapter)
+
+Optional tuning:
+- `DISPATCH_CONCURRENCY`: Parallel message sends (default: 3)
+- `SEND_TIMEOUT_MS`: WhatsApp send timeout (default: 20000ms)
+- `DEDUP_TTL_MS`: Deduplication window (default: 180000ms)
+- `SSE_STALE_MS`: SSE health check threshold (default: 10000ms)
+
+### Gateway API Contract
+
+#### Inbound POST `/api/messages`
+```typescript
+{
+  networkId: string,
+  botId: string, 
+  botType: string,
+  groupId?: string,    // WhatsApp group JID (@g.us)
+  userId?: string,     // WhatsApp user JID (@c.us)
+  messageId?: string,  // Provider message ID
+  message: string
+}
+```
+
+#### Outbound SSE `/api/messages/out/:networkId/:botId`
+```typescript
+{
+  networkId: string,
+  botId: string,
+  botType: string,
+  groupId?: string,     // Target group JID
+  userId?: string,      // Target user JID
+  replyMessageId?: string,  // Quote this message
+  message: string,
+  direction?: 'out',    // Filter to prevent echo
+  eventId?: number,     // Monotonic sequence ID
+  refId?: string        // Idempotency key
+}
+```
+
+### Adapting for Other Networks
+To create adapters for other chat networks:
+1. Replace WhatsApp client initialization (lines 78-94)
+2. Update message extraction logic (lines 122-152)
+3. Modify send implementation (lines 559-567)
+4. Keep intact: Gateway interface, SSE subscription, deduplication, SQLite queue
+
+The architecture intentionally isolates transport-specific code from the generic gateway integration layer.
+
+---
+
+# WhatsApp Adapter Reliability Improvements - Migration Guide
+
+Source: https://github.com/beacon21m/adaptor_whatsapp/blob/main/MIGRATION_GUIDE.md
+
+# WhatsApp Adapter Reliability Improvements - Migration Guide
+
+## Overview
+
+The enhanced WhatsApp adapter (`index-improved.ts`) implements the reliability specification with:
+- **Zero message loss** through persistent queueing and status tracking
+- **No duplicates** via idempotency tracking
+- **Fast recovery** with proper SSE reconnection
+- **Enhanced observability** through detailed logging
+
+## Key Improvements
+
+### 1. Message Status Tracking (ACK/Confirm/Fail)
+
+The adapter now implements a 3-phase confirmation protocol:
+- **ACK**: Confirms receipt of message from gateway
+- **Confirm**: Reports successful send to WhatsApp
+- **Fail**: Reports permanent failures with reason
+
+**Impact**: Gateway can track exact message state and retry/alert as needed.
+
+### 2. Heartbeat Monitoring
+
+- Monitors SSE heartbeats from gateway
+- Automatically reconnects if no heartbeat for 45 seconds
+- Configurable via `HEARTBEAT_TIMEOUT_MS`
+
+**Impact**: Faster detection of connection issues (45s vs previous 10s stale check).
+
+### 3. Proper SSE Reconnection
+
+- Sends `Last-Event-ID` header on reconnection
+- Gateway replays missed messages
+- Persists last event ID to database
+
+**Impact**: No message loss during network interruptions.
+
+### 4. Idempotency Tracking
+
+- Tracks processed message IDs in persistent database
+- Prevents duplicate sends even after restart
+- Auto-cleanup of old entries (>7 days)
+
+**Impact**: Guarantees exactly-once delivery semantics.
+
+### 5. Retry with Exponential Backoff
+
+- Configurable retry attempts (default: 3)
+- Exponential backoff: 1s → 2s → 4s → ... (max 30s)
+- Distinguishes retriable vs permanent failures
+
+**Impact**: Better handling of transient failures.
+
+### 6. Persistent Message Queue
+
+All messages stored in SQLite with states:
+- `pending`: Newly received
+- `delivered`: ACKed to gateway
+- `sending`: Currently being sent
+- `sent`: Successfully sent
+- `failed`: Permanently failed
+- `retry`: Scheduled for retry
+
+**Impact**: Messages survive adapter restarts.
+
+### 7. Enhanced Logging
+
+Structured logging with clear prefixes:
+```
+[adapter] Connected to gateway (last_event_id: 5678)
+[adapter] Received message msg_123 (event_id: 5679)
+[adapter] Sending message msg_123 to WhatsApp (attempt 1)
+[adapter] Successfully sent message msg_123 (external: whatsapp_abc)
+```
+
+## Migration Steps
+
+### 1. Review Configuration
+
+New environment variables:
+```bash
+# Reliability settings (with defaults)
+HEARTBEAT_TIMEOUT_MS=45000        # 45 seconds
+HEARTBEAT_CHECK_INTERVAL_MS=10000 # 10 seconds
+MAX_RETRY_ATTEMPTS=3               # Max send retries
+INITIAL_RETRY_DELAY_MS=1000        # Initial retry delay
+MAX_RETRY_DELAY_MS=30000          # Max retry delay
+```
+
+### 2. Database Migration
+
+The enhanced adapter uses a new database schema. On first run, it will:
+1. Create new tables (`messages`, `processed_messages`)
+2. Import last event ID from existing metadata
+3. Preserve WhatsApp session data
+
+**Note**: The old `outbox` table is not migrated. Any pending messages will be lost during migration.
+
+### 3. Gateway Requirements
+
+The gateway MUST implement:
+- [ ] `POST /messages/:messageId/ack` endpoint
+- [ ] `POST /messages/:messageId/confirm` endpoint
+- [ ] `POST /messages/:messageId/fail` endpoint
+- [ ] SSE heartbeat events every 15 seconds
+- [ ] Include `messageId` in SSE message payloads
+- [ ] Support `Last-Event-ID` header for replay
+
+### 4. Testing Plan
+
+1. **Start with existing adapter** to ensure clean state
+2. **Stop existing adapter** gracefully
+3. **Deploy enhanced adapter** with same configuration
+4. **Monitor logs** for successful connection and message flow
+5. **Test scenarios**:
+   - Send test message through gateway
+   - Verify ACK/Confirm flow in logs
+   - Disconnect network briefly and reconnect
+   - Restart adapter mid-message
+   - Send duplicate message (should be skipped)
+
+### 5. Rollback Plan
+
+If issues occur:
+1. Stop enhanced adapter
+2. Start original adapter (`index.ts`)
+3. Messages in new database won't be processed by old adapter
+4. Manual intervention may be needed for stuck messages
+
+## Monitoring Checklist
+
+After deployment, monitor:
+
+- **Connection stability**: Check for frequent reconnections
+- **Message latency**: Time from receipt to confirmation
+- **Retry rate**: High retry rate indicates issues
+- **Duplicate detection**: Should be minimal (<1%)
+- **Error logs**: Look for patterns in failures
+
+## Performance Impact
+
+- **Database writes**: ~3-4 per message (queue, ACK, confirm)
+- **Memory**: Minimal increase for tracking
+- **Network**: Additional ACK/Confirm requests to gateway
+- **CPU**: Negligible impact from improved logic
+
+## Compatibility Notes
+
+### Breaking Changes
+- Requires gateway to implement new endpoints
+- Different database schema (not backward compatible)
+- Messages now require `messageId` field from gateway
+
+### Non-Breaking Changes
+- Still uses same WhatsApp session data
+- Same core message format
+- Same environment variables (with additions)
+
+## Troubleshooting
+
+### Issue: "ACK failed" warnings
+**Cause**: Gateway doesn't implement ACK endpoint
+**Solution**: Gateway must implement `/messages/:messageId/ack`
+
+### Issue: Messages stuck in "pending"
+**Cause**: WhatsApp client not ready
+**Solution**: Check WhatsApp authentication and QR code
+
+### Issue: High retry rate
+**Cause**: WhatsApp rate limiting or network issues
+**Solution**: Reduce `DISPATCH_CONCURRENCY` or increase retry delays
+
+### Issue: Duplicate messages sent
+**Cause**: Idempotency tracking not working
+**Solution**: Check database permissions and `processed_messages` table
+
+## Next Steps
+
+1. **Gateway Implementation**: Ensure gateway implements required endpoints
+2. **Staging Test**: Deploy to staging environment first
+3. **Load Testing**: Verify performance under load
+4. **Monitoring Setup**: Configure alerts for key metrics
+5. **Documentation**: Update runbooks with new operational procedures
+
+## Support
+
+For issues or questions:
+- Review logs with `[adapter]` prefix
+- Check database state: `sqlite3 .state/state.sqlite`
+- Verify SSE connection: `curl -N ${GATEWAY_API_BASE_URL}:${PORT}/messages/stream`
+
+---
