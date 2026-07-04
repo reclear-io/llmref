@@ -1,0 +1,2026 @@
+# Proxmox CSI Plugin
+
+Source: https://github.com/sergelogvinov/proxmox-csi-plugin/blob/main/README.md
+
+# Proxmox CSI Plugin
+
+I have been using the `rancher.io/local-path` storage provisioner for over 3 years, and it has solved almost all of my problems.
+However, in the event that the server needs maintenance such as rebooting, upgrading, or reinstalling,
+I have to manage the PV myself by using tools like rsync, backup-restore, or other utilities to migrate the data to another server.
+
+I am currently using persistent storage only for databases in the cluster, and in a high availability setup, all databases can replicate themselves.
+That's why I do not need to use network storage, as database replication can recover data from the other replicas.
+Additionally, using local disks provides me with better performance.
+
+Nowadays, dedicated services are incredibly powerful.
+However, bootstrapping a Kubernetes node with 40/80 CPUs and 128/256GB of RAM can be overwhelming and may present new challenges.
+You would need to modify the default parameters in the kubelet configuration, which can be a complex process.
+Therefore, I have opted to use the Proxmox hypervisor to launch two or more virtual machines (VMs) on a single physical server, whether it's for a homelab or a small production use case.
+
+The Proxmox cloud has prompted me to consider the aging of local storage. It's often better to store local data on the hypervisor side rather than in the VM disk, as it offers greater flexibility. Migrating pods with persistent data between VMs within a Proxmox node becomes a much simpler process as a result.
+
+This project aims to address this concept. All persistent volumes (PVs) will be created and stored on the Proxmox side, and pods will access the data as attached block devices.
+
+This CSI plugin was designed to support multiple independent Proxmox clusters within a single Kubernetes cluster.
+It enables the use of a single storage class to deploy one or many deployments/statefulsets across different regions, leveraging region/zone anti-affinity or topology spread constraints
+
+## In Scope
+
+* [Dynamic provisioning](https://kubernetes-csi.github.io/docs/external-provisioner.html): Volumes are created dynamically when `PersistentVolumeClaim` objects are created.
+* [Topology](https://kubernetes-csi.github.io/docs/topology.html): feature to schedule Pod to Node where disk volume pool exists.
+* Volume metrics: usage stats are exported as Prometheus metrics from `kubelet`.
+* [Volume expansion](https://kubernetes-csi.github.io/docs/volume-expansion.html): Volumes can be expanded by editing `PersistentVolumeClaim` objects.
+* [Storage capacity](https://kubernetes.io/docs/concepts/storage/storage-capacity/): Controller expose the Proxmox storade capacity.
+* [Encrypted volumes](https://kubernetes-csi.github.io/docs/secrets-and-credentials-storage-class.html): Encryption with LUKS.
+* [Volume bandwidth](https://pve.proxmox.com/wiki/Manual:_qm.conf): Maximum read/write limits.
+* [Volume migration](docs/pvecsictl.md): Offline migration of PV to another Proxmox node (region).
+* [Volume attributes class](docs/options.md): Detailed options for StorageClass.
+* [Volume zone replication](docs/options.md): ZFS replication to another Proxmox node (zone).
+* [Volume snapshots](https://kubernetes.io/docs/concepts/storage/volume-snapshots/): Create and restore volume snapshots. See [limits](docs/volumesnapshot.md) in the documentation.
+
+## Overview
+
+
+![ProxmoxClusers!](/docs/proxmox-regions.gif)
+
+Arrows with dotted lines indicate the capability of attaching a Persistent Volume (PV) to a Pod.
+
+- Each Proxmox cluster has predefined in cloud-config the region name (see `clusters[].region` below).
+- Each Proxmox cluster has many Proxmox Nodes. In kubernetes scope it is called as `zone`. The name of `zone` is the name of Proxmox node.
+- Pods can easily migrate between Kubernetes nodes on the same physical Proxmox node (`zone`).
+  The PV will automatically be moved by the CSI Plugin.
+- Pods with Persistent Volume (PV) allocated on `local storage (like: lvm, lvm-thin, zfs, xfs, ext4)` **cannot** automatically migrate across zones (Proxmox nodes).
+  You can manually move PVs across zones using [pvecsictl](docs/pvecsictl.md) tool.
+- Pods with Persistent Volume (PV) allocated on `shared disk (like: ceph, nfs)` **can** automatically migrate across zones (inside one region).
+
+## Installation
+
+To make use of the Proxmox CSI Plugin you need to correctly configure your Proxmox installation as well as your Kubernetes instance.
+
+Requirements for Proxmox CSI Plugin
+* Proxmox nodes must be clustered
+* Proxmox CSI Plugin must have privileges in your Proxmox instance
+* Kubernetes must be labelled with the correct topology
+* A StoreClass referencing the CSI plugin exists
+
+How to configure the above is detailed below
+
+For details about how to install and deploy the CSI plugin, see [Installation instruction](docs/install.md).
+
+### Proxmox VM Config:
+
+For the Proxmox CSI Plugin to work you need to cluster your Proxmox nodes.
+You can cluster a single Proxmox node with itself.
+Read more about Proxmox clustering [here](https://pve.proxmox.com/wiki/Cluster_Manager).
+Additionally, you can add [SMBIOS information](docs/options-node.md#cloud-init-smbios-custom-fields) to your VM configuration.
+
+VM config after creating a Pod with PVC:
+
+![VM](/docs/vm-disks.png)
+
+`scsi2` disk on VM is a Kubernetes PV created by this CSI plugin.
+
+For better performance use SCSI Controller - `VirtIO SCSI single`.
+
+### Kubernetes Topology Labels
+
+Proxmox CSI Plugin uses the well-known node labels to define the disk location:
+
+* `topology.kubernetes.io/region` - the name must be the same as in cloud config region name
+* `topology.kubernetes.io/zone` - proxmox node name
+* `topology.proxmox.sinextra.dev/region` - alternative region label (optional)
+* `topology.proxmox.sinextra.dev/node` - alternative zone label (optional)
+
+Node spec:
+* `Spec.ProviderID` - providerID magic string `proxmox://$REGION/$VMID` to help define the virtual machine ID, it cannot be changed after the first update. If it not exists, the plugin will find the VM by the name or UUID.
+
+**Important**: The `topology.kubernetes.io/region` topology label **must** be set.
+Region is the Proxmox cluster name in cloud config.
+
+See [Node Annotations and Labels](docs/options-node.md) for more details.
+
+The labels can be set manually using `kubectl`,
+or automatically through a tool like [Proxmox CCM](https://github.com/sergelogvinov/proxmox-cloud-controller-manager).
+I recommend using the CCM (Cloud Controller Manager).
+
+### Storage Class Definition
+
+Storage Class resource:
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: proxmox-data-xfs
+parameters:
+  csi.storage.k8s.io/fstype: xfs|ext4
+  storage: data
+  cache: directsync|none|writeback|writethrough
+  ssd: "true|false"
+provisioner: csi.proxmox.sinextra.dev
+allowVolumeExpansion: true
+reclaimPolicy: Delete
+volumeBindingMode: WaitForFirstConsumer
+```
+
+Storage parameters:
+* `storage` - proxmox storage ID
+* `cache` - qemu cache param: `directsync`, `none`, `writeback`, `writethrough` [Official documentation](https://pve.proxmox.com/wiki/Performance_Tweaks)
+* `ssd` - true if SSD/NVME disk, which enables both SSD emulation and Discard options in Proxmox
+
+For more detailed options and a comprehensive understanding, refer to the following link [StorageClass options](docs/options.md)
+
+## Deployment examples
+
+### Pod with ephemeral storage
+
+Deploy a test Pod
+
+```shell
+kubectl apply -f https://raw.githubusercontent.com/sergelogvinov/proxmox-csi-plugin/main/docs/deploy/test-pod-ephemeral.yaml
+```
+
+Check status of PV and PVC
+
+```shell
+$ kubectl -n default get pods,pvc
+NAME       READY   STATUS    RESTARTS   AGE
+pod/test   1/1     Running   0          45s
+
+NAME                             STATUS   VOLUME                                     CAPACITY   ACCESS MODES   STORAGECLASS      AGE
+persistentvolumeclaim/test-pvc   Bound    pvc-5bc58ec7-da55-48d2-9dc5-75d4d6629a4e   1Gi        RWO            proxmox-data-xfs  45s
+
+$ kubectl describe pv pvc-5bc58ec7-da55-48d2-9dc5-75d4d6629a4e
+Name:              pvc-5bc58ec7-da55-48d2-9dc5-75d4d6629a4e
+Labels:            <none>
+Annotations:       pv.kubernetes.io/provisioned-by: csi.proxmox.sinextra.dev
+                   volume.kubernetes.io/provisioner-deletion-secret-name:
+                   volume.kubernetes.io/provisioner-deletion-secret-namespace:
+Finalizers:        [kubernetes.io/pv-protection external-attacher/csi-proxmox-sinextra-dev]
+StorageClass:      proxmox-data-xfs
+Status:            Bound
+Claim:             default/test-pvc
+Reclaim Policy:    Delete
+Access Modes:      RWO
+VolumeMode:        Filesystem
+Capacity:          1Gi
+Node Affinity:
+  Required Terms:
+    Term 0:        topology.kubernetes.io/region in [Region-1]
+                   topology.kubernetes.io/zone in [pve-1]
+Message:
+Source:
+    Type:              CSI (a Container Storage Interface (CSI) volume source)
+    Driver:            csi.proxmox.sinextra.dev
+    FSType:            xfs
+    VolumeHandle:      Region-1/pve-1/data/vm-9999-pvc-5bc58ec7-da55-48d2-9dc5-75d4d6629a4e
+    ReadOnly:          false
+    VolumeAttributes:      cache=writethrough
+                           storage.kubernetes.io/csiProvisionerIdentity=1682607985217-8081-csi.proxmox.sinextra.dev
+                           storage=data
+```
+
+### StatefulSet with persistent storage
+
+```shell
+kubectl apply -f https://raw.githubusercontent.com/sergelogvinov/proxmox-csi-plugin/main/docs/deploy/test-statefulset.yaml
+```
+
+Check status of PV and PVC
+
+```shell
+$ kubectl -n default get pods,pvc -owide
+NAME         READY   STATUS    RESTARTS   AGE   IP             NODE        NOMINATED NODE   READINESS GATES
+pod/test-0   1/1     Running   0          27s   10.32.8.251    worker-11   <none>           <none>
+pod/test-1   1/1     Running   0          27s   10.32.13.202   worker-31   <none>           <none>
+pod/test-2   1/1     Running   0          26s   10.32.2.236    worker-12   <none>           <none>
+pod/test-3   1/1     Running   0          26s   10.32.14.20    worker-32   <none>           <none>
+
+NAME                                   STATUS   VOLUME                                     CAPACITY   ACCESS MODES   STORAGECLASS      AGE   VOLUMEMODE
+persistentvolumeclaim/storage-test-0   Bound    pvc-3b76c8aa-1024-4f2e-88ca-8b3e27e27f65   1Gi        RWO            proxmox-data-xfs  27s   Filesystem
+persistentvolumeclaim/storage-test-1   Bound    pvc-70394f08-db69-435f-a373-6c4526732042   1Gi        RWO            proxmox-data-xfs  27s   Filesystem
+persistentvolumeclaim/storage-test-2   Bound    pvc-8a64b28e-826c-4ece-84f7-7bd921250881   1Gi        RWO            proxmox-data-xfs  26s   Filesystem
+persistentvolumeclaim/storage-test-3   Bound    pvc-847c1eca-1c1f-4be3-ba15-754785ffe4ad   1Gi        RWO            proxmox-data-xfs  26s   Filesystem
+
+$ kubectl describe pv pvc-3b76c8aa-1024-4f2e-88ca-8b3e27e27f65
+Name:              pvc-3b76c8aa-1024-4f2e-88ca-8b3e27e27f65
+Labels:            <none>
+Annotations:       pv.kubernetes.io/provisioned-by: csi.proxmox.sinextra.dev
+                   volume.kubernetes.io/provisioner-deletion-secret-name:
+                   volume.kubernetes.io/provisioner-deletion-secret-namespace:
+Finalizers:        [kubernetes.io/pv-protection external-attacher/csi-proxmox-sinextra-dev]
+StorageClass:      proxmox
+Status:            Bound
+Claim:             default/storage-test-0
+Reclaim Policy:    Delete
+Access Modes:      RWO
+VolumeMode:        Filesystem
+Capacity:          1Gi
+Node Affinity:
+  Required Terms:
+    Term 0:        topology.kubernetes.io/zone in [pve-1]
+                   topology.kubernetes.io/region in [Region-1]
+Message:
+Source:
+    Type:              CSI (a Container Storage Interface (CSI) volume source)
+    Driver:            csi.proxmox.sinextra.dev
+    FSType:            xfs
+    VolumeHandle:      Region-1/pve-1/data/vm-9999-pvc-3b76c8aa-1024-4f2e-88ca-8b3e27e27f65
+    ReadOnly:          false
+    VolumeAttributes:      cache=writethrough
+                           storage.kubernetes.io/csiProvisionerIdentity=1682607985217-8081-csi.proxmox.sinextra.dev
+                           storage=data
+```
+
+## Disk usage capacity
+
+Check existence of CSIDriver
+
+```shell
+$ kubectl get CSIDriver
+NAME                        ATTACHREQUIRED   PODINFOONMOUNT   STORAGECAPACITY   TOKENREQUESTS   REQUIRESREPUBLISH   MODES                  AGE
+csi.proxmox.sinextra.dev    true             true             true              <unset>         false               Persistent             47h
+```
+
+Check Proxmox pool capacity.
+Available capacity should be non-zero size.
+
+```shell
+$ kubectl get csistoragecapacities -ocustom-columns=CLASS:.storageClassName,AVAIL:.capacity,ZONE:.nodeTopology.matchLabels -A
+CLASS              AVAIL       ZONE
+proxmox-data-xfs   470268Mi    map[topology.kubernetes.io/region:Region-2 topology.kubernetes.io/zone:pve-3]
+proxmox-data-xfs   5084660Mi   map[topology.kubernetes.io/region:Region-1 topology.kubernetes.io/zone:pve-1]
+```
+
+Check node CSI drivers on a node
+
+```shell
+$ kubectl get CSINode worker-11 -oyaml
+apiVersion: storage.k8s.io/v1
+kind: CSINode
+metadata:
+  name: worker-11
+spec:
+  drivers:
+  - allocatable:
+      count: 16
+    name: csi.proxmox.sinextra.dev
+    nodeID: worker-11
+    topologyKeys:
+    - topology.kubernetes.io/region
+    - topology.kubernetes.io/zone
+```
+
+## FAQ
+
+See [FAQ](docs/faq.md) for answers to common questions.
+
+## Resources
+
+* https://arslan.io/2018/06/21/how-to-write-a-container-storage-interface-csi-plugin/
+* https://kubernetes-csi.github.io/docs/
+* https://pve.proxmox.com/wiki/Manual:_qm.conf
+* https://pve.proxmox.com/wiki/Performance_Tweaks
+* https://kb.blockbridge.com/guide/proxmox/
+* https://github.com/sergelogvinov/ansible-role-proxmox
+* https://github.com/sergelogvinov/terraform-talos/tree/main/proxmox
+
+## Contributing
+
+Contributions are welcomed and appreciated!
+See [Contributing](CONTRIBUTING.md) for our guidelines.
+
+If this project is useful to you, please consider starring the [repository](https://github.com/sergelogvinov/proxmox-csi-plugin).
+
+## Privacy Policy
+
+This project does not collect or send any metrics or telemetry data.
+You can build the images yourself and store them in your private registry, see the [Makefile](Makefile) for details.
+
+To provide feedback or report an issue, please use the [GitHub Issues](https://github.com/sergelogvinov/proxmox-csi-plugin/issues).
+
+## License
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+[http://www.apache.org/licenses/LICENSE-2.0](http://www.apache.org/licenses/LICENSE-2.0)
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+---
+
+`Proxmox®` is a registered trademark of [Proxmox Server Solutions GmbH](https://www.proxmox.com/en/about/company).
+
+---
+
+# Adopters
+
+Source: https://github.com/sergelogvinov/proxmox-csi-plugin/blob/main/ADOPTERS.md
+
+# Adopters
+
+This is a list of organizations or projects that have adopted the Proxmox CSI driver.
+
+## Adopters (listed alphabetically)
+
+* **[Boriss Novickovs](https://github.com/kubebn/talos-proxmox-kaas)**
+  Kubernetes As a Service in Proxmox. Homelab using Talos and Proxmox, including base add-ons and GitOps practices. Proxmox CCM/CSI to manage VMs and storages.
+
+* **[Proxmox Kubernetes Engine](https://github.com/Caprox-eu/Proxmox-Kubernetes-Engine)**
+  PKE (Proxmox Kubernetes Engine) is a solution for automatically deploying and managing high available Kubernetes clusters directly on Proxmox VE environments. Based on Kubernetes Cluster-API and fully API-Driven.
+
+* **[Serge Logvinov](https://github.com/sergelogvinov/terraform-talos/tree/main/proxmox)**
+   Terraform example for Talos on Proxmox. I am using the Proxmox CSI plugin for GitHub Actions (for ephemeral storage) and databases on Proxmox. _Not so well documented_.
+
+* **[Vegard Hagen](https://blog.stonegarden.dev/articles/2024/06/k8s-proxmox-csi/)**
+  Article explaining of to get Proxmox CSI Plugin working along with some testing. 
+
+### Template
+
+* **[Project/User name](Project URL)**
+  Description & Use cases
+
+---
+
+# Contributing
+
+Source: https://github.com/sergelogvinov/proxmox-csi-plugin/blob/main/CONTRIBUTING.md
+
+# Contributing
+
+## Pull Requests
+
+All PRs require a single commit.
+
+Having one commit in a Pull Request is very important for several reasons:
+* A single commit per PR keeps the git history clean and readable.
+  It helps reviewers and future developers understand the change as one atomic unit of work, instead of sifting through many intermediate or redundant commits.
+* One commit is easier to cherry-pick into another branch or to track in changelogs.
+* Squashing into one meaningful commit ensures the final PR only contains what matters.
+
+## Developer Certificate of Origin
+
+All commits require a [DCO](https://developercertificate.org/) sign-off.
+This is done by committing with the `--signoff` flag.
+
+## Development
+
+The build process for this project is designed to run entirely in containers.
+To get started, run `make help` and follow the instructions.
+
+## Conformance
+
+To verify conformance status, run `make conformance`.
+This runs a series of tests on the working tree and is required to pass before a contribution is accepted.
+
+---
+
+# Architecture
+
+Source: https://github.com/sergelogvinov/proxmox-csi-plugin/blob/main/docs/architecture.md
+
+# Architecture
+
+Proxmox cluster with local storage like: lvm, lvm-thin, zfs, xfs, ext4, etc.
+
+![ProxmoxClusers!](/docs/proxmox-regions.jpeg)
+
+- Each Proxmox cluster has predefined in cloud-config the region name (see `clusters[].region` below).
+- Each Proxmox Cluster has many Proxmox Nodes. In kubernetes scope it is called as `zone`. The name of `zone` is the name of Proxmox node.
+- Pods can easily migrate between Kubernetes nodes on the same physical Proxmox node (`zone`).
+  The PV will automatically be moved by the CSI Plugin.
+- Pods with PVC `cannot` automatically migrate across zones (Proxmox nodes).
+  You can manually move PVs across zones using [pvecsictl](docs/pvecsictl.md) to migrate Pods across zones.
+
+
+```mermaid
+---
+title: Automatic Pod migration within zone
+---
+flowchart LR
+    subgraph cluster1["Proxmox Cluster (Region 1)"]
+        subgraph node11["Proxmox Node (zone 1)"]
+                direction BT
+                subgraph vm1["VM (worker 1)"]
+                        pod11(["Pod (pv-1)"])
+                end
+                subgraph vm2["VM (worker 2)"]
+                        pod12(["Pod (pv-1)"])
+                end
+                pv11[("Disk (pv-1)")]
+        end
+        subgraph node12["Proxmox Node (zone 2)"]
+                direction BT
+                subgraph vm3["VM (worker 3)"]
+                    pod22(["Pod (pv-2)"])
+                end
+            pv22[("Disk (pv-2)")]
+        end
+    end
+pv11 .-> vm1
+pv11 -->|automatic| vm2
+pod11 -->|migrate| pod12
+
+pv22 --> vm3
+```
+```mermaid
+---
+title: Manual migration using pvecsictl across zones
+---
+flowchart
+    subgraph cluster1["Proxmox Cluster (Region 1)"]
+    direction BT
+        subgraph node11["Proxmox Node (zone 1)"]
+                subgraph vm1["VM (worker 1)"]
+                        pod11["Pod (pv-1)"]
+                end
+                subgraph vm2["VM (worker 2)"]
+                        pod21["Pod (pv-2)"]
+                end
+                pv11[("Disk (pv-1)")]
+                pv21[("Disk (pv-2)")]
+        end
+        subgraph node12["Proxmox Node (zone 2)"]
+            direction TB
+                subgraph vm3["VM (worker 3)"]
+                    pod22["Pod (pv-2)"]
+                end
+            pv22[("Disk (pv-2)")]
+        end
+    end
+pv11 --> vm1
+pv21 .-> vm2
+
+pv22 --> vm3
+pod21 -->|migrate| pod22
+pv21 -->|pvecsictl| pv22
+```
+
+---
+
+# Benchmarks
+
+Source: https://github.com/sergelogvinov/proxmox-csi-plugin/blob/main/docs/benchmark.md
+
+# Benchmarks
+
+## Server 1
+
+Test result without optimisations.
+VM pinned on cpu cores.
+
+* Intel(R) Xeon(R) E-2386G
+* Soft raid 1 - 2 x NVME SAMSUNG MZQL2960HCJR
+
+### Host
+
+* 4K
+  * READ: bw=1591MiB/s (1669MB/s), 1591MiB/s-1591MiB/s (1669MB/s-1669MB/s), io=559GiB (601GB), run=360001-360001msec
+  * WRITE: bw=531MiB/s (556MB/s), 531MiB/s-531MiB/s (556MB/s-556MB/s), io=187GiB (200GB), run=360001-360001msec
+* 16K
+  * READ: bw=2196MiB/s (2303MB/s), 2196MiB/s-2196MiB/s (2303MB/s-2303MB/s), io=772GiB (829GB), run=360003-360003msec
+  * WRITE: bw=732MiB/s (768MB/s), 732MiB/s-732MiB/s (768MB/s-768MB/s), io=257GiB (276GB), run=360003-360003msec
+
+### VM + pvc disk
+
+* 4k
+  * READ: bw=547MiB/s (573MB/s), 547MiB/s-547MiB/s (573MB/s-573MB/s), io=192GiB (206GB), run=360002-360002msec
+  * WRITE: bw=182MiB/s (191MB/s), 182MiB/s-182MiB/s (191MB/s-191MB/s), io=64.1GiB (68.8GB), run=360002-360002msec
+* 16K
+  * READ: bw=1690MiB/s (1772MB/s), 1690MiB/s-1690MiB/s (1772MB/s-1772MB/s), io=594GiB (638GB), run=360002-360002msec
+  * WRITE: bw=563MiB/s (591MB/s), 563MiB/s-563MiB/s (591MB/s-591MB/s), io=198GiB (213GB), run=360002-360002msec
+
+# Tests
+
+Prepare shell script `onedisk.sh`.
+
+```shell
+#!/bin/bash
+
+[ $# -ne 3 ] && echo Usage $0 numjobs /dev/DEVICENAME BLOCKSIZE && exit 1
+
+fio --name=onedisk \
+    --filename=$2 \
+    --filesize=10g --rw=randrw --rwmixread=75 --bs=$3 --direct=1 --overwrite=1 \
+    --numjobs=$1 --iodepth=32 --time_based=1 --runtime=360 \
+    --ioengine=io_uring \
+    --gtod_reduce=1 --group_reporting
+```
+
+## Proxmox server 1
+
+* Intel(R) Xeon(R) E-2386G
+* Soft raid 1 - 2 x NVME SAMSUNG MZQL2960HCJR
+
+### Host machine
+
+```shell
+# sh onedisk.sh 4 /root/file 4k
+
+onedisk: (g=0): rw=randrw, bs=(R) 4096B-4096B, (W) 4096B-4096B, (T) 4096B-4096B, ioengine=io_uring, iodepth=32
+...
+fio-3.33
+Starting 4 processes
+onedisk: Laying out IO file (1 file / 10240MiB)
+Jobs: 4 (f=4): [m(4)][100.0%][r=1617MiB/s,w=536MiB/s][r=414k,w=137k IOPS][eta 00m:00s]
+onedisk: (groupid=0, jobs=4): err= 0: pid=205991: Sun Sep  3 11:21:55 2023
+  read: IOPS=407k, BW=1591MiB/s (1669MB/s)(559GiB/360001msec)
+   bw (  MiB/s): min= 1543, max= 1649, per=100.00%, avg=1592.12, stdev= 6.40, samples=2876
+   iops        : min=395024, max=422184, avg=407582.36, stdev=1638.41, samples=2876
+  write: IOPS=136k, BW=531MiB/s (556MB/s)(187GiB/360001msec); 0 zone resets
+   bw (  KiB/s): min=521208, max=569720, per=100.00%, avg=543497.39, stdev=2386.29, samples=2876
+   iops        : min=130302, max=142430, avg=135874.34, stdev=596.57, samples=2876
+  cpu          : usr=7.66%, sys=36.29%, ctx=101284505, majf=0, minf=34
+  IO depths    : 1=0.1%, 2=0.1%, 4=0.1%, 8=0.1%, 16=0.1%, 32=100.0%, >=64=0.0%
+     submit    : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=0.0%, >=64=0.0%
+     complete  : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.1%, 64=0.0%, >=64=0.0%
+     issued rwts: total=146668960,48894104,0,0 short=0,0,0,0 dropped=0,0,0,0
+     latency   : target=0, window=0, percentile=100.00%, depth=32
+
+Run status group 0 (all jobs):
+   READ: bw=1591MiB/s (1669MB/s), 1591MiB/s-1591MiB/s (1669MB/s-1669MB/s), io=559GiB (601GB), run=360001-360001msec
+  WRITE: bw=531MiB/s (556MB/s), 531MiB/s-531MiB/s (556MB/s-556MB/s), io=187GiB (200GB), run=360001-360001msec
+
+Disk stats (read/write):
+    md3: ios=146652094/48890416, merge=0/0, ticks=38342068/6192620, in_queue=44534688, util=100.00%, aggrios=73334651/48895282, aggrmerge=19/1005, aggrticks=19170301/3708332, aggrin_queue=22878634, aggrutil=100.00%
+  nvme0n1: ios=73783133/48895282, merge=18/1005, ticks=19427962/3533561, in_queue=22961523, util=100.00%
+  nvme1n1: ios=72886169/48895282, merge=21/1005, ticks=18912640/3883104, in_queue=22795745, util=100.00%
+```
+
+```shell
+# sh onedisk.sh 4 /root/test 16k
+
+onedisk: (g=0): rw=randrw, bs=(R) 16.0KiB-16.0KiB, (W) 16.0KiB-16.0KiB, (T) 16.0KiB-16.0KiB, ioengine=io_uring, iodepth=32
+...
+fio-3.33
+Starting 4 processes
+Jobs: 4 (f=4): [m(4)][100.0%][r=2231MiB/s,w=750MiB/s][r=143k,w=48.0k IOPS][eta 00m:00s]
+onedisk: (groupid=0, jobs=4): err= 0: pid=207879: Sun Sep  3 11:31:18 2023
+  read: IOPS=141k, BW=2196MiB/s (2303MB/s)(772GiB/360003msec)
+   bw (  MiB/s): min= 1566, max= 2395, per=100.00%, avg=2197.12, stdev=31.28, samples=2876
+   iops        : min=100266, max=153328, avg=140615.75, stdev=2001.84, samples=2876
+  write: IOPS=46.8k, BW=732MiB/s (768MB/s)(257GiB/360003msec); 0 zone resets
+   bw (  KiB/s): min=539776, max=815808, per=100.00%, avg=749899.50, stdev=10446.40, samples=2876
+   iops        : min=33736, max=50988, avg=46868.70, stdev=652.90, samples=2876
+  cpu          : usr=3.34%, sys=16.53%, ctx=52397217, majf=0, minf=28
+  IO depths    : 1=0.1%, 2=0.1%, 4=0.1%, 8=0.1%, 16=0.1%, 32=100.0%, >=64=0.0%
+     submit    : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=0.0%, >=64=0.0%
+     complete  : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.1%, 64=0.0%, >=64=0.0%
+     issued rwts: total=50599778,16865750,0,0 short=0,0,0,0 dropped=0,0,0,0
+     latency   : target=0, window=0, percentile=100.00%, depth=32
+
+Run status group 0 (all jobs):
+   READ: bw=2196MiB/s (2303MB/s), 2196MiB/s-2196MiB/s (2303MB/s-2303MB/s), io=772GiB (829GB), run=360003-360003msec
+  WRITE: bw=732MiB/s (768MB/s), 732MiB/s-732MiB/s (768MB/s-768MB/s), io=257GiB (276GB), run=360003-360003msec
+
+Disk stats (read/write):
+    md3: ios=50618639/16873910, merge=0/0, ticks=13754332/31965600, in_queue=45719932, util=100.00%, aggrios=25316786/16878196, aggrmerge=72/1088, aggrticks=6891637/29905978, aggrin_queue=36797616, aggrutil=100.00%
+  nvme0n1: ios=25075468/16878196, merge=79/1088, ticks=6945223/29939499, in_queue=36884723, util=100.00%
+  nvme1n1: ios=25558104/16878196, merge=65/1088, ticks=6838052/29872458, in_queue=36710510, util=100.00%
+```
+
+## Pod with pvc
+
+```shell
+# sh onedisk.sh 4 /mnt/test 4k
+
+onedisk: (g=0): rw=randrw, bs=(R) 4096B-4096B, (W) 4096B-4096B, (T) 4096B-4096B, ioengine=io_uring, iodepth=32
+...
+fio-3.34
+Starting 4 processes
+onedisk: Laying out IO file (1 file / 10240MiB)
+Jobs: 4 (f=4): [m(4)][100.0%][r=548MiB/s,w=181MiB/s][r=140k,w=46.4k IOPS][eta 00m:00s]
+onedisk: (groupid=0, jobs=4): err= 0: pid=30: Sun Sep  3 09:32:43 2023
+  read: IOPS=140k, BW=547MiB/s (573MB/s)(192GiB/360002msec)
+   bw (  KiB/s): min=455896, max=595600, per=100.00%, avg=559983.31, stdev=3580.80, samples=2876
+   iops        : min=113974, max=148900, avg=139995.64, stdev=895.21, samples=2876
+  write: IOPS=46.6k, BW=182MiB/s (191MB/s)(64.1GiB/360002msec); 0 zone resets
+   bw (  KiB/s): min=150664, max=199176, per=100.00%, avg=186642.97, stdev=1312.11, samples=2876
+   iops        : min=37666, max=49794, avg=46660.52, stdev=328.04, samples=2876
+  cpu          : usr=4.69%, sys=10.57%, ctx=5376789, majf=0, minf=29
+  IO depths    : 1=0.1%, 2=0.1%, 4=0.1%, 8=0.1%, 16=0.1%, 32=100.0%, >=64=0.0%
+     submit    : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=0.0%, >=64=0.0%
+     complete  : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.1%, 64=0.0%, >=64=0.0%
+     issued rwts: total=50377721,16791103,0,0 short=0,0,0,0 dropped=0,0,0,0
+     latency   : target=0, window=0, percentile=100.00%, depth=32
+
+Run status group 0 (all jobs):
+   READ: bw=547MiB/s (573MB/s), 547MiB/s-547MiB/s (573MB/s-573MB/s), io=192GiB (206GB), run=360002-360002msec
+  WRITE: bw=182MiB/s (191MB/s), 182MiB/s-182MiB/s (191MB/s-191MB/s), io=64.1GiB (68.8GB), run=360002-360002msec
+
+Disk stats (read/write):
+  sdb: ios=50349438/16781710, merge=0/4, ticks=33038153/10156053, in_queue=43194262, util=100.00%
+```
+
+```shell
+# sh onedisk.sh 4 /mnt/test 8k
+
+onedisk: (g=0): rw=randrw, bs=(R) 8192B-8192B, (W) 8192B-8192B, (T) 8192B-8192B, ioengine=io_uring, iodepth=32
+...
+fio-3.34
+Starting 4 processes
+Jobs: 4 (f=4): [m(4)][100.0%][r=969MiB/s,w=322MiB/s][r=124k,w=41.3k IOPS][eta 00m:00s]
+onedisk: (groupid=0, jobs=4): err= 0: pid=367: Sun Sep  3 09:41:12 2023
+  read: IOPS=123k, BW=963MiB/s (1010MB/s)(338GiB/360002msec)
+   bw (  KiB/s): min=931456, max=1049280, per=100.00%, avg=986381.34, stdev=4476.88, samples=2876
+   iops        : min=116432, max=131160, avg=123297.65, stdev=559.61, samples=2876
+  write: IOPS=41.1k, BW=321MiB/s (336MB/s)(113GiB/360002msec); 0 zone resets
+   bw (  KiB/s): min=306448, max=353200, per=100.00%, avg=328755.29, stdev=1758.10, samples=2876
+   iops        : min=38306, max=44150, avg=41094.37, stdev=219.76, samples=2876
+  cpu          : usr=4.41%, sys=10.44%, ctx=5764615, majf=0, minf=36
+  IO depths    : 1=0.1%, 2=0.1%, 4=0.1%, 8=0.1%, 16=0.1%, 32=100.0%, >=64=0.0%
+     submit    : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=0.0%, >=64=0.0%
+     complete  : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.1%, 64=0.0%, >=64=0.0%
+     issued rwts: total=44367761,14787431,0,0 short=0,0,0,0 dropped=0,0,0,0
+     latency   : target=0, window=0, percentile=100.00%, depth=32
+
+Run status group 0 (all jobs):
+   READ: bw=963MiB/s (1010MB/s), 963MiB/s-963MiB/s (1010MB/s-1010MB/s), io=338GiB (363GB), run=360002-360002msec
+  WRITE: bw=321MiB/s (336MB/s), 321MiB/s-321MiB/s (336MB/s-336MB/s), io=113GiB (121GB), run=360002-360002msec
+
+Disk stats (read/write):
+  sdb: ios=44354662/14783278, merge=32/13, ticks=33521354/10178081, in_queue=43699507, util=100.00%
+```
+
+```shell
+# sh onedisk.sh 4 /mnt/test 16k
+
+onedisk: (g=0): rw=randrw, bs=(R) 16.0KiB-16.0KiB, (W) 16.0KiB-16.0KiB, (T) 16.0KiB-16.0KiB, ioengine=io_uring, iodepth=32
+...
+fio-3.34
+Starting 4 processes
+Jobs: 4 (f=4): [m(4)][100.0%][r=1684MiB/s,w=566MiB/s][r=108k,w=36.2k IOPS][eta 00m:00s]
+onedisk: (groupid=0, jobs=4): err= 0: pid=678: Sun Sep  3 09:55:27 2023
+  read: IOPS=108k, BW=1690MiB/s (1772MB/s)(594GiB/360002msec)
+   bw (  MiB/s): min= 1612, max= 1786, per=100.00%, avg=1691.02, stdev= 6.01, samples=2876
+   iops        : min=103202, max=114350, avg=108225.52, stdev=384.76, samples=2876
+  write: IOPS=36.0k, BW=563MiB/s (591MB/s)(198GiB/360002msec); 0 zone resets
+   bw (  KiB/s): min=541984, max=616832, per=100.00%, avg=577054.10, stdev=2715.09, samples=2876
+   iops        : min=33874, max=38552, avg=36065.82, stdev=169.69, samples=2876
+  cpu          : usr=4.33%, sys=11.20%, ctx=6788336, majf=0, minf=28
+  IO depths    : 1=0.1%, 2=0.1%, 4=0.1%, 8=0.1%, 16=0.1%, 32=100.0%, >=64=0.0%
+     submit    : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=0.0%, >=64=0.0%
+     complete  : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.1%, 64=0.0%, >=64=0.0%
+     issued rwts: total=38942752,12977752,0,0 short=0,0,0,0 dropped=0,0,0,0
+     latency   : target=0, window=0, percentile=100.00%, depth=32
+
+Run status group 0 (all jobs):
+   READ: bw=1690MiB/s (1772MB/s), 1690MiB/s-1690MiB/s (1772MB/s-1772MB/s), io=594GiB (638GB), run=360002-360002msec
+  WRITE: bw=563MiB/s (591MB/s), 563MiB/s-563MiB/s (591MB/s-591MB/s), io=198GiB (213GB), run=360002-360002msec
+
+Disk stats (read/write):
+  sdb: ios=38931542/12974083, merge=62/17, ticks=34184349/9899500, in_queue=44083935, util=100.00%
+```
+
+```shell
+# sh onedisk.sh 4 /mnt/test 16k (iodepth=256)
+
+onedisk: (g=0): rw=randrw, bs=(R) 16.0KiB-16.0KiB, (W) 16.0KiB-16.0KiB, (T) 16.0KiB-16.0KiB, ioengine=io_uring, iodepth=256
+...
+fio-3.34
+Starting 4 processes
+Jobs: 4 (f=4): [m(4)][100.0%][r=1628MiB/s,w=538MiB/s][r=104k,w=34.4k IOPS][eta 00m:00s]
+onedisk: (groupid=0, jobs=4): err= 0: pid=1047: Sun Sep  3 10:03:14 2023
+  read: IOPS=103k, BW=1612MiB/s (1690MB/s)(567GiB/360013msec)
+   bw (  MiB/s): min= 1372, max= 1885, per=100.00%, avg=1613.29, stdev=18.91, samples=2876
+   iops        : min=87844, max=120668, avg=103250.38, stdev=1210.14, samples=2876
+  write: IOPS=34.4k, BW=537MiB/s (563MB/s)(189GiB/360013msec); 0 zone resets
+   bw (  KiB/s): min=467147, max=648544, per=100.00%, avg=550515.14, stdev=6655.87, samples=2876
+   iops        : min=29196, max=40534, avg=34406.92, stdev=415.99, samples=2876
+  cpu          : usr=2.89%, sys=8.44%, ctx=12706018, majf=0, minf=35
+  IO depths    : 1=0.1%, 2=0.1%, 4=0.1%, 8=0.1%, 16=0.1%, 32=0.1%, >=64=100.0%
+     submit    : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=0.0%, >=64=0.0%
+     complete  : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=0.0%, >=64=0.1%
+     issued rwts: total=37145047,12378209,0,0 short=0,0,0,0 dropped=0,0,0,0
+     latency   : target=0, window=0, percentile=100.00%, depth=256
+
+Run status group 0 (all jobs):
+   READ: bw=1612MiB/s (1690MB/s), 1612MiB/s-1612MiB/s (1690MB/s-1690MB/s), io=567GiB (609GB), run=360013-360013msec
+  WRITE: bw=537MiB/s (563MB/s), 537MiB/s-537MiB/s (563MB/s-563MB/s), io=189GiB (203GB), run=360013-360013msec
+
+Disk stats (read/write):
+  sdb: ios=37133935/12374452, merge=59/16, ticks=221395271/72436641, in_queue=293832005, util=100.00%
+```
+
+```shell
+# sh onedisk.sh 4 /mnt/test 16k (iodepth=4)
+
+onedisk: (g=0): rw=randrw, bs=(R) 16.0KiB-16.0KiB, (W) 16.0KiB-16.0KiB, (T) 16.0KiB-16.0KiB, ioengine=io_uring, iodepth=4
+...
+fio-3.34
+Starting 4 processes
+Jobs: 4 (f=4): [m(4)][100.0%][r=1067MiB/s,w=360MiB/s][r=68.3k,w=23.0k IOPS][eta 00m:00s]
+onedisk: (groupid=0, jobs=4): err= 0: pid=4036: Sun Sep  3 10:10:09 2023
+  read: IOPS=73.1k, BW=1142MiB/s (1197MB/s)(401GiB/360004msec)
+   bw (  MiB/s): min=  687, max= 1168, per=100.00%, avg=1142.55, stdev= 7.07, samples=2876
+   iops        : min=44018, max=74808, avg=73122.94, stdev=452.54, samples=2876
+  write: IOPS=24.4k, BW=381MiB/s (399MB/s)(134GiB/360004msec); 0 zone resets
+   bw (  KiB/s): min=228199, max=413152, per=100.00%, avg=389880.72, stdev=2975.48, samples=2876
+   iops        : min=14260, max=25822, avg=24367.48, stdev=186.00, samples=2876
+  cpu          : usr=5.71%, sys=17.36%, ctx=22683809, majf=0, minf=33
+  IO depths    : 1=0.1%, 2=0.1%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, >=64=0.0%
+     submit    : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=0.0%, >=64=0.0%
+     complete  : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=0.0%, >=64=0.0%
+     issued rwts: total=26309050,8767294,0,0 short=0,0,0,0 dropped=0,0,0,0
+     latency   : target=0, window=0, percentile=100.00%, depth=4
+
+Run status group 0 (all jobs):
+   READ: bw=1142MiB/s (1197MB/s), 1142MiB/s-1142MiB/s (1197MB/s-1197MB/s), io=401GiB (431GB), run=360004-360004msec
+  WRITE: bw=381MiB/s (399MB/s), 381MiB/s-381MiB/s (399MB/s-399MB/s), io=134GiB (144GB), run=360004-360004msec
+
+Disk stats (read/write):
+  sdb: ios=26302626/8765212, merge=41/11, ticks=4481802/765988, in_queue=5247795, util=100.00%
+```
+
+# Resources
+
+* https://pve.proxmox.com/wiki/Performance_Tweaks
+* https://kb.blockbridge.com/technote/proxmox-tuning-low-latency-storage/
+* https://documentation.suse.com/sles/15-SP3/single-html/SLES-virtualization-best-practices/index.html
+
+---
+
+# Plugin configuration file
+
+Source: https://github.com/sergelogvinov/proxmox-csi-plugin/blob/main/docs/config.md
+
+# Plugin configuration file
+
+This file is used to configure the Proxmox CSI driver plugin.
+
+```yaml
+features:
+  # Provider type
+  provider: default|capmox
+  # Controller VM ID. Must be greater than 100.
+  # Default is 9999, which is a safe value that is unlikely to conflict with existing VMs.
+  # You can change it if needed, but make sure to choose a value that is not used by any existing VM in your Proxmox cluster.
+  controllerVMID: 9999
+
+clusters:
+  # List of Proxmox clusters
+  - url: https://cluster-api-1.exmple.com:8006/api2/json
+    # Skip the certificate verification, if needed
+    insecure: false
+    # Proxmox api token
+    token_id: "kubernetes-csi@pve!csi"
+    token_id_file: "/etc/proxmox/token_id"          # Optional, alternative to token_id
+    token_secret: "secret"
+    token_secret_file: "/etc/proxmox/token_secret"  # Optional, alternative to token_secret
+    # Region name, which is cluster name
+    region: Region-1
+
+  # Add more clusters if needed
+  - url: https://cluster-api-2.exmple.com:8006/api2/json
+    insecure: false
+    token_id: "kubernetes-csi@pve!csi"
+    token_secret: "secret"
+    region: Region-2
+```
+
+## Cluster list
+
+You can define multiple clusters in the `clusters` section.
+
+* `url` - The URL of the Proxmox cluster API.
+* `insecure` - Set to `true` to skip TLS certificate verification.
+* `token_id` - The Proxmox API token ID.
+* `token_id_file` - The path to a file containing the Proxmox API token ID. This is an alternative to `token_id`.
+* `token_secret` - The name of the Kubernetes Secret that contains the Proxmox API token.
+* `token_secret_file` - The path to a file containing the Proxmox API token secret. This is an alternative to `token_secret`.
+* `region` - The name of the region, which is also used as `topology.kubernetes.io/region` label.
+
+## Feature flags
+
+* `provider` - Set the provider type. The default is `default`, which uses provider-id to define the Proxmox VM ID. The `capmox` value is used for working with the Cluster API for Proxmox (CAPMox).
+
+---
+
+# Verify images
+
+Source: https://github.com/sergelogvinov/proxmox-csi-plugin/blob/main/docs/cosign.md
+
+# Verify images
+
+We'll be employing [Cosing's](https://github.com/sigstore/cosign) keyless verifications to ensure that images were built in Github Actions.
+
+## Verify Helm chart
+
+We will verify the keyless signature using the Cosign protocol.
+
+```shell
+cosign verify ghcr.io/sergelogvinov/charts/proxmox-csi-plugin:0.1.4 --certificate-identity https://github.com/sergelogvinov/proxmox-csi-plugin/.github/workflows/release-charts.yaml@refs/heads/main --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+## Verify containers
+
+We will verify the keyless signature using the Cosign protocol.
+
+```shell
+# Edge version
+cosign verify ghcr.io/sergelogvinov/proxmox-csi-controller:edge --certificate-identity https://github.com/sergelogvinov/proxmox-csi-plugin/.github/workflows/build-edge.yaml@refs/heads/main --certificate-oidc-issuer https://token.actions.githubusercontent.com
+
+cosign verify ghcr.io/sergelogvinov/proxmox-csi-node:edge --certificate-identity https://github.com/sergelogvinov/proxmox-csi-plugin/.github/workflows/build-edge.yaml@refs/heads/main --certificate-oidc-issuer https://token.actions.githubusercontent.com
+
+# Releases
+cosign verify ghcr.io/sergelogvinov/proxmox-csi-controller:v0.2.0 --certificate-identity https://github.com/sergelogvinov/proxmox-csi-plugin/.github/workflows/release.yaml@refs/tags/v0.2.0 --certificate-oidc-issuer https://token.actions.githubusercontent.com
+
+cosign verify ghcr.io/sergelogvinov/proxmox-csi-node:v0.2.0 --certificate-identity https://github.com/sergelogvinov/proxmox-csi-plugin/.github/workflows/release.yaml@refs/tags/v0.2.0 --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+---
+
+# eraser.md
+
+Source: https://github.com/sergelogvinov/proxmox-csi-plugin/blob/main/docs/eraser.md
+
+direction down
+styleMode: plain
+
+CLUSTER1 [label: "Proxmox Cluster (Region-1)"] {
+  Node 1 [label: "Proxmox Node 1 (zone 1)"] {
+    VM1 [label: "VM-1"] {
+      pod2 [icon: k8s-pod, label: "pod", colorMode: outline, color: black] {
+      pvc1 [icon: k8s-pvc, label: "pvc", colorMode: outline, color: black]}
+    }
+    VM2 [label: "VM-2"] {
+      pod3 [icon: k8s-pod, label: "pod", colorMode: outline, color: black]  {
+      pvc3 [icon: k8s-pvc, label: "pvc", colorMode: outline, color: black]}
+    }
+    DiskNode1 [icon:azure-disks, label:"Local Disk"]
+  }
+  Node 2 [label: "Proxmox Node 2 (zone 2)"] {
+    VM3 [label: "VM-3"] {
+      pod4 [icon: k8s-pod, label: "pod", colorMode: bold] {
+      pvc4 [icon: k8s-pvc, label: "pvc", colorMode: bold]
+      }
+    }
+    DiskNode2 [icon:azure-disks, label:"Local Disk"]
+  }
+  DiskSH1 [icon:azure-disk-pool, label:"Shared Disk"]
+}
+
+pvc1 -- DiskNode1
+pvc3 -- DiskNode1
+pvc4 -- DiskNode2
+pvc1 -- DiskSH1
+pvc3 -- DiskSH1
+pvc4 - DiskSH1
+
+---
+
+# Fast answers to common questions
+
+Source: https://github.com/sergelogvinov/proxmox-csi-plugin/blob/main/docs/faq.md
+
+# Fast answers to common questions
+
+## Can PV/PVC migrate between Proxmox nodes?
+
+The __local storages__ can't be migrated between Proxmox nodes automatically.
+But you can do it manually by following tool [pvecsictl](../docs/pvecsictl.md)
+
+The __shared storages__ like nfs, ceph can be migrated between Proxmox nodes automatically.
+
+## Can I migrate a VM between Proxmox nodes with a PVC?
+
+Kubernetes has many immutable objects, and PersistentVolumeClaim (PVC) is one of them.
+Theoretically, you can migrate a VM with a PVC if all disk volumes are located on shared storage.
+
+Plugin requires node labels `topology.kubernetes.io/region` and `topology.kubernetes.io/zone` to be set properly.
+Proxmox CCM (and many other CCMs) uses [Cloud-Provider](https://github.com/kubernetes/cloud-provider.git) framework, which does not support label updates after the node initialization. So, you need to update the labels manually after VM migration or use Proxmox CCM. Proxmox CCM will update the labels automatically.
+
+Make sure that other kubernetes components like CNI can handle the node labels changes.
+
+## Create a PV/PVC with already existing disk
+
+If you have a disk already created in Proxmox, you can use it with the CSI plugin.
+First, you need to create a PV/PVC with special disk name and the storage class name.
+The size of the PersistentVolume must be the same as the disk size.
+
+```yaml
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: pvc-test
+spec:
+  accessModes:
+    - ReadWriteOnce
+  capacity:
+    storage: 10Gi
+  csi:
+    driver: csi.proxmox.sinextra.dev
+    fsType: xfs
+    volumeAttributes:
+      storage: zfs
+    volumeHandle: dev-1/pve-m-4/zfs/vm-100-disk-1
+  storageClassName: proxmox-zfs
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: storage-test-0
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: proxmox-zfs
+  volumeName: pvc-test
+```
+
+The disk name is `vm-100-disk-1`, and the storage class name is `proxmox-zfs`.
+
+## Device is not found error
+
+In rare cases, you may see the following error in the pod events:
+
+```shell
+MountVolume.MountDevice failed for volume "pvc-a5aed967-e96a-482a-a12f-212f81b9a1f8":
+rpc error: code = InvalidArgument desc = device /dev/disk/by-id/wwn-0x5056432d49443032 is not found
+```
+
+This error occurs in some Intel architectures with SCSI controller `VirtIO SCSI Single`, and the disk is not visible in Linux.
+The solution is to change the SCSI controller to `VirtIO SCSI` in the Proxmox VM configuration.
+
+## How to change encrypted disk secret key?
+
+The secret key cannot be change through kubernetes API, but you can use the following instructions.
+Before starting, read the good explanation of the [cryptsetup](https://wiki.archlinux.org/title/Dm-crypt/Device_encryption) tool.
+
+First, you need to run the pod with secured PVC, then you need to define the csi-plugin pod running on the same node as the pod with the PVC.
+
+Lets say the csi-plugin pod name is `proxmox-csi-plugin-node-hjchn` and `/dev/sdb` is the disk you want to change the secret key for.
+
+```shell
+# Check the disk
+kubectl -n csi-proxmox exec -ti proxmox-csi-plugin-node-hjchn -- /sbin/cryptsetup luksDump /dev/sdb
+# Check the passphrase
+kubectl -n csi-proxmox exec -ti proxmox-csi-plugin-node-hjchn -- /sbin/cryptsetup luksOpen --test-passphrase -v /dev/sdb
+```
+
+Add the new passphrase to the disk
+
+```shell
+# Add the new passphrase
+kubectl -n csi-proxmox exec -ti proxmox-csi-plugin-node-hjchn -- /sbin/cryptsetup luksAddKey /dev/sdb
+# Check the new passphrase
+kubectl -n csi-proxmox exec -ti proxmox-csi-plugin-node-hjchn -- /sbin/cryptsetup luksOpen --test-passphrase -v /dev/sdb
+# Check the disk
+kubectl -n csi-proxmox exec -ti proxmox-csi-plugin-node-hjchn -- /sbin/cryptsetup luksDump /dev/sdb
+```
+
+After you have added the new passphrase, you can remove the old one.
+And change the passphrase in kubernetes secret resource.
+
+```shell
+# Remove the old passphrase
+kubectl -n csi-proxmox exec -ti proxmox-csi-plugin-node-hjchn -- /sbin/cryptsetup luksRemoveKey /dev/sdb
+```
+
+## Can I use terraform with Proxmox CSI?
+
+Yes, you can. And I recommend it.
+Do not forget to set ignore changes for all disk. Otherwise, terraform will remove the dynamic PV/PVCs on every apply.
+
+```hcl
+# bpg/proxmox plugin
+
+resource "proxmox_virtual_environment_vm" "vm" {
+
+  lifecycle {
+    ignore_changes = [
+      disk,
+    ]
+  }
+```
+
+## Can I use only one shared storage class in the cluster?
+
+Yes, you can use only one shared storage class in the cluster.
+To avoid unnecessary API calls, you can disable disk capacity gathering in the plugin.
+
+```yaml
+# Helm chart values.yaml
+
+options:
+  enableCapacity: false
+```
+
+---
+
+# Install plugin
+
+Source: https://github.com/sergelogvinov/proxmox-csi-plugin/blob/main/docs/install.md
+
+# Install plugin
+
+This plugin allows Kubernetes to use `Proxmox VE` storage as a persistent storage solution for stateful applications.
+Supported storage types:
+- Directory
+- LVM
+- LVM-thin
+- ZFS
+- NFS
+- Ceph
+
+## Proxmox configuration
+
+Proxmox CSI Plugin requires the correct privileges in order to allocate and attach disks.
+
+Create `CSI` role in Proxmox:
+
+```shell
+pveum role add CSI -privs "VM.Audit VM.Config.Disk Datastore.Allocate Datastore.AllocateSpace Datastore.Audit"
+# Or if you need to use Replication feature (zfs replication)
+pveum role add CSI -privs "VM.Audit VM.Allocate VM.Clone VM.Config.CPU VM.Config.Disk VM.Config.HWType VM.Config.Memory VM.Config.Options VM.Migrate VM.PowerMgmt Datastore.Allocate Datastore.AllocateSpace Datastore.Audit"
+```
+
+Next create a user `kubernetes-csi@pve` for the CSI plugin and grant it the above role
+
+```shell
+pveum user add kubernetes-csi@pve
+pveum aclmod / -user kubernetes-csi@pve -role CSI
+pveum user token add kubernetes-csi@pve csi -privsep 0
+```
+
+Or through terraform:
+
+```hcl
+# Plugin: bpg/proxmox
+
+resource "proxmox_virtual_environment_role" "csi" {
+  role_id = "Kubernetes-CSI"
+
+  privileges = [
+    "VM.Audit",
+    "VM.Config.Disk",
+    "Datastore.Allocate",
+    "Datastore.AllocateSpace",
+    "Datastore.Audit",
+  ]
+}
+
+resource "proxmox_virtual_environment_user" "kubernetes" {
+  acl {
+    path      = "/"
+    propagate = true
+    role_id   = proxmox_virtual_environment_role.csi.role_id
+  }
+
+  comment = "Kubernetes"
+  user_id = "kubernetes-csi@pve"
+}
+
+resource "proxmox_virtual_environment_user_token" "csi" {
+  comment    = "Kubernetes CSI"
+  token_name = "csi"
+  user_id    = proxmox_virtual_environment_user.kubernetes.user_id
+}
+
+resource "proxmox_virtual_environment_acl" "csi" {
+  token_id = proxmox_virtual_environment_user_token.csi.id
+  role_id  = proxmox_virtual_environment_role.csi.role_id
+
+  path      = "/"
+  propagate = true
+}
+```
+
+All VMs in the cluster must have the `SCSI Controller` set to `VirtIO SCSI single` or `VirtIO SCSI` type to be able to attach disks.
+
+## Prepare Kubernetes cluster
+
+Proxmox CSI Plugin relies on the well-known Kubernetes topology node labels to define the disk location.
+* `topology.kubernetes.io/region` - Cluster name, the name must be the same as in cloud config region name
+* `topology.kubernetes.io/zone` - Proxmox node name
+
+
+```shell
+kubectl label nodes region1-node-1 topology.kubernetes.io/region=Region1
+kubectl label nodes region1-node-1 topology.kubernetes.io/zone=pve-1
+```
+> Note: All nodes provisioned by Proxmox CSI Plugin should be labeled.
+
+
+Alternatively, you can use [Proxmox Cloud Controller Manager](https://github.com/sergelogvinov/proxmox-cloud-controller-manager). Proxmox CCM will manage topology labels for you.
+
+
+## Install CSI Driver
+
+Create a namespace `csi-proxmox` for the plugin and grant it the `privileged` permissions
+
+```shell
+kubectl create ns csi-proxmox
+kubectl label ns csi-proxmox pod-security.kubernetes.io/enforce=privileged
+```
+
+All examples below assume that plugin controller runs on control-plane. Change the `nodeSelector` to match your environment if needed.
+
+```yaml
+nodeSelector:
+  node-role.kubernetes.io/control-plane: ""
+tolerations:
+  - key: node-role.kubernetes.io/control-plane
+    effect: NoSchedule
+```
+
+### Install the plugin by using kubectl
+
+Create a Proxmox cloud config to connect to your cluster with the Proxmox user you just created.
+More information about the configuration can be found in [Plugin configuration file](config.md).
+
+```yaml
+# config.yaml
+clusters:
+  # List of Proxmox clusters
+
+  - url: https://cluster-api-1.exmple.com:8006/api2/json
+    # Skip the certificate verification, if needed
+    insecure: false
+    # Proxmox api token
+    token_id: "kubernetes-csi@pve!csi"
+    token_secret: "secret"
+    # Region name, which is cluster name
+    region: Region-1
+
+  # Add more clusters if needed
+  - url: https://cluster-api-2.exmple.com:8006/api2/json
+    insecure: false
+    token_id: "kubernetes-csi@pve!csi"
+    token_secret: "secret"
+    region: Region-2
+```
+
+Upload the configuration to the Kubernetes as a secret
+
+```shell
+kubectl -n csi-proxmox create secret generic proxmox-csi-plugin --from-file=config.yaml
+```
+
+Install latest release version
+
+```shell
+kubectl apply -f https://raw.githubusercontent.com/sergelogvinov/proxmox-csi-plugin/main/docs/deploy/proxmox-csi-plugin-release.yml
+```
+
+Or install latest stable version (edge)
+
+```shell
+kubectl apply -f https://raw.githubusercontent.com/sergelogvinov/proxmox-csi-plugin/main/docs/deploy/proxmox-csi-plugin.yml
+```
+
+### Install the plugin by using Helm
+
+Create the helm values file, for more information see [values.yaml](../charts/proxmox-csi-plugin/values.yaml)
+
+```yaml
+# proxmox-csi.yaml
+config:
+  clusters:
+    - url: https://cluster-api-1.exmple.com:8006/api2/json
+      insecure: false
+      token_id: "kubernetes-csi@pve!csi"
+      token_secret: "secret"
+      region: Region-1
+    # Add more clusters if needed
+    - url: https://cluster-api-2.exmple.com:8006/api2/json
+      insecure: false
+      token_id: "kubernetes-csi@pve!csi"
+      token_secret: "secret"
+      region: Region-2
+
+# Define the storage classes
+storageClass:
+  - name: proxmox-data-xfs
+    storage: data
+    reclaimPolicy: Delete
+    fstype: xfs
+    # Define the storage class as default
+    annotations:
+      storageclass.kubernetes.io/is-default-class: "true"
+```
+
+Install the plugin. You need to prepare the `csi-proxmox` namespace first, see above
+
+```shell
+helm upgrade -i -n csi-proxmox -f proxmox-csi.yaml proxmox-csi-plugin oci://ghcr.io/sergelogvinov/charts/proxmox-csi-plugin
+```
+
+#### Option for k0s
+
+If you're running [k0s](https://k0sproject.io/) you need to add extra value to the helm chart
+
+```yaml
+kubeletDir: /var/lib/k0s/kubelet
+```
+
+#### Option for microk8s
+
+If you're running [microk8s](https://microk8s.io/) you need to add extra value to the helm chart
+
+```yaml
+kubeletDir: /var/snap/microk8s/common/var/lib/kubelet
+```
+
+### Install the plugin by using Talos machine config
+
+If you're running [Talos](https://www.talos.dev/) you can install Proxmox CSI plugin using the machine config
+
+```yaml
+cluster:
+  externalCloudProvider:
+    enabled: true
+    manifests:
+      - https://raw.githubusercontent.com/sergelogvinov/proxmox-csi-plugin/main/docs/deploy/proxmox-csi-plugin.yml
+```
+
+Or all together with the Proxmox Cloud Controller Manager
+
+* Proxmox CCM will label the nodes
+* Proxmox CSI will use the labeled nodes to define the regions and zones
+
+```yaml
+cluster:
+  inlineManifests:
+    - name: proxmox-cloud-controller-manager
+      contents: |-
+        apiVersion: v1
+        kind: Secret
+        type: Opaque
+        metadata:
+          name: proxmox-cloud-controller-manager
+          namespace: kube-system
+        stringData:
+          config.yaml: |
+            clusters:
+              - url: https://cluster-api-1.exmple.com:8006/api2/json
+                insecure: false
+                token_id: "kubernetes@pve!ccm"
+                token_secret: "secret"
+                region: Region-1
+    - name: proxmox-csi-plugin
+      contents: |-
+        apiVersion: v1
+        kind: Secret
+        type: Opaque
+        metadata:
+          name: proxmox-csi-plugin
+          namespace: csi-proxmox
+        stringData:
+          config.yaml: |
+            clusters:
+              - url: https://cluster-api-1.exmple.com:8006/api2/json
+                insecure: false
+                token_id: "kubernetes-csi@pve!csi"
+                token_secret: "secret"
+                region: Region-1
+  externalCloudProvider:
+    enabled: true
+    manifests:
+      - https://raw.githubusercontent.com/sergelogvinov/proxmox-cloud-controller-manager/main/docs/deploy/cloud-controller-manager.yml
+      - https://raw.githubusercontent.com/sergelogvinov/proxmox-csi-plugin/main/docs/deploy/proxmox-csi-plugin.yml
+```
+
+---
+
+# Metrics documentation
+
+Source: https://github.com/sergelogvinov/proxmox-csi-plugin/blob/main/docs/metrics.md
+
+# Metrics documentation
+
+This document is a reflection of the current state of the exposed metrics of the Proxmox CSI controller.
+
+## Gather metrics
+
+Enabling the metrics is done by setting the `--metrics-address` flag to the desired address and port.
+
+```yaml
+proxmox-csi-controller
+  --metrics-address=8080
+```
+
+### Helm chart values
+
+The following values can be set in the Helm chart to expose the metrics of the Talos CCM.
+
+```yaml
+controller:
+  podAnnotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "8080"
+```
+
+## Metrics exposed by the CSI controller
+
+### Proxmox API calls
+
+|Metric name|Metric type|Labels/tags|
+|-----------|-----------|-----------|
+|proxmox_api_request_duration_seconds|Histogram|`request`=<api_request>|
+|proxmox_api_request_errors_total|Counter|`request`=<api_request>|
+
+Example output:
+
+```txt
+proxmox_api_request_duration_seconds_bucket{request="storageStatus",le="0.1"} 13
+proxmox_api_request_duration_seconds_bucket{request="storageStatus",le="0.25"} 172
+proxmox_api_request_duration_seconds_bucket{request="storageStatus",le="0.5"} 199
+proxmox_api_request_duration_seconds_bucket{request="storageStatus",le="1"} 210
+proxmox_api_request_duration_seconds_bucket{request="storageStatus",le="2.5"} 210
+proxmox_api_request_duration_seconds_bucket{request="storageStatus",le="5"} 210
+proxmox_api_request_duration_seconds_bucket{request="storageStatus",le="10"} 210
+proxmox_api_request_duration_seconds_bucket{request="storageStatus",le="30"} 210
+proxmox_api_request_duration_seconds_bucket{request="storageStatus",le="+Inf"} 210
+proxmox_api_request_duration_seconds_sum{request="storageStatus"} 39.698945394000006
+proxmox_api_request_duration_seconds_count{request="storageStatus"} 210
+```
+
+---
+
+# Node Annotations and Labels
+
+Source: https://github.com/sergelogvinov/proxmox-csi-plugin/blob/main/docs/options-node.md
+
+# Node Annotations and Labels
+
+Individual Kubernetes Nodes can be configured by annotations and labels to provide additional information to the Proxmox CSI Driver.
+Most of these settings are optional.
+
+```yaml
+apiVersion: v1
+kind: Node
+metadata:
+  ...
+  annotations:
+    # Proxmox Virtual Machine ID to help identify the node (optional)
+    proxmox.sinextra.dev/instance-id: "VM-ID"
+
+  labels:
+    # Topology labels to override default node topology labels (optional)
+    # Note: Kubernetes scheduler uses only default topology labels - topology.kubernetes.io/region and topology.kubernetes.io/zone
+    topology.proxmox.sinextra.dev/region: cluster-1
+    topology.proxmox.sinextra.dev/zone: pve-node-1
+
+    # Default Kubernetes topology labels
+    topology.kubernetes.io/region: cluster-1
+    topology.kubernetes.io/zone: pve-node-1
+
+    # Maximum number of volumes that can be attached to this node, default is 24 (optional)
+    # Note: Currently, there is a maximum limit of 30 virtio iscsi volumes *total*, including root disks, that can be attached to a single VM in QEMU/Proxmox.
+    csi.proxmox.sinextra.dev/max-volume-attachments: "24"
+...
+spec:
+  # Provider ID to help identify the node in the Proxmox cluster (optional)
+  # Format: proxmox://<cluster-name>/<VM-ID>
+  #
+  # Note: This field is optional but recommended for better identification of the node.
+  # Or you can set SMBIOS custom fields in Cloud-Init configuration to set the Proxmox VM ID.
+  providerID: proxmox://cluster-1/VM-ID
+```
+
+## Cloud-Init SMBIOS custom fields
+
+Also you can use Cloud-Init SMBIOS custom fields to set the Proxmox VM ID during the node creation.
+Proxmox VM ID is very important for the Proxmox CSI Driver to identify nodes correctly.
+If it sets properly, the plugin will work more reliably and faster.
+
+Proxmox VM configuration example:
+
+```yaml
+smbios1: base64=1,serial=aD13ZWItMDJhO2k9MTIwMjA=,uuid=de5b02b0-828a-4d1d-b135-2b812aa7d943
+```
+
+Where `serial` field is base64 encoded string of `aD13ZWItMDJhO2k9MTIwMjA=` which decodes to `h=web-02a;i=12020`, where `i` is the VM ID.
+More information about Proxmox Cloud-Init SMBIOS fields is available in the [Cloud-Init SMBIOS documentation](https://cloudinit.readthedocs.io/en/latest/reference/datasources/nocloud.html#dmi-specific-kernel-command-line).
+
+Terraform [Proxmox provider](https://registry.terraform.io/providers/bpg/proxmox/latest/docs/resources/virtual_environment_vm) example:
+
+```hcl
+resource "proxmox_virtual_environment_vm" "k8s-nodes" {
+  node_name           = each.value.zone
+  vm_id               = each.value.id
+
+  smbios {
+    serial = "h=${each.value.zone};i=${each.value.id}"
+  }
+}
+```
+
+---
+
+# Storage Class
+
+Source: https://github.com/sergelogvinov/proxmox-csi-plugin/blob/main/docs/options.md
+
+# Storage Class
+
+A Kubernetes StorageClass is an object that defines the storage "classes" or tiers available for dynamic provisioning of storage volumes in a Kubernetes cluster. It abstracts the underlying storage infrastructure, making it easier for developers and administrators to manage persistent storage for applications running in Kubernetes.
+
+Deploy examples you can find [here](deploy/).
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: proxmox-storage-class-name
+  annotations:
+    # If you need to set it as default
+    storageclass.kubernetes.io/is-default-class: "true"
+parameters:
+  # Pre defined options
+  ## File system format (default: ext4)
+  csi.storage.k8s.io/fstype: ext4|xfs
+
+  ## Optional: If you want to encrypt the disk
+  csi.storage.k8s.io/node-stage-secret-name: "proxmox-csi-secret"
+  csi.storage.k8s.io/node-stage-secret-namespace: "kube-system"
+  ## Have to be the same as node-stage-secret-* if you want to expand the volume
+  csi.storage.k8s.io/node-expand-secret-name: "proxmox-csi-secret"
+  csi.storage.k8s.io/node-expand-secret-namespace: "kube-system"
+
+  ## Optional: File system format options
+  blockSize: "4096"
+  inodeSize: "256"
+
+  # Proxmox csi options
+  ## Proxmox storage ID
+  storage: data
+  storageFormat: raw|qcow2
+
+  ## Optional: Proxmox csi options
+  cache: directsync|none|writeback|writethrough
+  ssd: "true|false"
+
+  ## Optional: Proxmox disk speed limit
+  diskIOPS: "4000"
+  diskMBps: "1000"
+
+  ## Optional: Zone replication
+  replicate: "true"
+  replicateSchedule: "*/15"
+  replicateZones: "pve-1,pve-3"
+
+# Optional: This field allows you to specify additional mount options to be applied when the volume is mounted on the node
+mountOptions:
+  # Common for ssd
+  - noatime
+
+# Optional: Allowed topologies restricts what nodes this StorageClass can be used on
+allowedTopologies:
+- matchLabelExpressions:
+  # Region have to be exist, if you want to use allowedTopologies
+  - key: topology.kubernetes.io/region
+    values:
+    - Region-1
+  # Better to set zone, otherwise it will be used random node in the region
+  - key: topology.kubernetes.io/zone
+    values:
+    - pve-1
+    - pve-3
+
+provisioner: csi.proxmox.sinextra.dev
+allowVolumeExpansion: true
+reclaimPolicy: Delete|Retain
+volumeBindingMode: WaitForFirstConsumer|Immediate
+```
+
+You can use `VolumeAttributesClass` to redefine the mutable parameters of the `StorageClass`.
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: VolumeAttributesClass
+metadata:
+  name: proxmox-attributes
+driverName: csi.proxmox.sinextra.dev
+parameters:
+  ## Optional: Proxmox disk speed limit
+  diskIOPS: "4000"
+  diskMBps: "1000"
+
+  ## Optional: Backup disk with VM
+  backup: "true"
+
+  ## Optional: Zone replication
+  replicateSchedule: "*/30"
+  replicateZones: "rnd-1,rnd-2"
+```
+
+## Parameters:
+
+* `node-stage-secret-name`/`node-expand-secret-name`,  `node-stage-secret-namespace`/`node-expand-secret-namespace` - Refer to the name and namespace of the Secret object in the Kubernetes API. The secrets key name is `encryption-passphrase`. [Official documentation](https://kubernetes-csi.github.io/docs/secrets-and-credentials-storage-class.html)
+
+```yaml
+apiVersion: v1
+data:
+  encryption-passphrase: base64-encode
+kind: Secret
+metadata:
+  name: proxmox-csi-secret
+  namespace: kube-system
+```
+
+* `blockSize` - specify the size of blocks in bytes.
+* `inodeSize` - Specify the size of each inode in bytes.
+
+* `storage` - proxmox storage ID
+* `storageFormat` - disk format: `raw`, `qcow2` [Official documentation](https://pve.proxmox.com/wiki/Storage)
+
+* `cache` - qemu cache param: `directsync`, `none`, `writeback`, `writethrough` [Official documentation](https://pve.proxmox.com/wiki/Performance_Tweaks)
+* `ssd` - set true if SSD/NVME disk, which enables both SSD emulation *and* Discard options in the attached Proxmox disk
+
+* `diskIOPS` - maximum r/w I/O in operations per second
+* `diskMBps` - maximum r/w throughput in megabytes per second
+
+* `backup` - set true if you want to backup the disk with VM. Dangerous option! Do not use it unless you fully understand how to use it in the recovery process.
+
+* `replicate` - set true if you want to replicate the disk to another zone
+* `replicateSchedule` - replication schedule [in systemd calendar format](https://pve.proxmox.com/pve-docs/pve-admin-guide.html#pvesr_schedule_time_format) (default: `*/15`)
+* `replicateZones` - zones where the disk will be replicated, separated by commas, support up to 2 zones
+
+## AllowVolumeExpansion
+
+Allow you to resize (expand) the PVC in future.
+
+## ReclaimPolicy
+
+It defines what happens to the storage volume when the associated PersistentVolumeClaim (PVC) is deleted. There are two reclaim policies:
+
+* `Retain`: The storage volume is not deleted when the PVC is released, and it must be manually reclaimed by an administrator.
+* `Delete`: The storage volume is deleted when the PVC is released.
+
+## VolumeBindingMode
+
+It specifies how volumes should be bound to PVs (Persistent Volumes). There are two modes:
+
+* `Immediate`: PVs are bound as soon as a PVC is created, even if a suitable storage volume isn't immediately available. This is suitable for scenarios where waiting for storage is not an option.
+* `WaitForFirstConsumer`: PVs are bound only when a pod using the PVC is scheduled. This is useful when you want to ensure that storage is provisioned only when it's actually needed.
+
+# Persistent Storage
+
+The Persistent storage supports lifecycle management.
+You can prevent the disk from being deleted on the Proxmox side when the PersistentVolume is removed.
+
+```yaml
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  annotations:
+    csi.proxmox.sinextra.dev/lifecycle: "keep"
+...
+```
+
+---
+
+# pvecsictl tool
+
+Source: https://github.com/sergelogvinov/proxmox-csi-plugin/blob/main/docs/pvecsictl.md
+
+# pvecsictl tool
+
+`pvecsictl` is a command line tool for managing the Proxmox CSI PV/PVC resources.
+
+**Warning**: This tool is under development and should be used with caution.
+The commands and flags may change in the future.
+
+## Installation
+
+It works on macOS (Intel/ARM) and Linux (amd64/arm64)
+
+```shell
+brew install sergelogvinov/tap/pvecsictl
+```
+
+RBAC permissions required for the tool
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: pvecsictl
+rules:
+  # Get list of pods with PVCs
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "delete"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["csinodes"]
+    verbs: ["get", "list"]
+  # Create and delete PV/PVC
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get", "list", "watch", "create", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "create", "patch", "delete"]
+  # Node cordoning/uncordoning
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch", "patch"]
+```
+
+## Usage
+
+```shell
+Usage:
+  pvecsictl [command]
+
+Available Commands:
+  migrate     Migrate data from one Proxmox node to another
+  rename      Rename PersistentVolumeClaim
+  swap        Swap PersistentVolumes between two PersistentVolumeClaims
+```
+
+## Commands
+
+### Migrate
+
+Migration requires root privileges on the Proxmox cluster.
+You need to provide the cloud-config file with root credentials (username/password) to the Proxmox cluster.
+
+```yaml
+clusters:
+  - url: https://cluster-1:8006/api2/json
+    username: root@pam
+    password: "strong-password"
+    region: fsn1
+    ...
+```
+
+To migrate the data for PVC `storage-test-0` first find the backing PV by running
+
+```shell
+kubectl -n default get pvc storage-test-0 -ojsonpath='{.spec.volumeName}'
+```
+
+which in our case is `pvc-0d79713b-6d0b-41e5-b387-42af370d083f`.
+
+Next find the PV topology by inspecting its `nodeAffinity`
+
+```shell
+kubectl -n default get pv pvc-0d79713b-6d0b-41e5-b387-42af370d083f -ojsonpath='{.spec.nodeAffinity}'
+```
+
+which gives us
+
+```json
+{"required":{"nodeSelectorTerms":[{"matchExpressions":[{"key":"topology.kubernetes.io/region","operator":"In","values":["fsn1"]},{"key":"topology.kubernetes.io/zone","operator":"In","values":["hvm-1"]}]}]}}
+```
+
+By looking at the above `topology.kubernetes.io` fields we see that the PV is located in zone (node) `hvm-1` in region (cluster) `fsn1`.
+
+To move the PVC from zone `hvm-1` to `hvm-2` we can run
+
+```shell
+pvecsictl migrate --config=hack/cloud-config.yaml -n default storage-test-0 hvm-2
+````
+
+If you're met with
+
+```shell
+ERROR Error: persistentvolumeclaims is using by pods: test-0 on node kube-store-11, cannot move volume
+```
+
+you can force the process by adding the `--force` flag
+
+```shell
+pvecsictl migrate --config=hack/cloud-config.yaml -n default storage-test-0 hvm-2 --force
+
+INFO persistentvolumeclaims is using by pods: test-0 on node kube-store-11, trying to force migration
+INFO cordoning nodes: kube-11,kube-12,kube-21,kube-22,kube-store-11,kube-store-21
+INFO terminated pods: test-0
+INFO waiting pods: test-0
+...
+INFO waiting pods: test-0
+INFO moving disk vm-9999-pvc-0d79713b-6d0b-41e5-b387-42af370d083f to proxmox node hvm-2
+INFO replacing persistentvolume topology
+INFO uncordoning nodes: kube-11,kube-12,kube-21,kube-22,kube-store-11,kube-store-21
+INFO persistentvolumeclaims storage-test-0 has been migrated to proxmox node hvm-2
+```
+
+To check that the zone has changed run
+```shell
+kubectl -n default get pv pvc-0d79713b-6d0b-41e5-b387-42af370d083f -ojsonpath='{.spec.nodeAffinity}'
+```
+
+again
+
+```json
+{"required":{"nodeSelectorTerms":[{"matchExpressions":[{"key":"topology.kubernetes.io/region","operator":"In","values":["fsn1"]},{"key":"topology.kubernetes.io/zone","operator":"In","values":["hvm-2"]}]}]}}
+```
+
+to verify that the zone is now `hvm-2`.
+
+Pod lifetime when running `pvecsictl` with the `--force` flag
+
+```shell
+# kubectl -n default get pods -owide -w
+test-0   1/1     Running            0          4m28s   10.32.19.119   kube-store-11   <none>           <none>
+test-0   1/1     Terminating        0          6m44s   10.32.19.119   kube-store-11   <none>           <none>
+test-0   0/1     Terminating        0          7m      <none>         kube-store-11   <none>           <none>
+test-0   0/1     Terminating        0          7m      10.32.19.119   kube-store-11   <none>           <none>
+test-0   0/1     Terminating        0          7m      10.32.19.119   kube-store-11   <none>           <none>
+test-0   0/1     Terminating        0          7m      10.32.19.119   kube-store-11   <none>           <none>
+test-0   0/1     Pending            0          0s      <none>         <none>          <none>           <none>
+test-0   0/1     Pending            0          0s      <none>         <none>          <none>           <none>
+test-0   0/1     Pending            0          62s     <none>         <none>          <none>           <none>
+test-0   0/1     Pending            0          71s     <none>         kube-21         <none>           <none>
+test-0   0/1     ContainerCreating  0          71s     <none>         kube-21         <none>           <none>
+test-0   1/1     Running            0          85s     10.32.11.96    kube-21         <none>           <none>
+```
+
+Here we've migrated the StatefulSet Pod with PVC to another node.
+Force mode helps to migrate StatefulSet deployment to another node without scaling down all replicas.
+It cordoned all nodes which have csi-proxmox plugin. Migrated the disk to another node and un-cordoned all nodes.
+
+### Rename
+
+Rename PersistentVolumeClaim.
+
+Check the current PVCs:
+
+```shell
+# kubectl -n default get pvc
+storage-test-0   Bound    pvc-0d79713b-6d0b-41e5-b387-42af370d083f   5Gi        RWO            proxmox-xfs    <unset>                 7m6s
+storage-test-1   Bound    pvc-2727795f-680c-410a-b130-2e5dc85efcb3   5Gi        RWO            proxmox-xfs    <unset>                 15m
+```
+
+Rename the `storage-test-0` PVC by running
+
+```shell
+pvecsictl rename -n default storage-test-0 storage-test-2
+```
+
+If you're met with
+
+```shell
+ERROR Error: persistentvolumeclaims is using by pods: test-0 on node kube-21, cannot move volume
+```
+
+You can force the process by adding the `--force` flag
+
+```shell
+pvecsictl rename -n default storage-test-0 storage-test-2 --force
+
+INFO persistentvolumeclaims is using by pods: test-0 on node kube-21, trying to force migration
+INFO cordoning nodes: kube-11,kube-12,kube-21,kube-22,kube-store-11,kube-store-21
+INFO terminated pods: test-0
+INFO waiting pods: test-0
+...
+INFO waiting pods: test-0
+INFO uncordoning nodes: kube-11,kube-12,kube-21,kube-22,kube-store-11,kube-store-21
+INFO persistentvolumeclaims storage-test-0 has been renamed
+```
+
+Check the result:
+
+* storage-test-0 -> storage-test-2
+* storage-test-0 has new PV
+
+```shell
+# kubectl -n default get pvc
+storage-test-0   Bound    pvc-2c6a06b2-e693-4807-a872-63ca67e6ee52   5Gi        RWO            proxmox-xfs    <unset>                 100s
+storage-test-1   Bound    pvc-2727795f-680c-410a-b130-2e5dc85efcb3   5Gi        RWO            proxmox-xfs    <unset>                 19m
+storage-test-2   Bound    pvc-0d79713b-6d0b-41e5-b387-42af370d083f   5Gi        RWO            proxmox-xfs    <unset>                 102s
+```
+
+Pod lifetime during rename
+
+```shell
+# kubectl -n default get pods -owide -w
+test-0   1/1     Running             0          9m37s   10.32.11.96   kube-21         <none>           <none>
+test-1   1/1     Running             0          16m     10.32.4.232   kube-store-21   <none>           <none>
+test-0   1/1     Terminating         0          10m     10.32.11.96   kube-21         <none>           <none>
+test-0   0/1     Terminating         0          11m     <none>        kube-21         <none>           <none>
+test-0   0/1     Terminating         0          11m     10.32.11.96   kube-21         <none>           <none>
+test-0   0/1     Terminating         0          11m     10.32.11.96   kube-21         <none>           <none>
+test-0   0/1     Terminating         0          11m     10.32.11.96   kube-21         <none>           <none>
+test-0   0/1     Pending             0          0s      <none>        <none>          <none>           <none>
+test-0   0/1     Pending             0          0s      <none>        <none>          <none>           <none>
+test-0   0/1     Pending             0          8s      <none>        <none>          <none>           <none>
+test-0   0/1     Pending             0          13s     <none>        kube-store-11   <none>           <none>
+test-0   0/1     ContainerCreating   0          13s     <none>        kube-store-11   <none>           <none>
+test-0   1/1     Running             0          24s     10.32.19.17   kube-store-11   <none>           <none>
+```
+
+### Swap
+
+Swap PersistentVolumeClaim between two PVCs.
+
+Check the current PVC:
+
+```shell
+# kubectl get pods,pvc
+NAME         READY   STATUS    RESTARTS   AGE
+pod/test-0   1/1     Running   0          2m58s
+pod/test-1   1/1     Running   0          2m58s
+
+NAME                                   STATUS   VOLUME                                     CAPACITY   ACCESS MODES   STORAGECLASS   VOLUMEATTRIBUTESCLASS   AGE
+persistentvolumeclaim/storage-test-0   Bound    pvc-e248bc56-dcf4-4145-93b9-a374a7c3b900   10Gi       RWO            proxmox-lvm    <unset>                 2m51s
+persistentvolumeclaim/storage-test-1   Bound    pvc-41b7078d-aa9f-4757-9056-8bd1e8e0697f   15Gi       RWO            proxmox-lvm    <unset>                 2m52s
+```
+
+Swap PVCs:
+
+```shell
+pvecsictl swap -n default storage-test-0 storage-test-1 -f
+
+INFO persistentvolumeclaims is using by pods: test-0 on node builder-03a, trying to force swap
+INFO persistentvolumeclaims is using by pods: test-1 on node builder-04b, trying to force swap
+INFO cordoned nodes: builder-03a,builder-03b,builder-04a,builder-04b
+INFO terminated pods: test-0,test-1
+INFO waiting pods: test-0
+INFO waiting pods: test-0
+INFO persistentvolumeclaims storage-test-0,storage-test-1 has been swapped
+INFO uncordoning nodes: builder-03a,builder-03b,builder-04a,builder-04b
+```
+
+Check the result:
+
+* storage-test-0 <-> storage-test-1
+
+```shell
+# kubectl get pods,pvc
+NAME         READY   STATUS    RESTARTS   AGE
+pod/test-0   1/1     Running   0          19s
+pod/test-1   1/1     Running   0          19s
+
+NAME                                   STATUS   VOLUME                                     CAPACITY   ACCESS MODES   STORAGECLASS   VOLUMEATTRIBUTESCLASS   AGE
+persistentvolumeclaim/storage-test-0   Bound    pvc-41b7078d-aa9f-4757-9056-8bd1e8e0697f   15Gi       RWO            proxmox-lvm    <unset>                 13s
+persistentvolumeclaim/storage-test-1   Bound    pvc-e248bc56-dcf4-4145-93b9-a374a7c3b900   10Gi       RWO            proxmox-lvm    <unset>                 13s
+```
+
+# Feedback
+
+Use the [GitHub discussions](https://github.com/sergelogvinov/proxmox-csi-plugin/discussions) for feedback and questions.
+
+---
+
+# Make release
+
+Source: https://github.com/sergelogvinov/proxmox-csi-plugin/blob/main/docs/release.md
+
+# Make release
+
+## Change release version
+
+```shell
+git commit --allow-empty -m "chore: release 2.0.0" -m "Release-As: 2.0.0"
+```
+
+## Update helm chart and documentation
+
+```shell
+git branch -D release-please--branches--main
+git checkout release-please--branches--main
+export `jq -r '"TAG=v"+.[]' hack/release-please-manifest.json`
+
+sh hack/bump-chart-version.sh proxmox-csi-plugin false false true
+make helm-unit docs
+
+git add .
+git commit -s --amend
+```
+
+---
+
+# Volume Snapshot
+
+Source: https://github.com/sergelogvinov/proxmox-csi-plugin/blob/main/docs/volumesnapshot.md
+
+# Volume Snapshot
+
+Proxmox VE does not support volume snapshots natively. However, the Proxmox CSI Driver provides a way to create and manage volume snapshots using Kubernetes `VolumeSnapshot` resources.
+
+`Warning`: Note this is `experimental` feature and requires root access to Proxmox API (root@pam). All parameters and features may change in future releases.
+
+The snapshot created using this method is a full copy of the original volume, not a delta snapshot. This means that the snapshot will consume the same amount of storage as the original volume.
+
+## Prerequirements
+
+Update your Proxmox CSI Driver configuration to include all clusters where you want to enable volume snapshot support.
+Make sure to use the `root@pam` account for this feature to function properly.
+
+```yaml
+clusters:
+  - url: https://cluster-api-1.exmple.com:8006/api2/json
+    username: root@pam
+    password: "your_password"
+    ...
+```
+
+## Volume Snapshot Class
+
+Create a Kubernetes `VolumeSnapshotClass` to define how snapshots are created, and set its driver to the Proxmox CSI Driver.
+
+```yaml
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshotClass
+metadata:
+  name: snapshot-class-name
+parameters:
+  # Optional: specify zone to copy snapshots in a specific zone
+  zone: rnd-2
+driver: csi.proxmox.sinextra.dev
+deletionPolicy: Delete
+```
+
+### Parameters:
+
+* `zone`: (Optional) Specify the zone name to create snapshots within a specific availability zone. If not specified, the snapshot will be created in the same zone as the source volume.
+
+### DeletionPolicy
+
+The deletion policy determines what happens to a volume snapshot when its associated VolumeSnapshotClass is removed.
+There are two possible policies:
+
+* `Retain`: The VolumeSnapshotContent remains after the VolumeSnapshotClass is deleted. An administrator must manually delete or reclaim it
+* `Delete`: The VolumeSnapshotContent is automatically deleted when the VolumeSnapshotClass is deleted.
+
+## Creating a Volume Snapshot
+
+To create a volume snapshot, you need to create a `VolumeSnapshot` resource that references the `VolumeSnapshotClass` you created earlier.
+
+```yaml
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshot
+metadata:
+  name: snapshot-name
+  namespace: default
+spec:
+  volumeSnapshotClassName: snapshot-class-name
+  source:
+    persistentVolumeClaimName: pvc-source-name
+```
+
+Its takes some time to create the snapshot. You can check the status of the snapshot using the following command:
+
+```bash
+kubectl -n default get volumesnapshot snapshot-name
+```
+
+Output will look like:
+
+```shell
+NAME   READYTOUSE   SOURCEPVC          SOURCESNAPSHOTCONTENT   RESTORESIZE   SNAPSHOTCLASS   SNAPSHOTCONTENT                                    CREATIONTIME   AGE
+test   false        pvc-source-name                                          proxmox         snapcontent-e56c938a-3ead-4221-bb76-aa4aaf149dc2   52s            115s
+```
+
+Once the snapshot is ready to use, the `READYTOUSE` column will change to `true`.
+
+Now you can create a new PersistentVolumeClaim from the snapshot:
+
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: storage-test-2-restore
+  namespace: default
+spec:
+  storageClassName: proxmox-zfs
+  dataSource:
+    apiGroup: snapshot.storage.k8s.io
+    kind: VolumeSnapshot
+    name: snapshot-name
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+```
+
+Make sure the size of the new PVC is equal to or larger than the original PVC from which the snapshot was created.
+The restore process begins automatically once the PersistentVolumeClaim is attached to a Pod
+
+## Creating a PersistentVolumeClaim from an Existing PersistentVolumeClaim
+
+You can also create a new PersistentVolumeClaim by cloning an existing PersistentVolumeClaim.
+This is done by specifying the source PersistentVolumeClaim in the `dataSource` field of the new PersistentVolumeClaim.
+
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: storage-test-2-restore
+  namespace: default
+spec:
+  storageClassName: proxmox-zfs
+  dataSource:
+    kind: PersistentVolumeClaim
+    name: storage-test-2-0
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 55Gi
+```
+
+---
