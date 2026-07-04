@@ -1,0 +1,206 @@
+# goingdark.social Infrastructure
+
+Source: https://github.com/goingdark-social/iac/blob/main/README.md
+
+# goingdark.social Infrastructure
+
+> [!NOTE]  
+> The code included in this repository is not meant to be run as-is. It's a collection of infrastructure code and Kubernetes manifests used to deploy the goingdark.social Kubernetes cluster. You will need to adapt the code to your own needs and environment.
+
+## Overview
+
+This repository contains the complete infrastructure-as-code setup for deploying our production Kubernetes cluster on Hetzner Cloud. We run a Mastodon community focused on homelabs, self-hosting, and privacy advocacy.
+
+The project uses:
+
+- **OpenTofu** - Infrastructure provisioning and management
+- **Talos Linux** - Kubernetes-optimized operating system
+- **ArgoCD** - GitOps continuous deployment
+- **Cilium** - eBPF-based container networking
+- **VictoriaMetrics** - Monitoring and observability stack
+- **Gateway API** - Modern ingress management
+
+The infrastructure follows GitOps principles with ArgoCD managing application deployments from the `kubernetes/` directory.
+
+## Project Structure
+
+- [`opentofu/`](opentofu/) - Hetzner Cloud infrastructure code
+- [`kubernetes/apps/argocd/`](kubernetes/apps/argocd/) - GitOps deployment controller
+- [`kubernetes/apps/base-system/`](kubernetes/apps/base-system/) - Core cluster services (networking, monitoring, certificates)
+- [`kubernetes/apps/platform/`](kubernetes/apps/platform/) - Community applications
+  - [`mastodon/`](kubernetes/apps/platform/mastodon/) - Our Mastodon instance (glitch-soc)
+    - [`base/`](kubernetes/apps/platform/mastodon/base/) - Shared manifests and generators used by every environment
+    - [`overlays/prod/`](kubernetes/apps/platform/mastodon/overlays/prod/) - Production overlay, identical to the previous single-environment layout
+    - [`overlays/dev/`](kubernetes/apps/platform/mastodon/overlays/dev/) - Lightweight dev slice with trimmed resources and dev-only hostnames
+  - [`cryptpad/`](kubernetes/apps/platform/cryptpad/) - Privacy-respecting collaborative editor (base plus `overlays/prod` for ArgoCD)
+  - [`hypebot/`](kubernetes/apps/platform/hypebot/) - Community engagement automation (base plus `overlays/prod`)
+  - [`elastic/`](kubernetes/apps/platform/elastic/) - Elastic operator managed via Helm (`base/` + `overlays/prod`) and deployed into the shared `elastic-system` namespace
+- [`kubernetes/apps/database/`](kubernetes/apps/database/) - Database operators and tooling
+
+## Deploy Infrastructure
+
+Install [OpenTofu](https://opentofu.org/docs/intro/install/) first, then provision the Hetzner Cloud infrastructure:
+
+```bash
+cd opentofu
+tofu init -upgrade
+tofu plan     # Review planned changes
+tofu apply    # Deploy infrastructure
+```
+
+This creates the Kubernetes cluster, networking, storage, and security groups as defined in the OpenTofu configuration files.
+As part of the apply step Talos also syncs our Cilium L2 announcement policy, load balancer IP pool, and a ConfigMap with the chart values so the cluster comes up with our Cilium settings before ArgoCD takes over.
+
+## Bootstrap Applications
+
+After infrastructure deployment, bootstrap the cluster with applications:
+
+```bash
+# Set up cluster access
+export TALOSCONFIG=./opentofu/talosconfig
+export KUBECONFIG=./opentofu/kubeconfig
+
+# Deploy all applications via ArgoCD
+kubectl apply -f kubernetes/application-set.yaml
+```
+
+This bootstrap process installs:
+- ArgoCD for GitOps deployments
+- Core networking (Cilium with encryption)
+- Certificate management (cert-manager)
+- Monitoring stack (VictoriaMetrics, Grafana)
+- External secrets management
+- Our community applications (Mastodon, CryptPad, Hypebot)
+
+## What's Running
+
+Once deployed, the cluster hosts:
+
+- **Mastodon** - Our community social platform with 1000 character posts
+- **CryptPad** - Collaborative document editing without surveillance
+- **Hypebot** - Automated community engagement and post boosting
+- **Grafana** - Infrastructure monitoring and alerting
+- **PostgreSQL** - Primary database for Mastodon
+- **Redis** - Caching layer for improved performance
+
+All applications are managed through ArgoCD and deploy automatically when changes are pushed to the `kubernetes/` directory.
+
+## Mastodon environments
+
+The Mastodon app now follows a standard Kustomize structure: a reusable [`base/`](kubernetes/apps/platform/mastodon/base/) and dedicated overlays for each namespace. ArgoCD only syncs the overlays, so the production overlay stays unchanged while the new [`overlays/dev/`](kubernetes/apps/platform/mastodon/overlays/dev/) overlay runs a smaller copy with reduced autoscaling limits and separate hostnames inside the same cluster.
+Dev secrets are isolated from production: every ExternalSecret in the dev overlay reads `*-dev` keys from Bitwarden and the CNPG SecretStore points at the `mastodon-dev` namespace, so you need to provision those credentials before enabling sync. The platform ApplicationSet now only auto-syncs non-prod overlays—`platform-mastodon-prod` stays manual while other environments land in `<app>-<env>` namespaces.
+
+## Mastodon Web Metrics and Autoscaling
+
+- The `mastodon-web` service now exposes port 9394 so each pod's `/metrics` endpoint is reachable inside the cluster.
+- VictoriaMetrics scrapes that endpoint through a `VMServiceScrape` and a Prometheus adapter publishes custom metrics for queue latency, backlog, and request rate.
+- The web autoscaler scales when p95 queue time stays over 35 ms or backlog rises above three requests, and it keeps an 80 % memory target as a safety net.
+- Scale ups can add two pods every 30 seconds, while scale downs wait three minutes before stepping back to avoid flapping.
+- Sidekiq default and federation workers scale on the `sidekiq_queue_latency_seconds` metric (10 seconds for default, 30 seconds for federation) so they grow only when the queues back up.
+- Streaming workers follow the `mastodon_streaming_connected_clients` metric and add capacity once a pod carries around 200 live connections.
+
+## Autoscaler Node Pool Placement
+
+- The autoscaler node pool is now limited to stateless deployments that the descheduler can freely evict.
+- Stateful components like PostgreSQL, Redis, and Elasticsearch, along with single-replica Sidekiq and streaming workers, are pinned to the fixed worker pool so scale-down drains stay possible.
+- The descheduler policy now treats nodes below roughly 40 % utilization as underused and balances pods away from the autoscaler nodes so Cluster Autoscaler can remove idle machines.
+
+## Worker Node Sysctls
+
+- Talos applies `vm.max_map_count=262144` to every worker through OpenTofu so Elasticsearch and other mmap-heavy services come up cleanly on fresh nodes with no manual tuning.
+
+## Gateway API Observability
+
+- `kube-state-metrics` now ships the Kuadrant CustomResourceState bundle so VictoriaMetrics receives the `gatewayapi_*` series for GatewayClasses, Gateways, HTTPRoutes, TCPRoutes, TLSRoutes, GRPCRoutes, and UDPRoutes.
+- The Grafana sidecar auto-imports the Gateway API dashboards that live in `kubernetes/apps/base-system/victoriametrics/dashboards/`; each ConfigMap is labeled `grafana_dashboard=1` so the new boards show up without manual imports.
+- All dashboards point at the VictoriaMetrics datasource, so the existing scrape jobs and retention settings still apply—no extra Prometheus configuration is required.
+
+## Mastodon Tor Access
+
+- The external gateway exposes an HTTP listener on port 80 so Tor traffic reaches the cluster without onion TLS termination.
+- A dedicated HTTPRoute publishes the `.onion` hostname, sends `/api/v1/streaming` requests to the streaming service, routes everything else to the web pods, and adds an `Onion-Location` response header for Tor Browser.
+- A Tor hidden-service deployment forwards onion requests to the gateway load balancer and stores the generated hostname on a persistent volume so it survives pod restarts.
+- The `mastodon-app-secrets` ExternalSecret carries the onion hostname from Bitwarden so the value stays out of the repo and can be rotated alongside the Tor key material.
+- A Tor HTTP proxy runs inside the cluster on port 8118 and Mastodon points both `http_proxy` and `http_hidden_proxy` at it for federation with onion-only peers.
+- Mastodon sets `ALLOW_ACCESS_TO_HIDDEN_SERVICE=true` so it accepts the onion host while keeping HTTPS for the public domain.
+
+## Tech Stack
+
+**Infrastructure**: Hetzner Cloud, Talos Linux, OpenTofu
+**Orchestration**: Kubernetes, ArgoCD, Cilium
+**Monitoring**: VictoriaMetrics, VictoriaLogs, Grafana
+**Security**: External Secrets, cert-manager, Gateway API
+
+---
+
+# AGENTS.md
+
+Source: https://github.com/goingdark-social/iac/blob/main/AGENTS.md
+
+goingdark.social infrastructure repository for Hetzner Cloud and Talos Linux with OpenTofu provisioning and Kubernetes GitOps delivery through ArgoCD.
+
+<Global_rules>
+- Scope every change to the user request and touched components.
+- Preserve existing naming, directory, and architecture patterns in edited files.
+- Keep secrets out of tracked files and use variable or ExternalSecret inputs.
+- Reuse existing variables, modules, and resource objects before creating new ones.
+- Keep one Kubernetes resource per file outside strategic patch files.
+- Keep container image references pinned to explicit versions.
+- Keep procedural runbooks, TODO lists, and troubleshooting flows in skills.
+- Do not create any files the user did not ask for 
+- Never create markdown documents (summaries, findings, analyses, or reports) unless the user explicitly asks for that deliverable.
+</Global_rules>
+
+<kubernetes>
+Kubernetes configuration lives under kubernetes/ and deploys through ArgoCD with Kustomize.
+<kubernetes_rules>
+- Use Kustomize application roots as Kubernetes apply targets.
+- Avoid direct apply commands against base/ directories and resource subdirectories.
+- Use ExternalSecret resources with ClusterSecretStore bitwarden-backend for secret sync.
+- Use Gateway resources for listener and TLS configuration.
+- Use HTTPRoute for application routing.
+- Use default deny network posture with explicit allow rules.
+- Use subdirectory references in kustomization files instead of long per-file lists.
+- do not use helm directly. that is achieved with kustomize helmcharts.
+- Keep Mastodon resources grouped under workloads/, autoscaling/, networking/, monitoring/, secrets/, storage/, jobs/, and disruption/.
+- Keep VPA resources in recommender-only mode with updater and admission disabled.
+</kubernetes_rules>
+</kubernetes>
+
+<opentofu>
+OpenTofu configuration lives under opentofu/ and manages Hetzner and Talos infrastructure state.
+<opentofu_rules>
+- Run tofu commands from the opentofu/ directory.
+- Read variables before adding new OpenTofu variables.
+- Use provider source hcloud-k8s/kubernetes/hcloud for Hetzner blocks.
+- Use provider source cloudflare/cloudflare for Cloudflare blocks.
+- Use provider source hashicorp/kubernetes for Kubernetes blocks in OpenTofu.
+- Reference managed resources through resource attributes and module outputs.
+- Avoid data source lookups for resources created in the same OpenTofu state.
+- Pass secret and token values through var.* inputs.
+</opentofu_rules>
+</opentofu>
+
+<mail>
+Mail platform configuration lives under kubernetes/apps/platform/mail/ with split ingress between Cloudflare Tunnel and Hetzner LoadBalancer.
+<mail_rules>
+- Route mail web UI traffic through Cloudflare Tunnel and Gateway API.
+- Route SMTP and IMAP family traffic through a Kubernetes LoadBalancer Service managed by hcloud-cloud-controller-manager.
+- mail LoadBalancer listener ports set to 25, 465, 587, 993, and 4190.
+- mail LoadBalancer listener ports 110, 995, 143, 80, and 443 excluded.
+- Use CiliumNetworkPolicy v2 resources for mail network policy behavior.
+- Allow Cilium world identity ingress on ports 25, 465, 587, 993, and 4190.
+- Allow Cilium ingress identity ingress on port 8080.
+- Use StatefulSet volumeClaimTemplates for mail persistent storage.
+- Use storage class hcloud-volumes-encrypted-xfs for mail stateful volumes.
+- Use Cloudflare R2 regional endpoint format https://<account_id>.eu.r2.cloudflarestorage.com for backups.
+- Keep non-regional Cloudflare R2 endpoint format absent from backup settings.
+- Restart CNPG cluster with kubectl cnpg restart -n stalwart stalwart-postgresql.
+- Keep kubectl rollout restart absent from CNPG restart operations.
+- Keep direct CNPG pod deletion absent from CNPG restart operations.
+- Point DNS record mail.peekoff.com to the stalwart-mail LoadBalancer external IP.
+- Keep SMTP and IMAP mail domain records in Cloudflare DNS-only mode.
+</mail_rules>
+</mail>
+
+---
