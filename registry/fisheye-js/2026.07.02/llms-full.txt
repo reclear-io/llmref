@@ -1,0 +1,2202 @@
+# fisheye.js
+
+Source: https://github.com/gyeonghokim/fisheye.js/blob/main/README.md
+
+# fisheye.js
+
+DEMO: <https://gyeonghokim.github.io/fisheye.js/>
+
+> Modern fisheye undistortion library for the web using **WebGPU** (general-purpose GPU compute)
+
+fisheye.js processes [VideoFrame](https://developer.mozilla.org/en-US/docs/Web/API/VideoFrame)s with **WebGPU compute shaders**—no canvas 2D—and corrects fisheye lens distortion using the **OpenCV fisheye model** (Kannala–Brandt–style polynomial in angle θ with coefficients k1–k4). This is the same model as in [OpenCV's fisheye module](https://docs.opencv.org/4.x/db/d58/group__calib3d__fisheye.html).
+
+## Features
+
+- **WebGPU GPGPU**: Compute-shader pipeline via [TypeGPU](https://www.npmjs.com/package/typegpu); input/output as textures and readback to VideoFrame—no canvas element for undistortion
+- **OpenCV fisheye (Kannala–Brandt) model**: Distortion model `θ_d = θ × (1 + k1·θ² + k2·θ⁴ + k3·θ⁶ + k4·θ⁸)` for accurate calibration
+- **WebCodecs**: Built on the [VideoFrame](https://developer.mozilla.org/en-US/docs/Web/API/VideoFrame) API
+- **ESM**: `import { Fisheye } from "@gyeonghokim/fisheye.js"`
+- **npm**: Install via npm or other package managers
+
+## Getting Started(Typescript Example)
+
+```bash
+npm install @gyeonghokim/fisheye.js
+# optional
+npm install --save-dev @webgpu/types
+```
+
+if you installed `@webgpu/types`,
+
+```json
+{
+  "compilerOptions": {
+    "types": ["@webgpu/types"]
+  }
+}
+```
+
+> Why should I install webgpu types?
+> This library does not render your binary, it just undistorts the VideoFrame.
+> You should make **your own YUV renderer**, or you can install `@gyeonghokim/yuv-player`.
+
+in your code,
+
+```ts
+import { Fisheye } from "@gyeonghokim/fisheye.js";
+
+// Option 1: Flat style (simple)
+const fisheye = new Fisheye({
+  // OpenCV fisheye distortion coefficients D = [k1, k2, k3, k4]
+  k1: 0.5,
+  k2: 0.0,
+  k3: 0.0,
+  k4: 0.0,
+
+  // Output size
+  width: 1920,
+  height: 1080,
+
+  // Optional: Camera matrix K parameters
+  fx: 1000, // focal length x (pixels)
+  fy: 1000, // focal length y (pixels)
+  cx: 960, // principal point x (pixels)
+  cy: 540, // principal point y (pixels)
+
+  // Optional: New camera matrix P estimation parameters
+  balance: 0.0, // 0.0 = no black edges (zoom in), 1.0 = keep original FOV (may have black edges)
+  fovScale: 1.0, // >1.0 = widen FOV, <1.0 = narrow FOV
+
+  // Optional: Projection mode
+  projection: { kind: "rectilinear" }, // or "equirectangular", "cylindrical", "original"
+
+  // Optional: e-PTZ (pan/tilt/zoom) or multi-pane layout (use only one)
+  // ptz: { pan: 0, tilt: 0, zoom: 1 },
+  // pane: { kind: "2pane", orientation: "horizontal" }, // or { kind: "4pane" }
+});
+
+// Option 2: Grouped style (OpenCV-like)
+const fisheyeGrouped = new Fisheye({
+  K: { fx: 1000, fy: 1000, cx: 960, cy: 540 },
+  D: { k1: 0.5, k2: 0, k3: 0, k4: 0 },
+  size: { width: 1920, height: 1080 },
+  balance: 0.0,
+  fovScale: 1.0,
+  projection: { kind: "rectilinear" },
+  // ptz: { pan: 0, tilt: 0, zoom: 1 } or pane: { kind: "4pane" } (mutually exclusive)
+});
+
+// Option 3: Manual rectilinear with explicit P matrix
+const fisheyeManual = new Fisheye({
+  k1: 0.5, k2: 0, k3: 0, k4: 0,
+  width: 1920,
+  height: 1080,
+  projection: { kind: "rectilinear", mode: "manual", newFx: 800, newFy: 800 },
+});
+
+const renderLoop = async (timestamp: DOMHighResTimestamp) => {
+  const undistorted: VideoFrame = await fisheye.undistort(yourVideoFrame);
+  yourYUVPlayer.draw(undistorted);
+  requestAnimationFrame(renderLoop);
+};
+```
+
+## Architecture & Design
+
+### Distortion Model: OpenCV Fisheye (Kannala-Brandt)
+
+This library uses the **OpenCV fisheye model** (Kannala-Brandt, 2006) for undistortion:
+
+```
+# Normalized coordinates (a, b) where a = X/Z, b = Y/Z
+r = sqrt(a² + b²)
+θ = atan(r)                                           # incidence angle
+θ_d = θ × (1 + k₁θ² + k₂θ⁴ + k₃θ⁶ + k₄θ⁸)           # distorted angle
+x' = (θ_d / r) × a,  y' = (θ_d / r) × b              # distorted coords
+u = fx(x' + αy') + cx,  v = fy × y' + cy             # pixel coords
+```
+
+This is the same model as [OpenCV's fisheye module](https://docs.opencv.org/4.x/db/d58/group__calib3d__fisheye.html).
+
+**Important:** OpenCV's `fisheye.undistortImage()` always outputs **rectilinear (perspective) projection only**. It does not provide panoramic or other projection modes.
+
+### Projection Modes
+
+For **WebGPU efficiency**, projection transformation is applied in a **single GPU pass**:
+
+| Mode | Description |
+|------|-------------|
+| `rectilinear` | Standard perspective projection (same as OpenCV) |
+| `rectilinear` + `mode: "manual"` | Explicit P matrix with `newFx`, `newFy`, `newCx?`, `newCy?` |
+| `equirectangular` | Panoramic equirectangular projection |
+| `cylindrical` | Panoramic cylindrical projection |
+| `original` | Pass-through (no undistortion) |
+
+### Why Unified GPU Pipeline?
+
+Traditional OpenCV approach:
+
+```python
+# Step 1: Undistort (GPU/CPU)
+undistorted = cv2.fisheye.undistortImage(img, K, D, Knew)
+
+# Step 2: Projection transform (CPU) - if panoramic needed
+panorama = cv2.remap(undistorted, custom_map_x, custom_map_y, cv2.INTER_LINEAR)
+```
+
+**Our approach (single GPU compute shader):**
+
+```typescript
+// All in one GPU pass: undistortion + projection
+const undistorted = await fisheye.undistort(input);
+```
+
+## API
+
+### `new Fisheye(options?: FisheyeOptions)`
+
+Creates a new Fisheye undistortion instance.
+
+#### OpenCV Fisheye Model Parameters
+
+| Parameter  | Type      | Default    | Description                                              |
+| ---------- | --------- | ---------- | -------------------------------------------------------- |
+| `fx`       | `number?` | auto       | Camera matrix K: focal length in x-axis (pixels)         |
+| `fy`       | `number?` | auto       | Camera matrix K: focal length in y-axis (pixels)         |
+| `cx`       | `number?` | `width/2`  | Camera matrix K: principal point x-coordinate (pixels)   |
+| `cy`       | `number?` | `height/2` | Camera matrix K: principal point y-coordinate (pixels)   |
+| `k1`       | `number?` | `0`        | Distortion coefficient k1 (Kannala-Brandt)               |
+| `k2`       | `number?` | `0`        | Distortion coefficient k2 (Kannala-Brandt)               |
+| `k3`       | `number?` | `0`        | Distortion coefficient k3 (Kannala-Brandt)               |
+| `k4`       | `number?` | `0`        | Distortion coefficient k4 (Kannala-Brandt)               |
+| `width`    | `number?` | `300`      | Output image width (OpenCV `new_size.width`)             |
+| `height`   | `number?` | `150`      | Output image height (OpenCV `new_size.height`)           |
+| `balance`  | `number?` | `0.0`      | Balance (0.0 = no black edges/zoom in, 1.0 = keep original FOV) |
+| `fovScale` | `number?` | `1.0`      | FOV scale (>1.0 = widen FOV, <1.0 = narrow FOV)          |
+
+**Note:** These parameters exactly match [OpenCV fisheye API](https://docs.opencv.org/4.x/db/d58/group__calib3d__fisheye.html). Use values from `cv2.fisheye.calibrate()` or `cv2.fisheye.estimateNewCameraMatrixForUndistortRectify()`.
+
+#### Mode options (e-PTZ vs multi-pane)
+
+You can optionally use **e-PTZ** (electronic pan/tilt/zoom) for a single view, or **multi-pane** for split views. Use **only one** of `ptz` or `pane`; they are mutually exclusive.
+
+| Parameter | Type | Description |
+| --------- | ---- | ----------- |
+| `ptz` | `PTZOptions?` | e-PTZ: `pan` (degrees, -180–180), `tilt` (-90–90), `zoom` (1.0 = no zoom, >1 = zoom in). |
+| `pane` | `PaneLayout?` | Multi-view: `{ kind: "2pane", orientation?: "horizontal" \| "vertical" }` or `{ kind: "4pane" }`. |
+
+- **PTZOptions**: `{ pan?: number; tilt?: number; zoom?: number }`
+- **PaneLayout**: `TwoPaneLayout` (2-pane split, optional `orientation`) or `FourPaneLayout` (`{ kind: "4pane" }`)
+
+#### Projection Options
+
+| Parameter    | Type                 | Default                    | Description                                                    |
+| ------------ | -------------------- | -------------------------- | -------------------------------------------------------------- |
+| `projection` | `FisheyeProjection`  | `{ kind: "rectilinear" }`  | Output projection mode (see Projection Modes above)            |
+
+**FisheyeProjection types:**
+
+```typescript
+// Auto: P matrix computed from balance/fovScale
+{ kind: "rectilinear" }
+{ kind: "equirectangular" }
+{ kind: "cylindrical" }
+{ kind: "original" }
+
+// Manual: Explicit P matrix
+{ kind: "rectilinear", mode: "manual", newFx: number, newFy: number, newCx?: number, newCy?: number }
+```
+
+### `undistort(frame: VideoFrame): Promise<VideoFrame>`
+
+Undistorts a VideoFrame with fisheye distortion.
+
+**Parameters:**
+
+- `frame`: Input VideoFrame with fisheye distortion
+
+**Returns:** Promise that resolves to an undistorted VideoFrame
+
+**Differences from OpenCV:**
+
+Unlike OpenCV's `fisheye.undistortImage()` which only outputs rectilinear (perspective) projection, this method performs **all transformations in a single GPU pass** for WebGPU efficiency:
+
+1. **Undistortion** (OpenCV Kannala-Brandt fisheye model)
+2. **Projection** (rectilinear, equirectangular, cylindrical, or original)
+
+OpenCV equivalent for non-rectilinear projections would require 2 separate operations:
+```python
+# OpenCV: 2 CPU/GPU roundtrips for panoramic projection
+undistorted = cv2.fisheye.undistortImage(img, K, D, Knew)
+panorama = cv2.remap(undistorted, map_x, map_y, cv2.INTER_LINEAR)
+
+# fisheye.js: 1 GPU pass - undistortion + projection
+undistorted = await fisheye.undistort(img)
+```
+
+### `updateConfig(options: Partial<FisheyeOptions>): void`
+
+Updates the configuration. You can update any subset of the original options.
+
+### `destroy(): void`
+
+Cleans up GPU resources. Call this when you're done using the instance.
+
+## Working with YUV Binary Data
+
+If you receive raw YUV binary data from a camera or server, you can use the `createVideoFrameFromYUV` utility to create a VideoFrame:
+
+```ts
+import { Fisheye, createVideoFrameFromYUV } from "@gyeonghokim/fisheye.js";
+
+const fisheye = new Fisheye({ k1: 0.5, width: 1920, height: 1080 });
+
+// Example: Receiving NV12 data from a server
+const response = await fetch("/api/camera/frame");
+const yuvBuffer = await response.arrayBuffer();
+
+const frame = createVideoFrameFromYUV(new Uint8Array(yuvBuffer), {
+  format: "NV12", // YUV format
+  width: 1920,
+  height: 1080,
+  timestamp: performance.now() * 1000, // microseconds
+});
+
+const undistorted = await fisheye.undistort(frame);
+frame.close(); // Don't forget to close the original frame
+```
+
+### `createVideoFrameFromYUV(data, options)`
+
+Creates a VideoFrame from YUV binary data.
+
+**Parameters:**
+
+- `data`: YUV binary data (`ArrayBuffer`, `TypedArray`, or `DataView`)
+- `options`: Configuration object
+  - `format` (required): YUV pixel format
+  - `width` (required): Frame width in pixels
+  - `height` (required): Frame height in pixels
+  - `timestamp` (required): Timestamp in microseconds
+  - `duration` (optional): Duration in microseconds
+  - `displayWidth` (optional): Display width (defaults to width)
+  - `displayHeight` (optional): Display height (defaults to height)
+  - `colorSpace` (optional): Color space configuration
+  - `transfer` (optional): If `true`, transfers buffer ownership for zero-copy performance
+
+**Supported YUV Formats:**
+
+| Format  | Description                                     | Data Size            |
+| ------- | ----------------------------------------------- | -------------------- |
+| `I420`  | YUV 4:2:0 planar (Y, U, V planes)               | width × height × 1.5 |
+| `NV12`  | YUV 4:2:0 semi-planar (Y plane, interleaved UV) | width × height × 1.5 |
+| `I420A` | YUV 4:2:0 planar with alpha                     | width × height × 2.5 |
+| `I422`  | YUV 4:2:2 planar                                | width × height × 2   |
+| `I444`  | YUV 4:4:4 planar                                | width × height × 3   |
+
+### `calculateYUVDataSize(format, width, height)`
+
+Calculates the expected byte size for YUV data.
+
+```ts
+import { calculateYUVDataSize } from "@gyeonghokim/fisheye.js";
+
+const size = calculateYUVDataSize("NV12", 1920, 1080); // 3110400 bytes
+```
+
+## Development
+
+This project uses:
+
+- **Biome** for linting and formatting
+- **Husky** for git hooks
+- **Commitlint** for conventional commit messages
+- **Semantic Release** for automated versioning and publishing
+- **TypeScript** for type safety
+- **WebGPU** for GPU-accelerated processing
+
+### Scripts
+
+```bash
+npm run build      # Build the library
+npm run dev        # Build in watch mode
+npm run lint       # Run linter
+npm run lint:fix   # Fix linting issues
+npm run format     # Format code
+npm run type-check # Check TypeScript types
+```
+
+### Commit Message Format
+
+This project follows the [Conventional Commits](https://www.conventionalcommits.org/) specification:
+
+```
+<type>: <description>
+
+[optional body]
+
+[optional footer]
+```
+
+Types: `feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`, `build`, `ci`, `chore`, `revert`
+
+## License
+
+MIT
+
+---
+
+# Learning Path Overview
+
+Source: https://github.com/gyeonghokim/fisheye.js/blob/main/doc/00-learning-path.md
+
+# Learning Path Overview
+
+This page summarizes the recommended order and the goal of each module.
+
+## Core path
+
+1. **Linear Algebra Foundations**: vectors, norms, and angle derivations.
+2. **World/Camera Transforms**: rotation, translation, and coordinate frames.
+3. **Camera and Lens Basics**: pinhole projection, FOV, lens mappings.
+4. **Calibration**: intrinsics, extrinsics, and how to update them.
+5. **Generic Camera Model**: projection + distortion + valid region.
+6. **OpenCV Fisheye Model**: the exact polynomial used here.
+7. **Project Pipeline**: how the shader applies the model.
+8. **End-to-End Example**: full numeric chain from world to pixel.
+9. **Tuning**: how to interpret and adjust parameters.
+10. **GPU Abstraction**: why TypeGPU/WebGPU is used.
+11. **Validation**: how we verify the model is correct.
+
+## How to use this path
+
+- If you are new to camera math, follow the order strictly.
+- If you already know calibration, jump to the fisheye model and pipeline.
+
+---
+
+# Linear Algebra Foundations (with derivations)
+
+Source: https://github.com/gyeonghokim/fisheye.js/blob/main/doc/01-linear-algebra-foundations.md
+
+# Linear Algebra Foundations (with derivations)
+
+This module builds the minimum math vocabulary needed to understand the fisheye model used by this project. We emphasize **derivations** so you can see where each equation comes from.
+
+**Prerequisites:** none  
+**Next:** `08-world-camera-transforms.md`
+
+## 1. Coordinate systems we use
+
+We use three coordinate systems:
+
+1. **Pixel coordinates**: `(x, y)` in `[0, width) × [0, height)`
+2. **Normalized image coordinates**: `(u, v)` in `[-1, 1] × [-1, 1]`
+3. **Camera ray coordinates**: a 3D ray direction `(X, Y, Z)` from the lens center
+
+The camera is assumed to look along the **positive Z axis**.
+
+![Spherical coordinate system](images/spherical_coordinate_system.svg)
+
+Attribution: Wikimedia Commons, “Spherical coordinate system” (CC BY-SA 4.0), https://commons.wikimedia.org/wiki/File:Spherical_coordinate_system.svg
+
+## 2. From pixel to normalized image coordinates
+
+We center the coordinate system and normalize:
+
+```
+u = (x / width  - 0.5) * 2
+v = (y / height - 0.5) * 2
+```
+
+**Why this formula?**
+
+- `x / width` maps pixels to `[0, 1]`
+- subtracting `0.5` centers around `0`
+- multiplying by `2` maps to `[-1, 1]`
+
+This step is purely geometric and independent of the lens model.
+
+## 3. Vector length and radius
+
+The radius from the lens center is:
+
+```
+r = sqrt(u^2 + v^2)
+```
+
+This is the **Euclidean norm** of the vector `(u, v)`. In fisheye.js, this radius is the input to the fisheye model.
+
+## 4. From 2D radius to a 3D ray
+
+Assume a ray direction `(X, Y, Z)` from the lens center. The **optical axis** is the Z axis, so the angle `theta` between the ray and the axis satisfies:
+
+```
+cos(theta) = Z / sqrt(X^2 + Y^2 + Z^2)
+```
+
+If the ray is normalized (unit length), `sqrt(X^2 + Y^2 + Z^2) = 1` and:
+
+```
+cos(theta) = Z
+```
+
+The projection onto the image plane is given by `r = sqrt(X^2 + Y^2) / Z`, which leads to:
+
+```
+theta = atan(r)
+```
+
+This is the key connection between the **2D radius** and the **3D angle**.
+
+## 5. Dot product as angle derivation
+
+For two unit vectors `a` and `b`:
+
+```
+a · b = cos(angle)
+```
+
+If `b` is the optical axis `(0, 0, 1)`, then:
+
+```
+a · b = a_z = cos(theta)
+```
+
+This is another way to see why the angle depends on the Z component.
+
+## 6. Why we care about transforms
+
+The fisheye model is a **mapping function** from one radius to another. The GPU shader applies this mapping per pixel, so the idea of “mapping between spaces” is the core concept behind dewarping.
+
+## Visual summary
+
+```mermaid
+flowchart LR
+  Pixel["Pixel (x,y)"] --> Normalize["Normalize to (u,v)"]
+  Normalize --> Radius["r = sqrt(u^2 + v^2)"]
+  Radius --> Angle["theta = atan(r)"]
+```
+
+## What to remember
+
+- **Normalization** makes pixels comparable across resolutions.
+- **Radius** is a vector length in normalized coordinates.
+- **Angle** is derived from geometry: `theta = atan(r)`.
+
+---
+
+# Camera and Lens Basics (with derivations)
+
+Source: https://github.com/gyeonghokim/fisheye.js/blob/main/doc/02-camera-lens-basics.md
+
+# Camera and Lens Basics (with derivations)
+
+This module explains how a camera lens maps real-world directions onto a 2D image. The central idea is that a lens converts **ray angle** into **image radius**.
+
+**Prerequisites:** `08-world-camera-transforms.md`  
+**Next:** `10-calibration-intrinsics-extrinsics.md`
+
+## 1. Ray, angle, and radius
+
+Let a ray direction be `(X, Y, Z)` with optical axis along +Z. The angle between the ray and the optical axis is `theta`. The distance from the image center is `r`. A **lens model** is a function:
+
+```
+r = f(theta)
+```
+
+Different lenses choose different `f`.
+
+![Fisheye mapping function illustration](images/fisheye_mapping_function_illustration.svg)
+
+Attribution: Wikimedia Commons, “Fisheye mapping function illustration” (CC BY-SA 3.0), https://commons.wikimedia.org/wiki/File:Fisheye_mapping_function_illustration.svg
+
+## 2. Perspective (pinhole) derivation
+
+For a pinhole camera, the image plane is at distance `f` from the pinhole. By similar triangles:
+
+```
+tan(theta) = r / f
+```
+
+So:
+
+```
+r = f * tan(theta)
+```
+
+If you use normalized coordinates where `f = 1`, then:
+
+```
+r = tan(theta)
+```
+
+This is the standard perspective projection.
+
+![Pinhole camera](images/pinhole-camera.svg)
+
+Attribution: Wikimedia Commons, “Pinhole-camera.svg” (Public Domain), https://commons.wikimedia.org/wiki/File:Pinhole-camera.svg
+
+## 3. Fisheye mappings (why they differ)
+
+Fisheye lenses capture very wide angles, so `tan(theta)` grows too fast near 90°. Fisheye models pick different mappings, such as:
+
+- **Equidistant**: `r = f * theta`
+- **Equisolid**: `r = 2f * sin(theta / 2)`
+- **Orthographic**: `r = f * sin(theta)`
+- **Stereographic**: `r = 2f * tan(theta / 2)`
+
+These are different choices of `f(theta)`.
+
+![Lens mapping functions](images/lens_mapping_functions.svg)
+
+Attribution: Wikimedia Commons, “Lens mapping functions” (CC BY-SA 4.0), https://commons.wikimedia.org/wiki/File:Lens_mapping_functions.svg
+
+## 3.1 Equidistant projection (derivation)
+
+For an equidistant fisheye, the defining rule is:
+
+```
+r = f * theta
+```
+
+This means **equal changes in angle produce equal changes in radius**. It can be derived by assuming the lens is designed to keep angular spacing linear on the sensor. This is the baseline that the OpenCV fisheye model extends with a polynomial.
+
+## 3.2 Perspective vs equidistant (intuition)
+
+- Perspective: `r = f * tan(theta)` grows rapidly near 90°.
+- Equidistant: `r = f * theta` grows linearly and is stable at wide angles.
+
+This is why fisheye models are preferred for very wide fields of view.
+
+### 3.3 Quick numeric contrast
+
+With `f = 1`:
+
+```
+theta = 75°  -> tan(theta) ≈ 3.732, equidistant r = 1.309
+theta = 85°  -> tan(theta) ≈ 11.430, equidistant r = 1.484
+```
+
+Perspective expands too fast near the edge, which is why fisheye models avoid `tan`.
+
+## 4. Field of view (FOV) and scaling
+
+FOV defines the maximum `theta` you want to include. If the output corner corresponds to `theta = FOV / 2`, then the scale factor can be chosen so that:
+
+```
+r_corner = f(FOV / 2)
+```
+
+In fisheye.js, we scale the normalized radius so output corners map to the requested FOV.
+
+![Lens angle of view](images/lens_angle_of_view.svg)
+
+Attribution: Wikimedia Commons, “Lens angle of view” (CC BY-SA 3.0), https://commons.wikimedia.org/wiki/File:Lens_angle_of_view.svg
+
+### 4.1 Camera types by FOV (intuition)
+
+- **Telephoto**: narrow FOV (small angle) -> smaller image area, less distortion.
+- **Normal**: moderate FOV, similar to human vision perspective.
+- **Wide-angle**: large FOV, straight lines bend near edges in perspective.
+- **Fisheye**: very large FOV (often 180° or more), requires fisheye mapping.
+
+### 4.2 Quick numeric FOV intuition
+
+If `f` is fixed and sensor size grows, FOV grows:
+
+```
+FOV ≈ 2 * atan(sensor_width / (2f))
+```
+
+This is why larger sensors or shorter focal lengths produce wider views.
+
+## 5. Lens center offsets
+
+Real lenses are rarely perfectly centered. We correct by shifting:
+
+```
+centered = (u - centerX, v - centerY)
+```
+
+This means the radius and angle are computed around the **actual** lens center.
+
+## 6. Zoom
+
+Zoom is applied after distortion:
+
+```
+r_scaled = r_d / zoom
+```
+
+This is not a lens model by itself; it is a post-scaling step to control framing.
+
+## 7. Vignetting and valid image region
+
+**Vignetting** is brightness falloff toward the edges of the image. It is common in wide-angle lenses and can be used to identify the usable region of a fisheye image.
+
+![Vignetting example](images/woy_woy_channel_vignetted.jpg)
+
+Attribution: Wikimedia Commons, “Woy Woy Channel - Vignetted” (CC BY-SA 4.0), https://commons.wikimedia.org/wiki/File:Woy_Woy_Channel_-_Vignetted.jpg
+
+### 7.1 Detecting the vignetting boundary (practical method)
+
+1. Convert the image to grayscale.
+2. Compute the radial profile of brightness around the lens center.
+3. Find the radius where brightness falls below a threshold (e.g., 20–30% of center brightness).
+4. Define the **valid region** as the circle inside that radius.
+
+This boundary is typically close to the physical image circle of the lens.
+
+## Visual pipeline
+
+```mermaid
+flowchart LR
+  Ray["Incoming ray"] --> Theta["Angle theta"]
+  Theta --> LensModel["Lens model r = f(theta)"]
+  LensModel --> Radius["Image radius r"]
+  Radius --> Pixel["Pixel position"]
+```
+
+## What to remember
+
+- Perspective is derived from **similar triangles**.
+- Fisheye models are alternative `f(theta)` mappings.
+- FOV chooses how far in angle space you map.
+- Center offsets and zoom are post-geometry corrections.
+
+---
+
+# OpenCV Fisheye Model Math (derivation-focused)
+
+Source: https://github.com/gyeonghokim/fisheye.js/blob/main/doc/03-fisheye-model-math.md
+
+# OpenCV Fisheye Model Math (derivation-focused)
+
+fisheye.js implements the OpenCV fisheye (Kannala–Brandt) model. This section derives the formulas used in the shader and tests.
+
+**Prerequisites:** `09-generic-camera-model-valid-region.md`  
+**Next:** `04-project-pipeline.md`
+
+![Fisheye mapping function illustration](images/fisheye_mapping_function_illustration.svg)
+
+Attribution: Wikimedia Commons, “Fisheye mapping function illustration” (CC BY-SA 3.0), https://commons.wikimedia.org/wiki/File:Fisheye_mapping_function_illustration.svg
+
+## 1. Geometry: angle from normalized radius
+
+From normalized coordinates `(u, v)` centered at the lens:
+
+```
+r = sqrt(u^2 + v^2)
+```
+
+For a ray at angle `theta` from the optical axis, the perspective relation is:
+
+```
+tan(theta) = r
+```
+
+Therefore:
+
+```
+theta = atan(r)
+```
+
+This is **geometric** and does not yet include fisheye distortion.
+
+## 2. Why the mapping is a polynomial in theta
+
+Let the lens mapping be a function of angle:
+
+```
+r_d = f(theta)
+```
+
+Physical symmetry implies:
+
+- The mapping depends only on `theta`, not on direction angle.
+- The mapping is **odd**: flipping the sign of `theta` flips the sign of `r_d`.
+
+An odd function can be represented by a power series of odd powers:
+
+```
+r_d = theta + a1*theta^3 + a2*theta^5 + a3*theta^7 + a4*theta^9 + ...
+```
+
+OpenCV truncates this series after the `theta^9` term.
+
+## 3. OpenCV fisheye (Kannala–Brandt) form
+
+OpenCV writes the polynomial as:
+
+```
+theta_d = theta * (1 + k1*theta^2 + k2*theta^4 + k3*theta^6 + k4*theta^8)
+```
+
+Expanding this gives the odd-power series:
+
+```
+theta_d = theta + k1*theta^3 + k2*theta^5 + k3*theta^7 + k4*theta^9
+```
+
+So the `k1..k4` values are the coefficients of the odd series terms.
+
+## 4. Why r_d = theta_d in OpenCV fisheye
+
+The OpenCV fisheye model is based on an **equidistant** baseline: radius is proportional to angle. The polynomial above models deviation from the ideal equidistant lens. Therefore the distorted radius is:
+
+```
+r_d = theta_d
+```
+
+This is the critical convention used in this project (and tested in `fisheye.spec.ts`). We do **not** use `tan(theta_d)` here.
+
+### 4.1 Why equidistant is chosen (intuition)
+
+Perspective uses `r = tan(theta)`, which grows rapidly near 90°. For wide‑angle lenses, this creates extreme stretching near the edges and is a poor fit to real fisheye lenses.
+
+Equidistant uses:
+
+```
+r = f * theta
+```
+
+This keeps angular spacing **linear**, which matches how many fisheye lenses are designed and makes calibration more stable.
+
+### 4.2 Numeric comparison (tan vs equidistant)
+
+Assume `f = 1`:
+
+```
+theta = 60°  -> tan(theta) ≈ 1.732,  equidistant r = 1.047
+theta = 85°  -> tan(theta) ≈ 11.430, equidistant r = 1.484
+```
+
+The perspective radius explodes near 90°, while equidistant remains bounded and smooth.
+
+## 7. From calibration data to k1..k4 (least squares sketch)
+
+Given observed pairs `(theta_i, r_d_i)`, we fit:
+
+```
+r_d_i ≈ theta_i + k1*theta_i^3 + k2*theta_i^5 + k3*theta_i^7 + k4*theta_i^9
+```
+
+This is linear in the unknowns `k1..k4`, so it can be solved with least squares.
+
+Define matrix `A` and vector `b`:
+
+```
+A_i = [ theta_i^3, theta_i^5, theta_i^7, theta_i^9 ]
+b_i = r_d_i - theta_i
+```
+
+Then solve:
+
+```
+min || A k - b ||^2
+```
+
+This is how calibration estimates the coefficients from measurements.
+
+## 5. From r_d back to a 2D point
+
+We scale the direction vector:
+
+```
+scale = r_d / r
+u' = u * scale
+v' = v * scale
+```
+
+If `r` is near zero, we keep `(u', v') = (0, 0)` to avoid division by zero.
+
+## 6. Coefficient intuition
+
+- `k1` controls the main curvature (most visible effect).
+- `k2..k4` refine the curve near the edges.
+- The model is **calibration-driven**: coefficients are fit to real data.
+
+Practical notes from this repo:
+
+- Typical `k1` range is about `-1.0` to `1.0`.
+- Do not reuse coefficients from other models (e.g. radial polynomial, UCM).
+
+## Visual summary
+
+```mermaid
+flowchart TD
+  Centered["Centered coord (u,v)"] --> Radius["r = sqrt(u^2+v^2)"]
+  Radius --> Theta["theta = atan(r)"]
+  Theta --> Poly["theta_d = theta * (1 + k1*theta^2 + ...)"]
+  Poly --> Distorted["r_d = theta_d"]
+  Distorted --> Scale["scale = r_d / r"]
+  Scale --> UVp["(u', v') = (u*scale, v*scale)"]
+```
+
+## What to remember
+
+- The mapping is derived from an **odd power series in theta**.
+- OpenCV fisheye uses **r_d = theta_d**, not `tan(theta_d)`.
+- Coefficients are calibration parameters, not arbitrary knobs.
+
+---
+
+# Project Mapping Pipeline (step-by-step)
+
+Source: https://github.com/gyeonghokim/fisheye.js/blob/main/doc/04-project-pipeline.md
+
+# Project Mapping Pipeline (step-by-step)
+
+This module walks through how fisheye.js transforms a `VideoFrame` using WebGPU compute shaders and the OpenCV fisheye model.
+
+**Prerequisites:** `03-fisheye-model-math.md`  
+**Next:** `05-configuration-tuning.md`
+
+![Fisheye mapping function illustration](images/fisheye_mapping_function_illustration.svg)
+
+Attribution: Wikimedia Commons, “Fisheye mapping function illustration” (CC BY-SA 3.0), https://commons.wikimedia.org/wiki/File:Fisheye_mapping_function_illustration.svg
+
+## 1. High-level pipeline
+
+1. Create a `Fisheye` instance with config (k1..k4, fov, center, zoom, output size).
+2. Initialize GPU resources (uniform buffer, input/output textures).
+3. Run a compute shader that maps each output pixel to an input sample.
+4. Read back the output texture into a `VideoFrame`.
+
+```mermaid
+flowchart LR
+  App["App code"] --> Config["FisheyeOptions"]
+  Config --> Uniforms["Uniform buffer (k1..k4,fov,center,zoom)"]
+  Uniforms --> Compute["Compute shader per output pixel"]
+  Compute --> OutputTex["Output texture"]
+  OutputTex --> Readback["GPU readback buffer"]
+  Readback --> VideoFrame["Output VideoFrame"]
+```
+
+## 2. Uniforms and parameters (from `src/fisheye.ts`)
+
+The shader uses a uniform struct containing:
+
+- `k1..k4` distortion coefficients
+- `fov` in degrees
+- `centerX`, `centerY` offsets
+- `zoom` factor
+- `width`, `height` output size
+- `inputWidth`, `inputHeight` input size
+
+The CPU side updates these values when you call `updateConfig()` or when a new input frame size is detected.
+
+## 3. Per-pixel mapping derivation
+
+For each output pixel `(x, y)`:
+
+### Step 1: Normalize pixel coordinates
+
+```
+u = (x / width  - 0.5) * 2
+v = (y / height - 0.5) * 2
+```
+
+### Step 2: Center shift
+
+```
+u_c = u - centerX
+v_c = v - centerY
+r = sqrt(u_c^2 + v_c^2)
+```
+
+### Step 3: FOV scaling
+
+The shader scales `r` so that the output corner corresponds to `FOV / 2`. Since the corner in normalized space has radius `sqrt(2)`:
+
+```
+scale_raw = tan((fov_rad / 2)) / sqrt(2)
+scale = min(scale_raw, 1.0)
+r_fov = r * scale
+```
+
+### Step 4: Angle and fisheye polynomial
+
+```
+theta = atan(r_fov)
+theta_d = theta * (1 + k1*theta^2 + k2*theta^4 + k3*theta^6 + k4*theta^8)
+```
+
+### Step 5: Distorted radius and zoom
+
+```
+r_d = theta_d
+r_zoom = r_d / zoom
+```
+
+### Step 6: Map to input texture
+
+```
+scale = r_zoom / r
+u' = u_c * scale
+v' = v_c * scale
+```
+
+Then convert back to texture coordinates and sample the input texture.
+
+## 4. Parallelism and performance
+
+Each output pixel is computed independently, which makes this a perfect fit for a compute shader. The GPU executes thousands of these mappings in parallel.
+
+## What to remember
+
+- The pipeline is **output-driven**: each output pixel samples an input pixel.
+- The FOV scaling step ties geometry to the requested viewing angle.
+- The polynomial matches the OpenCV fisheye model exactly.
+
+---
+
+# Configuration and Tuning Guide (with calibration context)
+
+Source: https://github.com/gyeonghokim/fisheye.js/blob/main/doc/05-configuration-tuning.md
+
+# Configuration and Tuning Guide (with calibration context)
+
+This module explains how each configuration parameter affects fisheye dewarping and how those parameters are **derived** or **tuned**.
+
+**Prerequisites:** `11-end-to-end-pipeline.md`  
+**Next:** `07-gpu-rendering-typegpu.md`
+
+![Lens mapping functions](images/lens_mapping_functions.svg)
+
+Attribution: Wikimedia Commons, “Lens mapping functions” (CC BY-SA 4.0), https://commons.wikimedia.org/wiki/File:Lens_mapping_functions.svg
+
+## 1. Parameters and meanings
+
+- `k1..k4`: OpenCV fisheye distortion coefficients.
+  - Typical `k1` range: about `-1.0` to `1.0`.
+  - These coefficients define the polynomial:
+    ```
+    theta_d = theta + k1*theta^3 + k2*theta^5 + k3*theta^7 + k4*theta^9
+    ```
+- `fov`: Field of view in degrees.
+  - Common values: `120` to `200`.
+  - Used to scale the normalized radius so the corner maps to `FOV/2`.
+- `centerX`, `centerY`: Lens center offsets in normalized coordinates.
+  - Range `-1.0` to `1.0`.
+  - Applied before radial mapping so the radius is computed around the correct center.
+- `zoom`: Scales the distorted radius after correction.
+  - `zoom > 1` zooms in, cropping edges.
+  - `zoom < 1` zooms out, showing more edge area.
+- `width`, `height`: Output resolution of the dewarped frame.
+
+## 2. Where k1..k4 come from (derivation path)
+
+In camera calibration, you typically have:
+
+- A set of 3D points (like a chessboard in real space)
+- Their corresponding observed 2D points in the image
+
+For each point, the angle `theta` from the optical axis can be computed based on the estimated camera pose. The measured 2D radius gives you `r_d`. The model says:
+
+```
+r_d = theta + k1*theta^3 + k2*theta^5 + k3*theta^7 + k4*theta^9
+```
+
+This becomes a **least squares fitting problem** for `k1..k4`:
+
+```
+minimize sum_i ( r_d(i) - (theta_i + k1*theta_i^3 + ... + k4*theta_i^9) )^2
+```
+
+So the coefficients are not arbitrary; they are **fit parameters** derived from calibration data.
+
+## 3. Start with known calibration
+
+If you have calibration parameters from OpenCV `fisheye::calibrate`, use them directly. Do not mix coefficients from other fisheye or radial models.
+
+## 4. Manual tuning workflow
+
+If you do not have calibration data, adjust in this order:
+
+1. **Center offsets** (`centerX`, `centerY`)
+2. **FOV**
+3. **k1**, then **k2..k4**
+4. **zoom** for final framing
+
+```mermaid
+flowchart TD
+  Start["Start with defaults"] --> Center["Adjust centerX/centerY"]
+  Center --> Fov["Set FOV for global scale"]
+  Fov --> K1["Tune k1 for main curvature"]
+  K1 --> Krest["Fine-tune k2..k4"]
+  Krest --> Zoom["Adjust zoom for framing"]
+```
+
+## 5. Common symptoms and fixes
+
+- **Straight lines still curve**: adjust `k1` slightly (small steps).
+- **Image feels too wide/narrow**: adjust `fov`.
+- **Warp is off-center**: adjust `centerX`, `centerY`.
+- **Edges clipped**: reduce `zoom` or reduce `fov`.
+
+## 6. Example config
+
+```ts
+const dewarper = new Fisheye({
+  k1: 0.3,
+  k2: 0.0,
+  k3: 0.0,
+  k4: 0.0,
+  fov: 180,
+  centerX: 0,
+  centerY: 0,
+  zoom: 1.0,
+  width: 1280,
+  height: 720,
+});
+```
+
+## What to remember
+
+- `k1..k4` are **calibration coefficients**, not simple knobs.
+- FOV sets the global angle scale.
+- Center offsets should be fixed before fine curvature tuning.
+
+---
+
+# Validation and Testing (math correctness)
+
+Source: https://github.com/gyeonghokim/fisheye.js/blob/main/doc/06-validation-testing.md
+
+# Validation and Testing (math correctness)
+
+This module explains how the project validates the fisheye model and the GPU pipeline to ensure the derivations are implemented correctly.
+
+**Prerequisites:** `07-gpu-rendering-typegpu.md`  
+**Next:** end
+
+![Spherical coordinate system](images/spherical_coordinate_system.svg)
+
+Attribution: Wikimedia Commons, “Spherical coordinate system” (CC BY-SA 4.0), https://commons.wikimedia.org/wiki/File:Spherical_coordinate_system.svg
+
+## 1. Why validation matters
+
+Fisheye models differ by convention. A single mistake (for example using `tan(theta_d)` instead of `theta_d`) produces a visually plausible but **wrong** result. Tests encode the correct convention.
+
+## 2. Reference implementation used for tests
+
+In `src/fisheye.spec.ts`, the test function `opencvFisheyeForward()` computes:
+
+```
+theta = atan(r)
+theta_d = theta + k1*theta^3 + k2*theta^5 + k3*theta^7 + k4*theta^9
+scale = theta_d / r
+(x', y') = scale * (a, b)
+```
+
+Then it checks that:
+
+```
+r_d = sqrt(x'^2 + y'^2) = theta_d
+```
+
+This is the formal OpenCV fisheye rule used by the project.
+
+```mermaid
+flowchart LR
+  Inputs["(a,b), k1..k4"] --> Theta["theta = atan(r)"]
+  Theta --> ThetaD["theta_d polynomial"]
+  ThetaD --> Scale["scale = theta_d / r"]
+  Scale --> XY["(x', y')"]
+  XY --> Check["r_d = |(x',y')| = theta_d"]
+```
+
+## 3. End-to-end validation
+
+The `test/dewarp.spec.ts` test renders a full dewarp and compares against known-good fixtures. This detects:
+
+- Shader regressions or math mistakes
+- Resource binding bugs
+- Incorrect uniform updates or texture sizes
+
+## 4. When tests fail, what to inspect
+
+1. **Model mismatch**: check the polynomial and the `r_d = theta_d` convention.
+2. **Uniform values**: verify that `k1..k4`, `fov`, `center`, and `zoom` are correct.
+3. **FOV scaling**: confirm the corner scaling (`sqrt(2)` factor) is applied.
+
+## What to remember
+
+- Tests encode the **derivation** in executable form.
+- If tests pass, the implementation matches the intended model.
+
+---
+
+# GPU Rendering and TypeGPU Abstraction (with details)
+
+Source: https://github.com/gyeonghokim/fisheye.js/blob/main/doc/07-gpu-rendering-typegpu.md
+
+# GPU Rendering and TypeGPU Abstraction (with details)
+
+This module explains how GPU work is executed in WebGPU and how TypeGPU simplifies the workflow used by this project.
+
+**Prerequisites:** `05-configuration-tuning.md`  
+**Next:** `06-validation-testing.md`
+
+![Graphics pipeline diagram](images/graphics_pipeline_de.svg)
+
+Attribution: Wikimedia Commons, “Graphics pipeline de” (Public Domain), https://commons.wikimedia.org/wiki/File:Graphics_pipeline_de.svg
+
+Note: the image shows a full render pipeline. fisheye.js uses the **compute** path, which is a simpler subset focused on compute passes and buffer/texture resources.
+
+## 1. WebGPU execution model (compute path)
+
+WebGPU is a command-based API. For compute work, the conceptual steps are:
+
+1. **Create a device** and a **queue**.
+2. **Allocate resources** (buffers, textures).
+3. **Define a bind group layout** (what the shader expects).
+4. **Create a compute pipeline** (shader + layout).
+5. **Encode commands** (compute pass) and submit them.
+
+Typical command flow in WebGPU:
+
+- `device.createCommandEncoder()`
+- `encoder.beginComputePass()`
+- `pass.setPipeline(pipeline)`
+- `pass.setBindGroup(0, bindGroup)`
+- `pass.dispatchWorkgroups(...)`
+- `pass.end()`
+- `device.queue.submit([encoder.finish()])`
+
+This is the underlying flow that TypeGPU wraps.
+
+## 2. TypeGPU abstractions used here
+
+TypeGPU adds **typed layouts** and **typed resource access**:
+
+- `d.struct(...)` defines a uniform buffer shape.
+- `tgpu.bindGroupLayout(...)` defines bindings with types.
+- `root.createBuffer(...)` creates buffers with a data schema.
+- `createGuardedComputePipeline(...)` creates a compute pipeline from a TypeScript function.
+- `layout.$` gives typed access to buffers/textures inside shader code.
+
+These eliminate a large class of “layout mismatch” bugs.
+
+## 3. Mapping WebGPU concepts to TypeGPU
+
+```mermaid
+flowchart LR
+  WebGPU["WebGPU concepts"] -->|Device| Root["TypeGPU root (tgpu.init)"]
+  WebGPU -->|BindGroupLayout| Layout["tgpu.bindGroupLayout(...)"]
+  WebGPU -->|Buffers| Buffers["root.createBuffer(...).$usage(...)"]
+  WebGPU -->|ComputePipeline| Pipeline["root.~unstable.createGuardedComputePipeline(...)"]
+  WebGPU -->|BindGroup| BindGroup["root.createBindGroup(layout, resources)"]
+```
+
+## 4. How fisheye.js uses TypeGPU
+
+At a high level:
+
+1. **Define layout**: input texture, output texture, and uniform buffer.
+2. **Create buffers/textures**: size and usage are inferred from TypeGPU data types.
+3. **Create compute pipeline**: write the shader in TypeScript with `"use gpu"`.
+4. **Bind resources**: `layout.$` gives typed access to uniforms and textures.
+5. **Dispatch threads**: one thread per output pixel.
+
+This gives us a minimal and safe compute pipeline to run the dewarp math in parallel.
+
+## 5. Key official references (Context7)
+
+- TypeGPU bind group layouts and typed access: https://context7.com/software-mansion/typegpu/llms.txt
+- TypeGPU pipelines and guarded compute pipelines: https://context7.com/software-mansion/typegpu/llms.txt
+- WebGPU command encoding and compute pipeline basics: https://context7.com/gpuweb/gpuweb/llms.txt
+
+## What to remember
+
+- WebGPU is **encode → submit**.
+- TypeGPU provides **typed resource layouts** and **TypeScript shader access**.
+- fisheye.js uses **compute shaders**, not render pipelines.
+
+---
+
+# World Space and Camera Space Transforms (with derivations)
+
+Source: https://github.com/gyeonghokim/fisheye.js/blob/main/doc/08-world-camera-transforms.md
+
+# World Space and Camera Space Transforms (with derivations)
+
+This module teaches how **world space** and **camera space** are related using matrix operations. The goal is for a first-year student who just learned linear algebra to derive the formulas step by step.
+
+**Prerequisites:** `01-linear-algebra-foundations.md`  
+**Next:** `02-camera-lens-basics.md`
+
+![Central projection of a real camera](images/central_projection_of_a_real_camera.svg)
+
+Attribution: Wikimedia Commons, “Central projection of a real camera” (CC BY-SA 4.0), https://commons.wikimedia.org/wiki/File:Central_projection_of_a_real_camera.svg
+
+![Principles of imaging geometry of a camera](images/principles_of_imaging_geometry_of_a_camera.svg)
+
+Attribution: Wikimedia Commons, “Principles of imaging geometry of a camera” (CC BY-SA 4.0), https://commons.wikimedia.org/wiki/File:Principles_of_imaging_geometry_of_a_camera.svg
+
+## 1. Coordinate frames and basis vectors
+
+Any coordinate system can be described by **basis vectors**:
+
+- World basis: `X_w = (1,0,0)`, `Y_w = (0,1,0)`, `Z_w = (0,0,1)`
+- Camera basis: `X_c`, `Y_c`, `Z_c` (the camera's right, up, forward)
+
+If you stack the camera basis vectors as columns in a matrix:
+
+```
+R = [ X_c  Y_c  Z_c ]
+```
+
+then `R` **rotates** a vector from camera space into world space. Its inverse `R^-1` rotates world into camera space.
+
+Because `R` is a pure rotation, it is orthonormal, so:
+
+```
+R^-1 = R^T
+```
+
+## 2. Deriving the 2D rotation matrix
+
+Let a vector `(x, y)` rotate by angle `theta` to `(x', y')`. Using the unit circle:
+
+```
+x' = x cos(theta) - y sin(theta)
+y' = x sin(theta) + y cos(theta)
+```
+
+This can be written as a matrix:
+
+```
+[x']   [ cos(theta)  -sin(theta) ] [x]
+[y'] = [ sin(theta)   cos(theta) ] [y]
+```
+
+This is the 2D rotation matrix.
+
+## 3. 2D translation via homogeneous coordinates
+
+Translation cannot be written as a 2x2 matrix multiply. We add a dimension:
+
+```
+[x']   [ 1  0  tx ] [x]
+[y'] = [ 0  1  ty ] [y]
+[1 ]   [ 0  0   1 ] [1]
+```
+
+This 3x3 matrix performs translation by `(tx, ty)`.
+
+## 4. 3D rotation matrices
+
+In 3D, rotations around axes are:
+
+```
+Rx(theta) = [ 1     0            0
+              0  cos(theta)  -sin(theta)
+              0  sin(theta)   cos(theta) ]
+
+Ry(theta) = [  cos(theta)  0  sin(theta)
+               0           1   0
+             -sin(theta)  0  cos(theta) ]
+
+Rz(theta) = [ cos(theta)  -sin(theta)  0
+              sin(theta)   cos(theta)  0
+              0            0           1 ]
+```
+
+A general 3D rotation can be built by multiplying these in a chosen order.
+
+## 5. World -> camera derivation (extrinsics)
+
+Let:
+
+- `C` be the camera center in world coordinates
+- `R` be the rotation matrix whose columns are camera basis vectors
+
+To express a world point `X_w` in camera coordinates:
+
+1. **Translate** world point to camera origin:
+   ```
+   X_w' = X_w - C
+   ```
+2. **Rotate** into camera basis:
+   ```
+   X_c = R^T * X_w'
+   ```
+
+So:
+
+```
+X_c = R^T (X_w - C)
+```
+
+This is the standard **extrinsic transform**.
+
+Define:
+
+```
+t = -R^T C
+```
+
+Then:
+
+```
+X_c = R^T X_w + t
+```
+
+## 6. Homogeneous 4x4 form
+
+Using homogeneous coordinates `(x, y, z, 1)`:
+
+```
+[X_c]   [ R^T  t ] [X_w]
+[ 1 ] = [ 0    1 ] [ 1 ]
+```
+
+This 4x4 matrix combines rotation and translation into a single linear transform.
+
+## 7. Camera -> world (inverse transform)
+
+The inverse is:
+
+```
+X_w = R X_c + C
+```
+
+Because `R` is orthonormal, the inverse rotation is just `R` (not `R^T`) when going from camera to world.
+
+## 8. Connection to projection
+
+For a pinhole camera, a 3D camera-space point `(X_c, Y_c, Z_c)` projects to:
+
+```
+x = X_c / Z_c
+y = Y_c / Z_c
+```
+
+This gives normalized image coordinates `(x, y)`. fisheye.js then converts these to `r = sqrt(x^2 + y^2)` and uses the fisheye model to map angle to radius.
+
+So the full pipeline is:
+
+```
+World point -> camera transform -> normalized coordinates -> fisheye mapping
+```
+
+```mermaid
+flowchart LR
+  Xw["World point X_w"] --> Shift["Translate: X_w - C"]
+  Shift --> Rotate["Rotate: R^T (X_w - C)"]
+  Rotate --> Norm["Normalize by Z_c"]
+  Norm --> Fisheye["Fisheye model"]
+```
+
+## 9. Worked 2D example (from scratch)
+
+Let a 2D camera be at `C = (2, 1)` and rotated by `theta = 90°`. For a world point `X_w = (3, 1)`:
+
+1. Translate: `X_w' = (3,1) - (2,1) = (1,0)`
+2. Rotate 90°:
+   ```
+   R(90°) = [ 0 -1
+              1  0 ]
+   ```
+   ```
+   X_c = R^T X_w' = [ 0 1
+                      -1 0 ] [1,0] = (0, -1)
+   ```
+
+So the point ends up at `(0, -1)` in camera coordinates.
+
+## 10. Worked 3D example (numeric)
+
+Let:
+
+- Camera center `C = (1, 2, 3)`
+- Camera basis (world axes) be a 90° rotation around Z:
+  ```
+  R = [ 0 -1  0
+        1  0  0
+        0  0  1 ]
+  ```
+- World point `X_w = (2, 4, 3)`
+
+Step 1: translate to camera origin:
+
+```
+X_w' = X_w - C = (1, 2, 0)
+```
+
+Step 2: rotate into camera frame:
+
+```
+R^T = [ 0  1  0
+       -1  0  0
+        0  0  1 ]
+```
+
+```
+X_c = R^T X_w' = (2, -1, 0)
+```
+
+So in camera coordinates, the point is `(2, -1, 0)`. The sign flip is exactly what a 90° rotation should produce.
+
+## What to remember
+
+- Rotation matrices are **basis changes**.
+- World -> camera uses `R^T (X_w - C)`.
+- Homogeneous coordinates let you combine rotation + translation.
+
+---
+
+# Generic Camera Model and Fisheye Valid Region
+
+Source: https://github.com/gyeonghokim/fisheye.js/blob/main/doc/09-generic-camera-model-valid-region.md
+
+# Generic Camera Model and Fisheye Valid Region
+
+This module introduces the **generic camera model** and explains how to determine the **valid region** of a fisheye image and how dewarping is applied.
+
+**Prerequisites:** `10-calibration-intrinsics-extrinsics.md`  
+**Next:** `03-fisheye-model-math.md`
+
+## 1. Generic camera model (core idea)
+
+A generic camera model can be written as:
+
+```
+X_w -> X_c -> (x, y) -> r -> r_d -> (u, v) -> pixel
+```
+
+Where:
+
+- `X_w`: 3D world point
+- `X_c`: 3D camera point (after extrinsic transform)
+- `(x, y)`: normalized coordinates (pinhole projection)
+- `r`: radius in normalized plane
+- `r_d`: distorted radius from the lens model
+- `(u, v)`: distorted normalized coordinates
+
+This is “generic” because the **lens mapping** can be any function `r_d = f(theta)` or `r_d = f(r)`.
+
+## 1.1 Full step-by-step projection (single flow)
+
+Given a world point `X_w`:
+
+```
+X_c = R^T (X_w - C)
+x = X_c / Z_c
+y = Y_c / Z_c
+r = sqrt(x^2 + y^2)
+theta = atan(r)
+r_d = f(theta)
+x_d = x * (r_d / r)
+y_d = y * (r_d / r)
+[u v 1]^T = K [x_d y_d 1]^T
+```
+
+This is the complete chain from 3D world to 2D pixel coordinates.
+
+## 1.2 Full numeric example (world -> pixel)
+
+Assume:
+
+- Camera center `C = (1, 2, 3)`
+- Rotation `R = I` (camera aligned to world)
+- Intrinsics:
+  ```
+  fx = 800, fy = 800, cx = 320, cy = 240
+  ```
+- World point `X_w = (2, 4, 7)`
+- Fisheye mapping uses equidistant baseline: `r_d = theta`
+
+Step 1: world -> camera:
+
+```
+X_c = X_w - C = (1, 2, 4)
+```
+
+Step 2: perspective normalize:
+
+```
+x = X_c / Z_c = 1 / 4 = 0.25
+y = Y_c / Z_c = 2 / 4 = 0.5
+```
+
+Step 3: radius and angle:
+
+```
+r = sqrt(0.25^2 + 0.5^2) = sqrt(0.3125) ≈ 0.559
+theta = atan(r) ≈ 0.510 radians
+```
+
+Step 4: equidistant mapping:
+
+```
+r_d = theta ≈ 0.510
+scale = r_d / r ≈ 0.510 / 0.559 ≈ 0.913
+x_d = x * scale ≈ 0.25 * 0.913 ≈ 0.228
+y_d = y * scale ≈ 0.5 * 0.913 ≈ 0.456
+```
+
+Step 5: pixel projection:
+
+```
+u = fx * x_d + cx = 800 * 0.228 + 320 ≈ 502.4
+v = fy * y_d + cy = 800 * 0.456 + 240 ≈ 604.8
+```
+
+Final pixel coordinates: approximately `(u, v) = (502, 605)`.
+
+## 2. Pinhole projection with intrinsics
+
+From camera coordinates `(X_c, Y_c, Z_c)`:
+
+```
+x = X_c / Z_c
+y = Y_c / Z_c
+```
+
+The intrinsics matrix `K` maps these to pixel coordinates:
+
+```
+K = [ fx  0  cx
+      0  fy  cy
+      0   0   1 ]
+```
+
+```
+[u]   [fx  0  cx] [x]
+[v] = [ 0 fy  cy] [y]
+[1]   [ 0  0   1] [1]
+```
+
+This is the standard **pinhole camera model**.
+
+## 2.1 Radial and tangential distortion (generic model)
+
+Most calibration models add two distortion components:
+
+### Radial distortion (barrel/pincushion)
+
+Radial distortion depends on radius `r = sqrt(x^2 + y^2)`:
+
+```
+x_radial = x * (1 + k1*r^2 + k2*r^4 + k3*r^6)
+y_radial = y * (1 + k1*r^2 + k2*r^4 + k3*r^6)
+```
+
+**Why this form?** The distortion is **radially symmetric**, so it must depend only on `r`. A smooth symmetric function can be represented by a power series in `r^2`.
+
+![Barrel distortion](images/barrel_distortion.svg)
+
+Attribution: Wikimedia Commons, “Barrel distortion” (Public Domain), https://commons.wikimedia.org/wiki/File:Barrel_distortion.svg
+
+![Pincushion distortion](images/pincushion_distortion.svg)
+
+Attribution: Wikimedia Commons, “Pincushion distortion” (Public Domain), https://commons.wikimedia.org/wiki/File:Pincushion_distortion.svg
+
+### Tangential distortion (decentering)
+
+Tangential distortion occurs when lens elements are slightly off-center. With coefficients `p1`, `p2`:
+
+```
+x_tan = 2*p1*x*y + p2*(r^2 + 2*x^2)
+y_tan = p1*(r^2 + 2*y^2) + 2*p2*x*y
+```
+
+**Why this form?** If the lens is slightly decentered, the distortion depends on **cross terms** (`x*y`) and axis‑biased terms (`x^2`, `y^2`). These are the lowest‑order terms that model asymmetric shifts.
+
+The final distorted coordinate is:
+
+```
+x_d = x_radial + x_tan
+y_d = y_radial + y_tan
+```
+
+This generic radial+tangential model is widely used in camera calibration.
+
+## 3. Adding a generic lens mapping
+
+Replace the pinhole `r = tan(theta)` with a generic mapping:
+
+```
+r_d = f(theta)
+```
+
+Examples:
+
+- Perspective: `r = f * tan(theta)`
+- Equidistant: `r = f * theta`
+- OpenCV fisheye: `r_d = theta * (1 + k1*theta^2 + k2*theta^4 + k3*theta^6 + k4*theta^8)`
+
+fisheye.js uses the OpenCV fisheye model, so the lens mapping is polynomial in `theta`.
+
+## 4. Fisheye valid region (image circle)
+
+Fisheye images often form a **circular image** inside a rectangular frame. The valid region is typically:
+
+```
+r <= r_max
+```
+
+where `r_max` is the radius of the image circle.
+
+### 4.1 How to estimate r_max
+
+Practical methods:
+
+1. **Vignetting boundary**: detect where brightness sharply falls off (see `02-camera-lens-basics.md`).
+2. **Edge detection**: find the circular boundary of the lens image.
+3. **Calibration data**: use known circle radius from camera specs or calibration.
+
+Once you know `r_max`, you can mask or clamp pixels outside this radius.
+
+## 5. Dewarping method (inverse mapping)
+
+fisheye.js uses **output-driven sampling**:
+
+1. For each output pixel, compute its normalized coordinate.
+2. Convert to angle `theta = atan(r)`.
+3. Apply the OpenCV polynomial to get `theta_d`.
+4. Compute distorted radius `r_d = theta_d`.
+5. Map to the source pixel and sample.
+
+This is the **inverse mapping** method, which avoids holes in the output image.
+
+```mermaid
+flowchart LR
+  OutputPx["Output pixel"] --> Norm["Normalize to (u,v)"]
+  Norm --> Theta["theta = atan(r)"]
+  Theta --> Distort["r_d = f(theta)"]
+  Distort --> Sample["Sample input"]
+```
+
+## What to remember
+
+- The generic camera model is “projection + lens mapping.”
+- Pinhole projection uses the intrinsics matrix `K`.
+- The fisheye valid region is often a circle; detect it via vignetting or edges.
+- Dewarping is usually done with **inverse mapping** per output pixel.
+
+---
+
+# Calibration: Intrinsics, Extrinsics, and Pose (step-by-step)
+
+Source: https://github.com/gyeonghokim/fisheye.js/blob/main/doc/10-calibration-intrinsics-extrinsics.md
+
+# Calibration: Intrinsics, Extrinsics, and Pose (step-by-step)
+
+This module explains **camera calibration** from the ground up: how intrinsics and extrinsics are defined, how they are derived, how to update intrinsics when you crop or resize images, and how to interpret rotation/translation in practice.
+
+**Prerequisites:** `02-camera-lens-basics.md`  
+**Next:** `09-generic-camera-model-valid-region.md`
+
+## 1. Why calibration exists
+
+Calibration answers two questions:
+
+1. **How does the camera project 3D to 2D?** (intrinsics)
+2. **Where is the camera in the world?** (extrinsics)
+
+The calibrated camera model is the bridge between **geometry** and **pixels**.
+
+## 2. Intrinsic matrix K (what it means)
+
+For a 3D point in camera coordinates `(X_c, Y_c, Z_c)`, the ideal pinhole projection is:
+
+```
+x = X_c / Z_c
+y = Y_c / Z_c
+```
+
+Then intrinsics map normalized `(x, y)` into pixels `(u, v)`:
+
+```
+K = [ fx  0  cx
+      0  fy  cy
+      0   0   1 ]
+```
+
+```
+[u]   [fx  0  cx] [x]
+[v] = [ 0 fy  cy] [y]
+[1]   [ 0  0   1] [1]
+```
+
+### 2.1 How K is derived
+
+- `fx = f / s_x` where `f` is focal length and `s_x` is pixel size in x.
+- `fy = f / s_y` where `s_y` is pixel size in y.
+- `(cx, cy)` is the principal point (projection of optical axis on the image).
+
+So **intrinsics are the physical lens + sensor geometry expressed in pixels**.
+
+## 3. Extrinsic matrix [R | t] (what it means)
+
+Extrinsics convert **world coordinates** to **camera coordinates**.
+
+Let:
+
+- `C` = camera center in world coordinates
+- `R` = rotation from camera basis to world basis
+
+Then for a world point `X_w`:
+
+```
+X_c = R^T (X_w - C)
+```
+
+Define:
+
+```
+t = -R^T C
+```
+
+Then:
+
+```
+X_c = R^T X_w + t
+```
+
+So the extrinsic matrix is:
+
+```
+[R^T | t]
+```
+
+## 4. Full projection equation (homogeneous)
+
+Combine intrinsics and extrinsics:
+
+```
+P = K [R^T | t]
+```
+
+For a world point in homogeneous coordinates `(X_w, Y_w, Z_w, 1)`:
+
+```
+s * [u v 1]^T = P * [X_w Y_w Z_w 1]^T
+```
+
+This is the standard **camera projection model**.
+
+## 5. Updating intrinsics for crop and resize
+
+Calibration is valid for the image size used. If you crop or resize, you must adjust `K`.
+
+### 5.1 Resize (scale by sx, sy)
+
+If you resize the image by `sx` (width) and `sy` (height):
+
+```
+fx' = fx * sx
+fy' = fy * sy
+cx' = cx * sx
+cy' = cy * sy
+```
+
+### 5.2 Crop (offset by dx, dy)
+
+If you crop starting at `(dx, dy)` from the top-left:
+
+```
+cx' = cx - dx
+cy' = cy - dy
+```
+
+`fx` and `fy` do not change for a pure crop.
+
+### 5.3 Crop then resize
+
+Do crop first, then apply resize scaling:
+
+```
+cx' = (cx - dx) * sx
+cy' = (cy - dy) * sy
+fx' = fx * sx
+fy' = fy * sy
+```
+
+### 5.4 Numeric example (crop + resize)
+
+Assume:
+
+- Original image: 1280x720
+- `fx = 900`, `fy = 900`, `cx = 640`, `cy = 360`
+- Crop: `(dx, dy) = (100, 50)` to size 1000x600
+- Resize to 500x300, so `sx = 0.5`, `sy = 0.5`
+
+Step 1: crop:
+
+```
+cx_crop = 640 - 100 = 540
+cy_crop = 360 - 50 = 310
+```
+
+Step 2: resize:
+
+```
+fx' = 900 * 0.5 = 450
+fy' = 900 * 0.5 = 450
+cx' = 540 * 0.5 = 270
+cy' = 310 * 0.5 = 155
+```
+
+Final intrinsics:
+
+```
+fx' = 450, fy' = 450, cx' = 270, cy' = 155
+```
+
+## 6. Pose from rotation + translation
+
+Extrinsics encode pose:
+
+- **Rotation** gives camera orientation
+- **Translation** gives camera position
+
+If you have `[R^T | t]`, you can recover camera center:
+
+```
+C = -R t
+```
+
+This tells you where the camera sits in world coordinates.
+
+## 6.1 Numeric pose example (recover camera center)
+
+Let:
+
+```
+R = [ 1  0  0
+      0  0 -1
+      0  1  0 ]
+t = [ 0.5, -1.0, 2.0 ]^T
+```
+
+Then:
+
+```
+C = -R t
+```
+
+Compute:
+
+```
+R t = (0.5, -2.0, -1.0)
+C = (-0.5, 2.0, 1.0)
+```
+
+So the camera center is at `(-0.5, 2.0, 1.0)` in world coordinates.
+
+## 7. Roll, pitch, yaw (FLU -> RDF)
+
+Different systems use different axis conventions. A common mapping:
+
+- **FLU**: Forward, Left, Up
+- **RDF**: Right, Down, Forward
+
+One conversion is a fixed axis swap and sign flip. For example:
+
+```
+R_FLU_to_RDF = [ 0 -1  0
+                 0  0 -1
+                 1  0  0 ]
+```
+
+Then:
+
+```
+v_RDF = R_FLU_to_RDF * v_FLU
+```
+
+Once in a consistent axis convention, roll/pitch/yaw can be extracted from `R` (assuming ZYX order):
+
+```
+yaw   = atan2(R21, R11)
+pitch = asin(-R31)
+roll  = atan2(R32, R33)
+```
+
+This is a standard decomposition; the order must match your convention.
+
+### 7.1 Practical mount interpretation example
+
+If you extract:
+
+```
+roll  = 1.5°
+pitch = -2.1°
+yaw   = 0.3°
+```
+
+Then the camera is:
+
+- Rolled slightly clockwise
+- Pitched downward by about 2 degrees
+- Yawed slightly to the right
+
+This helps diagnose sensor mounting errors in the field.
+
+### 7.2 Numeric extraction example (ZYX order)
+
+Assume:
+
+```
+R = [ 0.999  0.020  0.030
+     -0.019  0.999 -0.040
+     -0.031  0.039  0.998 ]
+```
+
+Compute (ZYX):
+
+```
+yaw   = atan2(R21, R11) = atan2(-0.019, 0.999) ≈ -1.09°
+pitch = asin(-R31)      = asin(0.031) ≈ 1.78°
+roll  = atan2(R32, R33) = atan2(0.039, 0.998) ≈ 2.24°
+```
+
+So the camera is yawed slightly left, pitched slightly up, and rolled slightly clockwise.
+
+## 8. Calibration workflow (checkerboard)
+
+1. Capture 10–30 images of a checkerboard at different angles/distances.
+2. Detect corners in each image (sub‑pixel refinement improves accuracy).
+3. Solve for intrinsics and distortion coefficients by minimizing reprojection error.
+4. Solve for extrinsics per image (camera pose for each view).
+5. Validate with a held‑out image: projected points should align with observed corners.
+
+This is the practical process that yields `K`, distortion coefficients, and `R, t`.
+
+![Checkerboard pattern](images/checkerboard_pattern.svg)
+
+Attribution: Wikimedia Commons, “Checkerboard pattern” (Public Domain), https://commons.wikimedia.org/wiki/File:Checkerboard_pattern.svg
+
+## 9. Reprojection error (why optimization works)
+
+Calibration minimizes the reprojection error:
+
+```
+e_i = || u_i_observed - u_i_projected ||^2
+```
+
+The objective is:
+
+```
+minimize sum_i e_i
+```
+
+This turns calibration into a least‑squares optimization problem.
+
+### 9.1 Numeric reprojection example
+
+Assume one observed point:
+
+```
+u_observed = (500, 300)
+u_projected = (492, 308)
+```
+
+Then the squared error is:
+
+```
+e = (500 - 492)^2 + (300 - 308)^2 = 8^2 + (-8)^2 = 128
+```
+
+The optimizer reduces these errors across all points and images.
+
+## 10. Common failure modes (and fixes)
+
+- **All images from same angle**: add more varied viewpoints.
+- **Checkerboard too small**: use a larger pattern to increase signal.
+- **Blurry corners**: increase shutter speed or use tripod.
+- **Wrong axis convention**: verify FLU/RDF mapping before interpreting pose.
+
+### 10.1 Visual examples of failure causes
+
+![Blur example](images/blur_img.png)
+
+Attribution: Wikimedia Commons, “Blur img” (CC BY-SA 4.0), https://commons.wikimedia.org/wiki/File:Blur_img.png
+
+![Brightness/contrast/gamma example](images/brightness_contrast_gamma.png)
+
+Attribution: Wikimedia Commons, “Brightness Contrast Gamma” (CC BY-SA 3.0), https://commons.wikimedia.org/wiki/File:Brightness_Contrast_Gamma.png
+
+![Underexposed example](images/underexposed_photo.jpg)
+
+Attribution: Wikimedia Commons, “Underexposed photo” (CC BY-SA 4.0), https://commons.wikimedia.org/wiki/File:Underexposed_photo.JPG
+
+![Overexposed example](images/overexposed_photo.jpg)
+
+Attribution: Wikimedia Commons, “Overexposed photo” (CC BY-SA 4.0), https://commons.wikimedia.org/wiki/File:Overexposed_photo.JPG
+
+![Motion blur example](images/police_motorcycle_motion_blur.jpg)
+
+Attribution: Wikimedia Commons, “Police Motorcycle motion blur in Manhattan NYC” (CC BY-SA 2.0), https://commons.wikimedia.org/wiki/File:Police_Motorcycle_motion_blur_in_Manhattan_NYC.jpg
+
+![Exposure comparison example](images/photo_tree_exposure_compare.jpg)
+
+Attribution: Wikimedia Commons, “Photo of a tree as overexposed - normal - underexposed” (CC0), https://commons.wikimedia.org/wiki/File:Photo_of_a_tree_as_overexposed_-_normal_-_underexposed.jpg
+
+## 8. Practical interpretation (sensor mount alignment)
+
+If the sensor is tilted or rotated:
+
+- `R` captures the tilt.
+- You can compute roll/pitch/yaw to interpret it in degrees.
+- This allows you to measure **mount misalignment** (e.g., camera is pitched 2.1° down).
+
+This is useful for:
+
+- verifying sensor installation
+- compensating for mounting errors
+- comparing calibration results across devices
+
+## 9. Where this fits in fisheye.js
+
+fisheye.js uses a calibrated **lens model** (the OpenCV fisheye polynomial). In a full pipeline, you would:
+
+1. Transform world -> camera (extrinsics)
+2. Project to normalized `(x, y)`
+3. Apply fisheye mapping to get `(u, v)`
+4. Sample the fisheye image
+
+The calibration parameters govern steps 1–3.
+
+## What to remember
+
+- Intrinsics map normalized rays to pixels.
+- Extrinsics map world points into the camera frame.
+- Crop and resize **must** update K.
+- Rotation + translation define camera pose and mounting alignment.
+
+---
+
+# End-to-End Example and Checklist
+
+Source: https://github.com/gyeonghokim/fisheye.js/blob/main/doc/11-end-to-end-pipeline.md
+
+# End-to-End Example and Checklist
+
+This module is a single, complete walkthrough from world coordinates to output pixels. It ties together the math in one place.
+
+**Prerequisites:** `04-project-pipeline.md`  
+**Next:** `05-configuration-tuning.md`
+
+## 1. Full formula chain (one screen)
+
+```
+X_c = R^T (X_w - C)
+x = X_c / Z_c
+y = Y_c / Z_c
+r = sqrt(x^2 + y^2)
+theta = atan(r)
+r_d = f(theta)  // fisheye mapping
+x_d = x * (r_d / r)
+y_d = y * (r_d / r)
+[u v 1]^T = K [x_d y_d 1]^T
+```
+
+If you can follow every line above, you understand the full pipeline.
+
+## 2. Numeric example (start to finish)
+
+Assume:
+
+- `C = (1, 2, 3)`
+- `R = I`
+- `K = [[800, 0, 320], [0, 800, 240], [0, 0, 1]]`
+- `X_w = (2, 4, 7)`
+- Equidistant mapping: `r_d = theta`
+
+Step 1: world -> camera:
+
+```
+X_c = (1, 2, 4)
+```
+
+Step 2: normalize:
+
+```
+x = 1/4 = 0.25
+y = 2/4 = 0.5
+```
+
+Step 3: radius + angle:
+
+```
+r = sqrt(0.25^2 + 0.5^2) ≈ 0.559
+theta = atan(r) ≈ 0.510
+```
+
+Step 4: fisheye mapping:
+
+```
+r_d = theta ≈ 0.510
+scale = r_d / r ≈ 0.913
+x_d ≈ 0.228
+y_d ≈ 0.456
+```
+
+Step 5: pixels:
+
+```
+u = 800*0.228 + 320 ≈ 502
+v = 800*0.456 + 240 ≈ 605
+```
+
+Final pixel: `(u, v) ≈ (502, 605)`.
+
+## 3. Quick checklist (debug order)
+
+1. **Units**: angles in radians, pixels in integers.
+2. **Axes**: confirm world vs camera axes (FLU/RDF).
+3. **K update**: crop/resize applied correctly.
+4. **Mapping**: `r_d = theta_d` for OpenCV fisheye.
+5. **Center**: lens center offsets applied before radius.
+
+## 4. One‑page flow summary
+
+```mermaid
+flowchart LR
+  Xw["World point X_w"] --> Cam["X_c = R^T (X_w - C)"]
+  Cam --> Norm["x = X_c/Z_c, y = Y_c/Z_c"]
+  Norm --> Theta["theta = atan(r)"]
+  Theta --> Map["r_d = f(theta)"]
+  Map --> Dist["x_d = x * r_d/r"]
+  Dist --> Pix["[u v 1]^T = K [x_d y_d 1]^T"]
+```
+
+## 4. Interpretation
+
+- If the result is too wide: check FOV or `fx/fy`.
+- If the image is off-center: check `(cx, cy)` or `(centerX, centerY)`.
+- If edges look wrong: verify `r_d = theta_d` and zoom.
+
+---
+
+# fisheye.js Learning Path
+
+Source: https://github.com/gyeonghokim/fisheye.js/blob/main/doc/index.md
+
+# fisheye.js Learning Path
+
+This documentation set teaches the math and GPU concepts behind fisheye.js for web developers who are new to video processing and only have basic linear algebra familiarity.
+
+## Table of Contents
+
+0. [Learning Path Overview](00-learning-path.md)
+1. [Linear Algebra Foundations](01-linear-algebra-foundations.md)
+2. [World Space and Camera Space Transforms](08-world-camera-transforms.md)
+3. [Camera and Lens Basics](02-camera-lens-basics.md)
+4. [Calibration: Intrinsics, Extrinsics, and Pose](10-calibration-intrinsics-extrinsics.md)
+5. [Generic Camera Model and Fisheye Valid Region](09-generic-camera-model-valid-region.md)
+6. [OpenCV Fisheye Model Math](03-fisheye-model-math.md)
+7. [Project Mapping Pipeline](04-project-pipeline.md)
+8. [End-to-End Example and Checklist](11-end-to-end-pipeline.md)
+9. [Configuration and Tuning Guide](05-configuration-tuning.md)
+10. [GPU Rendering and TypeGPU Abstraction](07-gpu-rendering-typegpu.md)
+11. [Validation and Testing](06-validation-testing.md)
+
+---
