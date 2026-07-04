@@ -1,0 +1,413 @@
+# iamcacheauth
+
+Source: https://github.com/chinmina/iamcacheauth/blob/main/README.md
+
+# iamcacheauth
+
+AWS IAM authentication token generator for Amazon ElastiCache and MemoryDB, usable with any Redis-compatible Go client.
+
+> [!NOTE]
+> This library implements the token algorithm as [published by AWS][elasticache-iam-reference], something
+> that is currently stable and has a low risk of change. Aside from bugs and
+> dependency updates, it is highly unlikely that this library will be updated.
+>
+> The library is MIT licensed: if there are dependency issues you wish to avoid,
+> please feel free to incorporate the `library*.go` and `LICENSE.txt` files into
+> your own repository.
+>
+> All that said, contributions are welcome.
+
+Dependencies have been kept to the minimum practical, and the usage of the dependencies is simple. A `replace` statement in `go.mod` will allow a consuming module to align this library's dependency versions with theirs.
+
+## What it does
+
+ElastiCache and MemoryDB IAM authentication works by using a short-lived SigV4 presigned URL as the Redis `AUTH` password. This library generates those tokens via `Token(ctx)`, returning a plain string you can plug into any client's authentication mechanism.
+
+### Note
+
+1. Generated tokens have a short validity period, enough to establish the connection. They are not checked further once the connection is established, and new connections will use fresh tokens.
+1. Each call to `Token(ctx)` generates a fresh SigV4 presigned token. Tokens are never cached — a new one is signed for every connection attempt.
+2. The `ctx` parameter to `Token(ctx)` controls the timeout for credential retrieval (e.g. from STS, IMDS, or other credential sources). Signing itself is a local CPU-only operation and completes immediately after credentials are obtained.
+
+## Prerequisites
+
+- **Engine version** — ElastiCache: Valkey 7.2+ or Redis OSS 7.0+. MemoryDB: Valkey or Redis OSS 7.0+.
+- **TLS** — In-transit encryption must be enabled on the cache or cluster. Both services reject plaintext connections when IAM auth is active. Set `TLSConfig` to a non-nil value in your client.
+- **IAM-enabled user** — Create a user with `authentication-mode Type=iam`. On ElastiCache, the `username` and `user-id` must be set to the same value.
+- **User group / ACL** — Assign the IAM user to a user group (ElastiCache) or ACL (MemoryDB) attached to your cache or cluster.
+
+## Limitations
+
+These are AWS-imposed constraints that apply regardless of client library. See the [ElastiCache][elasticache-iam-reference] and [MemoryDB][memorydb-iam-reference] IAM auth documentation.
+
+Both services share these limitations:
+
+- **12-hour connection limit** — the server disconnects after 12 hours. Send `AUTH`/`HELLO` with a fresh token to renew, or set your client's connection lifetime below 12 hours (e.g. `11 * time.Hour`) so it reconnects proactively.
+- **15-minute token TTL** — tokens expire 15 minutes after signing. This library generates a fresh token per call, so expiry is not normally a concern.
+- **No `MULTI`/`EXEC`** — IAM authentication cannot be used inside transaction blocks.
+- **Restricted IAM condition keys** — not all global condition keys are available for `elasticache:Connect` / `memorydb:connect` policies. ElastiCache [documents the supported keys][elasticache-iam-reference] per deployment type (serverless vs replication group); MemoryDB does not specify which keys are supported.
+
+## Supported targets
+
+### Elasticache Valkey/Redis
+
+Provisioned instance support is the most straightforward:
+
+```go
+gen, err := iamcacheauth.NewElastiCache("my-iam-user", "my-cache", awsCfg)
+```
+
+For ElastiCache serverless caches, pass the `WithServerless` option. This adds the `ResourceType=ServerlessCache` query parameter required by the ElastiCache API.
+
+```go
+gen, err := iamcacheauth.NewElastiCache("my-iam-user", "my-cache", awsCfg,
+    iamcacheauth.WithServerless(),
+)
+```
+
+### MemoryDB
+
+Use `NewMemoryDB` instead of `NewElastiCache`. The client integration pattern is the same.
+
+```go
+gen, err := iamcacheauth.NewMemoryDB("my-iam-user", "my-cluster", awsCfg)
+```
+MemoryDB does not support serverless caches; `NewMemoryDB` returns an error if `WithServerless` is passed.
+
+## Client integration examples
+
+The `Token(ctx)` method returns a string, so it works with any Redis client. Below are patterns for three common Go clients.
+
+> [!IMPORTANT]
+> The `valkey-go` example has been tested: the others are correct according to their current APIs. Please provide feedback if you find issues.
+>
+> The token generation is consistent across clients, so the integration is the only point of uncertainty.
+
+### valkey-go
+
+```go
+import (
+    "context"
+    "crypto/tls"
+    "time"
+
+    "github.com/aws/aws-sdk-go-v2/config"
+    "github.com/chinmina/iamcacheauth"
+    "github.com/valkey-io/valkey-go"
+)
+
+ctx := context.Background()
+
+awsCfg, err := config.LoadDefaultConfig(ctx, config.WithRegion("us-east-1"))
+if err != nil {
+    return err
+}
+
+gen, err := iamcacheauth.NewElastiCache("my-iam-user", "my-cache", awsCfg)
+if err != nil {
+    return err
+}
+
+client, err := valkey.NewClient(valkey.ClientOption{
+    InitAddress:  []string{"my-cache.xxxx.use1.cache.amazonaws.com:6379"},
+    TLSConfig:    &tls.Config{},
+    ConnLifetime: 11 * time.Hour,
+    AuthCredentialsFn: func(_ valkey.AuthCredentialsContext) (valkey.AuthCredentials, error) {
+        // valkey-go's `AuthCredentialsFn` does not accept a context,
+        // either use the default context or construct one with the 
+        // necessary cancellation or timeout criteria.
+        token, err := gen.Token(context.Background())
+        if err != nil {
+            return valkey.AuthCredentials{}, err
+        }
+        return valkey.AuthCredentials{
+            Username: "my-iam-user",
+            Password: token,
+        }, nil
+    },
+})
+```
+
+### go-redis
+
+```go
+import (
+    "context"
+    "crypto/tls"
+
+    "github.com/redis/go-redis/v9"
+)
+
+client := redis.NewClient(&redis.Options{
+    Addr:      "my-cache.xxxx.use1.cache.amazonaws.com:6379",
+    TLSConfig: &tls.Config{},
+    CredentialsProviderContext: func(ctx context.Context) (string, string, error) {
+        token, err := gen.Token(ctx)
+        return "my-iam-user", token, err
+    },
+})
+```
+
+### redigo
+
+```go
+import (
+    "context"
+    "crypto/tls"
+    "time"
+
+    redigo "github.com/gomodule/redigo/redis"
+)
+
+endpoint := "my-cache.xxxx.use1.cache.amazonaws.com:6379"
+
+pool := &redigo.Pool{
+    DialContext: func(ctx context.Context) (redigo.Conn, error) {
+        token, err := gen.Token(ctx)
+        if err != nil {
+            return nil, err
+        }
+        c, err := redigo.DialContext(ctx, "tcp", endpoint,
+            redigo.DialTLSConfig(&tls.Config{}),
+            redigo.DialUseTLS(true),
+        )
+        if err != nil {
+            return nil, err
+        }
+        if _, err := c.Do("AUTH", "my-iam-user", token); err != nil {
+            c.Close()
+            return nil, err
+        }
+        return c, nil
+    },
+    MaxConnLifetime: 11 * time.Hour,
+}
+```
+
+## Running tests
+
+```bash
+make agent          # format, vet, build, and unit test
+make test           # unit tests only (no AWS required)
+```
+
+[elasticache-iam-reference]: https://docs.aws.amazon.com/AmazonElastiCache/latest/dg/auth-iam.html
+[memorydb-iam-reference]: https://docs.aws.amazon.com/memorydb/latest/devguide/auth-iam.html
+
+---
+
+# Agent Guidelines — iamcacheauth
+
+Source: https://github.com/chinmina/iamcacheauth/blob/main/AGENTS.md
+
+# Agent Guidelines — iamcacheauth
+
+This document is the authoritative reference for AI agents (and human contributors)
+working on this repository. Read it before making any changes.
+
+---
+
+## Repository Purpose
+
+`iamcacheauth` is a minimal Go library that generates AWS SigV4 presigned IAM
+authentication tokens for Amazon ElastiCache and MemoryDB (Valkey/Redis) and
+integrates with the `valkey-go` client via its `AuthCredentialsFn` callback.
+
+---
+
+## Toolchain Management
+
+The required Go version is managed by [mise](https://mise.jdx.dev/) via
+`mise.toml` in the repository root. `mise.toml` also sets environment
+variables (e.g. `GODEBUG=netdns=cgo`) needed for reliable operation in
+sandboxed environments.
+
+**Never modify the `go` directive or `toolchain` line in `go.mod` to work
+around a missing toolchain.** Instead, install mise and then the pinned
+toolchain:
+
+```bash
+curl https://mise.run | sh   # install mise (skip if already installed)
+mise trust                   # trust the repo's mise.toml
+mise install                 # install the Go version pinned in mise.toml
+```
+
+Activate mise in the current shell before running any Go or make commands:
+
+```bash
+eval "$(mise activate bash)"
+```
+
+All `make` targets and `go` commands will then use the correct version.
+If a dependency requires a newer Go version than what is pinned, update
+`mise.toml` (and the `go.mod` `go` directive to match) — do not
+downgrade `go.mod` to match an older local toolchain.
+
+---
+
+## How to Run
+
+All common tasks are expressed as `make` targets. Prefer `make` over invoking
+tools directly.
+
+```bash
+make agent       # format → fix → vet → build → test (full pre-push pipeline)
+
+make format      # gofmt -w .
+make fix         # go fix ./...
+make vet         # go vet ./...
+make build       # go build ./...
+make test        # go test -race ./...
+
+make test-integration   # go test -tags=integration -race -v ./...
+```
+
+## Dependency Constraints
+
+**Keep the dependency footprint minimal.** The only permitted non-stdlib
+dependencies are:
+
+| Dependency | Purpose |
+|---|---|
+| `github.com/valkey-io/valkey-go` | Valkey client integration |
+| `github.com/aws/aws-sdk-go-v2/config` | AWS credential loading |
+| `github.com/aws/smithy-go/aws-http-auth/sigv4` | SigV4 presigning |
+| `github.com/aws/smithy-go/aws-http-auth/credentials` | Credentials struct |
+
+Note: `sigv4` and `credentials` are sub-packages of the single Go module
+`github.com/aws/smithy-go/aws-http-auth`. The import paths include the
+sub-package suffix; the `go get` and `go.mod` entry uses the module path.
+
+Do not add any other third-party dependencies without explicit discussion.
+Convenience libraries (ORMs, routers, assertion frameworks, etc.) are not
+appropriate for this library.
+
+## Test Assertions — Standard Library Only
+
+Tests **must** use only the Go standard library for assertions. Do **not**
+introduce `testify`, `gomega`, or any other assertion/matcher library.
+
+Use the `testing.T` methods directly:
+
+```go
+// Correct
+if got != want {
+    t.Errorf("Token() = %q, want %q", got, want)
+}
+
+// Correct — fatal stops the test immediately
+if err != nil {
+    t.Fatalf("unexpected error: %v", err)
+}
+
+// Wrong — do not add testify or similar
+require.NoError(t, err)
+assert.Equal(t, want, got)
+```
+
+Helper functions in `_test.go` files are fine; they should call `t.Helper()`
+and delegate to `t.Errorf` / `t.Fatalf`.
+
+## Development Process — TDD
+
+Follow **Test-Driven Development**:
+
+1. **Write a failing test** that captures the requirement.
+2. **Write the minimum production code** to make the test pass.
+3. **Refactor** — clean up without changing behaviour. Tests must still pass.
+4. Run `make agent` before every commit.
+
+Unit tests live alongside production code in `*_test.go` files with no build
+tag. Integration tests must include `//go:build integration` as the first line.
+
+For time-dependent unit tests, use `testing/synctest` instead of
+`time.Sleep`. `synctest.Run` provides a fake clock that `time.Now()` reads
+automatically — no clock injection into production code is required, and
+tests run in microseconds rather than real time.
+
+Do not write code speculatively ahead of a failing test.
+
+## Git Usage
+
+### Semantic commits
+
+All commits must follow the [Conventional Commits](https://www.conventionalcommits.org/) format:
+
+```
+<type>(<scope>): <subject>
+
+<body>
+```
+
+Common types: `feat`, `fix`, `refactor`, `test`, `docs`, `chore`.
+
+### Commit message content
+
+**Never list what changed.** The diff shows that. Commit messages must explain:
+
+- **Why** the change was made — what problem, constraint, or decision drove it
+- **Trade-offs** — what alternatives were considered and why this approach was chosen
+- **Context** a reviewer needs that is not visible in the diff
+
+Bad (describes the diff):
+
+```
+feat(token): add ResourceType query parameter
+
+Added ResourceType=ServerlessCache to the query string when
+serverless is true. Updated tests accordingly.
+```
+
+Good (explains the why and trade-offs):
+
+```
+feat(token): distinguish serverless vs replication group at signing time
+
+ElastiCache rejects tokens for serverless caches that omit ResourceType,
+and rejects tokens for replication groups that include it. The flag is
+therefore mandatory for correctness, not optional configuration.
+
+Considered deriving the type from the endpoint hostname but the hostname
+format is undocumented and subject to change. Explicit configuration at
+construction time is more reliable and keeps the signing path simple.
+```
+
+### Pull request descriptions
+
+PR descriptions follow the same principle: explain the **why and context**,
+not the what. Reviewers can read the diff; they cannot read your mind.
+
+A PR description should answer:
+- What problem or requirement prompted this change?
+- What decision or design choice was made, and why?
+- What did you consider and reject, and why?
+- What should a reviewer pay particular attention to?
+
+Do not write a bulleted list that mirrors the commit titles or file changes.
+That information is already visible in the PR diff and commit log.
+
+## Architectural Constraints
+
+- **TLS is mandatory.** `ClientOption.TLSConfig` must be non-nil when using
+  IAM authentication. Document this prominently.
+- **Connection lifetime.** ElastiCache disconnects IAM-authenticated
+  connections after 12 hours. Recommend `ClientOption.ConnLifetime` < 12 h
+  (e.g. 11 h) so valkey-go reconnects proactively with fresh credentials.
+- **Fresh token per call.** Never cache generated tokens. Each invocation of
+  the credential callback must produce a newly signed token.
+- **Concurrency safety.** The token generator must be safe for concurrent
+  goroutine use; valkey-go may call `AuthCredentialsFn` from multiple
+  goroutines simultaneously.
+- **No network calls during signing.** SigV4 presigning is a local
+  cryptographic operation. Token generation (after credential retrieval) must
+  not make network calls.
+
+---
+
+# CLAUDE.md
+
+Source: https://github.com/chinmina/iamcacheauth/blob/main/CLAUDE.md
+
+AGENTS.md
+
+---

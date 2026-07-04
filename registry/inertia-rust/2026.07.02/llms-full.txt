@@ -1,0 +1,1636 @@
+# Inertia Rust
+
+Source: https://github.com/kaiofelps/inertia-rust/blob/v2/README.md
+
+# Inertia Rust
+
+> [!NOTE]
+> You are currently seeing the documentation for **inertia-rust v2.\***, which is compatible
+> to Inertia.js v2. While it is not the default version of inertia-rust, refer to the **main**
+> branch to see the documentation for v0.1.
+
+A server-side Inertia.js adapter for Rust. Inertia Rust aims to interoperate with any
+Rust (micro-)framework and template engine, since a compatible provider exists.
+
+Due to its flexibility, it requires a bit more configuration. Hence, please read
+[**Inertia Rust's documentation**](https://kaiofelps.github.io/inertia-rust/) carefully to ensure
+that your application works correctly.
+
+## Examples
+
+In the [examples directory](./examples/) you might find few applications using inertia-rust
+along with existing providers.
+
+
+## Changelog
+
+Every change made between one version and another is registered in the [CHANGELOG](./CHANGELOG.md)
+file.
+
+
+---
+
+# Actix Web Implementations
+
+Source: https://github.com/kaiofelps/inertia-rust/blob/v2/docs/src/advanced/actix-web-implementations.md
+
+# Actix Web Implementations
+
+Check some useful snippets of middlewares mentioned by the previous chapter.
+
+## Temporary Session Middleware (with Reflash)
+
+This middleware uses actix sessions to manage the Inertia Rust temporary sessions. It's responsible
+for:
+
+* Before the route execution:
+    * Removing flash data from user's session (errors, previous and current URLs);
+    * Instantiating a `InertiaTemporarySession` and injecting it to the current request;
+* After the route responds:
+    * Check if there is a request for reflashing the current session (and reflashes it, if so);
+    * Otherwise, adds the new "previous" and "current" requests URLs and the `SessionErrors` to the
+      actual user's session.
+
+```toml
+# ./Cargo.toml
+[dependencies]
+serde = { version = "1.0.217", features = ["derive"]}
+actix-web = "4.9.0"
+actix-session = "0.10.1"
+inertia-rust = { version = "2.0.0", features = ["actix"] }
+log = "0.4.22"
+serde_json = "1.0"
+```
+
+```rust
+use actix_session::SessionExt;
+use actix_web::dev::{forward_ready, Service, ServiceRequest, ServiceResponse, Transform};
+use actix_web::Error;
+use actix_web::HttpMessage;
+use futures_util::future::LocalBoxFuture;
+use inertia_rust::{actix::{is_inertia_response, SessionErrors}, InertiaSessionToReflash, InertiaTemporarySession};
+use log::error;
+use serde_json::Map;
+use std::future::{ready, Ready};
+
+pub struct ReflashTemporarySession;
+
+impl<S, B> Transform<S, ServiceRequest> for ReflashTemporarySession
+where
+    S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error>,
+    S::Future: 'static,
+    B: 'static,
+{
+    type Response = ServiceResponse<B>;
+    type Error = Error;
+    type InitError = ();
+    type Transform = ReflashTemporarySessionMiddleware<S>;
+    type Future = Ready<Result<Self::Transform, Self::InitError>>;
+
+    fn new_transform(&self, service: S) -> Self::Future {
+        ready(Ok(ReflashTemporarySessionMiddleware { service }))
+    }
+}
+
+pub struct ReflashTemporarySessionMiddleware<S> {
+    service: S,
+}
+
+const ERRORS_KEY: &str = "_errors";
+const PREV_REQ_KEY: &str = "_prev_req_url";
+const CURR_REQ_KEY: &str = "_curr_req_url";
+
+impl<S, B> Service<ServiceRequest> for ReflashTemporarySessionMiddleware<S>
+where
+    S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error>,
+    S::Future: 'static,
+    B: 'static,
+{
+    type Response = ServiceResponse<B>;
+    type Error = Error;
+    type Future = LocalBoxFuture<'static, Result<Self::Response, Self::Error>>;
+
+    forward_ready!(service);
+
+    fn call(&self, req: ServiceRequest) -> Self::Future {
+        let session = req.get_session();
+
+        let errors = session.remove(ERRORS_KEY).map(|errors| {
+            serde_json::from_str(&errors).unwrap_or_else(|err| {
+                error!("Failed to serialize session errors: {}", err);
+                Map::new()
+            })
+        });
+
+        let before_prev_url = session
+            .get::<String>(PREV_REQ_KEY)
+            .unwrap_or(None)
+            .unwrap_or("/".into());
+
+        let prev_url = session
+            .get::<String>(CURR_REQ_KEY)
+            .unwrap_or(None)
+            .unwrap_or("/".into());
+
+        // ---
+
+        let temporary_session = InertiaTemporarySession {
+            errors: errors.clone(),
+            prev_req_url: prev_url.clone(),
+        };
+
+        req.extensions_mut().insert(temporary_session);
+
+        let fut = self.service.call(req);
+        Box::pin(async move {
+            let res = fut.await?;
+
+            let req = res.request();
+            let session = req.get_session();
+
+            // If it's not a Inertia redirect or response, it might be assets response
+            // then, reflash everything so that assets don't affect real user's requests
+            let (prev_url, curr_url, optional_errors) = if !is_inertia_response(&res) {
+                (before_prev_url, prev_url, errors)
+            } else {
+                let inertia_session = req.extensions_mut().remove::<InertiaSessionToReflash>();
+
+                // if it needs to reflash a temporary flash session, then
+                // replace data from inertia session middleware with the same as before,
+                // so that the further request generates the same InertiaTemporarySession,
+                // containing the exactly same errors, previous url, and current url.
+                //
+                // otherwise, gets the previous request's URI and stores the current one's as the next
+                // request "previous", moving the navigation history
+                if let Some(InertiaSessionToReflash(inertia_session)) = inertia_session {
+                    (
+                        before_prev_url,
+                        inertia_session.prev_req_url,
+                        inertia_session.errors,
+                    )
+                } else {
+                    let errors = req
+                        .extensions_mut()
+                        .remove::<SessionErrors>()
+                        .map(|SessionErrors(errors)| errors);
+
+                    (prev_url, req.uri().to_string(), errors)
+                }
+            };
+
+            if let Err(err) = session.insert(ERRORS_KEY, optional_errors.unwrap_or_default()) {
+                error!("Failed to add errors to session: {}", err);
+            }
+
+            if let Err(err) = session.insert(PREV_REQ_KEY, prev_url) {
+                error!("Failed to update session previous request URL: {}", err);
+            };
+
+            if let Err(err) = session.insert(CURR_REQ_KEY, curr_url) {
+                error!("Failed to update session current request URL: {}", err);
+            };
+
+            Ok(res)
+        })
+    }
+}
+```
+
+Yet you need to enable your framework session middleware and manager (or your own). As errors are
+retrieved by `remove` method, they are **only available for one request lifetime**. Indeed, errors
+and flash messages shouldn't persist across multiple requests.
+
+> Note: Be sure to register this middleware always **after** `InertiaMiddleware`. Since actix web calls
+> the middlewares in the opposite order they've been registered, doing this will ensure that
+> `InertiaMiddleware` has the correct `InertiaTemporarySession` when it's finally executed.
+
+For more details on how to configure actix session, refer to their own documentation.
+
+---
+
+# Flash Messages and Validation Errors
+
+Source: https://github.com/kaiofelps/inertia-rust/blob/v2/docs/src/advanced/flash-messages.md
+
+# Flash Messages and Validation Errors
+
+[Inertia Middleware](../basic/installation.md#inertia-middleware) will also merge flash errors with the
+shared props. The resulting props will be injected back into the request and will be further merged again
+with the page props during rendering, thus, making all of them available to your client-side page component.
+
+As said earlier, Inertia Rust is not made for one single framework and all of them actually might have
+built-in sessions management. Hence, you need to built by yourself a second middleware that injects an `InertiaTemporarySession` object in the request context/extensions:
+
+```rust
+// InertiaTemporarySession struct from Inertia Rust
+#[derive(Clone, Serialize)]
+pub struct InertiaTemporarySession {
+    // Optional errors hashmap
+    pub errors: Option<Map<String, Value>>,
+    // The previous request URL
+    // useful for redirecting back with errors
+    pub prev_req_url: String,
+}
+```
+
+The middleware tries to extract this from the request context and merge it with the shared props. This
+is how validation errors might get available to your page components without explicitly sending them with `Inertia::render_with_props`.
+
+It's up to you to set up a middleware that extracts errors from the session and add them wrapped in
+`InertiaTemporarySession` to the request's extensions, however, there is a useful snippet containing a
+sample of this middleware in [Actix Web Implementations] chapter.
+
+## Reflash Session Middleware
+
+Sometimes, Inertia Rust will trigger a forced-refresh (see [Assets Management] topic from Inertia.js
+official documentation for more details). If there was a `InertiaTemporarySession` to be treated by
+that request, it'll be lost by the nature of temporary sessions.
+
+To avoid this, Inertia Rust wraps the current temporary session inside another struct ---
+`InertiaSessionToReflash`. This allows you to make a middleware responsible for using it to reflash the
+session. This way, the temporary session will be available for the subsequent request from the current
+client.
+
+Check a actix web implementation of this middleware at [Actix Web Implementations] chapter.
+
+[Assets Management]: https://inertiajs.com/asset-versioning
+[Actix Web Implementations]: ./actix-web-implementations.md#temporary-session-middleware-with-reflash
+
+## Redirecting Back With Errors
+
+To redirect back with errors, ensure the Inertia Temporary Session middleware is correctly set up. It
+must look for a `SessionErrors` instance in the request extensions and persist it in the user's session
+inside the `"_errors"` key -- or whatever key choosen to represent the errors in the sessions.
+
+> Note: `"_errors"` key is expected to represent a stringified JSON object.
+
+For instance, it would be something like the following pseudo Rust code:
+
+```rust
+use actix_web::{get, HttpRequest, Responder};
+use inertia_rust::{hashmap, Inertia, InertiaFacade};
+
+#[get("/foo")]
+async fn foo(req: HttpRequest) -> impl Responder {
+    Inertia::back_with_errors(&req, hashmap![
+        "age" => to_value("You must be over 13 y.o. to access this website").unwrap()
+    ])
+}
+```
+
+For making it a little bit better, you might provide your own facade for redirecting back with errors.
+Again, it's not possible for us to make this little helper, since it'd be necessary to introduce session
+management crates as dependency. Nor can we provide the utility trait so that you implement it yourself,
+since you can only implement your own traits for foreign struct.
+
+However, you can refer to [Actix Web Implementations](./actix-web-implementations.md#the-back-with-errors-method)
+and grab a snippet containing an sample implementation of a trait that enhances `Inertia` struct, providing
+a `back_with_errors` method.
+
+
+
+---
+
+# Template Resolvers
+
+Source: https://github.com/kaiofelps/inertia-rust/blob/v2/docs/src/advanced/template_resolvers.md
+
+# Template Resolvers
+
+Template resolvers are structs that implements Inertia Rust's `TemplateResolver` trait. They're responsible
+for rendering the root template from your application. Specially, for injecting Inertia.js head and body
+into the HTML.
+
+In summary, a template resolver has the following responsabilities:
+- Inject assets tags (e.g. script, css and link tags), usually via some bundler;
+- Inject Inertia SSRrendered head (or nothing if CSRendered);
+- Inject Inertia body (SSR or CSRendered);
+- Inject custom view data (if any).
+
+For instance, the default `ViteTemplateResolver` (available when `vite-template-resolver` feature is enabled)
+will use Vite Rust crate to inject the correct HTML tags for the application assets in the HTML (e.g.: React.js
+scripts, the application entrypoint script, stylesheets links, preload tags, etc). For handling the other
+responsabilities, it uses simple REGEXes to parse the available directives.
+
+## Creating a Template Resolver
+
+You can create your own template resolver pretty easily. All you need to do is create a struct with whatever
+data your template resolver needs to render a page. Then, implement `TemplateResolver` trait for it.
+
+For example, this is a short of `ViteTemplateResolver`:
+
+```rust
+use crate::{template_resolvers::TemplateResolver, InertiaError, ViewData};
+use async_trait::async_trait;
+use std::path::Path;
+use vite_rust::{features::html_directives::ViteDefaultDirectives, Vite};
+
+// It can contain anything you might need to resolve the template
+pub struct ViteTemplateResolver {
+    pub vite: Vite,
+    template_root: String
+}
+
+impl ViteTemplateResolver {
+    pub fn new(vite: Vite, template_path: &str) -> Self {
+        let file = std::fs::read(template_path).expect("file {} should exist.", template_path);
+        let template_root = String::from_utf8(file).expect("template file should contain a valid utf-8 encoded text.");
+
+        Ok(Self { vite, template_root })
+    }
+}
+
+#[async_trait(?Send)]
+impl TemplateResolver for ViteTemplateResolver {
+    async fn resolve_template(
+        &self,
+        view_data: ViewData<'_>,
+    ) -> Result<String, InertiaError> {
+        let mut html = self.template_root.clone();
+
+        let _ self.vite.vite_directive(&mut html);
+        self.vite.assets_url_directive(&mut html);
+        self.vite.hmr_directive(&mut html);
+        self.vite.react_directive(&mut html);
+
+        if let Some(ssr) =  &view_data.ssr_page {
+            html = html.replace("@inertia::body", ssr.get_body());
+            html = html.replace("@inertia::head", &ssr.get_head());
+        } else {
+            let stringified_page = serde_json::to_string(&view_data.page).unwrap();
+            let container = format!("<div id='app' data-page='{}'></div>\n", stringified_page);
+
+            html = html.replace("@inertia::body", &container);
+            html = html.replace("@inertia::head", "");
+        }
+
+        Ok(html)
+    }
+}
+```
+
+Naturally, there is no untreated `.unwrap()` or `.expect()` in the built-in template resolvers, and every error is
+properly handled.
+
+## The Vite and Handlebars Template Resolver
+
+This template resolver is enabled through the `vite-hbs-template-resolver` feature. It uses [Handlebars], one of the most reliable and production-ready template engines available for Rust.
+
+Through this template resolver, we expose a bunch of properties to you:
+
+- `inertia_head`: the head of your Inertia page component.
+- `inertia_body`: the body of your Inertia page component.
+- `page`: a HashMap containing all of your Inertia page component props (yes, you can directly access them from your
+    template like `page.user.name`, if it's a valid prop sent from your back-end).
+- `view_data`: a HashMap containing the view data custom props. You provide it by using `Inertia::view_data()` method.
+    Check [the Response guide] for more details.
+- `vite`: the vite scripts (already resolved according to the environment [development or production]).
+- `vite_react_refresh`: the script for refreshing your React application on development.
+
+[Handlebars]: https://crates.io/crates/handlebars
+[the Response guide]: ../basic/responses.md#root-template-data
+
+---
+
+# Testing
+
+Source: https://github.com/kaiofelps/inertia-rust/blob/v2/docs/src/advanced/testing.md
+
+# Testing
+
+To make testing even easier, Inertia provide a way of getting the inertia page as an object, so that you
+can make assertions over it and ensure the expected response is being sent.
+
+When making the request, call `.inertia()` from the `TestRequest` builder. This ensures that the response
+will be a JSON rather than an HTML.
+
+Then, simply call `.into_assertable_inertia()` from the response.
+
+```rust
+use inertia_rust::hashmap;
+use inertia_rust::test::{InertiaTestRequest, IntoAssertableInertia};
+
+#[tokio::test]
+async fn test() {
+    let app = actix_web::test::init_service(/* ... */).await;
+
+    let request = actix_web::test::TestRequest::get()
+        .inertia()
+        .uri("/")
+        .to_request();
+
+    let inertia_page = actix_web::test::call_service(&app, request)
+        .await
+        .into_assertable_inertia();
+
+    assert_eq!("/", inertia_page.get_url());
+    assert_eq!("Index", inertia_page.get_component());
+    assert_eq!(
+        &Map::from(hashmap!["foo" => "bar".to_string().into()]),
+        assertable.get_props()
+    );
+}
+```
+
+---
+
+# The Facades
+
+Source: https://github.com/kaiofelps/inertia-rust/blob/v2/docs/src/basic/facades.md
+
+# The Facades
+
+Inertia Rust has several traits that describe its behavior. The provider's job is to implement them
+to the framework structs, connecting Inertia Rust to it.
+
+The main trait describes the operations `inner_render`, `inner_render_with_props` and `inner_location`,
+which must be implemented and contains the actual methods (the implementations of the operations).
+For using these functions, you'd have to extract the `Inertia` instance from the request context and,
+again, pass a reference to the whole http request to it.
+
+It's definetely far from being fancy. That's why we also provide --- and require provides to implement
+--- the `InertiaFacade` trait. It contains the `render`, `render_with_props` and `location` operations.
+The provider uses the given request reference to extract the `Inertia` instance itself and call the
+respective method.
+
+It's way more elegant to do this:
+
+```rust
+use inertia_rust::{Inertia, InertiaFacade};
+use actix_web::{get, Responder, HttpRequest};
+
+#[get("/")]
+async fn index(req: HttpRequest) -> impl Responder {
+    Inertia::render(&req, "Index".into()).await
+}
+```
+
+Than this:
+
+```rust
+use inertia_rust::Inertia;
+use actix_web::{get, Responder, HttpRequest, web::Data};
+
+#[get("/")]
+async fn index(req: HttpRequest, inertia: Data<Inertia>) -> impl Responder {
+    inertia.inner_render(&req, "Index").await
+}
+```
+
+---
+
+# Forms
+
+Source: https://github.com/kaiofelps/inertia-rust/blob/v2/docs/src/basic/forms.md
+
+# Forms
+
+For validating forms, you need to use some validator crate, such as [garde] or [validator].
+However, whereas in a regular API you would simply return the validation errors, when building an
+Inertia application, every response must be a valid *Inertia response*.
+
+This means it's necessary to parse the validation errors and return back to the referer URL with
+the errors.
+
+> NOTE: in order to work with error flash messages, you *need* to configure your
+> [Reflash Session Middleware] properly. Also, you need to configure your framework sessions
+> manager.
+
+As this is something that happens very often, we offer a baked-in helper for parsing errors.
+Currently, the helper is only available for [validator] along with actix web. You can enable it
+through the `actix-validator` feature flag.
+
+> Indeed, we have plans to provide integrations with `garde` and other frameworks in the future.
+
+```toml
+# Cargo.toml
+[dependencies]
+inertia-rust = { version = "2", features = ["actix-validator", ...] }
+validator = "0.20"
+# ...
+```
+
+[garde]: https://crates.io/crates/garde
+[validator]: https://crates.io/crates/validator
+[Reflash Session Middleware]: ../advanced/flash-messages.md
+
+```rust
+use actix_web::{get, post, Responder, HttpRequest, Redirect};
+use inertia_rust::{hashmap, Inertia, InertiaFacade, InertiaProp};
+use inertia_rust::validators::InertiaValidateOrRedirect;
+use validator::Validator;
+use serde::Deserialize;
+
+#[get("/users")]
+async fn index(req: HttpRequest) -> impl Responder {
+    Inertia::render(&req, "Users/Index".into(), hashmap![
+        "users" => InertiaProp::data(User::all().await),
+    ])
+}
+
+#[post("/users/store")]
+async fn store(req: HttpRequest, body: Json<CreatUserDto>) -> impl Responder {
+    let data = match body.validate_or_back(&req) {
+        Err(err_redirect) => return err_redirect,
+        Ok(data) => data,
+    };
+
+    if let Err(err) => User::create(data).await {
+        return Inertia::back_with_errors(&req, hashmap![
+            "error" => "Oops, we could not create this user. Try again later."
+        ]);
+    };
+
+    Redirect::to("/users").see_other()
+}
+
+// the validation struct
+#[derive(Deserialize, Validator)]
+struct CreateUserDto {
+    #[validate(
+        required(message = "First name is a mandatory field."),
+        length(max = 50, message = "Your first name must be shorter than 50 characters".)
+    )]
+    first_name: Option<String>,
+
+    #[validate(
+        required(message = "Last name is a mandatory field."),
+        length(max = 50, message = "Your last name must be shorter than 50 characters".)
+    )]
+    last_name: Option<String>,
+
+    #[validate(
+        required(message = "Email is a mandatory field."),
+        length(max = 50, message = "Your e-mail address must be shorter than 50 characters".),
+        email(message = "You must provide a valid e-mail address.")
+    )]
+    email: Option<String>
+}
+```
+
+---
+
+# Installation
+
+Source: https://github.com/kaiofelps/inertia-rust/blob/v2/docs/src/basic/installation.md
+
+# Installation
+
+To get Inertia working, you'll need to ensure some peer dependencies are installed. Once you opt-in a specific
+provider, assure the needed peer crate is also available.
+
+```toml
+# Cargo.toml
+
+[dependencies]
+inertia-rust = { version = "2", features = ["actix", "vite-hbs-template-resolver"] }
+actix-web = "4"
+vite-rust = { version = "0.2" }
+```
+
+The **vite-hbs-template-resolver** feature enables the `ViteHBSTemplateResolver`. We'll discuss it furthermore, in the
+[Template Resolvers], along with how to set up your own template resolver. On this documentation, we'll use
+[vite-rust] and [Actix Web], so you must have them installed.
+
+[Template Resolvers]: ../advanced/template_resolvers.md
+[Actix Web]: https://actix.rs/
+
+## Available Crate Features
+
+* `actix`: enable Actix Web provider;
+* `vite-template-resolver`: enable `ViteTemplateResolver` *\(deprecated\)*;
+* `vite-hbs-template-resolver`: enable `ViteHBSTemplateResolver`;
+* `actix-validator`: enable `InertiaValidateOrRedirect` trait + implementation for actix web's `HttpRequest` and `Redirect` and with `validator` create.
+
+## Vite Setup
+
+`ViteTemplateResolver` requires a `Vite` instance, so, we need to both set up Vite and Inertia. Read [vite-rust]
+docs for more details about setting it up. For this example, consider the following configuration:
+
+```rust
+// src/config/vite.rs
+use vite_rust::{Vite, ViteConfig};
+
+pub async fn initialize_vite() -> Vite {
+    let vite_config = ViteConfig::default()
+        .set_manifest_path("path/to/manifest.json")
+        // you can add the same client-side entrypoints to vite-rust,
+        // so that it won't panic if the manifest file doesn't exist but the
+        // development server is running
+        .set_entrypoints(vec!["www/app.ts"]);
+
+    match Vite::new(vite_config).await {
+        Err(err) => panic!("{}", err),
+        Ok(vite) => vite
+    }
+}
+```
+
+[vite-rust]: https://github.com/KaioFelps/vite-rust
+
+## Inertia Setup
+
+```rust
+// src/config/inertia.rs
+use super::vite::initialize_vite;
+use inertia_rust::{
+    template_resolvers::ViteHBSTemplateResolver, Inertia, InertiaConfig, InertiaError,
+    InertiaVersion,
+};
+use std::io;
+use vite_rust::ViteMode;
+
+pub async fn initialize_inertia() -> Result<Inertia, io::Error> {
+    let vite = initialize_vite().await;
+    let version = vite.get_hash().unwrap_or("development").to_string();
+    let dev_mode = *vite.mode() == ViteMode::Development;
+
+    let resolver = ViteHBSTemplateResolver::builder()
+        .set_vite(vite)
+        .set_template_path("www/root.hbs") // the path to your root handlebars template
+        .set_dev_mode(dev_mode)
+        .build()
+        .map_err(InertiaError::to_io_error)?;
+
+
+    Inertia::new(
+        InertiaConfig::builder()
+            .set_url("http://localhost:3000")
+            .set_version(InertiaVersion::Literal(version))
+            .set_template_resolver(Box::new(resolver))
+            .build(),
+    )
+}
+```
+
+### Inertia Configuration
+
+| Option            | Type (default)                            | Description   |
+| ---               | ---                                       | ---           |
+| url               | `&str`                                    | A valid [href](https://developer.mozilla.org/en-US/docs/Web/API/Location) of the current application |
+| version           | `InertiaVersion`                          | The current asset version of the application. See [Asset versioning](https://inertiajs.com/asset-versioning) for more details. |
+| template_resolver | `Box<dyn TemplateResolver + Send + Sync>` | A valid [Template Resolver]. |
+| with_ssr          | `bool` (`false`)                          | Whether Server-side Rendering should be enabled or not. |
+| custom_ssr_client | `Option<SsrClient>` (`SsrClient::default`)| The Inertia Server address. |
+| encrypt_history   | `bool` (`false`)                          | Whether to encrypt the session or not. Refer to [History encryption] for more details. |
+
+For even more details, read the [`InertiaConfig`] and [`InertiaConfigBuilder`] documentations.
+
+[Template Resolver]: https://kaiofelps.github.io/inertia-rust/advanced/template_resolvers.html
+[Flash Messages and Validation Errors]: https://kaiofelps.github.io/inertia-rust/advanced/flash-messages.html
+[History encryption]: https://inertiajs.com/history-encryption
+[`InertiaConfig`]: https://docs.rs/inertia-rust/latest/inertia_rust/struct.InertiaConfig.html
+[`InertiaConfigBuilder`]: https://docs.rs/inertia-rust/latest/inertia_rust/struct.InertiaConfigBuilder.html
+
+## Actix Web Server
+```rust
+// src/main.rs
+use std::sync::{Arc, OnceLock};
+use actix_web::{dev::Path, web::Data, App, HttpServer};
+use config::inertia::initialize_inertia;
+
+mod config;
+
+#[actix_web::main]
+async fn main() -> std::io::Result<()> {
+    dotenvy::dotenv().ok();
+    env_logger::init();
+
+    // starts a Inertia manager instance.
+    let inertia = initialize_inertia().await?;
+    let inertia = Data::new(inertia);
+
+    HttpServer::new(move || App::new().app_data(inertia.clone()))
+        .bind(("127.0.0.1", 3000))?
+        .run()
+        .await
+}
+```
+
+## Root Template
+`ViteHBSTemplateResolver` receives a path to an handlebars template file. It will read this file and keep the content
+in-memory for rendering it on every request. Your template will look like this:
+
+```hbs
+<!doctype html>
+<html lang="en" class="h-full">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, user-scalable=no, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0">
+    <meta http-equiv="X-UA-Compatible" content="ie=edge">
+    <link rel="shortcut icon" type="image/x-icon" href="/favicon.ico">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Poppins:ital,wght@0,100;0,200;0,300;0,400;0,500;0,600;0,700;0,800;0,900;1,100;1,200;1,300;1,400;1,500;1,600;1,700;1,800;1,900&display=swap" rel="stylesheet">
+    {{!-- only include this line if you're using react --}}
+    {{{ vite_react_refresh }}}
+    {{{ vite }}}
+    {{{ inertia_head }}}
+</head>
+<body class="h-full">
+    {{{ inertia_body }}}
+</body>
+</html>
+```
+
+There are a few more data you can access on your template. Refer to [`ViteHBSTemplateResolver`] specific section
+to check them out.
+
+<details open>
+    <summary summary>For the deprecated <i>ViteTemplateResolver</i>, the template is a little bit different.</summary>
+   
+```html
+<!-- www/root.html -->
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, user-scalable=no, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0">
+    <meta http-equiv="X-UA-Compatible" content="ie=edge">
+    <!-- include this if you're using ReactJs -->
+    <!-- @vite::react -->
+    @vite
+    @inertia::head
+</head>
+<body>
+    @inertia::body
+</body>
+</html>
+```
+
+</details>
+
+[`ViteHBSTemplateResolver`]: ../advanced/template_resolvers.md#the-vite-and-handlebars-template-resolver
+
+## Inertia Middleware
+
+The Inertia Middleware comes from your opted provider. It has few responsibilities:
+- allow you to share props, via `with_shared_props` method (discussed in [Shared Props](../props/shared.md));
+- ensure that redirects for `PUT`, `PATCH` and `DELETE` requests always use a 303 status code;
+- merge shared props with errors flash messages (discussed in [Flash Messages and Validation Errors](../advanced/flash-messages.md)).
+
+```rust
+use actix_web::{App, HttpServer};
+use inertia_rust::actix::InertiaMiddleware;
+use inertia_rust::{hashmap, InertiaProp, InertiaProps, InertiaService};
+
+#[actix_web::main]
+async fn main() -> std::io::Result<()> {
+    // ...
+
+    HttpServer::new(move || {
+        App::new()
+            .app_data(inertia.clone())
+            .wrap(InertiaMiddleware::new())
+    })
+    .bind(("127.0.0.1", 3000))?
+    .run()
+    .await
+}
+```
+
+---
+
+You can check more examples in [Inertia Rust examples] directory. Also, do check [Inertia.js client-side setup] tutorial.
+
+[Inertia Rust examples]: https://github.com/KaioFelps/inertia-rust/tree/v2/examples
+[Inertia.js client-side setup]: https://inertia-rails.dev/guide/client-side-setup
+
+---
+
+# Props
+
+Source: https://github.com/kaiofelps/inertia-rust/blob/v2/docs/src/basic/props.md
+
+# Props
+
+It's possible to pass data from the server to the front-end as simple props. To do this, simply
+create a `HashMap` with `&str` keys and `InertiaProp` values. Then, use `Inertia::render_with_props`
+passing the props hashmap as the third parameter.
+
+Also, for defining the props hash map, we provide a very trivial macro: `hashmap!`. You can use it
+like this:
+
+```rust
+use inertia_rust::{hashmap, Inertia, InertiaFacade, InertiaProp};
+use actix_web::{get, web, HttpRequest, Responder};
+use serde_json::{json};
+use serde::Serialize;
+
+#[derive(Serialize)]
+struct User {
+    pub name: String,
+    pub email: String,
+}
+
+impl User {
+    // let's just pretend this is a method that fetch users from some database
+    pub async fn all() -> Vec<User> {
+        vec![
+            User {
+                name: "John Doe".into(),
+                email: "johndoe@gmail.com".into()
+            },
+            User {
+                name: "Ada Lovelace".into(),
+                email: "thereWereNoEmailByThatTimeActually!@gmail.com".into(),
+            }
+        ]
+    }
+}
+
+#[get("/users")]
+async fn home(req: HttpRequest) -> impl Responder {
+    let props = hashmap![
+        "users" => InertiaProp::data(User::all().await),
+    ];
+
+    Inertia::render_with_props(&req, "Users/Index".into(), props).await
+}
+```
+
+Indeed, all `hashmap!` do is to create a `std::collections::HashMap` and insert each item you've passed
+into it.
+
+Note that a new enum has been introduced to our code right now: `InertiaProp`. It contains all the variants
+of props that Inertia can handle.
+
+Every `InertiaProp` variant must contain --- or resolve to --- an `Result<serde_json::Value, InertiaError`>
+object. You can achieve this by calling `value.into_inertia_value()`. `value` must be serializable. Also,
+you must bring the `IntoInertiaPropResult` trait into the scope.
+
+If you're using `InertiaProp` helpers, you don't even need to worry about serializing by yourself (again,
+since the object *is* serializable):
+
+```rust
+use inertia_rust::{InertiaProp, IntoInertiaPropResult};
+
+let prop = InertiaProp::Data("foo".into_inertia_value());
+// or
+let prop = InertiaProp::data("foo"); // using `data` helper for generating a `InertiaProp::Data`
+```
+
+On the official Inertia.js documentation, you may find the following PHP snippet:
+
+```php
+return Inertia::render('Users/Index', [
+    // ALWAYS included on standard visits
+    // OPTIONALLY included on partial reloads
+    // ALWAYS evaluated
+    'users' => User::all(),
+
+    // ALWAYS included on standard visits
+    // OPTIONALLY included on partial reloads
+    // ONLY evaluated when needed
+    'users' => fn () => User::all(),
+
+    // NEVER included on standard visits
+    // OPTIONALLY included on partial reloads
+    // ONLY evaluated when needed
+    'users' => Inertia::lazy(fn () => User::all()),
+
+    // ALWAYS included on standard visits
+    // ALWAYS included on partial reloads
+    // ALWAYS evaluated
+    'users' => Inertia::always(User::all()),
+]);
+```
+
+You can achieve the exact same behaviors with Inertia Rust:
+
+```rust
+return Inertia::render_with_props(&req, "Users/Index", hashmap![
+    // ALWAYS included on standard visits
+    // OPTIONALLY included on partial reloads
+    // ALWAYS evaluated
+    "users" => InertiaProp::data(User::all().await),
+
+    // ALWAYS included on standard visits
+    // OPTIONALLY included on partial reloads
+    // ONLY evaluated when needed
+    "users" => InertiaProp::lazy(prop_resolver!({ User::all().await.into_inertia_value() })),
+
+    // NEVER included on standard visits
+    // OPTIONALLY included on partial reloads
+    // ONLY evaluated when needed
+    "users" => InertiaProp::demand(prop_resolver!({ User::all().await.into_inertia_value() })),
+
+    // ALWAYS included on standard visits
+    // ALWAYS included on partial reloads
+    // ALWAYS evaluated
+    "users" => InertiaProp::always(User::all().await),
+]);
+```
+
+## The `prop_resolver!` macro
+
+Inertia props that take callbacks --- such as `Lazy`, `Demand` and `Deferred` variants --- are
+asynchronous, so that you can `.await` inside of them. To use it, it'd be necessary the following code:
+
+```rust
+use std::sync::Arc;
+use inertia_rust::InertiaProp;
+use inertia_rust::IntoInertiaPropResult;
+
+let lazy_prop = InertiaProp::Lazy(Arc::new(move || Box::pin(async move {
+    User::all().await.into_inertia_value();
+})));
+```
+
+Such a massive amount of code, we know. However, it's necessary in order to have asynchronous callbacks
+support.
+
+In order to avoid writting all this boilerplate, Inertia Rust provide another macro: `prop_resolver!`,
+as you've seen above:
+
+```rust
+use std::sync::Arc;
+use inertia_rust::{prop_resolver, InertiaProp, IntoInertiaPropResult};
+
+let lazy_prop = InertiaProp::Lazy(prop_resolver!({ User::all().await.into_inertia_value() }));
+```
+
+There are some cases --- mainly in test environments or playgrounds --- where you might want to mock
+some database and, therefore, need to move values to inside of the resolver closure:
+
+```rust
+use std::sync::Arc;
+use inertia_rust::InertiaProp;
+use inertia_rust::IntoInertiaPropResult;
+
+let user = Arc::new(User { name: "John Doe".into(), email: "johndoe@gmail.com".into() });
+let permissions = Arc::new(vec!["read", "delete", "update", "delete"]);
+
+InertiaProp::lazy(Arc::new(move || {
+    let user = user.clone();
+    let permissions = permissions.clone();
+
+    Box::pin(async move {
+        user_can(user, permissions).await.into_inertia_value()
+    })
+}));
+```
+
+Unfortunately, we have to move a clone of the `Arc`-wrapped variables to inside of the closure,
+then move again to inside of the inner async closure.
+
+`prop_resolver!` also covers this. As first parameter, you'll pass the "cloning" statements separated
+by commas. The actual async closure goes as the second parameter, then:
+
+```rust
+use std::sync::Arc;
+use inertia_rust::{prop_resolver, InertiaProp, IntoInertiaPropResult};
+
+let user = Arc::new(User { name: "John Doe".into(), email: "johndoe@gmail.com".into() });
+let permissions = Arc::new(vec!["read", "delete", "update", "delete"]);
+
+InertiaProp::lazy(prop_resolver!(
+    let user = user.clone(),                // statements separated by comma
+    let permissions = permissions.clone();  // statements and block separated by semicolon
+    { user_can(user, permissions).await.into_inertia_value() }   // block
+));
+```
+
+---
+
+# Routes and Responses
+
+Source: https://github.com/kaiofelps/inertia-rust/blob/v2/docs/src/basic/responses.md
+
+# Routes and Responses
+
+Creating routes is totally up to the framework you're using for building your application, of course. However,
+we provide some facilities. For instance, you can render a simple page both ways:
+
+```rust
+use inertia_rust::{Inertia, InertiaFacade, InertiaService};
+use actix_web::{app, get, Responder, HttpRequest};
+
+// this
+App::new().inertia_route("/", "Index");
+
+// is the same as this
+#[get("/")]
+async fn index(req: HttpRequest) -> impl Responder {
+    Inertia::render(&req, "Index".into()).await
+}
+
+App::new().service(index);
+```
+
+## Redirects
+If you want to redirect to another page, it's enough to return your framework Redirect response. However, when
+redirecting to an external site, make sure to use `Inertia::location` method. It'll defer the redirect to the
+browser:
+
+```rust
+use inertia_rust::{Inertia, InertiaFacade};
+use actix_web::{get, Responder, HttpRequest};
+
+#[get("/")]
+async fn index(req: HttpRequest) -> impl Responder {
+    Inertia::location(&req, "https://inertiajs.com")
+}
+```
+
+To redirect to the previous page (a.k.a **redirect back**), use the `back` facade method:
+
+```rust
+use inertia_rust::{Inertia, InertiaFacade};
+use actix_web::{get, Responder, HttpRequest};
+
+#[get("/")]
+async fn index(req: HttpRequest) -> impl Responder {
+    Inertia::back(&req)
+}
+```
+
+If you've configured your [Inertia Temporary Session] middleware, it will use the previous visited page with
+more accuracy. Otherwise, it'll look for a `referer` header. In last case, it will redirect to `/`.
+
+Redirecting back with props is a little bit of advanced. Refer to [Redirecting Back With Errors] for an
+detailed explanation.
+
+[Inertia Temporary Session]: ../advanced/flash-messages.md
+[Redirecting Back With Errors]: ../advanced/flash-messages.md#redirecting-back-with-errors
+
+## Responses
+Calling the facade `render` method render a page (be it ReactJs, Svelte or Vue.js):
+
+```rust
+use inertia_rust::{Inertia, InertiaFacade};
+use actix_web::{get, Responder, HttpRequest};
+
+#[get("/users")]
+async fn index(req: HttpRequest) -> impl Responder {
+    Inertia::render(&req, "Users/Index".into()).await
+}
+```
+
+`"Users/Index"` is a `Component` --- which is just a meaningful struct containing the name of the jsx, vue or
+svelte component to be rendered. Naturally, you must have configured your `www/app.ts` file to find this
+page component (again, remember to check [Inertia.js documentation]).
+
+For example, it could be:
+
+```jsx
+import { Head } from "@inertiajs/react";
+
+type User = {
+    name: string;
+    email: string;
+}
+
+type UsersPageProps = {
+    users: User[];
+}
+
+export default function UsersPage({ user }: UsersPageProps) {
+    return (
+        <>
+            <Head title="Users" />
+            <div>
+                <h1>Users</h1>
+                {users.map(user => (
+                    <div>
+                        <span><strong>Name: </strong>{user.name}</span>
+                        <span><strong>E-mail: </strong>{user.email}</span>
+                    </div>
+                ))}
+            </div>
+        </>
+    )
+}
+```
+
+You've noticed that this page has a `user` property. Actually, Inertia Rust is the one who will provide
+this property! We didn't provide any props to the page, though. We'll fix this in the next chapter, where
+props are discussed.
+
+[Inertia.js documentation]: https://inertia-rails.dev/guide/client-side-setup
+
+## Root Template Data
+
+Depending on the template resolver you're using, there are different manners of passing data directly to
+the root template.
+
+The built-in `ViteTemplateResolver` allows you to achieve this through request's view data:
+
+```rust
+use inertia_rust::{hashmap, Inertia, InertiaFacade};
+use actix_web::{get, Responder, HttpRequest};
+
+#[get("/")]
+async fn index(req: HttpRequest) -> impl Responder {
+    Inertia::view_data(&req, hashmap![ "meta" => "Your page description".into() ]);
+    Inertia::render(&req, "Index".into()).await
+}
+```
+
+After calling the `view_data` method, you can access the defined data in your template HTML the following
+way:
+
+```html
+<!-- using the deprecated ViteTemplateResolver, in a .html file -->
+<meta name="description" content="@inertia::view_data(meta)">
+```
+
+```hbs
+{{!-- using the ViteHBSTemplateResolver, in a .hbs file --}}
+<meta name="description" content="{{ view_data.meta }}">
+```
+
+If the value isn't defined, the resolvers replace the value by an ordinary JavaSript `null`.
+
+> Remember: a different template resolver could allow you to pass data in different ways, for example,
+> through the actual page props. You should check the template resolver documentation for more details.
+
+### Default View Data
+`ViteHBSTemplateResolver` will always inject a default view data property: `isSsr` (also accessible by `is_ssr`).
+You can use it, for instance, to conditionally hydrate or create your React root. This property will be true
+only when the Inertia response has been server-side rendered.
+
+---
+
+# Server-Side Rendering
+
+Source: https://github.com/kaiofelps/inertia-rust/blob/v2/docs/src/basic/ssr.md
+
+# Server-Side Rendering
+
+Inertia Rust supports server-side rendering. Enabling SSR gives your website better SEO, since the
+very first page will be server-side rendered. Thereafter, they'll be ordinary SPA pages.
+
+> Note: Node.js must be available in order to run the Inertia SSR server.
+
+Enabling SSR is a very simple task. However, you must make few changes in your code so that the Node.js
+process is correctly iniitialized and killed --- otherwise, the Node.js process would be left running,
+stopping further servers from running on the port it occupies.
+
+First of all, enable SSR in your Inertia configs:
+
+```diff
+// src/config/inertia.rs
+use super::vite::initialize_vite;
+use inertia_rust::{
+    template_resolvers::ViteHBSTemplateResolver, Inertia, InertiaConfig, InertiaError,
+-   InertiaVersion,
++   InertiaVersion, SsrClient
+};
+use std::io;
+
+pub async fn initialize_inertia() -> Result<Inertia, io::Error> {
+    let vite = initialize_vite().await;
+    let version = vite.get_hash().unwrap_or("development").to_string();
+    let dev_mode = *vite.mode() == ViteMode::Development;
+
+    let resolver = ViteHBSTemplateResolver::builder()
+        .set_vite(vite)
+        .set_template_path("www/root.hbs") // the path to your root handlebars template
+        .set_dev_mode(dev_mode)
+        .build()
+        .map_err(InertiaError::to_io_error)?;
+
+    Inertia::new(
+        InertiaConfig::builder()
+            .set_url("http://localhost:3000")
+            .set_version(InertiaVersion::Literal(version))
+            .set_template_resolver(Box::new(resolver))
++           .enable_ssr()
++           // `set_ssr_client` is optional. If not set, `SsrClient::default()` will be used,
++           // which is is "127.0.0.1:13714"
++           .set_ssr_client(SsrClient::new("127.0.0.1", 1000))
+            .build(),
+    )
+}
+```
+
+```diff
+// src/main.rs
+use std::sync::{Arc, OnceLock};
+use actix_web::{dev::Path, web::Data, App, HttpServer};
+use config::inertia::initialize_inertia;
+
+mod config;
+
+#[actix_web::main]
+async fn main() -> std::io::Result<()> {
+    dotenvy::dotenv().ok();
+    env_logger::init();
+
+    // starts a Inertia manager instance.
+    let inertia = initialize_inertia().await?;
+    let inertia = Data::new(inertia);
++   let inertia_clone = inertia.clone();
+
+-   HttpServer::new(move || App::new().app_data(inertia.clone()))
+-       .bind(("127.0.0.1", 3000))?
+-       .run()
+-       .await
+
++   let server = HttpServer::new(move || App::new().app_data(inertia_clone.clone()))
++       .bind(("127.0.0.1", 3000))?;
+
++   // Starts a Node.js child process that runs the Inertia's server-side rendering server.
++   // It must be started after the server initialization to ensure that the http server won't
++   // panic and shutdown without killing the Node.Js process.
++   let node = inertia.start_node_server("path/to/your/ssr.js".into())?;
++
++   let server = server.run().await;
++   let _ = node.kill().await;+
++
++   return server;
+}
+```
+
+Indeed, you can replace `let _ = node.kill().await;` with `std::mem::drop(node.kill())`, but `.await`ing on it
+guarantees that the process has been killed before shutting down.
+
+Inertia always inserts a view data property `isSsr` (or even `is_ssr`), which is a boolean value representing
+if the page has been server-side rendered or not.
+
+You might use it on your `app.tsx` to conditionally *hydrate* or *create* your front-end according to the
+response being or not SSRendered.
+
+Add the following meta tag on your root template's `head` element:
+```hbl
+<meta name="ssr" content="{{ view_data.is_ssr }}">
+```
+
+Then, in your `app.ts|js|tsx|jsx` file, add the follow condition:
+```ts
+import "./app.scss";
+
+import { createInertiaApp } from "@inertiajs/react";
+import { createRoot, hydrateRoot } from "react-dom/client";
+
+createInertiaApp({
+  // ...
+  setup({ el, App, props }) {
+    const isSSR = document.head
+      .querySelector("meta[name='ssr']")?
+      .getAttribute("content") === "true" ?? false;
+
+    if (isSSR) {
+      hydrateRoot(el, <App {...props} />);
+      return;
+    }
+
+    createRoot(el).render(<App {...props} />);
+  },
+});
+```
+
+---
+
+# Introduction
+
+Source: https://github.com/kaiofelps/inertia-rust/blob/v2/docs/src/introduction.md
+
+# Introduction
+
+**Inertia Rust** is a Rust adapter for Inertia.js.
+
+It's not its aim to work around a single specific framework. Instead, it's built out
+of providers, which are responsible for implementing the crate's traits for a given framework.
+
+Currently, only **actix-web** has a provider. As it's the first --- and the only --- existing provider,
+every code block will be considering it as the underlying framework. Note, however, that the code shouldn't
+be very different depending on the opted provider.
+
+We will cover only how to make things that are specific to Inertia Rust. For the front-end, refer to
+[Inertia's oficial documentation](https://inertiajs.com/).
+
+> Note: This documentation describes how to use `inertia-rust v2.x`, which is compatible with Inertia.js
+> v2.0.0. Also, it has notable differences comparing to the former v0.1.0.
+>
+> Indeed, we went from v0.1.0 straight to v2.0.0. The reason is we wanted to let it as clear as possible
+> that this is the correct version of the crate to work with Inertia.js v2.
+
+## Inertia Rust v0.1.0
+If you want to use Inertia.js 1, you must refer to a previous version of Inertia Rust. Unfortunately, there
+is no such a documentation about it. We hope you can make it using the following files:
+
+<table><tbody>
+<thead>
+<tr>
+    <th> File </th>
+    <th> Content </th>
+</tr>
+</thead>
+<tr>
+<td>
+
+[v0.1.0 README.md]
+        
+</td>
+<td>
+
+* How to set up inertia-rust with vite-rust;
+* How to use and/or create template resolvers;
+* How to enable SSR;
+* Render pages;
+* Enable Inertia Middleware and share props.
+        
+</td>
+</tr>
+<tr>
+<td>
+
+[v0.1.0 REQUIREMENTS.md]
+
+</td>
+<td>
+
+Not actually a requirements list for you to use Inertia, but of an lib to be a useful Inertia Adapter:
+
+* Create valid Inertia responses;
+* Create valid Inertia routes;
+* Generating error props;
+* Redirects.
+
+</td>
+</tr>
+<tr>
+<td>
+
+[CHANGELOG.md]
+
+</td>
+<td>
+
+A changelog of every change that has occurred between v0.1.0 and v2.0.0, including the good-to-know
+breaking changes. Note that developer experience --- DX --- has been drastically enhanced from the former
+to the latter version.
+
+</td>
+</tr>
+<tbody></table>
+
+[v0.1.0 README.md]: https://github.com/KaioFelps/inertia-rust/blob/v1/README.md
+[v0.1.0 REQUIREMENTS.md]: https://github.com/KaioFelps/inertia-rust/blob/v1/REQUIREMENTS.md
+[CHANGELOG.md]: https://github.com/KaioFelps/inertia-rust/blob/v2/CHANGELOG.md
+
+---
+
+# Deferred Props
+
+Source: https://github.com/kaiofelps/inertia-rust/blob/v2/docs/src/props/deferred.md
+
+# Deferred Props
+
+Deferred props behave the exactly same way as `InertiaProp::Demand`. However, when you use `Deferred` instead of
+`Demand`, Inertia router will automatically make a partial request to obtain the deferred props after the page
+loads.
+
+It means deferred data will be loaded after the page has already been rendered, so if you defer heavy or time-
+consuming data, your page might load faster.
+
+## Deferring a Prop
+
+```rust
+use actix_web::{get, HttpRequest, Responder};
+use inertia_rust::{hashmap, prop_resolver, Inertia, InertiaProp, IntoInertiaPropResult};
+
+// let's pretend these are some ORM's models and
+// assume they have an `all` method.
+use domain::identity::models::Role;
+use domain::identity::models::User;
+use domain::identity::models::Permission;
+
+#[get("/users")]
+pub async fn users(req: HttpRequest) -> impl Responder {
+    Inertia::render_with_props(&req, "Users/Index", hashmap![
+        'users' => InertiaProp::data(User::all().await),
+        'roles' => InertiaProp::data(Role::all().await),
+        'permissions' => InertiaProp::defer(prop_resolver!({ Permission::all().await.into_inertia_value() })),
+    ]).await
+}
+```
+
+## Grouping Requests
+
+Deferred prop are splitten in groups. Each group is paralelly requested by the client Inertia router.
+`InertiaProp::defer` will put the resolver in the `"default"` group of deferred props. If you want to
+create a custom group, call `InertiaProp::defer_with_group` passing the group name as the second parameter:
+
+```rust
+#[get("/users")]
+pub async fn users(req: HttpRequest) -> impl Responder {
+    Inertia::render(&req, "Users/Index", hashmap![
+        'users' => InertiaProp::data(User::all().await),
+        'roles' => InertiaProp::data(Role::all().await),
+        'permissions' => InertiaProp::defer(prop_resolver!({ Permission::all().await.into_inertia_value() })),
+        'teams' => InertiaProp::defer_with_group(prop_resolver!({ Team::all().await.into_inertia_value() }), 'attributes'),
+        'projects' => InertiaProp::defer_with_group(prop_resolver!({ Project::all().await.into_inertia_value() }), 'attributes'),
+        'tasks' => InertiaProp::defer_with_group(prop_resolver!({ Task::all().await.into_inertia_value() }), 'attributes'),
+    ]).await
+}
+```
+
+---
+
+# Merging Props
+
+Source: https://github.com/kaiofelps/inertia-rust/blob/v2/docs/src/props/merging.md
+
+# Merging Props
+
+Merging Props are merged with the existing props in the client-side, instead of overwriting them. For instance,
+if your client already has a property `"permissions"` that is a list `["read", "delete"]`, given that
+`"permissions"` is a mergeable prop, when a new partial request receives a list `"permissions" = ["update"]`,
+the new value of `"permissions"` in the client will be `["read", "delete", "update]` instead of `["update"]`.
+
+## Making a Mergeable Prop
+
+```rust
+use actix_web::{web, get, HttpRequest, Responder};
+use inertia_rust::{hashmap, Inertia, InertiaProp};
+use serde::Deserialize;
+
+#[derive(Deserialize)]
+struct RequestQuery {
+    page: Option<usize>,
+    per_page: Option<usize>
+}
+
+#[get("/users")]
+pub async fn users(req: HttpRequest, query: web::Query<RequestQuery>) -> impl Responder {
+    let page = query.page.unwrap_or(1);
+    let per_page = query.per_page.unwrap_or(10);
+
+    Inertia::render_with_props(&req, "Users/Index", hashmap![
+        'results' => InertiaProp::merge(User::paginate(page, per_page).await),
+    ])
+}
+```
+
+Again, let's pretend `User` is a model of some ORM which contains a `paginate` method.
+
+**Deferred props can also be mergeable**. The behavior will be a combination of them both: the deferred prop
+will be fetched in a separate request, and when it is received, it'll be merged with the existing version of itself.
+
+```rust
+#[get("/users")]
+pub async fn users(req: HttpRequest, query: web::Query<RequestQuery>) -> impl Responder {
+    let page = query.page.unwrap_or(1);
+    let per_page = query.per_page.unwrap_or(10);
+
+    return Inertia::render_with_props(&req, "Users/Index", hashmap![
+        'results' => InertiaProp::defer(prop_resolve!({ User::paginate(page, per_page).await })).into_mergeable(),
+    ])
+}
+```
+
+## Resetting Props
+
+When a mergeable property is asked to be reset, it will behave like an ordinary `InertiaProp::Data` variant
+--- or a `InertiaProp::Deferred`, if it's a deferred and mergeable prop.
+
+```js
+router.reload({
+    reset: ['results'],
+    //...
+})
+```
+
+---
+
+# Shared Props
+
+Source: https://github.com/kaiofelps/inertia-rust/blob/v2/docs/src/props/shared.md
+
+# Shared Props
+
+There are some props that are sent to the front-end on every request. These can be easily shared through
+`InertiaMiddleware` rather than conventional props on each request.
+
+The middleware contains a `with_shared_props` method, which requires a callback that receives a reference
+to the current HTTP request. You can use it to extract any information you might want to share.
+
+```rust
+use actix_web::{App, HttpServer};
+use inertia_rust::actix::InertiaMiddleware;
+use inertia_rust::{hashmap, InertiaProp, InertiaProps, InertiaService};
+
+#[actix_web::main]
+async fn main() -> std::io::Result<()> {
+    // ...
+
+    HttpServer::new(move || {
+        App::new()
+            .app_data(inertia.clone())
+            .wrap(InertiaMiddleware::new().with_shared_props(Arc::new(|req| {
+                // get the sessions from the request
+                // depending on your opted framework
+                let session = req.get_session();
+                let flash = session.get::<String>("flash").unwrap();
+                async move {
+                    hashmap![ "flash" => InertiaProp::data(flash) ]
+                }
+                .boxed_local()
+            })))
+    })
+    .bind(("127.0.0.1", 3000))?
+    .run()
+    .await
+}
+```
+
+---
+
+# History Encryption
+
+Source: https://github.com/kaiofelps/inertia-rust/blob/v2/docs/src/security/history-encryption.md
+
+# History Encryption
+
+History encryption is a way of protecting the page data stored in the browser history. For more details
+about it, refer to the official Inertia.js [History encryption] documentation. In this page, you can see
+how to enable it in Inertia Rust.
+
+[History encryption]: https://inertiajs.com/history-encryption
+
+## Global Encryption
+
+On your Inertia struct config, you can `encrypt_history` to globally enable history encryption:
+
+```rust
+use inertia_rust::{Inertia, InertiaConfig};
+
+let inertia = Inertia::new(
+        InertiaConfig::builder()
+            .encrypt_history()
+            .build());
+```
+
+It'll set `Inertia::encrypt_history` to `true`. By default, it's disabled.
+
+## Per-request Encryption
+
+Call `encrypt_history(bool)` to enable or disable encryption of a request before you render the page:
+
+```rust
+Inertia::encrypt_history(&req, true);
+```
+
+It overwrites the global configuration and even the middleware (we'll cover it in the next topic). It
+means you can use it to disable encryption for an specific route by passing `false` as parameter.
+
+## Encrypt Middleware
+
+You can import the `EncryptHistoryMiddleware` from your provider and wrap some routes with it to enable
+encryption for the routes within the wrapped group.
+
+```rust
+use actix_web::App;
+use inertia_rust::actix::EncryptHistoryMiddleware;
+
+App::new().wrap(EncryptHistoryMiddleware::new());
+```
+
+## Clearing History
+
+To clear the history state from the server-side, call `clear_history` before rendering the page:
+
+```rust
+Inertia::clear_history(&req):
+```
+
+Again, for more information about clearing history, refere to Inertia's [Clearing history] section from
+History encryption documentation.
+
+[Clearing history]: https://inertiajs.com/history-encryption#clearing-history
+
+---
+
+# Basic Usage
+
+Source: https://github.com/kaiofelps/inertia-rust/blob/v2/docs/src/SUMMARY.md
+
+
+[Introduction](./introduction.md)
+
+# Basic Usage
+- [Installation](./basic/installation.md)
+- [Server-Side Rendering](./basic/ssr.md)
+- [The Facades](./basic/facades.md)
+- [Routes and Responses](./basic/responses.md)
+- [Props](./basic/props.md)
+- [Forms](./basic/forms.md)
+
+# More About Props
+- [Shared Props](./props/shared.md)
+- [Deferred Props](./props/deferred.md)
+- [Merging Props](./props/merging.md)
+
+# Security
+- [History Encryption](./security/history-encryption.md) 
+
+# Advanced
+- [Template Resolvers](./advanced/template_resolvers.md)
+- [Flash Messages and Validation Errors](./advanced/flash-messages.md)
+    - [Actix Web Implementations](./advanced/actix-web-implementations.md)
+- [Testing](./advanced/testing.md)
+
+---
