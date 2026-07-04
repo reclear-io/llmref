@@ -1,0 +1,127 @@
+# simple-mcts
+
+Source: https://github.com/loic-smetryns/simple-mcts/blob/main/README.md
+
+# simple-mcts
+
+A lightweight, generic Monte Carlo Tree Search (MCTS) engine for Rust, built around a cache-friendly arena allocator.
+
+`simple-mcts` gives you the low-level primitives to run MCTS/PUCT-style search (à la AlphaZero) on any turn-based, zero-sum game, without imposing a particular game representation. You bring your own state, your own evaluator (neural net, rollout, heuristic...), and the engine handles selection, expansion, and backpropagation over a flat, index-based tree.
+
+## Features
+
+- **Generic over the action space** — the engine is parameterized by `N`, the fixed number of possible actions per state (`Engine<N>`).
+- **Arena-based tree** — nodes live in a contiguous `Vec` and are addressed by a compact `NonZeroU32`-backed index, avoiding `Rc<RefCell<...>>` and reference-counting overhead.
+- **Pluggable selection & backpropagation** — provide your own selection heuristic (PUCT is included) and score transformer (e.g. negation for alternating-turn games).
+- **Tree reuse** — `commit_action` re-roots the tree on the move actually played, keeping the relevant subtree and discarding the rest, with amortized compaction.
+- **Batch mode** — `MctsBatch` manages thousands of independent `Engine` instances behind a slot-map allocator, useful for self-play or vectorized evaluation pipelines.
+- **`no_std`-friendly core logic** (the crate only depends on `std::num::NonZeroU32` and standard collections — no heavyweight dependencies).
+## Installation
+
+```toml
+[dependencies]
+simple-mcts = "0.2"
+```
+
+## Core concepts
+
+The library is built around a small set of pieces you assemble yourself:
+
+- **`Action`** — a thin wrapper around a `usize` index identifying one of the `N` legal moves.
+- **`StateEvaluation<N>`** — the result of evaluating a game state: either `Active(score, policies)` for an ongoing game, or `Terminal(score)` once the game is over. `score` is always expressed from the perspective of the player who *just moved*.
+- **A selection function** — any `Fn(score, node_visits, parent_visits, policy, c) -> f32`, e.g. the provided `puct`.
+- **A score transformer** — any `FnMut(f32) -> f32` applied while backpropagating, typically `negate_score` for two-player alternating games.
+  A search iteration always follows the same three-step loop:
+
+1. **`select`** — walk the tree from the root using your selection heuristic until hitting a leaf or a terminal node, recording the path taken.
+2. **evaluate** — replay that path on your own game state and evaluate the resulting position (rollout, heuristic, neural net...).
+3. **`update`** (or `expand` + `backpropagate` separately) — insert the new node and propagate its score back to the root.
+## Quick start
+
+```rust
+use simple_mcts::{negate_score, puct, visits_to_probabilities, Action, Engine, StateEvaluation};
+ 
+// `MyGame` is your own game state, with `N` possible actions.
+const N: usize = 9;
+const C: f32 = std::f32::consts::SQRT_2;
+ 
+let mut engine = Engine::<N>::new();
+let game = MyGame::new();
+let mut path = Vec::new();
+ 
+for _ in 0..10_000 {
+    // 1. Select a leaf according to PUCT.
+    let selection = engine.select(&mut path, &puct, C);
+ 
+    // 2. Replay the path on a fresh copy of the game and evaluate it.
+    let mut state = game.clone();
+    for action in path.iter() {
+        state.play(*action);
+    }
+    let evaluation = evaluate(&state); // your own evaluator -> StateEvaluation<N>
+ 
+    // 3. Expand + backpropagate, negating the score at each ply.
+    engine.update(evaluation, selection, negate_score).unwrap();
+}
+ 
+// Turn root visit counts into a move-selection distribution.
+let move_probabilities = visits_to_probabilities(engine.scores());
+```
+
+See [`examples/tic_tac_toe.rs`](examples/tic_tac_toe.rs) and [`examples/connect4.rs`](examples/connect4.rs) for complete, runnable implementations (Connect 4 uses random rollouts as its evaluator).
+
+```bash
+cargo run --release --example tic_tac_toe
+cargo run --release --example connect4
+```
+
+## Tree reuse across moves
+
+Once you've picked and played a real move, call `commit_action` to re-root the engine's internal tree on that branch instead of throwing the whole search away:
+
+```rust
+engine.commit_action(Action::new(chosen_action));
+```
+
+If the branch was never explored, the tree is simply cleared. Otherwise the matching subtree becomes the new root, and unreachable nodes are compacted away once their overhead becomes significant.
+
+## Batch search with `MctsBatch`
+
+For self-play or any workload that needs many independent trees driven by the same hyperparameters, `MctsBatch` wraps a slot-map of `Engine<N>` instances:
+
+```rust
+use simple_mcts::{MctsBatch, MctsConfig, MctsStateEvaluation, StateEvaluation};
+ 
+let config = MctsConfig::new(1.414, puct, negate_score);
+let mut batch = MctsBatch::<_, _, N>::from_config(config);
+ 
+let ids = batch.populate(256); // 256 independent search trees
+ 
+// Selection phase across every active engine at once.
+let selections = batch.selection();
+ 
+// ... evaluate each resulting state with your own evaluator ...
+ 
+let mut evaluations: Vec<MctsStateEvaluation<N>> = /* build from `selections` */;
+batch.update(&mut evaluations).unwrap();
+ 
+let scores = batch.scores(); // Vec<MctsScore<N>>, one per active engine
+```
+
+`MctsBatch` also exposes `remove_one` / `remove` to free engines (their slots are recycled via a free-list), `commit_action` / `commit_actions` to re-root individual trees, and `update_one_with_transformer` as an escape hatch when backpropagation logic needs per-call context (e.g. asymmetric or multi-player scoring).
+
+## Utility functions
+
+- **`puct(score, node_visits, parent_visits, policy, c) -> f32`** — the PUCT selection formula (`Q + c·P·√N / (1+n)`), robust to unvisited nodes.
+- **`negate_score(s) -> f32`** — flips the sign of a score; the standard transformer for alternating two-player games.
+- **`visits_to_probabilities(visits) -> [f32; N]`** — normalizes raw visit counts into a probability distribution.
+- **`visits_to_probabilities_with_temperature(visits, tau) -> [f32; N]`** — AlphaZero-style temperature-scaled policy extraction; `tau <= 0.0` performs greedy selection (splitting probability evenly across ties).
+## When *not* to use this crate
+
+`simple-mcts` only provides the search skeleton: tree management, selection, and backpropagation. It does **not** implement any game logic, evaluator, or neural network inference — you're expected to bring those yourself, as shown in the examples.
+
+## License
+
+Licensed under either of [MIT license](LICENSE-MIT) or [Apache License, Version 2.0](LICENSE-APACHE), at your option.
+
+---
