@@ -107,6 +107,15 @@ https://raw.githubusercontent.com/reclear-io/llmref/main/registry/drizzle/0.45.2
 Large dump artifacts (chunks, embeddings) live off-repo; see a snapshot's `dumps`
 endpoint. Format: [SCHEMA.md](./SCHEMA.md) · PR flow: [CONTRIBUTING.md](./CONTRIBUTING.md).
 
+## Backend engine
+
+The engine that produces this registry - the crawler, normalization, embedding,
+and API server - will be open-sourced at some point. We're deliberately not
+rushing that: we want the internals stable first, and we'd rather not expose a
+moving target to vulnerabilities while we're still iterating in sprints. The
+hosted API (`api.llmref.org`) and this registry are free and public today
+regardless.
+
 ## Links
 
 - **Documentation** - https://llmref.org
