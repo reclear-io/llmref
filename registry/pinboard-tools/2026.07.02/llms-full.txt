@@ -1,0 +1,630 @@
+# pinboard-tools
+
+Source: https://github.com/kevinmcmahon/pinboard-tools/blob/main/README.md
+
+# pinboard-tools
+
+A Python library for syncing and managing Pinboard bookmarks.
+
+## Features
+
+- **Efficient incremental sync** with Pinboard.in API (only fetches changed bookmarks)
+- **Bidirectional sync** with configurable conflict resolution strategies
+- **SQLite database** with normalized tag storage and full-text search
+- **Thread-safe** database singleton with proper locking
+- **Error recovery** for failed sync operations with retry support
+- **Tag analysis** and similarity detection
+- **Tag consolidation** for merging duplicate tags
+- **Exponential backoff** on API rate limits with max retry protection
+- **Rate limiting** and optimized API usage
+- **Chunking utilities** for LLM processing
+
+## Installation
+
+```bash
+pip install pinboard-tools
+```
+
+## Quick Start
+
+```python
+from pinboard_tools import (
+    init_database,
+    get_session,
+    BidirectionalSync,
+)
+
+# Initialize database
+init_database("bookmarks.db")
+
+# Create sync engine
+db = get_session()
+sync = BidirectionalSync(db=db, api_token="your-pinboard-api-token")
+
+# Perform efficient incremental sync
+stats = sync.sync()
+print(f"Local to remote: {stats['local_to_remote']}")
+print(f"Remote to local: {stats['remote_to_local']}")
+print(f"Conflicts resolved: {stats['conflicts_resolved']}")
+```
+
+## Core Components
+
+### Database Models
+
+- `Bookmark` - Bookmark entity with all Pinboard fields
+- `Tag` - Tag entity with normalization
+- `BookmarkTag` - Many-to-many relationship
+- `SyncStatus` - Track sync state (`synced`, `pending_local`, `pending_remote`, `conflict`, `error`)
+
+### Sync Engine
+
+- `PinboardAPI` - API client with rate limiting, exponential backoff, and JSON error handling
+- `BidirectionalSync` - Efficient incremental sync with conflict resolution, error recovery, and remote-to-local mirroring through `upsert_pinboard_post`
+- `upsert_pinboard_post` - Mirror a Pinboard API post into the local database
+
+### Tag Analysis
+
+- `TagSimilarityDetector` - Find similar tags
+- `TagConsolidator` - Merge duplicate tags
+
+### Utilities
+
+- `chunk_bookmarks_for_llm` - Prepare data for LLM processing
+- DateTime helpers for Pinboard format
+
+## Database Schema
+
+The library uses a normalized SQLite schema with full-text search:
+
+```sql
+-- Core tables (see pinboard_tools/data/schema.sql for complete structure)
+bookmarks (href, description, extended, hash, time, sync_status, ...)
+tags (name)
+bookmark_tags (bookmark_id, tag_id)
+sync_metadata (key, timestamp)
+
+-- Convenience view
+bookmarks_with_tags  -- joins bookmarks with their tags as space-separated string
+```
+
+## API Reference
+
+### Initialization
+
+```python
+# Initialize database with schema
+init_database(db_path: str)
+
+# Get database session
+with get_session() as session:
+    # Use session for queries
+```
+
+### Syncing
+
+```python
+# Create sync client
+sync = BidirectionalSync(db=session, api_token="your-token")
+
+# Efficient incremental sync (only fetches changed bookmarks)
+stats = sync.sync()
+
+# Sync only local changes to remote
+stats = sync.sync(direction=SyncDirection.LOCAL_TO_REMOTE)
+
+# Sync only remote changes to local
+stats = sync.sync(direction=SyncDirection.REMOTE_TO_LOCAL)
+
+# Retry bookmarks that previously failed to sync
+retried = sync.retry_failed_bookmarks()
+if retried > 0:
+    stats = sync.sync()  # re-sync the retried bookmarks
+```
+
+### Local mirroring
+
+Use `upsert_pinboard_post` when another application has already written a
+bookmark to Pinboard and wants to keep the local SQLite database in step without
+running a full sync:
+
+```python
+from pinboard_tools import PinboardAPI, get_session, init_database, upsert_pinboard_post
+
+init_database("bookmarks.db")
+db = get_session()
+api = PinboardAPI("your-token")
+
+api.add_post(
+    url="https://example.com",
+    description="Example",
+    extended="A useful example.",
+    tags="examples docs",
+)
+posts = api.get_post(url="https://example.com")
+if posts:
+    upsert_pinboard_post(db, posts[0])
+```
+
+The mirrored bookmark is marked `synced`, tags are normalized through the same
+tag tables as sync, and `last_synced_at` is updated.
+
+### Tag Analysis
+
+```python
+# Find similar tags
+detector = TagSimilarityDetector(session)
+similar_groups = detector.find_similar_tags(threshold=0.8)
+
+# Consolidate tags
+consolidator = TagConsolidator(session)
+consolidator.consolidate_tags(old_tag="python3", new_tag="python")
+```
+
+## License
+
+Apache License 2.0 - see LICENSE file for details
+
+---
+
+# 0001. Local Bookmark Upsert Public API
+
+Source: https://github.com/kevinmcmahon/pinboard-tools/blob/main/docs/adr/0001-local-bookmark-upsert-public-api.md
+
+# 0001. Local Bookmark Upsert Public API
+
+## Status
+
+## Context
+
+Applications that write directly to Pinboard may also need to keep the local
+pinboard-tools SQLite database current. Before this decision, the code that
+inserted or updated local bookmarks from remote Pinboard posts lived inside the
+private `BidirectionalSync` implementation. Callers outside pinboard-tools had
+to either run a broader sync or duplicate schema-specific SQL and tag handling.
+
+## Decision
+
+Expose `upsert_pinboard_post(db, post)` as the public local mirror API. The
+function accepts a Pinboard-shaped post, validates the required fields, inserts
+or updates the local bookmark, updates normalized tags, marks the bookmark
+`synced`, and records `last_synced_at`.
+
+Invalid post data raises `InvalidPinboardPostError`.
+
+## Consequences
+
+Write-through clients can save remotely and mirror the saved remote post
+locally without depending on private sync methods. The local database remains
+consistent with the same normalized tag tables used by sync.
+
+Callers are still responsible for obtaining a fresh Pinboard-shaped post from
+the API after a remote write, so the mirrored row uses Pinboard's authoritative
+`hash`, `time`, and metadata.
+
+---
+
+# 0002. Retire Obsolete Database Surface
+
+Source: https://github.com/kevinmcmahon/pinboard-tools/blob/main/docs/adr/0002-retire-obsolete-database-surface.md
+
+# 0002. Retire Obsolete Database Surface
+
+## Status
+
+## Context
+
+The database package has accumulated obsolete standalone schema migration
+helpers and row conversion helpers that are no longer part of the supported
+database surface. The active schema initialization path is
+`Database.init_schema()`, which loads the packaged `schema.sql` resource.
+
+Some database types and helpers remain current and useful: dataclasses,
+row-shaped type definitions, tag helpers, query helpers, `BookmarkTag`, and
+`TagMerge` are still part of the documented surface where applicable.
+
+## Decision
+
+Retire only the stale database migration helpers and unused row conversion
+helpers from documentation and release notes.
+
+Keep documenting the current bookmark row converter, the database dataclasses,
+row-shaped type definitions, normalized tag helpers, and query helpers. Schema
+ownership remains with `Database.init_schema()` and packaged
+`schema.sql`.
+
+## Consequences
+
+The public documentation no longer advertises helper APIs that callers should
+not depend on.
+
+Existing supported database models, tag operations, query helpers, and packaged
+schema initialization remain visible and unchanged.
+
+---
+
+# 0003. FTS-Backed Bookmark Search
+
+Source: https://github.com/kevinmcmahon/pinboard-tools/blob/main/docs/adr/0003-fts-backed-bookmark-search.md
+
+# 0003. FTS-Backed Bookmark Search
+
+## Status
+
+## Context
+
+The documentation advertises full-text search support for bookmarks, and the
+packaged SQLite schema already creates a `bookmarks_fts` FTS5 virtual table over
+bookmark `href`, `description`, and `extended` content. Schema triggers keep the
+FTS table synchronized with the canonical `bookmarks` rows.
+
+The supported database query surface includes bookmark search. That helper
+should match the documented architecture and the schema that already exists:
+search should use the FTS index rather than scanning bookmark columns with
+`LIKE` predicates.
+
+Bookmark search also accepts raw user input. SQLite FTS query syntax is more
+expressive than plain text search, so treating user input as an FTS expression
+directly can change search meaning or raise syntax errors. Search results still
+need to be returned as bookmark-shaped rows that include normalized tags.
+
+## Decision
+
+Use `bookmarks_fts` as the backing index for the bookmark search query helper.
+The helper should join FTS matches back to `bookmarks_with_tags` so callers
+continue to receive bookmark rows with tag strings, not FTS-only rows.
+
+Schema version 3 repairs the external-content FTS maintenance triggers and
+rebuilds `bookmarks_fts` for existing databases so current installs get the
+same update and delete behavior as newly initialized databases.
+
+Raw user input must be handled as data. The helper should bind values through
+SQLite parameters and transform user text into a safe FTS query form before
+using `MATCH`; it should not concatenate raw input into SQL or treat raw input
+as trusted FTS syntax.
+
+## Consequences
+
+Bookmark search behavior aligns with the documented full-text search feature
+and uses the schema's maintained FTS5 index instead of column-wide `LIKE`
+scans.
+
+Search callers keep the same result shape, including tags from the normalized
+tag model, while the implementation can rely on SQLite FTS ranking and matching
+semantics in the future.
+
+User-entered punctuation, operators, or malformed FTS syntax should not be able
+to break the query or alter the SQL statement. The helper is responsible for
+normalizing that input into supported FTS search terms.
+
+---
+
+# 0004. Local Mirror Persistence Seam
+
+Source: https://github.com/kevinmcmahon/pinboard-tools/blob/main/docs/adr/0004-local-mirror-persistence-seam.md
+
+# 0004. Local Mirror Persistence Seam
+
+## Status
+
+## Context
+
+`upsert_pinboard_post(db, post)` is the public local mirror API for writing a
+Pinboard-shaped post into the SQLite bookmark store. Bidirectional sync also
+needs several bookmark persistence operations: finding pending local bookmarks,
+building local bookmark lookups, marking sync success or error, retrying failed
+bookmarks, and touching synced rows after a successful sync.
+
+Before this decision, those SQL statements were mixed into
+`BidirectionalSync`. That made the sync workflow responsible for both
+orchestration and bookmark persistence details, even when the SQL operated on
+the same local mirror state used by the public upsert helper.
+
+## Decision
+
+Keep `upsert_pinboard_post(db, post)` as the only documented local mirror
+entry point, and keep `InvalidPinboardPostError` unchanged.
+
+Move focused bookmark persistence SQL into private helpers in
+`pinboard_tools.local_mirror`. `BidirectionalSync` delegates local bookmark
+queries and sync-status updates to those helpers while keeping its existing
+transaction boundaries. The retry helper commits because the existing
+`retry_failed_bookmarks()` behavior commits the reset immediately.
+
+Do not introduce a broad repository class. The current need is a narrow
+persistence seam around local mirror bookmark operations, not a new object model
+or abstraction for every database query.
+
+## Consequences
+
+Bookmark persistence logic used by local mirror and bidirectional sync is easier
+to test directly and easier to keep consistent.
+
+`BidirectionalSync` remains the sync orchestrator and conflict-resolution owner,
+while `local_mirror` owns focused bookmark persistence details.
+
+The private helper names are implementation details. Callers should continue to
+use the documented public API rather than depending on these helpers.
+
+---
+
+# 0005. Sync Decision Module
+
+Source: https://github.com/kevinmcmahon/pinboard-tools/blob/main/docs/adr/0005-sync-decision-module.md
+
+# 0005. Sync Decision Module
+
+## Status
+
+## Context
+
+Remote-to-local bidirectional sync needs to decide whether a Pinboard post
+should update the local bookmark, be ignored, or lose to a pending local
+change. Before this decision, that classification logic lived inside
+`BidirectionalSync` next to API calls, database lookups, local mirror writes,
+conflict counters, dry-run handling, and status updates.
+
+Keeping classification and orchestration together made conflict behavior harder
+to test directly. It also meant timestamp and tag comparison rules were tied to
+database access even though the decision only needs a local snapshot, a remote
+post, and a conflict policy.
+
+## Decision
+
+Add `pinboard_tools.sync.decisions` as a pure sync decision module. It accepts a
+`LocalBookmarkSnapshot`, a Pinboard-shaped remote post, and a local conflict
+policy enum, then returns a small action enum.
+
+The decision module does not call the Pinboard API, read or write the database,
+or import `BidirectionalSync`'s public conflict enum. `BidirectionalSync`
+remains the orchestrator: it fetches remote posts, builds local snapshots,
+translates its existing `ConflictResolution` values into decision policies,
+applies local mirror writes, preserves dry-run behavior, and updates sync
+statistics.
+
+## Consequences
+
+Sync classification rules are directly testable without API or SQLite setup.
+The rules for tag-order-insensitive equality, remote field changes, newer
+remote timestamps, pending local conflicts, and naive local timestamp
+comparison live in one focused module.
+
+`BidirectionalSync` keeps its public behavior and enum surface while delegating
+classification. Future changes to sync policy can be tested in the pure module
+before changing orchestration or persistence code.
+
+---
+
+# 0006. Idempotent Schema Initialization
+
+Source: https://github.com/kevinmcmahon/pinboard-tools/blob/main/docs/adr/0006-idempotent-schema-initialization.md
+
+# 0006. Idempotent Schema Initialization
+
+## Status
+
+## Context
+
+`Database.init_schema()` is the supported entry point for creating and
+migrating the SQLite bookmark database. Callers use it before local mirror
+upserts, sync operations, search, and tests. Those callers should not need to
+know whether a database file is new, empty, partially initialized, or already
+at the current schema version.
+
+The bookmark database contains primary local mirror tables plus derived
+representations: normalized tag junction rows, the `bookmarks_with_tags` view,
+and the `bookmarks_fts` full-text index. Derived objects must be repairable and
+rebuildable because local mirror state can lag or be reconciled from Pinboard.
+
+The packaged `schema.sql` previously mixed idempotent table/index creation with
+non-idempotent trigger and view creation. Running `init_schema()` against an
+existing database could fail with duplicate trigger errors, pushing schema-state
+guessing into callers.
+
+## Decision
+
+Keep schema ownership inside pinboard-tools. `Database.init_schema()` and the
+packaged `schema.sql` resource must be safe to run repeatedly against an
+existing database.
+
+Use `IF NOT EXISTS` for schema objects that are part of the current schema,
+including triggers and views. Keep versioned migrations responsible for
+replacing objects whose definitions changed. Schema version 3 repairs the FTS
+maintenance triggers and rebuilds the FTS index so existing databases converge
+with newly initialized databases.
+
+Callers should invoke `Database.init_schema()` before using the local database
+instead of inferring schema state from file existence, file size, or private
+SQLite internals.
+
+## Consequences
+
+Applications can delegate database creation, migration, and repair to
+pinboard-tools without carrying local schema heuristics.
+
+The local SQLite database remains a repairable mirror of Pinboard data. The FTS
+index and bookmark/tag views are derived data maintained by schema triggers and
+can be rebuilt during migrations when trigger behavior changes.
+
+Future schema changes must preserve mixed-version safety: old databases,
+newly-created databases, and databases initialized multiple times should all
+converge through `Database.init_schema()`.
+
+---
+
+# Release Process
+
+Source: https://github.com/kevinmcmahon/pinboard-tools/blob/main/RELEASING.md
+
+# Release Process
+
+This document describes how to release new versions of `pinboard-tools` to PyPI.
+
+## Prerequisites
+
+- You must be a maintainer with write access to the repository
+- PyPI trusted publishing must be configured (see below)
+- All tests must be passing on the main branch
+
+## Release Methods
+
+### Method 1: Automated Release (Recommended)
+
+Use the GitHub Actions workflow to automatically bump version and create a release:
+
+1. Go to the [Actions tab](../../actions) in the repository
+2. Click on the "Release" workflow (`.github/workflows/publish.yml`)
+3. Click "Run workflow"
+4. Select:
+   - **Version bump type**: `patch`, `minor`, or `major`
+   - **Pre-release**: Check if this is a pre-release version
+5. Click "Run workflow"
+
+The workflow will:
+
+- Bump the version in `pyproject.toml`, `pinboard_tools/__init__.py`, `docs/conf.py`, and `uv.lock`
+- Run linting, formatting, type checking, tests with coverage, package build, and metadata checks
+- Commit and push the version change after local release checks pass
+- Verify the PyPI version and GitHub release do not already exist
+- Publish the package to PyPI using trusted publishing
+- Create a GitHub release with auto-generated release notes
+- Upload signed artifacts to the GitHub release
+
+#### Recovery mode
+
+Use **Version bump type** `none` only when the repository has already been
+bumped to the release version but PyPI publishing failed before the package was
+uploaded. This rebuilds and publishes the existing version without creating a
+new version bump commit.
+
+### Method 2: Manual Release
+
+If you prefer to control the version bump manually:
+
+1. **Update version locally**:
+
+   ```bash
+   # Check current version
+   uv run --with bump-my-version bump-my-version show current_version
+   
+   # Bump version (choose one)
+   uv run --with bump-my-version bump-my-version bump patch  # 0.1.1 -> 0.1.2
+   uv run --with bump-my-version bump-my-version bump minor  # 0.1.1 -> 0.2.0
+   uv run --with bump-my-version bump-my-version bump major  # 0.1.1 -> 1.0.0
+   ```
+
+2. **Commit and push**:
+
+   ```bash
+   git add pyproject.toml pinboard_tools/__init__.py docs/conf.py uv.lock
+   GIT_EDITOR=true git commit
+   git push origin main
+   ```
+
+3. **Create GitHub release**:
+   - Go to [Releases](../../releases)
+   - Click "Draft a new release"
+   - Click "Choose a tag" and create new tag: `v0.1.2` (match your version)
+   - Set release title: `v0.1.2`
+   - Auto-generate release notes or write your own
+   - Check "Set as a pre-release" if applicable
+   - Click "Publish release"
+
+Manual GitHub release creation does not publish to PyPI. Prefer the automated
+workflow unless you are deliberately handling PyPI publication yourself.
+
+## Version Numbering
+
+We follow [Semantic Versioning](https://semver.org/):
+
+- **MAJOR** (1.0.0): Incompatible API changes
+- **MINOR** (0.1.0): New functionality, backwards compatible
+- **PATCH** (0.0.1): Bug fixes, backwards compatible
+
+## Pre-releases
+
+For testing releases before making them public:
+
+1. Use the automated workflow with "Pre-release" checked, or
+2. Manually create a release and check "Set as a pre-release"
+
+Pre-releases are visible on PyPI but won't be installed by default.
+
+## PyPI Trusted Publishing Setup
+
+This project uses PyPI's trusted publishing feature, which is more secure than API tokens.
+
+To configure (already done for this project):
+
+1. Log in to [PyPI.org](https://pypi.org)
+2. Go to your project's settings
+3. Add a new trusted publisher:
+   - **Owner**: `kevinmcmahon`
+   - **Repository**: `pinboard-tools`
+   - **Workflow**: `publish.yml`
+   - **Environment**: `pypi`
+
+## Troubleshooting
+
+### Tests failing in CI
+
+The publish workflow won't run if tests fail. Check the test workflow results and fix any issues.
+
+### Version already exists on PyPI
+
+Each version can only be published once. Bump to a new version and try again.
+
+### Trusted publishing not working
+
+Ensure the PyPI trusted publisher configuration matches exactly:
+
+- Repository owner and name
+- Workflow filename (`publish.yml`)
+- Environment name (`pypi`)
+
+## Local Testing
+
+Before releasing, test the package build locally:
+
+```bash
+# Run the same checks used by CI and release
+uv run ruff check .
+uv run ruff format --check .
+uv run mypy pinboard_tools/
+uv run --with pytest-cov pytest --cov=pinboard_tools --cov-report=term-missing
+
+# Build the package
+uv build
+
+# Check the build
+uv run --with twine twine check dist/*
+
+# Test installation in a new environment
+cd /tmp
+python -m venv test-env
+source test-env/bin/activate
+pip install /path/to/pinboard-tools/dist/pinboard_tools-0.1.2-py3-none-any.whl
+python -c "import pinboard_tools; print(pinboard_tools.__version__)"
+```
+
+## Release Checklist
+
+Before releasing:
+
+- [ ] All tests pass locally: `make test`
+- [ ] Code is formatted: `make format`
+- [ ] Type checking passes: `make typecheck`
+- [ ] Documentation is updated if needed
+- [ ] CHANGELOG.md is updated (if maintaining one)
+- [ ] Version number follows semantic versioning
+
+## Post-Release
+
+After a successful release:
+
+1. Verify on [PyPI](https://pypi.org/project/pinboard-tools/)
+2. Test installation: `pip install pinboard-tools=={new_version}`
+3. Create a GitHub announcement if it's a major release
+4. Update any dependent projects
+
+---
