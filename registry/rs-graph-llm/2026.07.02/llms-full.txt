@@ -1,0 +1,536 @@
+# Start a claim
+
+Source: https://github.com/a-agmon/rs-graph-llm/blob/main/README.md
+
+<div align="center">
+  <img src="image.png" alt="graph-flow" width="300">
+
+  # graph-flow
+
+  ### Stateful Graph Workflow Framework for AI Agents in Rust
+
+  *A type-safe, LangGraph-inspired framework for building complex, interactive, resumable agent workflows*
+
+
+  ---
+</div>
+
+**graph-flow** combines the two ideas that make LangGraph pleasant to use — a graph execution engine for stateful workflows, and tight LLM ecosystem integration — and rebuilds them natively in Rust:
+
+- **[`graph-flow`](graph-flow/)** — the core graph execution library: task orchestration, session persistence, conditional routing, human-in-the-loop pauses
+- **[Rig](https://github.com/0xPlaygrounds/rig)** — Rust-native LLM integration and agent capabilities (optional `rig` feature)
+
+You get LangGraph-style workflow design with Rust's performance and type safety, a clean database schema for session state, and flexible execution models — step-by-step, fire-and-forget, or a mix of both in the same graph.
+
+## Repository Layout
+
+| Crate | What it shows |
+|---|---|
+| [`graph-flow/`](graph-flow/) | The framework library (published to crates.io) |
+| [`insurance-claims-service/`](insurance-claims-service/) | Production-style HTTP service: LLM-driven claim intake, conditional routing, human-in-the-loop approval |
+| [`recommendation-service/`](recommendation-service/) | RAG recommendation system with vector search |
+| [`examples/`](examples/) | Small progressive examples: `simple_example`, `complex_example`, `recommendation_flow`, `fanout_basic`, `terminal_client` |
+
+> **Start here**: read [`examples/simple_example.rs`](examples/simple_example.rs) for the core concepts, then the services for real-world patterns.
+
+## Quick Start
+
+```toml
+[dependencies]
+graph-flow = { version = "0.5", features = ["rig"] }  # drop "rig" if you don't need LLM helpers
+```
+
+### 1. Define tasks
+
+Tasks are the building blocks of a workflow. Each implements the [`Task`](graph-flow/src/task.rs) trait, reads and writes shared state through `Context`, and returns a `NextAction` that steers the graph:
+
+```rust
+use async_trait::async_trait;
+use graph_flow::{Context, NextAction, Task, TaskResult};
+
+struct HelloTask;
+
+#[async_trait]
+impl Task for HelloTask {
+    // id() defaults to the type name; override it for a custom identifier
+
+    async fn run(&self, context: Context) -> graph_flow::Result<TaskResult> {
+        let name: String = context.get("name").await.unwrap_or_default();
+        let greeting = format!("Hello, {name}");
+
+        // Store result for the next task
+        context.set("greeting", greeting.clone()).await;
+
+        // Continue to the next task, but hand control back to the caller
+        Ok(TaskResult::new(Some(greeting), NextAction::Continue))
+    }
+}
+```
+
+### 2. Build the graph
+
+```rust
+use graph_flow::GraphBuilder;
+use std::sync::Arc;
+
+let hello_task = Arc::new(HelloTask);
+let excitement_task = Arc::new(ExcitementTask);
+
+let graph = Arc::new(
+    GraphBuilder::new("greeting_workflow")
+        .add_task(hello_task.clone())
+        .add_task(excitement_task.clone())
+        .add_edge(hello_task.id(), excitement_task.id())
+        .build(),
+);
+```
+
+### 3. Execute with sessions
+
+Workflows are **stateful**: they can pause, wait for user input, and resume later — across process restarts if you use persistent storage. `FlowRunner` wraps the load → execute one step → save cycle:
+
+```rust
+use graph_flow::{ExecutionStatus, FlowRunner, InMemorySessionStorage, Session, SessionStorage};
+use std::sync::Arc;
+
+let storage = Arc::new(InMemorySessionStorage::new());
+let runner = FlowRunner::new(graph.clone(), storage.clone());
+
+// Create a session positioned at the first task
+let session = Session::new_from_task("session_001".to_string(), hello_task.id());
+session.context.set("name", "Batman".to_string()).await;
+storage.save(session).await?;
+
+// Drive the workflow step by step
+loop {
+    let result = runner.run("session_001").await?;
+    println!("Response: {:?}", result.response);
+
+    match result.status {
+        ExecutionStatus::Completed => break,
+        ExecutionStatus::Paused { .. } => continue,      // will auto-continue to the next task
+        ExecutionStatus::WaitingForInput => break,        // collect user input, set it in context, run again
+        ExecutionStatus::Error(e) => {
+            eprintln!("workflow error: {e}");
+            break;
+        }
+    }
+}
+```
+
+Prefer manual control (custom persistence, batching)? Use the lower-level API — it is exactly what `FlowRunner` does internally:
+
+```rust
+let mut session = storage.get("session_001").await?.unwrap();
+let result = graph.execute_session(&mut session).await?;
+storage.save(session).await?;
+```
+
+## Execution Control
+
+You choose how the graph advances by returning the right `NextAction` from each task:
+
+| `NextAction` | Behavior |
+|---|---|
+| `Continue` | Advance one edge, then return control to the caller (step-by-step) |
+| `ContinueAndExecute` | Advance and keep executing tasks in the same call until something pauses |
+| `WaitForInput` | Pause at the current task until new input arrives |
+| `GoTo(task_id)` | Jump to a specific task |
+| `End` | Complete the workflow |
+
+**`Continue`** is the interactive mode: after every hop the engine saves state and returns, so a web service can respond to the client between steps.
+
+**`ContinueAndExecute`** is fire-and-forget: the engine immediately runs the next task with the same context, and keeps going until a task returns `Continue`, `WaitForInput`, or `End`. Blend both freely — automated chains with interactive pauses in one workflow.
+
+```rust
+// Step-by-step: caller decides when the next task runs
+Ok(TaskResult::new(Some("Done".into()), NextAction::Continue))
+
+// Continuous: single runner.run() call executes the whole chain
+Ok(TaskResult::new(None, NextAction::ContinueAndExecute))
+```
+
+### ExecutionStatus
+
+Every execution returns an [`ExecutionResult`](graph-flow/src/graph.rs) with the task's response and a status:
+
+- **`Paused { next_task_id, reason }`** — task finished; the workflow will proceed to `next_task_id` on the next run (returned for `Continue` and `GoTo`)
+- **`WaitingForInput`** — workflow is parked on the current task until you provide input and run again
+- **`Completed`** — the workflow reached `End`
+- **`Error(String)`** — reserved for API compatibility; the engine currently reports failures as `Err(GraphError)` instead
+
+### Guard rails
+
+Two builder options protect long-running graphs:
+
+```rust
+let graph = GraphBuilder::new("wf")
+    .add_task(task)
+    .with_task_timeout(std::time::Duration::from_secs(60)) // per-task timeout (default: 5 min)
+    .with_max_execution_steps(50) // cap chained ContinueAndExecute steps (default: unlimited)
+    .build();
+```
+
+`with_max_execution_steps` turns an accidental `ContinueAndExecute` cycle into an error instead of an infinite loop.
+
+## Advanced Features
+
+### Conditional edges
+
+Branch at runtime on data in the `Context` ([`complex_example.rs`](examples/complex_example.rs)):
+
+```rust
+let graph = GraphBuilder::new("sentiment_flow")
+    .add_task(sentiment_task.clone())
+    .add_task(positive_task.clone())
+    .add_task(negative_task.clone())
+    .add_conditional_edge(
+        sentiment_task.id(),
+        |ctx| ctx.get_sync::<String>("sentiment").map(|s| s == "positive").unwrap_or(false),
+        positive_task.id(), // yes branch
+        negative_task.id(), // else branch
+    )
+    .build();
+```
+
+```mermaid
+graph TD
+    SA["SentimentAnalysisTask"] --> S{Sentiment?}
+    S -->|"positive"| P["PositiveResponseTask"]
+    S -->|"negative"| N["NegativeResponseTask"]
+```
+
+### LLM integration with Rig
+
+With the `rig` feature, chat history stored in the `Context` converts directly to Rig messages:
+
+```rust
+use rig::providers::openrouter;
+
+async fn run(&self, context: Context) -> graph_flow::Result<TaskResult> {
+    let user_input: String = context.get_sync("user_input").unwrap();
+
+    let client = openrouter::Client::new(&api_key);
+    let agent = client
+        .agent("openai/gpt-4o-mini")
+        .preamble("You are a helpful insurance assistant")
+        .build();
+
+    // Conversation context for the LLM
+    let chat_history = context.get_rig_messages().await;
+    let response = agent.chat(&user_input, chat_history).await?;
+
+    // Persist the exchange
+    context.add_user_message(user_input).await;
+    context.add_assistant_message(response.clone()).await;
+
+    Ok(TaskResult::new(Some(response), NextAction::Continue))
+}
+```
+
+### Context and state management
+
+[`Context`](graph-flow/src/context.rs) is thread-safe, typed, and fully serialized with the session:
+
+```rust
+// Typed key-value state
+context.set("claim_amount", 1500.0).await;
+let amount: f64 = context.get("claim_amount").await.unwrap();
+
+// Fallible insert (set() panics on unserializable values)
+context.try_set("key", value).await?;
+
+// Sync accessors for edge-condition closures
+let ok = context.get_sync::<bool>("condition").unwrap_or(false);
+
+// Built-in chat history (capped at 1000 messages by default)
+context.add_user_message("What's my claim status?".to_string()).await;
+context.add_assistant_message("Your claim is being processed".to_string()).await;
+let recent = context.get_last_messages(5).await;
+```
+
+### Parallel execution (FanOut)
+
+[`FanOutTask`](graph-flow/src/fanout.rs) runs child tasks concurrently within one graph node, waits for all of them, and aggregates their outputs into the context under prefixed keys ([`fanout_basic.rs`](examples/fanout_basic.rs)):
+
+```rust
+use graph_flow::FanOutTask;
+
+let fanout = FanOutTask::new("fanout", vec![Arc::new(ChildA), Arc::new(ChildB)])
+    .with_prefix("parallel");
+
+// FanOut is a regular task in the graph
+let graph = GraphBuilder::new("fanout_demo")
+    .add_task(prepare_task.clone())
+    .add_task(fanout.clone())
+    .add_task(consume_task.clone())
+    .add_edge(prepare_task.id(), fanout.id())
+    .add_edge(fanout.id(), consume_task.id())
+    .build();
+
+// Downstream tasks read: parallel.child_a.response, parallel.child_b.response, ...
+```
+
+Caveats: children's `NextAction` is ignored (the FanOut node controls flow), all children share one context, and if any child fails the FanOut fails with the first error (other children still complete, so partial results may be present).
+
+### Storage backends
+
+Both backends implement the same `SessionStorage` trait — swap freely between development and production:
+
+```rust
+// In-memory (development)
+let storage = Arc::new(InMemorySessionStorage::new());
+
+// PostgreSQL (production) - session ids must be valid UUIDs
+let storage = Arc::new(PostgresSessionStorage::connect(&database_url).await?);
+
+// Or bring your own pool configuration
+let pool = sqlx::postgres::PgPoolOptions::new().max_connections(20).connect(&url).await?;
+let storage = Arc::new(PostgresSessionStorage::with_pool(pool).await?);
+```
+
+## Case Study: Insurance Claims Processing
+
+The [`insurance-claims-service`](insurance-claims-service/) is a complete agentic workflow behind an Axum HTTP API:
+
+```mermaid
+graph TD
+    A["Initial Claim Query<br/>LLM conversation"] --> B["Insurance Type Classifier"]
+    B --> C{Insurance Type?}
+    C -->|"Car"| D["Car Insurance Details"]
+    C -->|"Apartment"| E["Apartment Insurance Details"]
+    D --> F["Smart Claim Validator"]
+    E --> F
+    F --> G{Claim Amount?}
+    G -->|"< $1000"| H["Auto-Approve"]
+    G -->|"≥ $1000"| I["Manual Review<br/>(waits for human input)"]
+    I --> K{Approval Decision?}
+    K -->|"approved"| L["Manual Approval"]
+    K -->|"other"| M["Final Summary"]
+    H --> M
+    L --> M
+```
+
+It demonstrates the framework's key patterns working together:
+
+- **LLM-first tasks** — every interactive step uses an agent for natural-language understanding ([`initial_claim_query.rs`](insurance-claims-service/src/tasks/initial_claim_query.rs))
+- **Structured extraction** — tasks parse JSON out of LLM responses into typed context values
+- **Content-based routing** — conditional edges route on the LLM's classification ([`insurance_type_classifier.rs`](insurance-claims-service/src/tasks/insurance_type_classifier.rs))
+- **Human-in-the-loop** — claims ≥ $1000 return `WaitForInput` and park the session until a reviewer responds ([`smart_claim_validator.rs`](insurance-claims-service/src/tasks/smart_claim_validator.rs))
+- **Full state tracking** — chat history, structured claim data, workflow position, and status messages survive across requests
+
+### Running it
+
+```bash
+export OPENROUTER_API_KEY="your-key"
+export DATABASE_URL="postgresql://user:pass@localhost/db"  # optional, defaults to in-memory
+
+cargo run --bin insurance-claims-service
+
+# Start a claim
+curl -X POST http://localhost:3000/execute \
+  -H "Content-Type: application/json" \
+  -d '{"content": "I need to file a claim for my car accident"}'
+
+# Continue the conversation (use the session_id from the response)
+curl -X POST http://localhost:3000/execute \
+  -H "Content-Type: application/json" \
+  -d '{"session_id": "uuid-here", "content": "It happened yesterday on Main Street"}'
+
+# Inspect session state
+curl http://localhost:3000/session/uuid-here
+```
+
+The HTTP handler is one workflow step per request:
+
+```rust
+async fn execute_graph(
+    State(state): State<AppState>,
+    Json(request): Json<ExecuteRequest>,
+) -> Result<Json<ExecuteResponse>, StatusCode> {
+    // Store the user's message in the session context
+    let session = state.session_storage.get(&session_id).await?;
+    session.context.set("user_input", request.content).await;
+    state.session_storage.save(session).await?;
+
+    // Execute one step; FlowRunner loads, runs, and saves the session
+    let result = state.flow_runner.run(&session_id).await?;
+
+    Ok(Json(ExecuteResponse {
+        session_id,
+        response: result.response,
+        status: format!("{:?}", result.status),
+    }))
+}
+```
+
+## Production Considerations
+
+- **Per-session concurrency**: `FlowRunner::run` is a load → execute → save cycle with no locking. Two concurrent runs of the *same* session race and the later save wins. Serialize requests per session (per-session mutex, sticky routing, or a queue).
+- **Timeouts and step limits**: set `with_task_timeout` to bound slow LLM calls, and `with_max_execution_steps` if your graph contains cycles reachable via `ContinueAndExecute`.
+- **Postgres session ids** must be valid UUIDs (the schema stores them as `UUID`).
+- **Durability of chained steps**: within one `ContinueAndExecute` chain, the session is saved only after the chain finishes — a crash mid-chain re-runs from the chain's first task.
+
+## API Stability
+
+The `0.5.x` line is semver-stable. A set of known API cleanups (unifying execution semantics, fallible `Context::set`, removing dead enum variants, an immutable `Graph`, optimistic locking for Postgres) is planned for the next major release and documented in [`graph-flow/ROADMAP.md`](graph-flow/ROADMAP.md). Deprecated items (`Graph::execute`, `NextAction::GoBack`) emit compiler warnings with migration hints.
+
+## License
+
+MIT License — see [LICENSE](LICENSE).
+
+---
+
+# CLAUDE.md
+
+Source: https://github.com/a-agmon/rs-graph-llm/blob/main/CLAUDE.md
+
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Commands
+
+### Building and Running
+```bash
+# Build all workspace members
+cargo build
+
+# Build and run specific services
+cargo run --bin insurance-claims-service
+cargo run --bin recommendation-service
+
+# Run examples
+cargo run --bin simple_example
+cargo run --bin complex_example  
+cargo run --bin recommendation_flow
+cargo run --bin terminal_client
+cargo run --bin fanout_basic
+```
+
+### Testing
+```bash
+# Run all tests
+cargo test
+
+# Run tests for specific crate
+cargo test -p graph-flow
+cargo test -p insurance-claims-service
+```
+
+### Environment Setup
+Required environment variables:
+- `OPENROUTER_API_KEY`: For LLM integration via OpenRouter
+- `DATABASE_URL`: PostgreSQL connection string (optional - uses in-memory storage if not set)
+
+## Architecture Overview
+
+This is a Rust implementation of a LangGraph-inspired stateful graph execution framework for LLM agents. The architecture consists of:
+
+### Core Framework (`graph-flow/`)
+- **Graph execution engine**: Handles task orchestration, state management, conditional routing
+- **Session management**: Persistent workflow state with pluggable storage backends
+- **Context system**: Thread-safe state sharing between tasks with built-in chat history management
+- **Task abstraction**: Async trait-based task system with timeout support
+
+### Key Components
+
+#### Task System
+- Tasks implement the `Task` trait with `run(context: Context) -> TaskResult`
+- `TaskResult` controls flow with `NextAction` enum:
+  - `Continue`: Move to next task, return control to caller (step-by-step execution)
+  - `ContinueAndExecute`: Move to next task and execute immediately (fire-and-forget)
+  - `WaitForInput`: Pause workflow waiting for user input
+  - `End`: Complete workflow
+  - `GoTo(task_id)`: Jump to specific task
+
+#### Execution Status System
+- `ExecutionStatus` returned from workflow execution provides rich context:
+  - `Paused { next_task_id }`: Workflow paused, will continue automatically to specified task
+  - `WaitingForInput`: Workflow waiting for user input to continue
+  - `Completed`: Workflow finished successfully
+  - `Error(String)`: Workflow failed with error message
+
+#### Graph Structure
+- Built using `GraphBuilder` with fluent API
+- Supports conditional edges with runtime evaluation: `add_conditional_edge(from, condition, yes_branch, no_branch)`
+- Tasks connected via directed edges with optional conditions
+
+#### Session Management
+- `Session` contains: id, graph_id, current_task_id, status_message, context
+- Storage backends: `InMemorySessionStorage` (dev) and `PostgresSessionStorage` (prod)
+- `FlowRunner` provides high-level session management (auto load/save)
+
+#### Context System
+- Thread-safe typed data storage: `context.set("key", value)` / `context.get("key")`
+- Built-in chat history: `add_user_message()`, `add_assistant_message()`, `get_chat_history()`
+- Rig integration: `get_rig_messages()` for LLM conversation context
+
+### Example Applications
+
+#### Insurance Claims Service (`insurance-claims-service/`)
+Complete multi-step insurance processing workflow:
+- LLM-driven claim intake and classification
+- Conditional routing (car vs apartment insurance)
+- Business rule validation ($1000 auto-approval threshold)
+- Human-in-the-loop approval for high-value claims
+- Comprehensive state tracking throughout process
+
+#### Recommendation Service (`recommendation-service/`)
+RAG-based recommendation system with vector search integration.
+
+### Integration Patterns
+
+#### LLM Integration (via Rig)
+```rust
+let agent = client.agent("openai/gpt-4o-mini")
+    .preamble("System prompt")
+    .build();
+let response = agent.chat(&user_input, context.get_rig_messages().await).await?;
+```
+
+#### HTTP Service Wrapper
+Services typically expose HTTP APIs using Axum:
+- `/execute` endpoint for workflow execution
+- `/session/{id}` for session state inspection
+- State management handled by `FlowRunner`
+
+## Development Patterns
+
+### Task Implementation
+- Tasks should be stateless - all state goes in `Context`
+- Use `TaskResult::new_with_status()` for debugging/logging information
+- Return appropriate `NextAction` to control workflow flow
+- Handle errors via `Result<TaskResult>` return type
+
+### Graph Construction
+- Define all tasks first, then connect with edges
+- Use conditional edges for runtime branching
+- Validate graph connectivity (builder warns about orphaned tasks)
+- Start task is automatically set to first added task
+
+### Session Lifecycle
+1. Create session with starting task: `Session::new_from_task()`
+2. Set initial context data: `session.context.set()`
+3. Execute step-by-step: `flow_runner.run(session_id)` 
+4. Handle execution results based on `ExecutionStatus`:
+   - `Paused { next_task_id }`: Continue execution loop, workflow will automatically proceed
+   - `WaitingForInput`: Continue execution loop, workflow is waiting for user input
+   - `Completed`: Break execution loop, workflow finished
+   - `Error(msg)`: Handle error, break execution loop
+
+### Storage Strategy
+- Development: Use `InMemorySessionStorage` for fast iteration
+- Production: Use `PostgresSessionStorage` for persistence and scalability
+- Both implement same `SessionStorage` trait for easy swapping
+
+## Workspace Structure
+
+- `graph-flow/`: Core framework library
+- `insurance-claims-service/`: Complete insurance workflow example
+- `recommendation-service/`: RAG recommendation system
+- `examples/`: Simple demonstrations and learning materials
+
+The examples/ folder contains multiple binaries showing different complexity levels - start with `simple_example.rs` for basics, then explore `recommendation_flow.rs` for a complete end-to-end RAG workflow.
+
+---
