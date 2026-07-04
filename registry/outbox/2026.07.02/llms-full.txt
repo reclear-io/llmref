@@ -1,0 +1,425 @@
+# In another terminal trigger a POST to trigger entity creation
+
+Source: https://github.com/oagudo/outbox/blob/main/README.md
+
+<p align="center" class="disable-logo">
+<a href="#"><img src="assets/logo.png" width="200"/></a>
+</p>
+
+
+![GitHub Actions](https://github.com/oagudo/outbox/actions/workflows/ci.yml/badge.svg)
+
+Lightweight library for the [transactional outbox pattern](https://microservices.io/patterns/data/transactional-outbox.html) in Go, not tied to any specific relational database or broker.
+
+## Key Features
+
+- **Lightweight:** Adds only one external dependency: [google/uuid](https://github.com/google/uuid)
+- **Database agnostic:** Works with PostgreSQL, MySQL, Oracle and other relational databases.
+- **Message broker agnostic:** Works with any message broker or external system.
+- **Easy integration:** Designed for easy integration into your own projects.
+- **Observability:** Exposes channels for processing errors and discarded messages that you can connect to your metrics and alerting systems.
+- **Fast publishing:** Optional immediate async message publishing after transaction commit for reduced latency, with guaranteed delivery fallback.
+- **Configurable retry and backoff policies:** Fixed, exponential or custom backoff strategies when delivery fails.
+- **Max attempts safeguard:** Automatically discards poison messages that exceed a configurable `maxAttempts` threshold.
+- **Scheduled messages:** Delay message publishing to a future time.
+
+## Usage
+
+The library consists of two main components:
+
+1. **Writer**: Stores your business objects and corresponding messages atomically within a single transaction
+2. **Reader**: Publishes stored messages to your message broker in the background
+
+### The Writer
+
+Supports two transaction management models, depending on how much control you need.
+
+#### 1. User managed transactions
+
+You control the transaction lifecycle (begin, commit, rollback), giving full flexibility to integrate the outbox into existing transaction management patterns.
+
+```go
+// Initialise Writer
+db, _ := sql.Open("pgx", "postgres://...")
+dbCtx := outbox.NewDBContext(db, outbox.SQLDialectPostgres)
+writer := outbox.NewWriter(dbCtx)
+
+tx, _ := db.BeginTx(ctx, nil)
+defer tx.Rollback()
+
+_, _ = tx.ExecContext(ctx, "INSERT INTO entity (...) VALUES (...)", ...)
+
+// Create message
+payload, _ := json.Marshal(entity)
+msg := outbox.NewMessage(payload)
+
+// Use unmanaged writer with existing transaction to store the message
+unmanagedWriter := writer.Unmanaged()
+err = unmanagedWriter.Store(ctx, tx, msg)
+
+tx.Commit()
+```
+
+#### 2. Library managed transactions
+
+The Writer handles the entire transaction lifecycle for you. This is the recommended approach for most use cases, as it reduces boilerplate and avoids common transactional pitfalls.
+
+```go
+// Use Write function for conditional or multiple message publishing.
+// If the callback returns an error the transaction is rolled back
+err = writer.Write(ctx,
+        func(ctx context.Context, tx outbox.TxQueryer, msgWriter outbox.MessageWriter) error {
+
+    result, err := tx.ExecContext(ctx,
+        "UPDATE orders SET status = 'confirmed' WHERE id = $1 AND status = 'pending'", id)
+    if err != nil {
+        return err
+    }
+    if rows, _ := result.RowsAffected(); rows == 0 {
+        return ErrOrderNotPending // no message, rollback
+    }
+
+    // Create and store outbox messages
+    payload, _ := json.Marshal(order)
+    msg := outbox.NewMessage(payload,
+        outbox.WithCreatedAt(order.CreatedAt),
+        outbox.WithMetadata(json.RawMessage(`{"trace_id":"abc123"}`)))
+
+    return msgWriter.Store(ctx, msg)
+})
+
+// Use WriteOne function for simple cases that store a single message unconditionally
+msg := outbox.NewMessage(payload)
+err = writer.WriteOne(ctx, msg, func(ctx context.Context, tx outbox.TxQueryer) error {
+    _, err := tx.ExecContext(ctx,
+        "INSERT INTO entity (id, created_at) VALUES ($1, $2)",
+        entity.ID, entity.CreatedAt)
+    return err
+})
+```
+
+<details>
+<summary><strong>🚀 Optimistic Publishing (Optional)</strong></summary>
+
+Publishes messages immediately after transaction commit for lower latency. The background reader acts as fallback if optimistic publishing fails.
+
+#### How It Works
+
+1. Transaction commits (entity + outbox message stored)
+2. Immediate publish attempt to broker (asynchronously, will not block the incoming request)
+3. On success message is removed from outbox
+4. On failure background reader handles delivery later
+
+#### Configuration
+
+```go
+// Create publisher (see Reader section below)
+publisher := &messagePublisher{}
+
+// Enable optimistic publishing in writer
+writer := outbox.NewWriter(dbCtx, outbox.WithOptimisticPublisher(publisher))
+```
+
+**Important considerations:**
+- Publishing happens asynchronously after transaction commit
+- Message consumers must be idempotent as messages could be published twice - by the optimistic publisher and by the reader (Note: consumer idempotency is a good practice regardless of optimistic publishing, though some brokers also provide deduplication features)
+- Publishing failures don't affect your transactions - they don't cause `Write()` to fail
+- Optimistic publisher is not triggered for user managed transactions - `Writer.Unmanaged()`
+
+</details>
+
+### The Reader
+
+The Reader periodically checks for unsent messages and publishes them to your message broker:
+
+```go
+// Create a message publisher implementation
+type messagePublisher struct {
+    // Your message broker client (e.g., Kafka, RabbitMQ)
+}
+func (p *messagePublisher) Publish(ctx context.Context, msg *outbox.Message) error {
+    // Publish the message to your broker. See examples below for specific implementations
+    return nil
+}
+
+// Create and start the reader
+reader := outbox.NewReader(
+    dbCtx,                              // Database context
+    &messagePublisher{},                // Publisher implementation
+    outbox.WithInterval(5*time.Second), // Polling interval (default: 10s)
+    outbox.WithReadBatchSize(200),      // Read batch size (default: 100)
+    outbox.WithDeleteBatchSize(50),     // Delete batch size (default: 20)
+    outbox.WithMaxAttempts(300),        // Discard after 300 attempts (default: MaxInt32)
+    outbox.WithExponentialDelay(        // Delay between attempts (default: Exponential; can also use Fixed or Custom)
+        500*time.Millisecond,           // Initial delay (default: 200ms)
+        30*time.Minute),                // Maximum delay (default: 1h)
+)
+reader.Start()
+defer reader.Stop(context.Background()) // Stop during application shutdown
+```
+
+#### Monitoring
+
+The reader exposes channels for errors and discarded messages:
+
+```go
+// Monitor processing errors
+go func() {
+    for err := range reader.Errors() {
+        switch e := err.(type) {
+        case *outbox.PublishError:
+            log.Printf("Failed to publish message | ID: %s | Error: %v",
+                e.Message.ID, e.Err)
+
+        case *outbox.UpdateError:
+            log.Printf("Failed to update message | ID: %s | Error: %v",
+                e.Message.ID, e.Err)
+
+        case *outbox.DeleteError:
+            log.Printf("Batch message deletion failed | Count: %d | Error: %v",
+                len(e.Messages), e.Err)
+            for _, msg := range e.Messages {
+                log.Printf("Failed to delete message | ID: %s", msg.ID)
+            }
+
+        case *outbox.ReadError:
+            log.Printf("Failed to read outbox messages | Error: %v", e.Err)
+
+        default:
+            log.Printf("Unexpected error occurred | Error: %v", e)
+        }
+    }
+}()
+
+// Monitor poison messages (exceeded max attempts)
+go func() {
+    for msg := range reader.DiscardedMessages() {
+        log.Printf("outbox message %s discarded after %d attempts",
+            msg.ID, msg.TimesAttempted)
+        // Example next steps:
+        //   • forward to a dead-letter topic
+        //   • raise an alert / metric
+        //   • persist for manual inspection
+    }
+}()
+```
+
+### Database Setup
+
+#### 1. Choose Your Database Dialect
+
+The library supports multiple relational databases. Configure the appropriate `SQLDialect` when creating the `DBContext`. Supported dialects are PostgreSQL, MySQL, MariaDB, SQLite, Oracle and SQL Server.
+
+```go
+dbCtx := outbox.NewDBContext(db, outbox.SQLDialectMySQL)
+```
+
+#### 2. Create the Outbox Table
+
+The outbox table stores messages that need to be published to your message broker. Choose your database below:
+
+<details>
+<summary><strong>🐘 PostgreSQL</strong></summary>
+
+```sql
+CREATE TABLE IF NOT EXISTS outbox (
+    id UUID PRIMARY KEY,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    scheduled_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    metadata BYTEA,
+    payload BYTEA NOT NULL,
+    times_attempted INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_outbox_created_at ON outbox (created_at);
+CREATE INDEX IF NOT EXISTS idx_outbox_scheduled_at ON outbox (scheduled_at);
+```
+</details>
+
+<details>
+<summary><strong>📊 MySQL</strong></summary>
+
+```sql
+CREATE TABLE IF NOT EXISTS outbox (
+    id BINARY(16) PRIMARY KEY,
+    created_at TIMESTAMP(3) NOT NULL,
+    scheduled_at TIMESTAMP(3) NOT NULL,
+    metadata BLOB,
+    payload BLOB NOT NULL,
+    times_attempted INT NOT NULL
+);
+
+CREATE INDEX idx_outbox_created_at ON outbox (created_at);
+CREATE INDEX idx_outbox_scheduled_at ON outbox (scheduled_at);
+```
+</details>
+
+<details>
+<summary><strong>🐬 MariaDB</strong></summary>
+
+```sql
+CREATE TABLE IF NOT EXISTS outbox (
+    id UUID PRIMARY KEY,
+    created_at TIMESTAMP(3) NOT NULL,
+    scheduled_at TIMESTAMP(3) NOT NULL,
+    metadata BLOB,
+    payload BLOB NOT NULL,
+    times_attempted INT NOT NULL
+);
+
+CREATE INDEX idx_outbox_created_at ON outbox (created_at);
+CREATE INDEX idx_outbox_scheduled_at ON outbox (scheduled_at);
+```
+</details>
+
+<details>
+<summary><strong>🗃️ SQLite</strong></summary>
+
+```sql
+CREATE TABLE IF NOT EXISTS outbox (
+    id TEXT PRIMARY KEY,
+    created_at DATETIME NOT NULL,
+    scheduled_at DATETIME NOT NULL,
+    metadata BLOB,
+    payload BLOB NOT NULL,
+    times_attempted INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_outbox_created_at ON outbox (created_at);
+CREATE INDEX IF NOT EXISTS idx_outbox_scheduled_at ON outbox (scheduled_at);
+```
+</details>
+
+<details>
+<summary><strong>🏛️ Oracle</strong></summary>
+
+```sql
+CREATE TABLE outbox (
+    id RAW(16) PRIMARY KEY,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    scheduled_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    metadata BLOB,
+    payload BLOB NOT NULL,
+    times_attempted NUMBER(10) NOT NULL
+);
+
+CREATE INDEX idx_outbox_created_at ON outbox (created_at);
+CREATE INDEX idx_outbox_scheduled_at ON outbox (scheduled_at);
+```
+</details>
+
+<details>
+<summary><strong>🪟 SQL Server</strong></summary>
+
+```sql
+CREATE TABLE outbox (
+    id UNIQUEIDENTIFIER PRIMARY KEY,
+    created_at DATETIMEOFFSET(3) NOT NULL,
+    scheduled_at DATETIMEOFFSET(3) NOT NULL,
+    metadata VARBINARY(MAX),
+    payload VARBINARY(MAX) NOT NULL,
+    times_attempted INT NOT NULL
+);
+
+CREATE INDEX idx_outbox_created_at ON outbox (created_at);
+CREATE INDEX idx_outbox_scheduled_at ON outbox (scheduled_at);
+```
+</details>
+
+## Examples
+
+Complete working examples for different databases and message brokers:
+
+- [Postgres & Kafka](./examples/postgres-kafka/service.go)
+- [Oracle & NATS](./examples/oracle-nats/service.go)
+- [MySQL & RabbitMQ](./examples/mysql-rabbitmq/service.go)
+
+To run an example:
+
+```bash
+cd examples/postgres-kafka # or examples/oracle-nats or examples/mysql-rabbitmq
+../../scripts/up-and-wait.sh
+go run service.go
+
+# In another terminal trigger a POST to trigger entity creation
+curl -X POST http://localhost:8080/entity
+```
+
+## FAQ
+
+### What happens when multiple instances of my service use the library?
+
+When running multiple instances of your service, each with its own reader, be aware that:
+
+- Multiple readers will independently retrieve messages. This can result in messages published more than once. To handle this you can either:
+  1. Ensure your consumers are idempotent and accept duplicates
+  2. Use broker deduplication features if available (e.g. NATS JetStream's Msg-Id)
+  3. Run the reader in a single instance only (e.g. single replica deployment in k8s with reader)
+
+The optimistic publisher feature can significantly reduce the number of duplicates. With optimistic publisher messages are delivered as soon as they are committed, so readers will usually see no messages in the outbox table.
+
+Also note that even in single instance deployments, message duplicates can still occur (e.g. if the service crashes right after successfully publishing to the broker). However, these duplicates are less frequent than when you are running multiple reader instances.
+
+### How to instantiate a `DBContext` when using `pgxpool` ?
+
+You can use `stdlib.OpenDBFromPool` [function](https://pkg.go.dev/github.com/jackc/pgx/v5/stdlib#OpenDBFromPool) to get a `*sql.DB` from a `*pgxpool.Pool`.
+
+```go
+import (
+    "github.com/jackc/pgx/v5/pgxpool"
+    "github.com/jackc/pgx/v5/stdlib"
+    "github.com/oagudo/outbox"
+)
+
+// ...
+pool, _ := pgxpool.New(context.Background(), os.Getenv("DATABASE_URL"))
+db := stdlib.OpenDBFromPool(pool)
+dbCtx := outbox.NewDBContext(db, outbox.SQLDialectPostgres)
+```
+
+## Contributing
+
+Contributions welcome! Bug fix PRs are always appreciated. For new features or bigger changes, consider opening an issue first so we can discuss the approach together.
+
+---
+
+# Security Policy
+
+Source: https://github.com/oagudo/outbox/blob/main/SECURITY.md
+
+# Security Policy
+
+## Reporting a Vulnerability
+
+If you believe you have found a security vulnerability, please report it to me as described below.
+
+### Reporting Process
+
+To report a security issue, please use the GitHub Security Advisory ["Report a Vulnerability"](https://github.com/oagudo/outbox/security/advisories/new) tab.
+
+### What to Expect
+
+I will send a response indicating the next steps in handling your report. After the initial reply to your report, I will keep you informed of the progress towards a fix and full announcement, and may ask for additional information or guidance.
+
+## Supported Versions
+
+| Version | Supported          |
+| ------- | ------------------ |
+| latest  | :white_check_mark: |
+
+## Security Updates
+
+Security updates will be released as soon as possible after a vulnerability is confirmed. These updates will be published as a new release on GitHub.
+
+## Best Practices
+
+- Keep your dependencies up to date
+- Use the latest stable version of the software
+- Follow security best practices
+- Review the code for potential security issues before deploying
+
+## Attribution
+
+This security policy is adapted from the [GitHub Security Policy example](https://docs.github.com/en/code-security/getting-started/adding-a-security-policy-to-your-repository). 
+
+---
