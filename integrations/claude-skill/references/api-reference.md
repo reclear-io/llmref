@@ -23,12 +23,12 @@ Auth is optional (an `Authorization: Bearer <key>` header only raises rate limit
 {
   "project": "nextjs",
   "requested_version": "latest",
-  "resolved_version": "15.1.0",
+  "resolved_version": "2026.07.02",
   "artifacts": {
-    "llms.txt": "/v1/projects/nextjs/15.1.0/llms.txt",
-    "llms-full.txt": "/v1/projects/nextjs/15.1.0/llms-full.txt",
-    "meta.json": "/v1/projects/nextjs/15.1.0/meta.json",
-    "dumps": "/v1/projects/nextjs/15.1.0/dumps"
+    "llms.txt": "/v1/projects/nextjs/2026.07.02/llms.txt",
+    "llms-full.txt": "/v1/projects/nextjs/2026.07.02/llms-full.txt",
+    "meta.json": "/v1/projects/nextjs/2026.07.02/meta.json",
+    "dumps": "/v1/projects/nextjs/2026.07.02/dumps"
   }
 }
 ```

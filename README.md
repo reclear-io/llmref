@@ -48,6 +48,15 @@ Example — Svelte 5.0.0:
 https://raw.githubusercontent.com/reclear-io/fullcontext/main/registry/svelte/5.0.0/llms.txt
 ```
 
+## Backend engine
+
+This repository is the public registry data. The engine that produces it — the
+crawler, normalization, embedding, and API server — will be open-sourced at some
+point. We're deliberately not rushing that: we want the internals stable first,
+and we'd rather not expose a moving target to vulnerabilities while we're still
+iterating in sprints. The hosted API (`api.llmref.org`) and this registry are free
+and public today regardless.
+
 ## Contributing
 
 - [CONTRIBUTING.md](./CONTRIBUTING.md) — PR title format, registry layout, submission guidelines

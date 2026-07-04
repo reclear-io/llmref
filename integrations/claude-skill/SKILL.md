@@ -17,9 +17,10 @@ description: >-
 
 LLM Reference is a **versioned, reproducible** documentation registry. Unlike a
 live "latest" doc index, every snapshot is pinned to an exact upstream version
-and is byte-for-byte stable. Reach for it when the *version* matters — an agent
-working on `next@14.2` should read 14.2 docs, not an amalgam of whatever is
-current.
+and is byte-for-byte stable. Reach for it when the *version* matters — read the exact snapshot a project
+depends on rather than an amalgam of whatever is current. Versions are semver for
+package-sourced docs (e.g. `drizzle-orm@0.45.2`) and crawl dates for site-crawled
+projects (e.g. Next.js at `2026.07.02`).
 
 Base URL: `https://api.llmref.org/v1` — **no account or API key required.**
 
@@ -64,16 +65,17 @@ curl -s "https://api.llmref.org/v1/projects?query=next"
 # 2. Resolve — turn "latest" (or a version query) into a concrete snapshot
 curl -s "https://api.llmref.org/v1/resolve?project=nextjs&version=latest"
 
-# 3a. Read the compact, model-ready docs for a concrete version
-curl -s "https://api.llmref.org/v1/projects/nextjs/15.1.0/llms.txt"
+# 3a. Read the compact, model-ready docs. `latest` resolves server-side; pin the
+#     resolved_version from step 2 when you need reproducibility.
+curl -s "https://api.llmref.org/v1/projects/nextjs/latest/llms.txt"
 
 # 3b. Or the full merged docs (large; license-gated — see gotchas)
-curl -s "https://api.llmref.org/v1/projects/nextjs/15.1.0/llms-full.txt"
+curl -s "https://api.llmref.org/v1/projects/nextjs/latest/llms-full.txt"
 
 # 3c. Or search semantically for just the relevant passages
 curl -s -X POST "https://api.llmref.org/v1/search/semantic" \
   -H "Content-Type: application/json" \
-  -d '{"project":"nextjs","version":"15.1.0","query":"configure caching","top_k":5,"token_budget":2000}'
+  -d '{"project":"nextjs","version":"latest","query":"configure caching","top_k":5,"token_budget":2000}'
 ```
 
 ### With the MCP tools (if connected)
@@ -86,12 +88,20 @@ The server's own instructions enforce that ordering, so just start with
 
 ## Version pinning (the whole point)
 
-If the project has a lockfile or `package.json`, read the version the user
-actually depends on and request **that** version — not `latest`. If you must use
-`latest`, call `/resolve` once, record the `resolved_version`, and use that
-concrete version for every following call so results stay reproducible within the
-task. To notice a snapshot has changed, compare the `content_fingerprint` in
-`meta.json`.
+Pin to a concrete version so results stay reproducible — but how you get that
+version depends on the project:
+
+- **Package-sourced docs** (npm/PyPI/crates) are versioned by **semver**. If the
+  project is in the user's lockfile or `package.json`, request that release.
+- **Site-crawled docs** (pulled from a project's website, like Next.js) are
+  versioned by **crawl date** (e.g. `2026.07.02`), not semver — a lockfile semver
+  won't match. For these, resolve `latest`, record the `resolved_version`, and
+  reuse that concrete value.
+
+Either way, never hardcode a version you didn't get from `list_versions` or
+`/resolve` — guessing one 404s. To notice a snapshot changed underneath you,
+compare the `content_fingerprint` in `meta.json`. (Semver-*range* resolution —
+asking for `15.1` and getting the matching snapshot — is planned, not yet live.)
 
 ## Gotchas
 
