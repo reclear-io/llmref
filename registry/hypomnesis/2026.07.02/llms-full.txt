@@ -1,0 +1,2084 @@
+# hypomnesis
+
+Source: https://github.com/pcfvw/hypomnesis/blob/main/README.md
+
+# hypomnesis
+
+**ὑπόμνησις** — *External RAM and VRAM, measured.*
+
+> 🆕 **`0.2.4` surfaces NVIDIA's driver/firmware *reserved* memory.** A new additive `GpuDeviceInfo::reserved_bytes: Option<u64>` exposes the carve-out NVML holds *within* its reported `total` (`total = reserved + free + used`) — **live-measured at 259 MiB** on an `RTX 5060 Ti`, exactly matching `nvidia-smi -q -d MEMORY`'s `Reserved` line next to `Total: 16311 MiB`. It is a subset of `total_bytes`, so allocation headroom is `total_bytes − reserved_bytes` (which `free_bytes` already reflects). Sourced from NVML's v2 memory query (`nvmlDeviceGetMemoryInfo_v2`, R510+) with a graceful pre-R510 fallback to `None`; `total_bytes` is unchanged. Driven by a [`candle-mi`](https://github.com/PCfVW/candle-mi) `v0.1.16` dogfooding report. See [`CHANGELOG.md`](CHANGELOG.md) and [`docs/roadmap-v0.2.4.md`](docs/roadmap-v0.2.4.md).
+
+> 🚀 **`0.2.3` adds first-class macOS support on Apple Silicon.** Three platforms now share one contract — `Windows`, `Linux`, and `macOS` all expose process `RSS`, device-wide GPU memory, per-process GPU memory, and a `hmn ps` listing with the same JSON shape on every platform. The macOS backend is libSystem-only (`task_info`, `ledger`, `sysctl`, `proc_listpids`, `proc_pidpath`) for everything except the device-wide GPU budget, which reads `MTLDevice.recommendedMaxWorkingSetSize` through a minimal `objc2-metal` binding. Cross-platform `used_bytes` semantics are preserved — the macOS `graphics_footprint` ledger entry behaves the same way Windows `WorkingSetSize` and Linux `VmRSS` do under memory pressure. Authored by contributor [@LittleCoinCoin](https://github.com/LittleCoinCoin) ([PR #1](https://github.com/PCfVW/hypomnesis/pull/1)); daily-driven on M3 Pro / 36 GiB. All additive under the `#[non_exhaustive]` policy carried over from v0.2.0–v0.2.2. See [`CHANGELOG.md`](CHANGELOG.md) for the v0.2.3 entry and [`ROADMAP.md`](ROADMAP.md) for the rationale.
+
+## Table of Contents
+
+- [Install](#install)
+- [Usage](#usage)
+- [Binary (`hmn`)](#binary-hmn)
+- [Capabilities](#capabilities)
+- [Feature Flags](#feature-flags)
+- [Used by](#used-by)
+- [License](#license)
+- [Development](#development)
+
+## Install
+
+```toml
+[dependencies]
+hypomnesis = "0.2"
+```
+
+The default feature set (`nvml`, `dxgi`, `nvidia-smi-fallback`) covers process RSS and per-process / device-wide GPU memory on both Windows (`IDXGIAdapter3` + `NVML`) and Linux (`NVML`), with a `nvidia-smi` subprocess fallback. The `dxgi` dependency on the `windows` crate is target-conditional — Linux users pay nothing for it.
+
+On macOS, the `metal` feature is in the default set. Process RSS and per-process GPU memory come from libSystem syscalls (`task_info`, `ledger`, `sysctl`). The device-wide "free" figure comes from `MTLDevice.recommendedMaxWorkingSetSize` via the `objc2-metal` binding (target-conditional, macOS-only) — no libSystem signal on Apple Silicon UMA approximates Apple's own kernel-projected GPU working-set budget within useful accuracy.
+
+For candle-mi-compatible delta and printing helpers (`MemoryReport`, `print_delta`, `print_before_after`, `ram_mb`, `vram_mb`):
+
+```toml
+hypomnesis = { version = "0.2", features = ["report"] }
+```
+
+For a stripped-down build (process RSS only, no GPU backends):
+
+```toml
+hypomnesis = { version = "0.2", default-features = false }
+```
+
+## Usage
+
+```rust
+use hypomnesis::Snapshot;
+
+fn main() -> Result<(), hypomnesis::HypomnesisError> {
+    let snap = Snapshot::now(0)?;
+    println!("RAM: {} bytes", snap.ram_bytes);
+
+    if let Some(dev) = snap.gpu_device {
+        let total_gib = dev.total_bytes as f64 / (1u64 << 30) as f64;
+        let used_gib  = dev.used_bytes  as f64 / (1u64 << 30) as f64;
+        println!(
+            "GPU 0 [{}]: {:.1} / {:.1} GiB used",
+            dev.name.as_deref().unwrap_or("unknown"),
+            used_gib, total_gib,
+        );
+        // `total_bytes` is the full NVML framebuffer (= `nvidia-smi` Total).
+        // `reserved_bytes` is the driver/firmware carve-out *within* it
+        // (NVML R510+); allocation headroom is `total - reserved`, which
+        // `free_bytes` already reflects.
+        if let Some(reserved) = dev.reserved_bytes {
+            let reserved_mib = reserved as f64 / (1u64 << 20) as f64;
+            println!("  ({:.0} MiB reserved)", reserved_mib);
+        }
+    }
+
+    if let Some(proc_gpu) = snap.gpu {
+        let kind = if proc_gpu.is_per_process { "per-process" } else { "device-wide" };
+        let mib  = proc_gpu.used_bytes as f64 / (1u64 << 20) as f64;
+        println!("This process: {:.0} MiB ({})", mib, kind);
+    }
+
+    Ok(())
+}
+```
+
+Expected output (RTX 5060 Ti, Windows, idle process):
+
+```
+RAM: 142475264 bytes
+GPU 0 [NVIDIA GeForce RTX 5060 Ti]: 1.8 / 15.9 GiB used
+  (259 MiB reserved)
+This process: 119 MiB (per-process)
+```
+
+## Binary (`hmn`)
+
+`hypomnesis` ships a small CLI binary, `hmn`, behind the default-off `cli` feature. Install it with:
+
+```sh
+cargo install hypomnesis --features cli
+```
+
+Two subcommands:
+
+```sh
+hmn                    # device summary (free / total per GPU)
+hmn ps                 # all GPU processes — discovery command
+hmn ps --pid 12345     # filter to one PID
+hmn ps --device 0      # filter to one GPU on multi-GPU rigs
+hmn ps --json          # scriptable output
+```
+
+Example default output (single NVIDIA dGPU, the maintainer's reference machine — Ryzen 9 5950X has no iGPU, so only one adapter surfaces):
+
+```
+GPU 0 [NVIDIA GeForce RTX 5060 Ti]: free 13284 MiB / 16311 MiB (259 MiB reserved)
+```
+
+The `(259 MiB reserved)` parenthetical (NVML R510+) is the driver/firmware carve-out *within* the 16311 MiB total — matching `nvidia-smi -q -d MEMORY`'s `Reserved` line. It is elided on backends that don't expose it (DXGI, `nvidia-smi`, Metal, pre-R510).
+
+Apple Silicon, idle process (Apple M3 Pro, 36 GiB unified memory):
+
+```
+GPU 0 [Apple M3 Pro]: free 28753 MiB / 36864 MiB
+```
+
+The `free` figure here is `MTLDevice.recommendedMaxWorkingSetSize` — the kernel-projected GPU working-set budget on UMA — and `total` is `sysctl hw.memsize`. See the [macOS UMA semantics](#macos-uma-semantics-what-free_bytes-means) section below for what these numbers mean and why they differ from the discrete-GPU "free vs total" model.
+
+Illustrative output on a *heterogeneous* machine (NVIDIA dGPU + Intel/AMD iGPU on Windows). Not yet verified end-to-end on real hardware — see [`docs/roadmap-v0.2.0.md`](docs/roadmap-v0.2.0.md) "Verification plan":
+
+```
+GPU 0 [NVIDIA GeForce RTX 5060 Ti]: free 13284 MiB / 16311 MiB (259 MiB reserved)
+GPU 1 [Intel Iris Xe Graphics]: free 32768 MiB / 32768 MiB
+```
+
+(The Intel iGPU line has no reserved parenthetical — `DXGI` does not expose the NVML carve-out, so `reserved_bytes` is `None` there.)
+
+`hmn ps` (illustrative — empty on machines with no active CUDA workload):
+
+```
+PID    NAME              VRAM      DEVICE
+12345  lm-studio.exe     8.2 GiB   NVIDIA GeForce RTX 5060 Ti
+67890  python.exe        1.4 GiB   NVIDIA GeForce RTX 5060 Ti
+```
+
+A one-line summary is written to **stderr** after each `hmn ps` run:
+
+```
+hmn: 2 compute processes found.
+hmn: 0 compute processes found matching pid=99 device=0.   # with filters
+```
+
+The stderr summary is always printed, even when the table is empty, so interactive users get an unambiguous "command worked, here's the count" line without breaking stdout's scriptability. Pipelines like `hmn ps | awk 'NR>1 {print $1}'` or `hmn ps --json | jq` work as expected. Redirect `2>/dev/null` to suppress the summary.
+
+**Limitations** (intrinsic to the underlying data sources, not bugs):
+
+1. **Per-platform semantics differ — compute-only on Linux, all-GPU-users on Windows.** `hmn ps` on Linux (via `NVML`'s `nvmlDeviceGetComputeRunningProcesses_v3`) enumerates only processes with an active `CUDA` context — browsers using GPU compositing, games, and pure-graphics apps do not appear. `hmn ps` on Windows (via `PDH`'s `\GPU Process Memory(*)\Dedicated Usage`) enumerates **every** process holding GPU memory — the desktop compositor (`dwm.exe`), browsers, games, and `CUDA` / compute alongside. The semantic shift reflects what each platform's kernel actually accounts for; check the `source` field on `GpuProcessEntry` if you care about the distinction.
+
+2. **Windows `used_bytes` reflects WDDM's *dedicated commit*, not resident set.** Under `WDDM` a process can commit GPU allocations exceeding physical `VRAM` — the kernel pages them via the shared system memory budget. Numbers exceeding the device's total `VRAM` are real, not bugs: they match Task Manager's `Dedicated GPU memory` column. (Example: on a 16 GiB GPU, a heavy browser process can show 15+ GiB committed.)
+
+3. **`?` in the NAME column means the calling user cannot resolve that PID's name via `OpenProcess`.** Most cases — system services, other-user processes like `dwm.exe`, `csrss.exe`, vendor services — resolve when `hmn ps` is run as Administrator. **The Windows kernel itself (`PID 4`) is rendered as `[kernel]`, not `?`** — there is no executable image to read, so it's special-cased so it does not pollute the "unresolvable" count. `PPL`-protected processes (Windows Defender, anti-cheat engines) would also remain `?` even elevated, but typically do not appear in `hmn ps` output unless they are actively holding GPU memory.
+
+   *Security note.* By construction, a `?` row that does not resolve under elevation is one of: a process owned by another user, a process running as `SYSTEM` / `LOCAL SERVICE` / `NETWORK SERVICE`, a `PPL`-protected process, or a transient race between PDH's sample and the `OpenProcess` call. None of these are intrinsically malicious — but on a single-user desktop, an *unexpected* `?` row holding substantial VRAM is worth investigating: a malicious local process (including a privileged-or-cross-user AI agent) using GPU resources would land in exactly this set. The `(N protected — re-run elevated for names)` parenthetical on the `hmn ps` summary line is intentionally surfaced because this distinction is security-relevant. `hypomnesis` is a measurement tool, not a malware scanner — but its honesty about the gap is itself a defensive primitive.
+
+4. **Pre-`WDDM 2.0` Windows falls back to `nvidia-smi --query-compute-apps`.** Vanishingly rare in 2026 — `WDDM 2.0` shipped with Windows 10 1709 (October 2017). On the fallback path, `hmn ps` is compute-only (matching the Linux semantic) and `used_memory` may be `[N/A]` under `WDDM` (parser drops those rows). The `source` field on `GpuProcessEntry` reads `GpuQuerySource::NvidiaSmi` rather than `GpuQuerySource::Pdh` on this path.
+
+5. **`R570`-class driver-bug filtering.** The `u64::MAX` sentinel (`R570` driver bug on `RTX 5060 Ti` and similar consumer GeForce cards) and the `used > total` corruption checks are applied per-row in `hmn ps`; affected rows are dropped rather than reported as garbage.
+
+6. **macOS `used_bytes` reflects currently-resident GPU pages.** The kernel evicts idle Metal pages from a process's `graphics_footprint`, so the same PID may report different values across successive `hmn ps` calls when its working set has cooled. This is the same resident-bytes semantics as Windows `WorkingSetSize` and Linux `VmRSS` — not a macOS quirk, the cross-platform contract.
+
+7. **macOS cross-user PIDs are silently skipped.** The per-PID `ledger` syscall returns `EPERM` for processes owned by another user. `hmn ps` enumerates same-user PIDs only by default; run elevated (`sudo hmn ps`) to include cross-user PIDs such as `WindowServer`, `kernel_task`, and other-user-owned applications.
+
+### Composable workflows
+
+`hmn ps --json` exists for scripting and survives across platforms (same JSON shape on Windows, Linux, and macOS). Two recipes that have come up in dogfooding:
+
+**Top-5 GPU consumers** (any platform with `jq` installed):
+
+```sh
+hmn ps --json | jq 'sort_by(-.used_bytes) | .[:5]'
+```
+
+**Terminate any process holding more than 1 GiB of `VRAM`** — the JSON output composes with the platform's native kill command. Windows (PowerShell or cmd):
+
+```sh
+hmn ps --json | jq -r '.[] | select(.used_bytes > 1073741824) | .pid' | ForEach-Object { taskkill /F /PID $_ }
+```
+
+Linux / macOS:
+
+```sh
+hmn ps --json | jq -r '.[] | select(.used_bytes > 1073741824) | .pid' | xargs -r kill -TERM
+```
+
+(Use `kill -KILL` instead of `-TERM` if you want the hard variant; `-r` skips empty input.)
+
+#### Why no `hmn kill`?
+
+A `hmn kill <pid>` subcommand was considered for v0.2.3 and rejected to preserve `hypomnesis`'s "measurement, not control" scope discipline. Process termination is not a *measurement* operation — it's a control operation, and one with platform-specific permission models (`taskkill` vs `kill -SIGNAL` vs `sudo kill`) that `hmn` would inevitably get wrong on at least one platform. Piping JSON to the platform's native killer is more honest about what's happening, more flexible (filter on any field, not just PID), and keeps `hypomnesis`'s API surface small.
+
+## Capabilities
+
+| Metric | Windows | Linux | macOS |
+|--------|---------|-------|-------|
+| Process RSS | `K32GetProcessMemoryInfo` | `/proc/self/status` (no `unsafe`) | `task_info(TASK_VM_INFO_PURGEABLE).phys_footprint` |
+| Device-wide GPU memory | `NVML` (`nvml.dll`) | `NVML` (`libnvidia-ml.so.1`) | `sysctl hw.memsize` (total) + `MTLDevice.recommendedMaxWorkingSetSize` (free) |
+| Device reserved memory | `NVML` v2 (`nvmlDeviceGetMemoryInfo_v2`, R510+) | `NVML` v2 (R510+) | n/a (`None` — UMA has no carve-out) |
+| Per-process GPU memory | `DXGI` (`IDXGIAdapter3::QueryVideoMemoryInfo`) | `NVML` (`nvmlDeviceGetComputeRunningProcesses`) | `ledger(LEDGER_ENTRY_INFO_V2).graphics_footprint` |
+| Fallback | `nvidia-smi` subprocess | `nvidia-smi` subprocess | none (libSystem syscalls always succeed on Apple Silicon) |
+
+`hypomnesis` uses `IDXGIAdapter3` on Windows because `WDDM` means the kernel memory manager — not the NVIDIA driver — owns GPU allocations, so `NVML`'s per-process query returns `NOT_AVAILABLE` under Windows. `DXGI 1.4` is the only reliable per-process source. On Linux, `NVML`'s `nvmlDeviceGetComputeRunningProcesses_v3` returns true per-process figures. On Apple Silicon (M-series), the GPU shares system DRAM via unified memory architecture (UMA), so `hw.memsize` is both the system RAM total and the GPU memory pool.
+
+The crate handles two known driver bugs out of the box:
+
+1. **`NVML` `u64::MAX` sentinel** — some `R570`-series drivers report `0xFFFFFFFFFFFFFFFF` for every running process's memory (observed on `RTX 5060 Ti`). `hypomnesis` detects this and falls back to `nvidia-smi`.
+2. **`used > total` corruption** — sanity-checks each per-process reading against the device-wide total; falls back to `nvidia-smi` on detected corruption.
+
+### macOS UMA semantics: what `free_bytes` means
+
+On a discrete GPU, `free_bytes` is "untaken bytes in the VRAM pool" — a hard number bounded by the card's physical memory. On Apple Silicon the GPU has no separate pool: it shares system DRAM via unified memory architecture (UMA). `hypomnesis` therefore reports `free_bytes` as `MTLDevice.recommendedMaxWorkingSetSize` — the kernel-projected GPU working-set budget that Apple's Metal driver itself computes, factoring in wired-page reserves, system memory pressure, and the kernel's known compression / eviction capability.
+
+Two consequences worth noting:
+
+- **The number changes slowly under load.** Apple's driver smooths it; it is a policy figure, not an instant-state reading. Expect it to shrink modestly as system memory pressure rises and recover as pressure abates.
+- **Per-process `used_bytes` (from `graphics_footprint`, used by `gpu_processes()` and `process_gpu_info()`) reflects currently resident GPU pages**, matching the resident-bytes semantics of Windows `WorkingSetSize` and Linux `VmRSS`. Idle apps' Metal pages get evicted by the kernel; the same PID may report different values across calls. This is the contract Windows and Linux already exhibit, not a macOS-specific quirk.
+
+## Feature Flags
+
+| Feature | Default | Description |
+|---------|---------|-------------|
+| `nvml` | yes | `NVML` dynamic load via `libloading` (Linux + Windows-`WDDM` device-wide) |
+| `dxgi` | yes | Windows per-process `VRAM` via `IDXGIAdapter3` (no-op on non-Windows) |
+| `metal` | yes | macOS device-wide GPU budget via `objc2-metal` (`MTLDevice.recommendedMaxWorkingSetSize`); no-op on non-macOS. RAM and per-process GPU paths are libSystem-only and unaffected by this flag. |
+| `nvidia-smi-fallback` | yes | Subprocess fallback when `NVML` / `DXGI` fail or are disabled |
+| `report` | no | `MemoryReport` delta + `print_delta` / `print_before_after` / `ram_mb` / `vram_mb` helpers (`candle-mi` parity, candidate for `candle-mi` v0.2 migration via Cargo flag flip); `format_free` / `print_free` / `format_total` / `format_used` formatting helpers on `GpuDeviceInfo` |
+| `debug-output` | no | Print raw `NVML` / `DXGI` values to stderr (diagnostic) |
+| `cli` | no | Build the `hmn` CLI binary (pulls `clap` 4 as a dep). Library users do not need this; install via `cargo install hypomnesis --features cli`. |
+| `test-helpers` | no | Expose `GpuDeviceInfoBuilder` for downstream tests that need synthetic `GpuDeviceInfo` fixtures. Default-off, additive — production code must never enable it. |
+
+## Used by
+
+- [candle-mi](https://github.com/PCfVW/candle-mi) — mechanistic-interpretability toolkit for `candle`. As of **v0.1.16** it deletes its in-tree measurement FFI and delegates `src/memory.rs` to `hypomnesis` (lean feature set: `nvml`, `dxgi`, `nvidia-smi-fallback`, `metal`), flattening a `hypomnesis::Snapshot` into its own `MemorySnapshot`. Its v0.1.16 dogfooding report — live-validated on an `RTX 5060 Ti` (16 GiB, Windows / `WDDM`) — drove this release's `reserved_bytes` addition.
+- [hf-fetch-model](https://github.com/PCfVW/hf-fetch-model) — Hugging Face model weights and metadata fetcher (uses `device_info` for `inspect --check-gpu`)
+
+## License
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT License](LICENSE-MIT) at your option.
+
+## Development
+
+- Exclusively developed with [Claude Code](https://claude.com/product/claude-code) (dev) and [Augment Code](https://www.augmentcode.com/) (review)
+- Git workflow managed with [Fork](https://fork.dev/)
+- All code follows [CONVENTIONS.md](CONVENTIONS.md), derived from [Amphigraphic-Strict](https://github.com/PCfVW/Amphigraphic-Strict)'s [Grit](https://github.com/PCfVW/Amphigraphic-Strict/tree/master/Grit) — a strict Rust subset designed to improve AI coding accuracy.
+
+---
+
+# hypomnesis Coding Conventions (Grit + Grit-HMN Extensions)
+
+Source: https://github.com/pcfvw/hypomnesis/blob/main/CONVENTIONS.md
+
+# hypomnesis Coding Conventions (Grit + Grit-HMN Extensions)
+
+This document describes the [Amphigraphic coding](https://github.com/PCfVW/Amphigraphic-Strict)
+conventions used in `hypomnesis`. It is a superset of the
+[Grit — Strict Rust for AI-Assisted Development](https://github.com/PCfVW/Amphigraphic-Strict/tree/master/Grit)
+base, with hypomnesis-specific extensions for FFI safety and feature-gated
+backends.
+
+The trigger checklist, doc-comment, signature, and `unsafe` rules below are
+aligned with [`anamnesis/CONVENTIONS.md`](https://github.com/PCfVW/anamnesis/blob/main/CONVENTIONS.md)
+and [`candle-mi/CONVENTIONS.md`](https://github.com/PCfVW/candle-mi/blob/main/CONVENTIONS.md).
+The numeric / SIMD sections of those documents are deliberately omitted
+here: hypomnesis is a measurement crate, not a numeric pipeline. The
+[FFI patterns](#ffi-patterns) and [feature-gated backends](#feature-gated-backends)
+sections are unique to hypomnesis.
+
+## Trigger Checklist
+
+**Before writing any line of code, check which triggers apply.**
+
+| You are about to... | Check these rules |
+|---|---|
+| Write a `///` or `//!` comment | [Backtick hygiene](#backtick-hygiene), [field-level docs](#field-level-docs), [intra-doc link safety](#intra-doc-link-safety) |
+| Write a `pub fn` or `pub const fn` | [`const fn`](#const-fn), [`#[must_use]`](#must_use-policy), [pass by value](#pass-by-value-vs-reference) |
+| Write a `pub fn` returning `Result<T>` | [`# Errors` section](#errors-doc-section) |
+| Write a `pub enum` or `pub struct` | [`#[non_exhaustive]`](#non_exhaustive-policy) or [`// EXHAUSTIVE:`](#exhaustive-annotation) |
+| Write an `as` cast | [`// CAST:`](#cast-annotation) |
+| Write `slice[i]` or `slice[a..b]` | [`// INDEX:`](#index-annotation) |
+| Write `.as_str()`, `.to_owned()` | [`// BORROW:`](#borrow-annotation) |
+| Write an `unsafe` block | [`// SAFETY:`](#safety-annotation), [feature-gating](#feature-gating-policy-for-unsafe), [FFI patterns](#ffi-patterns) |
+| Write `Box<dyn T>` or `&dyn T` | [`// TRAIT_OBJECT:`](#trait_object-annotation) |
+| Write a `match` or `if let` | [`if let` vs `match`](#if-let-vs-match), [`// EXPLICIT:`](#explicit-annotation) if no-op arm |
+| Write error strings | [Error message wording](#error-message-wording) |
+| Add `#[allow(clippy::...)]` for a newer lint | [MSRV lint guard](#msrv-lint-guard) |
+| Add a new GPU backend (Metal, ROCm, ...) | [Feature-gated backends](#feature-gated-backends) |
+
+## When Writing Doc Comments (`///`, `//!`)
+
+### Backtick Hygiene
+
+All identifiers, types, trait names, field names, crate names, and
+file-format names in doc comments must be wrapped in backticks so that
+rustdoc renders them as inline code and Clippy's `doc_markdown` lint passes.
+
+Applies to: struct/enum/field names, method names (`fn foo`), types
+(`Vec<T>`, `Option<u64>`), crate names (`libloading`, `windows`, `thiserror`),
+shared-library names (`nvml.dll`, `libnvidia-ml.so.1`), and acronyms that
+double as types (`DXGI`, `NVML`, `WDDM`, `RSS`, `VRAM`, `IDXGIAdapter3`).
+
+> ✅ `` /// Calls `IDXGIAdapter3::QueryVideoMemoryInfo` to read per-process VRAM. ``
+> ❌ `/// Calls IDXGIAdapter3::QueryVideoMemoryInfo to read per-process VRAM.`
+
+### Intra-Doc Link Safety
+
+Rustdoc intra-doc links must resolve under all feature-flag combinations.
+Feature-gated items (e.g., `MemoryReport` behind the `report` feature) must
+use plain backtick text in cross-references from feature-independent
+modules, not link syntax:
+
+> ✅ `` /// See `MemoryReport` (requires `report` feature). ``
+> ❌ `` /// See [`MemoryReport`](crate::report::MemoryReport). ``
+
+Within a feature-gated module, intra-doc links to other items in the same
+module are safe. Cross-module links between feature-gated areas are safe
+when the linked target is in the same feature set as the linker.
+
+### Field-Level Docs
+
+Every field of every `pub` struct must carry a `///` doc comment describing:
+
+1. what the field represents,
+2. its unit (bytes, MiB, milliseconds) or valid range where applicable,
+3. when the field can be `None` or zero (for `Option`-typed and accumulator fields).
+
+> Example:
+> ```rust
+> pub struct GpuDeviceInfo {
+>     /// Zero-based GPU index (NVML-canonical ordering on Windows).
+>     pub index: u32,
+>     /// Adapter name (e.g., `NVIDIA GeForce RTX 5060 Ti`).
+>     /// `None` when the source backend does not provide it.
+>     pub name: Option<String>,
+>     /// Total GPU memory in bytes.
+>     pub total_bytes: u64,
+> }
+> ```
+
+### `# Errors` Doc Section
+
+All public fallible methods (`-> Result<T>`) must include an `# Errors`
+section. Each bullet uses the format:
+
+    /// # Errors
+    /// Returns [`HypomnesisError::Nvml`] if NVML fails to load or report a count.
+    /// Returns [`HypomnesisError::DeviceIndexOutOfRange`] if `index` exceeds the device count.
+
+Rules:
+
+- Start each bullet with `Returns` followed by the variant in rustdoc link
+  syntax: `` [`HypomnesisError::Variant`] ``.
+- Follow with `if` (condition), `on` (event), or `when` (circumstance).
+- One bullet per distinct error path.
+
+## When Writing Function Signatures
+
+### `const fn`
+
+Declare a function `const fn` when **all** of the following hold:
+
+1. The body contains no heap allocation, I/O, or `dyn` dispatch.
+2. All called functions are themselves `const fn`.
+3. There are no trait-method calls that are not yet `const`.
+
+Constructors of plain data structs (`MemoryReport::new`), accessors, and
+pure arithmetic helpers should be `const fn`. When in doubt, annotate and
+let the compiler reject it — do not omit `const` preemptively.
+
+> ✅ `pub const fn new(before: Snapshot, after: Snapshot) -> Self { ... }`
+
+### `#[must_use]` Policy
+
+All public functions and methods that return a value and have no side
+effects must be annotated `#[must_use]`. This includes constructors,
+accessors, and pure queries.
+
+`Result<T>` is already `#[must_use]` at the type level; explicit annotation
+on `pub fn -> Result<T>` is redundant but not wrong. The
+`clippy::must_use_candidate` lint is at `warn`.
+
+> ✅ `#[must_use] pub fn ram_delta_mb(&self) -> f64 { ... }`
+
+### Pass by Value vs Reference
+
+| Type | Rule |
+|---|---|
+| `Copy` type ≤ 2 words (`u32`, `u64`, `bool`, `GpuQuerySource`) | Pass by value |
+| `Copy` type > 2 words | Pass by reference |
+| Non-`Copy`, not mutated (`String`, `Snapshot`) | Pass by `&T` |
+| Non-`Copy`, mutated | Pass by `&mut T` |
+| Owned, consumed by callee | Pass by value (move semantics) |
+
+Never accept `&mut T` when the body never writes through the reference;
+Clippy's `needless_pass_by_ref_mut` will flag it. Similarly,
+`trivially_copy_pass_by_ref` flags `&T` where `T: Copy` and is small
+enough to pass by value.
+
+## When Writing Public Enums and Structs
+
+### `#[non_exhaustive]` Policy
+
+Future-proofing rests on `#[non_exhaustive]`, not on parameter type elaboration.
+
+- **Public enums** that may gain new variants: `#[non_exhaustive]`.
+  `HypomnesisError`, `GpuQuerySource` are non-exhaustive — new error
+  paths and new GPU backends will land in patch releases.
+- **Public structs** that may gain new fields: `#[non_exhaustive]`.
+  `GpuDeviceInfo`, `ProcessGpuInfo`, `Snapshot`, `MemoryReport` are
+  non-exhaustive — fields like `temperature_celsius`, `pcie_link_gen`,
+  or per-segment VRAM (local vs non-local) may be added.
+- **Internal dispatch enums** matched exhaustively by this crate:
+  `#[allow(clippy::exhaustive_enums)] // EXHAUSTIVE: <reason>`.
+
+Once a type is `#[non_exhaustive]`, downstream callers cannot construct
+it via struct literal syntax. Provide a constructor (`Snapshot::now`,
+`MemoryReport::new`) for every public type that callers need to build.
+
+## When Writing Expressions
+
+These annotations are required **on or immediately before** the line where
+the pattern occurs. Apply them as you write the line, not in a review pass.
+
+### CAST Annotation
+
+`// CAST: <from> → <to>, <reason>` — required on every `as` cast between
+numeric types. Prefer `From`/`Into` for lossless conversions and
+`TryFrom`/`TryInto` with `?` for fallible ones. Use `as` only when
+truncation or wrapping is the deliberate intent, or when the bit-level
+reinterpretation is the whole point.
+
+> Example: `// CAST: u64 → f64, byte count for MiB conversion (fits in f64 mantissa for any process)`
+> Example: `// CAST: usize → u32, struct size for K32GetProcessMemoryInfo cb field (fixed 80 bytes on x64)`
+
+### INDEX Annotation
+
+`// INDEX: <reason>` — required on every direct slice index (`slice[i]`,
+`slice[a..b]`) that cannot be replaced by an iterator. Direct indexing
+panics on out-of-bounds; prefer `.get(i)` with `?` or explicit error
+handling.
+
+> Example: `// INDEX: nvml_infos buffer is sized to NVML_MAX_PROCESSES; count is bounded above`
+
+### BORROW Annotation
+
+`// BORROW: <what is converted>` — required on explicit `.as_str()`,
+`.as_bytes()`, `.to_owned()` conversions (Grit Rule 2).
+
+> Example: `// BORROW: explicit String::from_utf16_lossy — DXGI Description is fixed-size UTF-16 array`
+
+### TRAIT_OBJECT Annotation
+
+`// TRAIT_OBJECT: <reason>` — required on every `Box<dyn Trait>` or
+`&dyn Trait` usage. hypomnesis avoids dynamic dispatch where possible;
+backends are selected by feature flag and `#[cfg]`, not by trait objects.
+
+## When Writing `unsafe`
+
+hypomnesis carries `#![deny(unsafe_code)]` at the crate root. `forbid` is
+not appropriate because the crate fundamentally relies on three distinct
+FFI surfaces (NVML dynamic load, DXGI COM, `K32GetProcessMemoryInfo`
+extern) — `unsafe` is intrinsic to the work.
+
+Every `unsafe` block must be **scoped, annotated, and feature-gated**.
+
+### SAFETY Annotation
+
+`// SAFETY: <invariants>` — required on every `unsafe` block or
+`unsafe fn` (inline comment, not a doc comment). Document:
+
+1. What invariants the call requires (e.g., "buffer is at least N bytes",
+   "handle is valid for the lifetime of the process").
+2. How those invariants are established at this call site.
+
+> Example:
+> ```rust
+> // SAFETY: K32GetProcessMemoryInfo writes into the stack-allocated counters
+> // struct (cb field set to its size). GetCurrentProcess returns a pseudo-handle
+> // that is always valid for the lifetime of the process.
+> let ok = unsafe { K32GetProcessMemoryInfo(handle, &raw mut counters, cb) };
+> ```
+
+### Feature-Gating Policy for `unsafe`
+
+| Feature gate | Accepted `unsafe` scope |
+|---|---|
+| (always, on `target_os = "windows"`) | `K32GetProcessMemoryInfo` extern via `unsafe extern "system"` block in `src/ram.rs` |
+| `nvml` | NVML dynamic load and FFI in `src/gpu/nvml.rs` |
+| `dxgi` | DXGI COM calls in `src/gpu/dxgi.rs` (Windows-only) |
+
+Each accepted use must satisfy all of:
+
+1. The `unsafe` block lives in a **single, dedicated module** — never
+   scattered across the codebase.
+2. Every `unsafe` block carries a `// SAFETY:` comment.
+3. The module is gated behind `#[cfg(feature = "...")]` — users who
+   don't enable the feature get zero unsafe code from that backend.
+4. A safe Linux equivalent exists where the platform makes one possible
+   (Linux RAM uses `/proc/self/status` with no unsafe; the Windows RAM
+   path is the only platform where `unsafe` is unavoidable).
+
+Adding a new backend requires updating this table and adding the
+appropriate `#[cfg(feature = "...")]` to the new module's parent
+declaration in `src/gpu/mod.rs`.
+
+### FFI Patterns
+
+Three FFI patterns recur in hypomnesis. Each has its own conventions.
+
+**Pattern 1 — `unsafe extern "system"` block (Windows ABI).**
+Used for stable Windows API functions whose ABI is well-known
+(`K32GetProcessMemoryInfo`, `GetCurrentProcess`). The block declares the
+function signatures inline. Each declared function gets a doc comment
+linking to the Microsoft documentation page.
+
+**Pattern 2 — `libloading::Library::new` + symbol lookup (NVML).**
+Used for NVML, which is loaded at runtime so the crate works even when
+the NVIDIA driver is absent. `unsafe` is required at three points:
+library load, symbol lookup, and call. Conventions:
+
+- Hold the `Library` for the duration of all calls; don't load and
+  re-load per query.
+- Initialize (`nvmlInit_v2`) and shut down (`nvmlShutdown`) in matched
+  pairs — on every return path, including error paths.
+- Treat `nvmlReturn_t` constants (`NVML_SUCCESS = 0`,
+  `NVML_ERROR_INSUFFICIENT_SIZE = 7`) as named consts, not magic numbers.
+
+**Pattern 3 — `windows` crate COM (`IDXGIFactory1` → `IDXGIAdapter3`).**
+Used for DXGI on Windows. The `windows` crate handles refcounting via
+`Drop`, so manual `Release` is not needed. Conventions:
+
+- Use `.cast::<T>()` for safe COM interface upcasting; check the
+  `Result` and surface failure as `HypomnesisError::Dxgi`.
+- Do not store COM pointers across function boundaries; they are cheap
+  to re-acquire and have non-trivial thread-safety considerations.
+- Prefer `&raw mut foo` over `&mut foo as *mut _` for taking pointers
+  to be passed into FFI (Rust 2024 edition idiom).
+
+### MSRV Lint Guard
+
+`lib.rs` carries `#![allow(unknown_lints)]` so that
+`#[allow(clippy::newer_lint)]` in test modules does not break the MSRV
+CI build. Without it, every new clippy lint suppression risks an MSRV
+failure under future `#![deny(warnings)]`.
+
+No special action is required when adding a new `#[allow(clippy::...)]`.
+If MSRV is bumped, this guard remains necessary as long as MSRV trails
+the development toolchain.
+
+## When Writing Control Flow
+
+### `if let` vs `match`
+
+Use the most specific construct for the pattern at hand:
+
+| Situation | Preferred form |
+|---|---|
+| Testing a single variant, no binding needed | `matches!(expr, Pat)` |
+| Testing a single variant, binding needed | `if let Pat(x) = expr { … }` |
+| Two or more variants with different bodies | `match expr { … }` |
+| Exhaustive dispatch over an enum | `match expr { … }` |
+
+Never `match` with a single non-`_` arm and a no-op `_ => {}` where
+`if let` or `matches!` would be clearer.
+
+### EXPLICIT Annotation
+
+`// EXPLICIT: <reason>` — required when a match arm is intentionally a
+no-op, or when an imperative loop is used instead of an iterator chain
+for a stateful computation.
+
+> Example: `// EXPLICIT: NVML init failed; nothing to clean up before returning None`
+
+### EXHAUSTIVE Annotation
+
+`// EXHAUSTIVE: <reason>` — required on `#[allow(clippy::exhaustive_enums)]`
+or `#[allow(clippy::wildcard_enum_match_arm)]` when a wildcard is used on
+a foreign `#[non_exhaustive]` enum that we cannot match exhaustively.
+
+> Example: `// EXHAUSTIVE: HypomnesisError is internal; this dispatcher owns and matches all variants`
+
+## When Writing Error Strings
+
+### Error Message Wording
+
+Error strings passed to `HypomnesisError` variants follow two patterns:
+
+- **External failures** (FFI, subprocess, I/O): `"failed to <verb>: {e}"`
+  > Example: `HypomnesisError::Nvml(format!("failed to load nvml: {e}"))`
+  > Example: `HypomnesisError::NvidiaSmi(format!("failed to spawn nvidia-smi: {e}"))`
+- **Validation failures** (sentinel value, out-of-range): `"<noun> <problem> (<context>)"`
+  > Example: `HypomnesisError::Nvml(format!("nvmlDeviceGetMemoryInfo returned NVML_ERROR ({code})"))`
+  > Example: `HypomnesisError::Dxgi("no DXGI adapter with non-zero dedicated VRAM found".into())`
+
+Rules:
+
+- Use lowercase, no trailing period.
+- Include the offending value and the valid range when applicable.
+- Wrap external errors with `: {e}`, not `.to_string()`.
+- For NVML return codes, name the code (`NVML_ERROR_*`) where possible;
+  fall back to the numeric value when the code is unknown to us.
+
+## Feature-Gated Backends
+
+hypomnesis's GPU backends are independent units of code, each gated by a
+Cargo feature:
+
+| Feature | Module | In v0.1 | Adds dep |
+|---|---|---|---|
+| `nvml` | `src/gpu/nvml.rs` | yes | `libloading` |
+| `dxgi` | `src/gpu/dxgi.rs` (Windows only) | yes | `windows` |
+| `nvidia-smi-fallback` | `src/gpu/nvidia_smi.rs` | yes | none (stdlib) |
+| `report` | `src/report.rs` | yes | none |
+| `debug-output` | (cross-cutting) | yes | none |
+| `rocm` (future) | `src/gpu/rocm.rs` | no | TBD |
+| `metal` (future) | `src/gpu/metal.rs` (macOS) | no | TBD |
+
+Adding a new backend (for a new GPU vendor or new measurement source) is
+a five-step recipe:
+
+1. Add the feature to `Cargo.toml` `[features]` and any optional dependency.
+2. Create `src/gpu/<backend>.rs` with module-level `//!` docs explaining
+   the FFI mechanism, what it measures, and platform constraints.
+3. Add `#[cfg(feature = "<backend>")] pub mod <backend>;` (and a
+   `cfg(target_os)` guard if platform-specific) to `src/gpu/mod.rs`.
+4. Wire the backend into the dispatchers (`device_info`, `device_count`,
+   `process_gpu_info`) in priority order. Backends try in sequence;
+   first success wins.
+5. Add a new variant to `GpuQuerySource` (the enum is `#[non_exhaustive]`,
+   so this is non-breaking) and update the smoke tests.
+
+Default features (`nvml`, `nvidia-smi-fallback`, `dxgi`) cover the
+ecosystem's most common case (NVIDIA on Windows or Linux). Disabling
+defaults yields a nearly empty crate that compiles to almost nothing —
+useful for callers that only want process RSS.
+
+---
+
+# Dogfooding report (from candle-mi): surface NVML `reserved` memory
+
+Source: https://github.com/pcfvw/hypomnesis/blob/main/docs/dogfooding-feedbacks/dogfooding-candle-mi-nvml-reserved.md
+
+# Dogfooding report (from candle-mi): surface NVML `reserved` memory
+
+**Date:** 2026-06-29
+**Reporter:** candle-mi (v0.1.16 — migrated `src/memory.rs` to `hypomnesis 0.2.3`)
+**Severity:** Enhancement — additive, non-breaking
+**Affected area:** `gpu::device_info` / `GpuDeviceInfo` (the device-wide total/free/used triplet)
+**Status:** ✅ **Resolved in v0.2.4** (2026-06-29)
+
+> ## Resolution (v0.2.4)
+>
+> Shipped as `GpuDeviceInfo::reserved_bytes: Option<u64>`, sourced from
+> `nvmlDeviceGetMemoryInfo_v2` (R510+) with a graceful pre-R510 fallback to
+> `None`. `total_bytes` is unchanged. See [`CHANGELOG.md`](../../CHANGELOG.md)
+> and [`docs/roadmap-v0.2.4.md`](../roadmap-v0.2.4.md).
+>
+> **Correction to this report's figures (live-validated on the reference
+> RTX 5060 Ti, driver 591.86).** The real driver/firmware reservation is
+> **259 MiB**, not the 73 MiB inferred below. Three sources agree:
+> `nvidia-smi -q -d MEMORY` prints `Total: 16311 MiB` / `Reserved: 259 MiB`;
+> NVML v1 `total` == v2 `total` == 16311 MiB; and the raw v2 struct satisfies
+> `reserved + free + used == total` exactly — so `reserved` is a **subset of**
+> `total`, not added on top.
+>
+> The report's **73 MiB** (`DXGI 16384 − NVML 16311`) is a *different*
+> quantity: board/ECC overhead sitting *below* what NVML reports, which NVML
+> does not expose as a field. It was also computed from two non-agreeing
+> sources — live `DXGI DedicatedVideoMemory` is `16052 MiB` here, not the
+> `16384` assumed below. The shipped field reads NVML's own v2 `reserved`
+> directly rather than reverse-engineering it from a cross-source
+> subtraction. The request was sound; only the inferred magnitude was off.
+
+## Context — the migration went well
+
+candle-mi v0.1.16 deletes its ~600 lines of in-tree measurement FFI and delegates
+to `hypomnesis 0.2.3` (lean set: `nvml`, `dxgi`, `nvidia-smi-fallback`, `metal`).
+Live validation on an RTX 5060 Ti (16 GB, Windows/WDDM):
+
+- per-process **used** (DXGI) — a 512 MiB GPU allocation produced an **exact
+  512 MB** `MemorySnapshot` VRAM delta;
+- GPU **name** — `dxgi::adapter_name().or(nvml)` gives byte-identical
+  `"NVIDIA GeForce RTX 5060 Ti"`;
+- the per-process flag and RAM are all correct.
+
+No defect. One observation worth an enhancement.
+
+## Observation — the device total is the *usable* figure, with no way to see the carveout
+
+`device_info().total_bytes` reports **16311 MiB** on this card — the NVML v1
+`nvmlDeviceGetMemoryInfo` total, which equals `nvidia-smi` (good, ecosystem-consistent).
+But the card's **physical** capacity is **16384 MiB** (DXGI `DedicatedVideoMemory`).
+The **73 MiB** gap is NVIDIA's documented driver/firmware reservation:
+
+> NVML `nvmlMemory_v2_t.reserved` — *"Device memory (in bytes) reserved for system
+> use (driver or firmware)."* (page tables, context/channel structures, ECC parity).
+
+So `16384 physical = 16311 usable + 73 reserved`. Today hypomnesis surfaces only
+the usable total; a consumer cannot show the breakdown (e.g. candle-mi would like
+to print `… / 16311 MB usable (+73 MB driver-reserved)`).
+
+## Request — expose `reserved` via `nvmlDeviceGetMemoryInfo_v2`
+
+Add an optional reserved-memory figure to `GpuDeviceInfo`, sourced from NVML's
+**v2** memory query:
+
+- Call `nvmlDeviceGetMemoryInfo_v2` (`nvmlMemory_v2_t`: `version, total, reserved,
+  free, used`). In v2, `total` is the **full physical** (16384) and `reserved`
+  (73) is broken out — unlike v1, whose `total` is already net of the reservation.
+- Add `reserved_bytes: Option<u64>` to `GpuDeviceInfo` (the struct is
+  `#[non_exhaustive]`, so this is additive/non-breaking).
+- **Driver-compat fallback:** `nvmlDeviceGetMemoryInfo_v2` is R510+; on older
+  drivers it returns `NVML_ERROR_FUNCTION_NOT_FOUND` (see nvidia-settings #78).
+  Fall back to v1 and set `reserved_bytes = None`.
+- Consider whether `total_bytes` should remain the usable figure (16311, current,
+  `nvidia-smi`-consistent — recommended for stability) or move to the v2 physical
+  (16384); if the latter, that's a semantic change worth a major/minor bump and a
+  CHANGELOG note. Keeping `total_bytes` as-is and *adding* `reserved_bytes` is the
+  non-breaking path.
+
+## Evidence (RTX 5060 Ti, Windows 11, driver 591.86)
+
+| Source | Total | Notes |
+|---|---|---|
+| DXGI `DedicatedVideoMemory` | 16384 MiB | full physical / nominal "16 GB" |
+| NVML v1 `nvmlDeviceGetMemoryInfo.total` | 16311 MiB | = `nvidia-smi` (usable) |
+| `nvidia-smi --query-gpu=memory.total` | 16311 MiB | confirms NVML v1 |
+| implied `reserved` | 73 MiB | = NVML v2 `reserved` |
+
+## Downstream payoff
+
+Once `reserved_bytes` lands, candle-mi (and `hmn`) can render the honest
+breakdown — *usable + reserved (+ physical)* — turning "why is it 16311 not
+16384?" from a FAQ into a one-line answer in the output itself.
+
+## References
+
+- NVML `nvmlMemory_v2_t`: <https://docs.nvidia.com/deploy/nvml-api/structnvmlMemory__v2__t.html>
+- NVML device queries: <https://docs.nvidia.com/deploy/nvml-api/group__nvmlDeviceQueries.html>
+- `nvmlDeviceGetMemoryInfo_v2` driver-compat (R510+ `FUNCTION_NOT_FOUND`): nvidia-settings issue #78
+- NVIDIA forum — NVML total = `nvidia-smi`: <https://forums.developer.nvidia.com/t/why-cudamemgetinfo-total-memory-less-than-nvmldevicegetmemoryinfo-total-memory/370883>
+
+---
+
+# hypomnesis Adoption Report — `inspect --check-gpu` (hf-fm v0.10.1)
+
+Source: https://github.com/pcfvw/hypomnesis/blob/main/docs/hypomnesis-adoption.md
+
+# hypomnesis Adoption Report — `inspect --check-gpu` (hf-fm v0.10.1)
+
+**Date:** 2026-05-12
+**hf-fm version:** 0.10.1
+**hypomnesis version:** 0.2.0
+**Context:** Adopting `hypomnesis` as the GPU-measurement substrate for the new `hf-fm inspect <repo> [FILE] --check-gpu [N]` flag. This is the first external consumer of `hypomnesis` (called out as the proof-of-concept use case in the [hypomnesis brief](https://github.com/PCfVW/hypomnesis/blob/main/docs/hypomnesis-brief.md)), and the report is written for the upstream maintainer (us) so the next hypomnesis release can act on real-world wear-and-tear.
+
+## Summary
+
+hypomnesis 0.2.0 worked on the first try. `device_info(index)` returned correct device-wide totals, free, and used numbers on a Windows 11 box with an RTX 5060 Ti (NVML primary, DXGI for the device name), and the error variants degraded cleanly when we passed out-of-range indices. No surprises, no workarounds, no `// SAFETY:` comments anywhere in the hf-fm side of the integration — the unsafe is all in hypomnesis and stays there.
+
+Five concrete observations follow. One is a testability gap that immediately blocked unit tests in `gpu_check.rs`; two are ergonomic gaps where every caller will write the same workaround (one of which only bites future consumers, not hf-fm itself); one is a brief-vs-reality calibration on API surface used; one is an error-taxonomy contract worth pinning down before a second consumer arrives.
+
+## What worked well
+
+### Default-features set is exactly right
+
+The hf-fm `Cargo.toml` line is the minimum form:
+
+```toml
+hypomnesis = "0.2"
+```
+
+No feature flags, no `default-features = false`, no target-conditional fiddling. The default set (`nvml`, `nvidia-smi-fallback`, `dxgi`) covers Windows NVIDIA + Linux NVIDIA out of the box, and the `windows` crate is already target-conditional in `hypomnesis/Cargo.toml` so Linux users pay nothing for it. **Keep that default invariant** — any future feature reshuffle that breaks the "one line, no flags" install bar should be considered a regression for downstream adopters.
+
+### Error variants are well-named and `Display`-friendly
+
+`HypomnesisError`'s `Display` impl produces strings that we could surface verbatim, with one polishing pass for sentence form. The `DeviceIndexOutOfRange { index, count }` variant is particularly nice — it carries enough structured data that hf-fm can render `"index 9 out of range (have 1 device)"` (singular/plural agreement) without parsing the string.
+
+### `#[non_exhaustive]` on the error and snapshot types is the right call
+
+We hit a future-proofing gap exactly *once* during the integration (next section), and the `#[non_exhaustive]` annotation kept hf-fm's `match` on `HypomnesisError` honest — we added a `_ => format!("hypomnesis error: {err}")` catch-all and the compiler gave us no choice. **Keep it.**
+
+## What didn't quite work — five concrete asks
+
+### 1. `GpuDeviceInfo` is `#[non_exhaustive]` and has no constructor — blocks downstream unit tests
+
+This is the loudest finding. We wanted three unit tests in `src/gpu_check.rs` for the fit / miss arithmetic:
+
+```rust
+#[test]
+fn gpu_check_json_fit_path() {
+    let dev = hypomnesis::GpuDeviceInfo {        // ← rejected: cannot construct an
+        index: 0,                                //   `#[non_exhaustive]` struct from
+        name: Some("RTX 5060 Ti".to_owned()),    //   an external crate
+        total_bytes: 17_179_869_184,
+        free_bytes: 15_246_684_160,
+        used_bytes: 1_933_185_024,
+    };
+    /* ... */
+}
+```
+
+`#[non_exhaustive]` on `GpuDeviceInfo` is correct for API evolution (we want to add `temperature_celsius` later without a major bump) but it forbids external construction with a struct literal, which kills test fixtures for any downstream renderer. The current state is: we have one unit test (`gpu_check_json_error_path`, no `GpuDeviceInfo` needed) and a comment block in lieu of the other three, plus a manual-smoke-test note in the verification section of the v0.10.1 plan.
+
+**Ask:** add a builder-style test fixture path, gated by a `test-helpers` (or `unstable-test`) Cargo feature. Concretely: `#[cfg(feature = "test-helpers")] impl GpuDeviceInfo { pub fn builder() -> GpuDeviceInfoBuilder { ... } }` with `index`/`name`/`total_bytes`/`free_bytes`/`used_bytes` setters and a `build()`. A positional `pub const fn synthetic(index, name, total, free, used)` would *partially defeat* the `#[non_exhaustive]` invariant — when `temperature_celsius` lands, the constructor's signature shifts and every downstream test fixture breaks, which is exactly what `#[non_exhaustive]` was supposed to prevent. A builder absorbs new fields with new defaulted setters. The `test-helpers` feature gate is the standard Rust idiom for "public-but-clearly-not-the-real-API" (`#[doc(hidden)] pub` is hidden-but-still-public for semver purposes, so the feature gate is more honest).
+
+Quantitative impact: every downstream that renders or transforms `GpuDeviceInfo` will hit this on first attempt at unit-testing the render path. With one PR upstream, we unblock all of them in patch-release form (the feature is additive, default-off, and the builder's setters are append-only).
+
+### 2. No `format_total` / `format_used` parity for the `report` feature's `format_free`
+
+`hypomnesis 0.2` ships `GpuDeviceInfo::format_free` and `GpuDeviceInfo::print_free` under the `report` feature. We didn't pull `report` in (we format the verdict ourselves with hf-fm's own `format_size`), but the gap is noticeable: every consumer that wants `"NVIDIA RTX 5060 Ti — 16.0 GiB VRAM, free 14.2 GiB, used 1.8 GiB"` will hand-roll the same three lines of formatting glue. candle-mi will. Other consumers will too.
+
+**Caveat:** this would *not* retroactively serve hf-fm v0.10.1. `format_free` is opinionated — `"  GPU {idx}: free {N} MB / {T} MB[ [name]]\n"` (two-space indent, `MiB`-as-`MB`, trailing newline). hf-fm prints with `format_size` in `GiB`, no indent, and a column-aligned `"GPU N:"` prefix that does not match `format_free`'s shape ([gpu_check.rs:201-210](../hf-fetch-model/src/gpu_check.rs#L201-L210)). So this is a candle-mi-and-future-consumer ask, not a wear-and-tear ask from this adoption — recorded here because the gap is real, but it should not be sold as something hf-fm itself would adopt.
+
+**Ask:** one of —
+
+- **(a)** add `format_total(&self) -> String`, `format_used(&self) -> String` parity helpers, **or**
+- **(b)** add `format_summary(&self) -> String` returning the one-liner above (`"<name> — <total> VRAM, free <free>, used <used>"`),
+- **(c)** add `format_free_used_total(&self) -> (String, String, String)` so callers can choose their template.
+
+Whichever fits the report-feature spirit best. Option **(b)** is most opinionated; option **(a)** is closest in style to the existing `format_free` and the most natural patch-release addition.
+
+### 3. `name: Option<String>` — pick a canonical fallback before consumers diverge
+
+Every caller will write the same fallback. We did:
+
+```rust
+let name = dev.name.as_deref().unwrap_or("unknown GPU");
+```
+
+It's literally one line at the call site — the wear-and-tear concern isn't keystroke savings, it's *consumer divergence*. candle-mi will write the same line; without an upstream nudge, the two consumers will land on `"unknown GPU"` vs `"Unknown"` vs `"<unknown>"` and the ecosystem accumulates drift.
+
+**Ask:** add `impl GpuDeviceInfo { pub fn name_or_unknown(&self) -> &str { self.name.as_deref().unwrap_or("unknown GPU") } }`. Stable, no API surface to argue about, saves every downstream from re-rolling and from picking a different phrase. Hf-fm v0.10.4 will adopt it if it lands (already captured in the v0.10.4 roadmap line). Caveat: baking the literal `"unknown GPU"` into the library closes the door on localization — consumers who want a different phrase will still hand-roll. Acceptable trade-off for English-default tooling; flag explicitly in the doc-comment that the string is not localized.
+
+### 4. Surface used: <5% rather than the brief's "≈10%"
+
+The hypomnesis brief named hf-fm as a consumer of "`device_info` + `device_count`, ≈10 % of the surface." Actual usage in v0.10.1: **only `device_info`**. We do not call `device_count` because `--check-gpu N` targets a single device and the error path for an out-of-range index is handled by `device_info` itself returning `DeviceIndexOutOfRange { index, count }` — we get the count back through the error, for free, only when we actually need it.
+
+Not a problem with hypomnesis — just a note that the brief's "first consumer" estimate was slightly high. **Multi-GPU support (`--check-gpu all`, planned in hf-fm v0.10.4)** is when `device_count` will come into play; for now, the brief should probably say "uses `device_info` directly; `device_count` deferred to multi-GPU follow-up."
+
+### 5. `DeviceIndexOutOfRange` vs `NoGpuSource` — clear taxonomy, one small redundancy
+
+When we ran `--check-gpu 9` on a single-GPU box, we got the precise `"index 9 out of range (have 1 device)"` message. When we mentally simulated running it on a no-GPU box (we don't have one handy), we'd get `"no NVIDIA device detected (NVML / DXGI not usable)"`. The two messages are clearly distinguishable, which is what we want — users on a no-GPU box should know it's a backend gap, users on a wrong index should know it's a user-input gap.
+
+The one small redundancy: `DeviceIndexOutOfRange` returns the count in its variant, and we then format `(have {count} {plural})` into the message. If hypomnesis ever standardizes a `Display` form that already includes the count, we'd duplicate it (`"device index 9 out of range (have 1 devices) (have 1 device)"`). Doesn't happen today — the current `#[error("device index {index} out of range (have {count} devices)")]` is good — but it's worth pinning down: **do we want the variant's `Display` to be the canonical user-facing string, or should consumers be expected to format from the structured fields?** We chose to format from the fields so we could fix the `1 devices` → `1 device` plural.
+
+**Suggested contract** (to write into the `HypomnesisError` doc-comment): `Display` is the *default English one-liner* — fine for logs and library-tier error reporting; structured fields (`index`, `count`, backend strings) are the *canonical source* for any consumer that wants to localize, restyle, or assemble a richer message. Consumers expecting Display to be user-facing get a useful default; consumers writing CLIs or GUIs know to match on the variant. That's the convention every ecosystem library that exposes both layers ends up at; codifying it upstream saves the next consumer from re-discovering it.
+
+## Adoption mechanics — what we changed and why
+
+For the upstream record:
+
+- **Cargo.toml**: added `hypomnesis = "0.2"` to `[dependencies]` (always-on, not feature-gated). The lock-file diff was clean — `hypomnesis 0.2.0`, `libloading 0.9.0`, the Windows-target `windows 0.62.2` family. No version conflicts with existing deps.
+- **`src/gpu_check.rs`**: new ~480-line module gated by `#[path = "../gpu_check.rs"] mod gpu_check;` in `src/bin/main.rs` so it lives in the binary's module tree and stays out of the library's public API. Calls `hypomnesis::device_info(index)` exactly once per `--check-gpu` invocation.
+- **No `unsafe`**: hf-fm enforces `unsafe_code = "forbid"` under `[lints.rust]` in `Cargo.toml`. The unsafe NVML / DXGI is hypomnesis's problem, well-encapsulated.
+
+No need to wrap or feature-gate hypomnesis for cross-platform reasons — the `windows` crate is already target-conditional upstream.
+
+## What we'd be sad to lose
+
+A few hypomnesis design decisions paid off concretely in v0.10.1; calling them out so they don't get refactored away:
+
+- **`#[non_exhaustive]` everywhere** — kept our `match` honest; the `_ => format!("hypomnesis error: {err}")` catch-all guarantees we cope with future variants. (The flip side is the testability gap in finding #1 — handle that with a feature-gated builder, not by removing the annotation.)
+- **`device_info` is sync, not async** — we call it from a sync binary context; an async-only API would force a runtime where none is needed. The "long-lived NVML context" deferred from v0.2 to a later release (per [snapshot.rs:207](../src/snapshot.rs#L207)) should preserve a sync entry point even when the cached path eventually lands.
+- **Three independent backends, dispatched by priority** — we didn't have to make a choice between NVML and DXGI; hypomnesis tried NVML first (got the numbers) and used DXGI only for the adapter name on Windows. Exactly the pre-rolled cake we wanted.
+
+## Action items for hypomnesis 0.2.x / 0.3
+
+Concrete patch-release-safe wins, in order of impact:
+
+1. **`test-helpers`-feature-gated `GpuDeviceInfo::builder()`** — unblocks downstream tests without weakening `#[non_exhaustive]`'s evolution guarantee. (Finding #1.)
+2. **`name_or_unknown(&self) -> &str` convenience** — settles the fallback phrase upstream before candle-mi and hf-fm diverge on it. (Finding #3.)
+3. **`format_total` / `format_used` parity helpers under the `report` feature** — eliminates the format-the-three-numbers boilerplate for `report`-feature consumers. Does not retroactively help hf-fm v0.10.1 (see finding #2 caveat). (Finding #2.)
+4. **Doc note on the canonical user-facing error string** — pin down that `Display` is the default English one-liner and structured fields are the canonical source. (Finding #5.)
+
+Items 1–3 are additive and could land as a single hypomnesis 0.2.1 patch. Item 4 is doc-only.
+
+*Filed by the hf-fetch-model maintainer (= the hypomnesis maintainer = you) so the next hypomnesis release acts on the wear-and-tear from a real downstream adoption rather than synthetic guesses.*
+
+---
+
+# `hypomnesis` — a brief
+
+Source: https://github.com/pcfvw/hypomnesis/blob/main/docs/hypomnesis-brief.md
+
+# `hypomnesis` — a brief
+
+> *External measurement of a Rust process's RAM and VRAM state, on Windows, Linux, and macOS. The counterpart to `anamnesis`.*
+
+## Why this crate
+
+candle-mi's v0.1.1–v0.1.3 VRAM saga produced ~889 lines of battle-tested Rust covering capabilities that, as far as I can determine from crates.io, **do not exist elsewhere in the ecosystem**:
+
+| Capability | Who has it in Rust today |
+|-----------|--------------------------|
+| Device-wide NVML memory info (Linux + Windows) | `nvml-wrapper`, `all-smi`, `hardware-query` |
+| Per-process NVML compute processes (Linux) | `nvml-wrapper` |
+| **Per-process VRAM on Windows for the calling process via `IDXGIAdapter3::QueryVideoMemoryInfo`** | **No one — candle-mi was first** |
+| **Per-process VRAM on Windows for foreign processes via `PDH` `\GPU Process Memory(*)\Dedicated Usage` (consumer `WDDM 2.0`+)** | **No one — hypomnesis v0.2.2 was first** |
+| **Per-process Metal VRAM on macOS via `ledger(LEDGER_ENTRY_INFO_V2).graphics_footprint`** | **No one — hypomnesis v0.2.3 is first** |
+| NVML `u64::MAX` sentinel handling (R570 driver bug on RTX 5060 Ti) | No one |
+| `nvidia-smi` subprocess fallback with sanity checks | No one (generally) |
+| Process RSS via `K32GetProcessMemoryInfo` / `/proc/self/status` / `task_info(TASK_VM_INFO_PURGEABLE)` | `memory-stats` does RSS, but not combined with VRAM and not on macOS |
+
+The Windows DXGI implementation is the **hard part** — the multi-day deep dive through WDDM architecture, COM pointer manipulation (`IDXGIFactory1` → `IDXGIAdapter` → `IDXGIAdapter3` cast chain), and adapter enumeration (skipping Microsoft Basic Render Driver, handling dedicated vs shared memory segments). It belongs in the ecosystem as a reusable crate, not buried inside a single application's source tree.
+
+## Why the name
+
+Plato's *Phaedrus* distinguishes two kinds of memory:
+
+- **Anamnesis** (ἀνάμνησις) — the soul's inward recollection of truth it always possessed. Used in candle-mi: looking *inside* a model's weights.
+- **Hypomnesis** (ὑπόμνησις) — *external* memory aids, reminders, written records. Plato was skeptical of them because they replace true internal memory with external notation.
+
+A crate that queries and records what's currently in a process's memory is **literally hypomnesis**: external snapshots of memory state. The two names form a deliberate pair.
+
+Shorthand: **`hmn`** (rule: first letter of the Greek prefix + the `mn` root — mirrors `amn` for `anamnesis`).
+
+Availability confirmed on crates.io and GitHub (2026-04-29). The v0.0.1 placeholder (skeleton + stubs) was [published to crates.io](https://crates.io/crates/hypomnesis) on `2026-04-29T08:32:49Z` in Phase 1 Wave 1 — see Roadmap. The first functional release will be `0.1.0`, planned in Phase 1 Wave 2.
+
+## Scope (v0.1)
+
+**Included:**
+- Process RAM (RSS): Windows, Linux, macOS
+- Device-wide GPU memory (total/free/used): NVML on Linux + Windows, `sysctl hw.memsize` + `MTLDevice.recommendedMaxWorkingSetSize` on macOS
+- Per-process GPU memory: NVML on Linux, DXGI on Windows, `ledger(LEDGER_ENTRY_INFO_V2).graphics_footprint` on macOS
+- Compute-process listing: NVML + `/proc/<pid>/comm` on Linux, `nvidia-smi` on Windows, `proc_listpids` + per-PID `ledger` + `proc_pidpath` on macOS
+- `nvidia-smi` subprocess fallback (device-wide, Windows + Linux)
+- Robust sentinel handling (NVML `u64::MAX`, used > total sanity check)
+- GPU adapter name (DXGI description field on Windows, NVML on Linux, CPU brand string on macOS)
+
+**Explicitly out of scope:**
+- Inference tracking (candle-mi's `sync_and_trim_gpu` stays in candle-mi — it's candle/cudarc-specific)
+- CPU counters, thermal monitoring, power draw (that's `sysinfo`, `all-smi`, `hardware-query` territory)
+- AMD ROCm (future consideration)
+- Intel Macs (the macOS path detects Apple Silicon via `machdep.cpu.brand_string`; Intel Macs fall through to `NoGpuSource`)
+
+## Proposed public API
+
+```rust
+// Device-wide query — what hf-fm --check-gpu needs
+pub struct GpuDeviceInfo {
+    pub index: u32,
+    pub name: Option<String>,      // from DXGI or nvidia-smi
+    pub total_bytes: u64,
+    pub free_bytes: u64,
+    pub used_bytes: u64,
+}
+
+pub fn device_info(index: u32) -> Result<GpuDeviceInfo, HypomnesisError>;
+pub fn device_count() -> Result<u32, HypomnesisError>;
+
+// Per-process query — what candle-mi needs
+pub struct ProcessGpuInfo {
+    pub used_bytes: u64,
+    pub is_per_process: bool,       // false when falling back to device-wide
+    pub source: GpuQuerySource,     // Dxgi | Nvml | NvidiaSmi
+}
+
+pub fn process_gpu_info(device_index: u32) -> Result<ProcessGpuInfo, HypomnesisError>;
+
+// RAM — both crates need it
+pub fn process_rss() -> Result<u64, HypomnesisError>;
+
+// Convenience snapshot bundling everything
+pub struct Snapshot {
+    pub ram_bytes: u64,
+    pub gpu: Option<ProcessGpuInfo>,
+    pub gpu_device: Option<GpuDeviceInfo>,
+}
+
+impl Snapshot {
+    pub fn now(device_index: u32) -> Result<Self, HypomnesisError>;
+}
+```
+
+**No candle dependency.** That's the critical break from candle-mi's current API (`MemorySnapshot::now(&candle_core::Device)`).
+
+**`MemoryReport` and printing helpers behind opt-in `report` feature, default off.** The default crate exposes only raw measurement (`Snapshot`, `GpuDeviceInfo`, `ProcessGpuInfo`, the three query functions). Enable `features = ["report"]` to get `MemoryReport` (delta between two snapshots), `print_delta` / `print_before_after`, and `ram_mb` / `vram_mb` formatting helpers — preserved verbatim from candle-mi for migration parity. Phase 3 (candle-mi adopts) becomes a one-line Cargo flag flip, not a code rewrite. Default consumers who want a quick delta can still subtract two `Snapshot`s in 5 lines without enabling the feature.
+
+**Future-proofing rests on `#[non_exhaustive]`, not on parameter type elaboration.** Every public enum (`HypomnesisError`, `GpuQuerySource`) and every public struct (`GpuDeviceInfo`, `ProcessGpuInfo`, `Snapshot`) is `#[non_exhaustive]`, so new variants and fields can be added in 0.x patch releases without breaking callers. Multi-vendor addressing (UUID, LUID, AMD ROCm, Apple Metal) can therefore be layered in later as *new* selector types or *new* functions alongside the v0.1 `device_index: u32` API — no breaking change required.
+
+## Feature gates
+
+```toml
+[features]
+default = ["nvml", "nvidia-smi-fallback", "dxgi"]
+nvml = ["dep:libloading"]            # dynamic NVML load via libloading
+nvidia-smi-fallback = []             # no deps, just subprocess
+dxgi = ["dep:windows"]               # Windows-only (target-conditional dep), pulls ~500 kB of bindings
+report = []                          # MemoryReport + print_delta / print_before_after / ram_mb / vram_mb (candle-mi parity)
+debug-output = []                    # raw NVML / DXGI values to stderr (diagnostic)
+```
+
+`dxgi` is in default features (Settled Decision #7). The `windows` dependency is target-conditional via `[target.'cfg(windows)'.dependencies]`, so non-Windows users pay nothing for it. Disabling defaults is only useful for a stripped build that wants process RSS only (no GPU backends, no `windows` crate, no `libloading`). The `report` and `debug-output` features are opt-in and pull no additional dependencies.
+
+## Dependencies (total)
+
+- `libloading` (already in candle-mi)
+- `windows = "0.62"` with `Win32_Graphics_Dxgi`, `Win32_Graphics_Dxgi_Common` features (Windows only; already in candle-mi)
+- `thiserror` for the error type
+
+That's it. No candle, no serde, no tokio. MSRV 1.88 (match candle-mi).
+
+## First consumer: hf-fetch-model
+
+> **Status:** Phase 2 — **shipped**. `hf-fetch-model 0.10.1` (released 2026-05-12) adopts `hypomnesis = "0.2"` for the `inspect --check-gpu` flag described below. See [`docs/hypomnesis-adoption.md`](hypomnesis-adoption.md) for the dogfooding report and the v0.2.1 roadmap items the integration surfaced.
+
+hf-fetch-model v0.10.x gets `--check-gpu [N]` on `inspect`:
+
+```
+$ hf-fm inspect google/gemma-4-E2B-it model.safetensors --check-gpu
+
+  Model weights:  9.54 GiB  (BF16, 5.12B params)
+  GPU 0:          NVIDIA GeForce RTX 5060 Ti — 16.0 GiB VRAM
+                  free: 14.2 GiB, used: 1.8 GiB
+  Fit:            ✓ 4.66 GiB headroom for weights + KV cache + runtime
+
+  Note: reports weights only. Large-context inference typically needs ~1.3–1.5×
+  weight size for KV cache and activations.
+```
+
+This is the proof-of-concept consumer. `hf-fm` uses `device_info` directly (well under 10% of hypomnesis's API surface). `device_count` is deferred to the multi-GPU follow-up (`--check-gpu all`, `hf-fm` v0.10.4) — `device_info`'s `DeviceIndexOutOfRange { index, count }` variant already exposes the count whenever an out-of-range index is queried, so the v0.10.1 single-device path does not need a separate count call. `candle-mi` is expected to exercise the broader surface (`Snapshot`, `report`-feature helpers) when it migrates to `hypomnesis 0.2.1`.
+
+## Roadmap
+
+**Phase 1 — Scaffold + name reservation**
+
+*Wave 1 — ✅ completed 2026-04-29*
+
+The full crate skeleton is in place, CI is green, and the v0.0.1 placeholder is on crates.io. Function bodies are still placeholders that return errors; Wave 2 ports the actual measurement code.
+
+- Repo created at [github.com/PCfVW/hypomnesis](https://github.com/PCfVW/hypomnesis) (sibling of `anamnesis`, `candle-mi`, `hf-fetch-model`, `d-ary-heap`)
+- Project metadata: `Cargo.toml` (edition 2024, MSRV 1.88, dual MIT-OR-Apache), `LICENSE-MIT` + `LICENSE-APACHE` (verbatim from `candle-mi`), `.gitignore`, `README.md` (anamnesis-aligned: 7 badges including a `NVIDIA NVML+DXGI` brand badge, Greek tagline, ToC, Install, Usage, Capabilities, Feature Flags, Used by, License, Development), `CHANGELOG.md` (Keep-a-Changelog format), `CONVENTIONS.md` (Grit + Grit-HMN extensions: NVML / DXGI / `K32GetProcessMemoryInfo` SAFETY guidance + a 5-step recipe for adding a new GPU backend), `docs/hypomnesis-brief.md` (this document)
+- Source skeleton: `src/{lib,error,snapshot,ram,report}.rs` and `src/gpu/{mod,nvml,dxgi,nvidia_smi}.rs`. All public types defined, all function signatures wired, all bodies are deliberate placeholders that return `HypomnesisError::*("not yet implemented (Phase 1 scaffolding)")`
+- Public API surface frozen per the *Decisions settled* section. Every public enum (`HypomnesisError`, `GpuQuerySource`) and every public struct (`GpuDeviceInfo`, `ProcessGpuInfo`, `Snapshot`, `MemoryReport`) is `#[non_exhaustive]`, so Wave 2 implementation work cannot accidentally widen the surface
+- `tests/smoke.rs` — public API reachability test (2 unit tests + 1 doctest, all passing)
+- `[package.metadata.docs.rs]` — docs.rs builds with `all-features = true` for both `x86_64-unknown-linux-gnu` and `x86_64-pc-windows-msvc`, exposing the Windows-only `dxgi` module on docs.rs alongside the cross-platform `nvml` path
+- CI: [`.github/workflows/ci.yml`](https://github.com/PCfVW/hypomnesis/blob/main/.github/workflows/ci.yml) — matrix `(ubuntu-latest, windows-latest) × (MSRV 1.88, stable)` running `fmt --check` + `clippy --all-targets` + `clippy --all-targets --all-features` + `test --all-features`, plus a separate doc-check job (`RUSTDOCFLAGS=-D warnings`). Green on first push: run [25098689267](https://github.com/PCfVW/hypomnesis/actions/runs/25098689267), 5 jobs in 1m13s
+- Publish workflow: [`.github/workflows/publish.yml`](https://github.com/PCfVW/hypomnesis/blob/main/.github/workflows/publish.yml) — anamnesis-aligned, triggers on `v*` tags or `workflow_dispatch`; runs full CI checks + doc check then `cargo publish`. Requires the `CARGO_REGISTRY_TOKEN` repo secret (set 2026-04-29 by the user across the four sibling crates)
+- **[`hypomnesis 0.0.1`](https://crates.io/crates/hypomnesis) published to crates.io at `2026-04-29T08:32:49Z`** — placeholder for name reservation. Commit [`8785ade`](https://github.com/PCfVW/hypomnesis/commit/8785ade) (21 files, 1768 insertions), tag `v0.0.1`, publish run [25098851149](https://github.com/PCfVW/hypomnesis/actions/runs/25098851149) (23s). The placeholder push was originally scheduled for Phase 2 but pulled forward into Wave 1 once the scaffold was publishable — the Greek root makes drive-by squatting unlikely, but the cost of a placeholder push is low and the cost of losing the name is high
+
+*Wave 2 — outstanding*
+
+- Port `candle-mi/src/memory.rs` (889 lines) into the existing placeholder bodies, dropping `candle_core::Device` in favor of `device_index: u32` and removing the `MemorySnapshot` mixed-concerns struct
+- Verify that `sync_and_trim_gpu` stays in candle-mi (out of scope for hypomnesis — design already excludes it; nothing to do here)
+- Port + expand the inline test suite from `candle-mi/src/memory.rs` (currently 6 unit tests covering `snapshot_cpu_has_ram`, `report_delta_*`, `ram_mb_conversion`, `vram_qualifier_*`); add `#[ignore]` live-GPU tests gated for `cargo test -- --ignored`
+- Live-GPU verification on both the Windows host (`RTX 5060 Ti`, native `NVML` + `DXGI` paths) and Ubuntu WSL2 (`NVML` via NVIDIA's CUDA-on-WSL driver) — confirms the cross-platform implementation matches across both `NVML` enumerations
+- Cross-check the `R570` `u64::MAX` sentinel-handling path still triggers and falls back to `nvidia-smi` cleanly (unique to this driver/card combination, can't be tested in CI without hardware)
+- Update `CHANGELOG.md` with `[0.1.0]` entry detailing every kernel ported
+- Bump `Cargo.toml` to `0.1.0` and re-run the 8-step publish flow (see `reference_publish_flow.md` in this Claude Code project's memory) → first functional release on crates.io
+- After `0.1.0` ships, the `[package.metadata.docs.rs]` block ensures docs.rs renders the full surface for both targets
+
+**Phase 2 — hf-fm adopts (validates the API)**
+
+- `hf-fetch-model 0.10.x` adds `inspect --check-gpu [N]` using `hypomnesis = "0.1"` directly from crates.io (no path dep needed — `0.1.0` is already published when this phase starts)
+- Iterate on API rough edges surfaced by real use → `hypomnesis 0.1.x` patches as needed (the `#[non_exhaustive]` policy makes additive changes patch-release-safe)
+- Optional: publish a `0.2.0` if a breaking surface change is unavoidable
+
+**Phase 3 — candle-mi migrates (optional, cleanup)**
+
+- candle-mi drops its in-tree `src/memory.rs`
+- Depends on `hypomnesis = "0.1"` with `features = ["report"]` so the existing `MemorySnapshot` / `MemoryReport` / `print_delta` / `print_before_after` / `ram_mb` / `vram_mb` ergonomics are preserved verbatim — Phase 3 is a one-line Cargo flag flip plus a thin `MemorySnapshot` adapter wrapping `hypomnesis::Snapshot`, not a code rewrite
+- Keeps `sync_and_trim_gpu` as its own (candle-specific, depends on `cudarc::driver::sys`)
+- Shipped in candle-mi `v0.2`
+
+## Decisions settled (Phase 1 — Wave 1, 2026-04-29)
+
+1. **Repo location** — `github.com/PCfVW/hypomnesis`. Sibling on GitHub of `anamnesis`, `candle-mi`, `hf-fetch-model`, `d-ary-heap`.
+2. **License** — `MIT OR Apache-2.0` (matches every sibling crate).
+3. **Error type** — `HypomnesisError` enum with `thiserror`, marked `#[non_exhaustive]`. Variants: `Ram(String)`, `Nvml(String)`, `Dxgi(String)`, `NvidiaSmi(String)`, `DeviceIndexOutOfRange { index, count }`, `NoGpuSource`, `Io(#[from] std::io::Error)`.
+4. **MSRV** — 1.88 (matches candle-mi).
+5. **Authorship** — driven from candle-mi's `src/memory.rs` by copy-and-refactor.
+6. **`device_index: u32` future-proofing** — keep `u32` for v0.1 (NVML-canonical, NVIDIA-only ordering on Windows: DXGI internally walks adapters and returns the N-th NVIDIA adapter with non-zero dedicated VRAM, skipping iGPUs and software drivers). Future-proofing rests on `#[non_exhaustive]` everywhere — see API section. Multi-vendor / UUID / LUID addressing can be added later as *new* functions alongside the existing `u32` API, never as a replacement.
+7. **`dxgi` in default features** — yes. Linux users pay nothing (target-conditional dep); Windows users get per-process VRAM out of the box.
+8. **`MemoryReport` and printing helpers** — gated behind opt-in `report` feature, default off. Names preserved verbatim from candle-mi so Phase 3 (candle-mi v0.2) is a one-line Cargo feature flip rather than a code rewrite. See "Proposed public API" for details.
+
+## Scope boundaries (repeat, for clarity)
+
+- Not a general system-info crate (use `sysinfo`, `hardware-query` for that)
+- Not a CUDA wrapper (use `cust`, `cudarc` for that)
+- Not a GUI or TUI (use `ratatui`, `iced` for that)
+- Not opinionated about *when* to measure — caller's responsibility
+
+One crate, one job: **tell you what's currently in this process's memory, precisely, across Windows, Linux, and macOS.**
+
+---
+
+# `hypomnesis` v0.2.0 — roadmap
+
+Source: https://github.com/pcfvw/hypomnesis/blob/main/docs/roadmap-v0.2.0.md
+
+# `hypomnesis` v0.2.0 — roadmap
+
+> *Wider, not taller. Same job — more callers can ask, more devices can answer.*
+
+## Why v0.2.0 (and not 0.1.x patches)
+
+Nothing in this roadmap is a breaking change. Every item is additive under the `#[non_exhaustive]` policy already in place, so the contents could ship as a stack of `0.1.x` patches without breaking any caller.
+
+**0.2.0 is chosen as a signal, not a forced bump.** Two surface expansions warrant a minor-version tour:
+
+1. A shipped binary (`hmn`) — even gated behind a default-off feature, this is a new public artifact with its own UX.
+2. Multi-adapter enumeration on Windows — `Snapshot::all()` is a structural addition to the device side of the API.
+
+Anything that turns out to be controversial in pre-release review can be peeled back into a 0.1.x patch instead.
+
+## Scope
+
+Three waves, ordered for testability. Single-adapter NVIDIA paths are verifiable on the maintainer's actual hardware (Windows + Ryzen 9 5950X + RTX 5060 Ti; Ubuntu WSL2 + RTX 5060 Ti via NVIDIA's CUDA-on-WSL driver). The Ryzen 9 5950X has no integrated GPU, so the **multi-adapter** path on Windows (NVIDIA dGPU plus a non-NVIDIA `DXGI` adapter such as an Intel / AMD iGPU) cannot be verified end-to-end on this hardware — the code is exercised by length-tolerant live tests and code review only, and waits on either an iGPU-equipped machine or an external contributor's PR for a hands-on confirmation.
+
+### Wave A — `GpuDeviceInfo::print_free` (shipped)
+
+> **Status: implemented.** See commit `9a965ec` and CHANGELOG `[Unreleased]`.
+> The original sketch proposed a `free_bytes()` method *and* a `print_free`
+> helper. Implementation review found that `pub free_bytes: u64` already
+> exists as a field on `GpuDeviceInfo` (since v0.1.0), so the proposed
+> method would have collided with the field name. The field was kept,
+> and only the print helper was added as a feature-gated method on
+> `GpuDeviceInfo` — see *"Lessons"* below.
+
+**Motivation (still applies).** The free-VRAM-right-now question — *"if I load this model now, will it fit?"* — should be a one-liner. The existing `dev.free_bytes` field already delivers that at the data layer; the wave adds the matching `report`-feature print helper for the LM-Studio-style headroom-check log line.
+
+**API delivered:**
+
+```rust
+// Behind feature = "report" — methods on GpuDeviceInfo, mirroring
+// Snapshot::ram_mb / vram_mb (feature-gated impl on the type):
+impl GpuDeviceInfo {
+    pub fn format_free(&self) -> String { ... }
+    pub fn print_free(&self) { ... }
+}
+```
+
+Format: `  GPU <idx>: free <N> MB / <T> MB[ [<adapter name>]]\n`. `print_free` delegates to `format_free`, which locks the format under unit-test verification (4 inline tests covering name-present / name-absent / fully-allocated device with `free=0` / `print_*` smoke).
+
+**Lessons (to apply when drafting Wave D+):**
+
+- **Verify against the current struct layout before sketching API additions.** The `free_bytes()` proposal would have failed to compile because the field already had that name. A 30-second `Read` of `src/snapshot.rs` would have caught it before the roadmap shipped. Future waves should grep the existing `pub` items for any name they propose to add.
+- **Driver-reported numbers can be more accurate than derived ones.** On the NVML path, the field stores `nvmlDeviceGetMemoryInfo`'s `free` — the driver knows about reservations and alignment that `total - used` does not. The proposed `free_bytes()` method would have *thrown away* that precision on the most common path. When the field exists, prefer it over a recomputation method.
+- **Method symmetry beats roadmap-literal signatures.** The roadmap sketched `print_free(dev: &GpuDeviceInfo)` as a free function; implementation chose `dev.print_free()` to mirror the existing `Snapshot::ram_mb` / `vram_mb` pattern. Free functions are fine in isolation, but consistency with the type's existing feature-gated methods wins on discoverability.
+
+**Out of this wave (still applies).** Free RAM (`/proc/meminfo` `MemAvailable`, Windows `GlobalMemoryStatusEx`) is *not* added. That's a different job and would justify a `system_free_bytes()` call only when a real consumer asks. Process RSS already covers "what this process holds"; "what the OS has free" is a system-info question.
+
+**Effort actual.** ~30 minutes including the field/method-collision discussion and 4 unit tests.
+
+### Wave B — Multi-adapter enumeration on Windows
+
+**Motivation.** Today `Snapshot::now(device_index: u32)` answers for one device. The DXGI path already calls `IDXGIFactory1::EnumAdapters1`, which returns *every* adapter (the existing code skips Microsoft Basic Render Driver by name, then picks one). Real machines — including the maintainer's — have iGPU + dGPU. Closing this gap is "finish the device side," not new work.
+
+**API additions:**
+
+```rust
+impl Snapshot {
+    /// Snapshot every NVIDIA dGPU plus, on Windows, every additional
+    /// DXGI adapter that exposes non-zero VRAM (e.g. AMD/Intel iGPU).
+    pub fn all() -> Result<Vec<Self>, HypomnesisError> { ... }
+}
+```
+
+`Snapshot::now(idx)` keeps its current shape unchanged. `Snapshot::all()` is purely additive.
+
+**Cross-platform parity, honest:**
+
+| Platform | What `all()` returns |
+|---|---|
+| Windows | NVIDIA dGPU(s) via NVML + every other DXGI adapter with non-zero VRAM (iGPU). iGPU `total_bytes` is the WDDM shared-memory budget, not dedicated VRAM. |
+| Linux | NVIDIA dGPU(s) via NVML only. AMD iGPUs do not surface — NVML is NVIDIA-only and there is no AMD/Intel backend yet. |
+
+The Linux limitation is a property of the data sources, not a v0.2 bug — the AMD ROCm and Apple Metal backends remain out of scope (see §Out of scope below).
+
+**Effort.** Small. The DXGI loop already enumerates all adapters; v0.2 keeps the full list rather than reducing to one. Plus a Linux-side NVML device-count loop.
+
+### Wave C — `hmn` CLI behind `cli` feature
+
+**Motivation.** Hypomnesis is a library; for a free-VRAM check or a process-VRAM lookup the natural shape is a one-shot terminal command. `nvidia-smi` exists but has two real gaps `hmn` closes:
+
+- On Windows under WDDM, `nvidia-smi`'s per-process compute-app query returns blank — the same gap the DXGI path was built to close.
+- Output shape is identical on Windows and Linux, scriptable from PowerShell or bash without per-platform parsing.
+
+**Subcommand surface:**
+
+```
+hmn                    # device summary (free/used/total per GPU)
+hmn ps                 # all GPU processes — discovery command
+hmn ps --pid 12345     # filter to one PID
+hmn ps --device 0      # filter to one GPU on multi-GPU rigs
+hmn ps --json          # scriptable output
+```
+
+`hmn ps` columns:
+
+```
+PID     NAME              VRAM      DEVICE
+12345   lm-studio.exe     8.2 GiB   RTX 5060 Ti
+67890   python.exe        1.4 GiB   RTX 5060 Ti
+```
+
+**Naming choice for `ps`.** `docker ps` is the precedent: a domain-scoped `ps` that lists what *this* tool tracks (here, processes holding GPU memory), not Unix processes. `--help` clarifies *"processes using GPU memory."* Alternatives (`gps`, `rp`, `gpu-ps`) considered and rejected — see commit log / PR discussion.
+
+**Data sources, all already in the library:**
+
+| Platform | `hmn ps` backend |
+|---|---|
+| Linux | `nvmlDeviceGetComputeRunningProcesses_v3` for `(pid, used_memory)`; `/proc/<pid>/comm` for name |
+| Windows | `nvidia-smi --query-compute-apps=pid,name,used_memory --format=csv` (already plumbed as a fallback) |
+
+No new backends. The binary shapes data the library already collects into a table.
+
+**Packaging.**
+
+```toml
+[features]
+cli = ["dep:clap"]              # default-off — library users don't pull clap
+
+[[bin]]
+name = "hmn"
+required-features = ["cli"]
+```
+
+`cargo install hypomnesis --features cli` installs `hmn`. Splitting into a separate `hypomnesis-cli` crate later remains cheap if it grows; not needed now.
+
+**Effort.** Weekend. Most of the work is `clap` arg parsing and table formatting; the backends are reused as-is.
+
+## Honest limitations baked into Wave C from day one
+
+These are properties of the underlying data sources and must be documented in `--help` and `README.md`, not papered over:
+
+1. **Compute-only.** Both `nvmlDeviceGetComputeRunningProcesses_v3` (Linux) and `nvidia-smi --query-compute-apps` (Windows) see CUDA workloads. Browsers using GPU compositing, games, and pure-graphics apps do not appear in `hmn ps`.
+2. **Windows process names may be `?`.** Querying another PID's image name can fail for protected processes. Show `?` rather than failing the whole command.
+3. **WDDM bug parity.** The same `u64::MAX` sentinel and `used > total` corruption checks the library already handles must apply per-row in `hmn ps`. Rows that trip a sentinel fall back to `nvidia-smi` (already plumbed) or display as `?`.
+4. **Windows `--all` per-process attribution is `nvidia-smi`-backed.** DXGI's `QueryVideoMemoryInfo` only answers for the *calling* process — there is no "for that other PID" version, and NVML's per-process query returns `NOT_AVAILABLE` under WDDM (the original reason DXGI exists in this crate). So `hmn ps` on Windows is honest-but-second-class compared to Linux NVML's clean enumeration.
+
+## Out of scope for v0.2.0 (carrying the discipline forward)
+
+| Idea | Why deferred |
+|---|---|
+| AMD ROCm backend (`rocm_smi_lib`) | Maintainer has no AMD dGPU; shipping untested code violates project discipline. Wait for hardware access or a real PR. |
+| Apple Metal backend (`MTLDevice.currentAllocatedSize`) | Same reason — no Apple machine. |
+| Peak / high-water-mark tracking (`MemoryReport::fold`) | Real motivating use case is *point-in-time free* (your LM Studio scenario), already solved by Wave A. Peak-over-time is a benchmark-loop need, not a current consumer ask. |
+| RSS column in `hmn ps` | RSS for *another* PID needs `OpenProcess + K32GetProcessMemoryInfo` on Windows (permission caveat) and `/proc/<pid>/status` on Linux. Start of "extend the crate beyond GPU memory." Ship `ps` VRAM-only first; add RSS only when a consumer asks. |
+| AMD iGPU on Linux | NVML doesn't see it; would need a separate Linux DRM/sysfs path. Defer with the AMD ROCm backend. |
+| TUI / live mode (`hmn top`) | That's `nvtop`'s job. Shell loop with `watch -n 1 hmn` is the Unix answer. |
+| `hmn` reading from another machine over SSH/RPC | Not in scope; users run `ssh host hmn`. |
+
+## Verification plan (Wave 2 of v0.2.0)
+
+The same hardware that validated v0.1.0 covers most of v0.2.0:
+
+- **Windows host (Ryzen 9 5950X + RTX 5060 Ti, single GPU)** — verifies Wave A's `free_bytes` matches `nvidia-smi --query-gpu=memory.free` to within the WDDM-commit-vs-nvidia-smi rounding gap. Verifies the NVIDIA branch of Wave B's `Snapshot::all` enumeration. Verifies `hmn ps` against `nvidia-smi --query-compute-apps`.
+- **Ubuntu WSL2 (RTX 5060 Ti via NVIDIA's CUDA-on-WSL driver)** — verifies the Linux `NVML` path of `Snapshot::all()` (single device, no iGPU — that's expected). Verifies `hmn ps` enumerates a Python+CUDA process correctly.
+- **R570 sentinel path** — manual verification that the `u64::MAX` fallback still triggers and `hmn ps` rows fall back to `nvidia-smi` cleanly. Cannot be automated in CI without hardware.
+
+**Not yet verifiable on the maintainer's hardware:**
+
+- **Wave B multi-adapter end-to-end** — the 5950X has no iGPU and no second discrete GPU is installed. Wave B's `enumerate_non_nvidia` code path runs on every `Snapshot::all` call (the debug-output trace confirms it walks `EnumAdapters1`), but no qualifying non-NVIDIA adapter exists to surface. The live test [`snapshot_all_enumerates_nvidia_and_optional_extras`](../tests/live_gpu.rs) is length-tolerant by design and passes here; the multi-adapter assertions inside it have not yet been triggered on real hardware. This is acceptable for a v0.2 minor release because the code is reviewed and unit-tested, but a v0.3+ ought to either pick up an iGPU-equipped test machine or wait for a contributor PR before doubling down on this path.
+
+CI matrix and publish flow remain unchanged from v0.1.0 — see `reference_publish_flow.md` in this Claude Code project's memory.
+
+## After v0.2.0 (gestures only — not commitments)
+
+These are likely candidates for v0.3.0+ but require either a real consumer ask or hardware access before promotion:
+
+- AMD ROCm backend (needs maintainer access to AMD hardware, or an external contributor with the hardware)
+- Apple Metal backend (needs Apple Silicon machine, or external contributor)
+- Peak-over-time tracking in `report` (needs a benchmark-loop consumer to ask)
+- `hmn ps --rss` column (needs a consumer who wants RSS+VRAM in one shot)
+- `hmn watch` (live-refresh TUI; only if `watch hmn` proves insufficient)
+
+`#[non_exhaustive]` keeps every one of these additive — none requires a 1.0 bump.
+
+## Decisions settled (this roadmap, 2026-05-06)
+
+1. **0.2.0 over 0.1.x stack** — chosen as a signal of surface expansion (CLI binary + multi-adapter), not because anything breaks.
+2. **`Snapshot::all()` as additive method, not a shape change** — `Snapshot::now(idx)` keeps its current shape. No breaking change.
+3. **`hmn` as the binary name** — matches the project's Greek-shorthand convention (`hmn` = `hypomnesis`, mirroring `amn` for `anamnesis`).
+4. **`ps` as the listing subcommand** — `docker ps` precedent. Alternatives (`gps`, `rp`, `procs`, `gpu-ps`) rejected for either acronym collision (`gps`), invented-for-this-tool opacity (`rp`), or verbosity (`gpu-ps`). `procs` retained as an acceptable fallback if `ps` proves contentious in review.
+5. **`cli` feature default-off** — library users don't pull `clap`. Installation is `cargo install hypomnesis --features cli`.
+6. **Compute-only `ps` is documented, not papered over** — the limitation is intrinsic to NVML/`nvidia-smi`'s data; `--help` and README state it plainly.
+
+## One crate, one job — still
+
+> *Tell you what's currently in this process's memory, precisely, across Windows and Linux.*
+
+v0.2.0 stays inside that motto. It widens the matrix (more devices visible, more callers — including a CLI — can ask), but it doesn't change the job.
+
+---
+
+# `hypomnesis` v0.2.1 — roadmap
+
+Source: https://github.com/pcfvw/hypomnesis/blob/main/docs/roadmap-v0.2.1.md
+
+# `hypomnesis` v0.2.1 — roadmap
+
+> *Sharper, not wider. Same surface — easier to test against, kinder to repeat callers.*
+
+## Why v0.2.1 (and not 0.3.0 or a stack of git tags)
+
+Every item in this roadmap is **additive and patch-safe** under the `#[non_exhaustive]` policy already in place. No public type changes shape, no existing method changes signature, no default feature flips. The release exists to absorb wear-and-tear feedback from `hypomnesis`'s first real downstream consumer (`hf-fetch-model 0.10.1`, see [docs/hypomnesis-adoption.md](hypomnesis-adoption.md)) before a second consumer (`candle-mi 0.2`) arrives.
+
+**0.2.1 is the right vehicle, not 0.3.0.** Three small code additions and two doc passes do not warrant a minor bump:
+
+1. No new artifact (unlike 0.2.0's `hmn` binary).
+2. No structural API shape change (unlike 0.2.0's `Snapshot::all`).
+3. Every new public item is either feature-gated default-off or a thin convenience method on an existing type.
+
+If pre-release review surfaces a controversial item, it can be peeled out into 0.2.2 rather than blocking the polished bits.
+
+## Scope
+
+Five waves, ordered code-first then docs (impact descending within each group). Three code waves (additive API surface), two doc waves (no compiled artifact). The maintainer's existing hardware (Windows + Ryzen 9 5950X + RTX 5060 Ti; Ubuntu WSL2 + RTX 5060 Ti) covers verification — no wave touches a backend, so no new hardware path is exercised.
+
+### Wave A — `test-helpers` feature + `GpuDeviceInfo::builder()`
+
+**Motivation.** `GpuDeviceInfo` is `#[non_exhaustive]` and has no constructor, so downstream test fixtures cannot construct it from struct-literal syntax. `hf-fetch-model 0.10.1` filed this as the loudest adoption finding — three planned unit tests in `src/gpu_check.rs` (fit-hit JSON, fit-miss JSON, render-path) could not be written and were replaced by a comment block and manual smoke tests. The same gap will block `candle-mi`'s render-side tests when it adopts.
+
+**Why a feature-gated builder, not a `pub const fn synthetic(...)` or `#[doc(hidden)] pub fn`.**
+
+- A positional `synthetic(index, name, total, free, used)` constructor *partially defeats* `#[non_exhaustive]`. When `temperature_celsius` lands in a future release, the constructor's signature shifts and every downstream test fixture breaks — precisely what `#[non_exhaustive]` was supposed to prevent. A builder absorbs new fields with new defaulted setters.
+- `#[doc(hidden)] pub` is hidden-but-still-public for semver: hiding from docs does not exempt it from the API contract. A Cargo feature gate is the standard idiom for "public-but-clearly-not-the-real-API" surface.
+
+**API additions:**
+
+```rust
+// Behind feature = "test-helpers" — default-off, additive.
+#[cfg(feature = "test-helpers")]
+impl GpuDeviceInfo {
+    /// Start a builder for constructing synthetic `GpuDeviceInfo` values
+    /// in downstream tests. Not intended for production code.
+    pub fn builder() -> GpuDeviceInfoBuilder { ... }
+}
+
+#[cfg(feature = "test-helpers")]
+pub struct GpuDeviceInfoBuilder { /* private fields */ }
+
+#[cfg(feature = "test-helpers")]
+impl GpuDeviceInfoBuilder {
+    pub fn index(self, index: u32) -> Self { ... }
+    pub fn name(self, name: Option<String>) -> Self { ... }
+    pub fn total_bytes(self, total: u64) -> Self { ... }
+    pub fn free_bytes(self, free: u64) -> Self { ... }
+    pub fn used_bytes(self, used: u64) -> Self { ... }
+    pub fn build(self) -> GpuDeviceInfo { ... }
+}
+```
+
+Default values: `index = 0`, `name = None`, `total_bytes = 0`, `free_bytes = 0`, `used_bytes = 0`. The defaults make the builder a one-line synthesis (`GpuDeviceInfo::builder().total_bytes(16 * 1_024 * 1_024 * 1_024).build()`) for tests that only care about one field.
+
+**Verify against the current struct layout before sketching.** Lesson carried forward from Wave A of v0.2.0 — grep the `pub` surface for `builder` / `GpuDeviceInfoBuilder` / `build` before the wave starts, in case a method by that name already exists.
+
+**Cargo.toml addition:**
+
+```toml
+[features]
+test-helpers = []          # default-off — downstream test fixtures only
+```
+
+**Documentation.** The `#[cfg(feature = "test-helpers")]` items need module-level documentation calling out that:
+
+- The feature is intended for downstream test code (`[dev-dependencies] hypomnesis = { version = "0.2", features = ["test-helpers"] }`).
+- The builder is **not** semver-stable in the production sense — adding setters when `GpuDeviceInfo` gains fields is expected and does not warrant a major bump.
+- Production code should never enable the feature.
+
+**Effort.** Half a day. Builder type + 5 setter methods + 1 `build()` + 4-6 unit tests (one for each setter, one for `build()` with all defaults, one for `build()` round-tripping all fields).
+
+### Wave B — `GpuDeviceInfo::name_or_unknown(&self) -> &str`
+
+**Motivation.** Every consumer that renders the device name will write the same `unwrap_or("...")` fallback. `hf-fetch-model 0.10.1` did at [gpu_check.rs:200](../../hf-fetch-model/src/gpu_check.rs#L200). `candle-mi 0.2` will too. Without an upstream nudge, the two consumers will land on different phrases (`"unknown GPU"` vs `"Unknown"` vs `"<unknown>"`) and the ecosystem accumulates drift.
+
+The wear-and-tear concern is **not** keystroke savings — it's one line at the call site. The concern is consumer divergence on the fallback phrase.
+
+**API addition:**
+
+```rust
+impl GpuDeviceInfo {
+    /// Adapter name, or `"unknown GPU"` when [`Self::name`] is `None`.
+    ///
+    /// Convenience wrapper for `self.name.as_deref().unwrap_or("unknown GPU")`,
+    /// added so multiple downstream consumers don't diverge on the fallback
+    /// phrase. The returned string is **not** localized — consumers needing
+    /// a different phrase or non-English output should match on
+    /// [`Self::name`] directly.
+    #[must_use]
+    pub fn name_or_unknown(&self) -> &str {
+        self.name.as_deref().unwrap_or("unknown GPU")
+    }
+}
+```
+
+Always-on (not feature-gated) because it's zero-cost and zero-dependency. Lives on `GpuDeviceInfo` for parity with the existing `format_free` / `print_free` feature-gated methods (Wave A of v0.2.0 established the "methods on the type, not free functions" convention).
+
+**Documentation.** The non-localization caveat must be in the doc-comment — both as honesty about the limitation and as a forward-pointer for the only realistic reason a consumer would skip the helper.
+
+**Effort.** 15 minutes including 2 unit tests (`name = Some(...)` returns the inner; `name = None` returns `"unknown GPU"`).
+
+### Wave C — `format_total` / `format_used` parity for the `report` feature
+
+**Motivation.** `hypomnesis 0.2` ships `GpuDeviceInfo::format_free` / `print_free` under the `report` feature. Consumers that want the matching `total` and `used` summaries — `candle-mi 0.2` is the immediate one — will hand-roll the same MiB-conversion-plus-format three times each.
+
+**Honest caveat:** This wave does **not** retroactively serve `hf-fetch-model 0.10.1`. `format_free` is opinionated — `"  GPU {idx}: free {N} MB / {T} MB[ [name]]\n"` (two-space indent, MiB-displayed-as-MB for parity with `ram_mb`/`vram_mb`, trailing newline). `hf-fm` prints with its own `format_size` in GiB, no indent, and a column-aligned `"GPU N:"` prefix that does not match `format_free`'s shape. The wave lands for `report`-feature consumers (candle-mi and future), not for `hf-fm`.
+
+**Option (a) chosen over (b) / (c).** Three options were on the table in [hypomnesis-adoption.md §2](hypomnesis-adoption.md):
+
+- **(a)** `format_total` / `format_used` parity helpers — closest in style to `format_free`, smallest API surface.
+- **(b)** `format_summary` returning a one-liner — most opinionated, locks the format and the field order.
+- **(c)** `format_free_used_total` returning a tuple — most flexible for callers who template their own output.
+
+**(a)** wins for patch-release scope: it's a strict parity extension of an existing feature, with no new format to defend in code review. **(b)** and **(c)** wait for a second `report`-feature consumer to validate the desired shape — see *Out of scope* below.
+
+**API additions:**
+
+```rust
+#[cfg(feature = "report")]
+impl GpuDeviceInfo {
+    /// Format a one-line total-`VRAM` summary as an owned `String` ending in a newline.
+    ///
+    /// Format: `  GPU <idx>: total <T> MB[ [<adapter name>]]\n`.
+    /// Mirrors [`Self::format_free`]'s style exactly; the adapter-name
+    /// suffix is omitted when [`Self::name`] is `None`. `MB` here means
+    /// `MiB` (`bytes / 1_048_576`).
+    #[must_use]
+    pub fn format_total(&self) -> String { ... }
+
+    /// Format a one-line used-`VRAM` summary as an owned `String` ending in a newline.
+    ///
+    /// Format: `  GPU <idx>: used <U> MB[ [<adapter name>]]\n`.
+    /// Style and unit conventions identical to [`Self::format_total`].
+    #[must_use]
+    pub fn format_used(&self) -> String { ... }
+}
+```
+
+No `print_total` / `print_used` companions in this wave. `print_free` exists because v0.2.0's Wave A had a real consumer use case for direct stdout output (LM-Studio-style headroom log line); `total` and `used` do not have an equivalent motivating consumer yet. Add them when one asks.
+
+**Documentation.** Update the `## Feature flags` section of `lib.rs` and the `## Feature Flags` table in `README.md` to mention the new helpers under the existing `report` entry.
+
+**Effort.** 1 hour. Two methods + 6 unit tests (name-present / name-absent / fully-allocated edge for each of `format_total` and `format_used`, matching the existing `format_free` test suite at [snapshot.rs:428-483](../src/snapshot.rs#L428-L483)).
+
+### Wave D — `HypomnesisError` `Display` vs structured-fields contract (doc-only)
+
+**Motivation.** `hf-fetch-model 0.10.1` chose to render error variants by matching on the variant and formatting from structured fields (`DeviceIndexOutOfRange { index, count }`) rather than by using the `Display` impl directly — specifically to fix the `"1 devices"` → `"1 device"` plural agreement. The choice is correct but undocumented: the next consumer will re-discover it from scratch, and a future hypomnesis change that "improves" `Display` (e.g., adding the count again to a variant that already exposed it) could create double-printed redundancies in downstream output.
+
+**Doc addition.** Append to the `HypomnesisError` module-level doc-comment in [src/error.rs](../src/error.rs):
+
+```text
+## Display vs structured fields
+
+`HypomnesisError`'s `Display` impl is the **default English one-liner** —
+suitable for logs, library-tier error reporting, and `?`-propagation
+where the consumer is content with the default rendering. Structured
+fields (`DeviceIndexOutOfRange { index, count }`, the inner `String`
+of `Nvml` / `Dxgi` / `NvidiaSmi`) are the **canonical source** for any
+consumer that wants to:
+
+- Localize the message to a non-English language.
+- Restyle for a CLI / GUI / JSON output.
+- Apply singular/plural agreement, custom punctuation, or richer formatting.
+
+This contract makes `Display` stable for the common case while leaving
+custom-render consumers free to assemble their own strings without
+fighting the default. Consumers writing user-facing tools should
+prefer `match err { E::DeviceIndexOutOfRange { index, count } => ... }`
+over `format!("{err}")`.
+```
+
+The wording explicitly names the use cases (localization, restyle, plural agreement) so the contract is testable: any future change that breaks one of those use cases is a contract violation, not a debatable refactor.
+
+**No code changes.** The existing `#[error(...)]` strings are correct and remain unchanged.
+
+**Effort.** 30 minutes including a once-over of every existing variant's `#[error(...)]` string to confirm none of them is so consumer-unfriendly that the doc note is overpromising.
+
+### Wave E — `docs/hypomnesis-brief.md` correction + `README.md` "Used by"
+
+**Motivation.** Two stale facts in user-facing docs now that `hf-fetch-model 0.10.1` has shipped:
+
+1. **The brief overestimates `hf-fm`'s surface usage.** [hypomnesis-brief.md](hypomnesis-brief.md) (around line 137) says *"hf-fm uses ~10% of hypomnesis's API surface (`device_info` + `device_count`)."* Actual v0.10.1 usage is **only `device_info`** — `device_count` is not called because `--check-gpu N` targets a single device and the out-of-range path is handled by `device_info`'s `DeviceIndexOutOfRange` variant carrying the count for free.
+2. **The `README.md` "Used by" section still says "No consumers yet."** With `hf-fm 0.10.1` shipped, the section should match the convention used in `hf-fm`'s own README (`- [candle-mi](...) — Mechanistic interpretability toolkit for language models`).
+
+**Brief edit** (`docs/hypomnesis-brief.md`):
+
+Replace the *"hf-fm uses ~10% of hypomnesis's API surface (`device_info` + `device_count`)"* sentence with:
+
+```text
+hf-fm uses `device_info` directly (well under 10% of hypomnesis's API
+surface). `device_count` is deferred to the multi-GPU follow-up
+(`--check-gpu all`, hf-fm v0.10.4) — `device_info`'s
+`DeviceIndexOutOfRange { index, count }` variant already exposes the
+count whenever an out-of-range index is queried, so the v0.10.1 single-
+device path does not need a separate count call.
+```
+
+**README edit** (`README.md`):
+
+Replace the current `## Used by` body with:
+
+```markdown
+## Used by
+
+- [hf-fetch-model](https://github.com/PCfVW/hf-fetch-model) — Hugging Face model weights and metadata fetcher (uses `device_info` for `inspect --check-gpu`)
+
+_Forthcoming: [candle-mi](https://github.com/PCfVW/candle-mi) is expected to migrate its in-tree memory module to `hypomnesis` (`features = ["report"]`) after v0.2.1 lands._
+```
+
+Format follows the `hf-fetch-model` README convention (`- [name](url) — purpose`), with a single parenthetical noting which API surface the consumer touches. The italics "Forthcoming" sentence preserves the `candle-mi` forward-reference that the original "No consumers yet" body carried, without lying about current state.
+
+**Effort.** 15 minutes total. Pure text edits, reviewable in one pass.
+
+## Out of scope for v0.2.1 (carrying the discipline forward)
+
+| Idea | Why deferred |
+|---|---|
+| `format_summary(&self) -> String` (`hypomnesis-adoption.md` finding #2 option (b)) | Opinionated one-liner — wait for a second `report`-feature consumer to validate the shape and the field order. candle-mi's adoption will be the natural moment. |
+| `format_free_used_total(&self) -> (String, String, String)` (finding #2 option (c)) | Tuple-of-three return is over-engineered for the current consumer count. Revisit only if a templating consumer surfaces. |
+| `print_total` / `print_used` companions to Wave C's `format_*` | `print_free` exists because of a real LM-Studio-style log-line consumer; no equivalent ask for total/used yet. Pure parity-for-parity's-sake is a code-bloat trap. |
+| Localization of `name_or_unknown`'s fallback string | Baking `"unknown GPU"` into the library is documented as English-only; consumers wanting other languages match on `name` directly. A real internationalization story belongs in a v0.3+ release with `unic-langid` or equivalent, not in a patch. |
+| Long-lived NVML context (the "planned for v0.2" note that slipped) | Real perf work — needs design ([snapshot.rs:207](../src/snapshot.rs#L207) defers it to "a later release"). Patch releases should not introduce performance-sensitive infrastructure. v0.3 or later. |
+| Constructors for `ProcessGpuInfo`, `Snapshot`, `GpuProcessEntry` under `test-helpers` | Wave A only adds the `GpuDeviceInfo` builder because that is the type currently blocking downstream tests. Other `#[non_exhaustive]` types can grow builders the same way when a downstream actually asks. |
+| AMD ROCm backend, Apple Metal backend | Carried over from v0.2.0 — still no maintainer hardware access. |
+| Peak / high-water-mark tracking | Carried over from v0.2.0 — still no benchmark-loop consumer asking. |
+| `hmn` CLI surface changes (new subcommands, new flags) | The CLI just shipped in v0.2.0. Patch release is too early to widen its surface; let real users exercise the existing shape first. |
+
+## Verification plan
+
+All five waves are additive and touch no backend code, so no new hardware path is exercised. The verification surface is:
+
+- **Wave A** — `cargo test --features test-helpers` exercises the builder unit tests on Windows + WSL2. `cargo test` (no extra features) confirms the builder is invisible to default builds. `cargo build` and `cargo doc` with `--all-features` confirm there is no symbol collision with existing items.
+- **Wave B** — `cargo test` covers the two unit tests. No feature gating.
+- **Wave C** — `cargo test --features report` covers the six unit tests, matching the existing `format_free` test pattern at [snapshot.rs:428-483](../src/snapshot.rs#L428-L483).
+- **Wave D** — `cargo doc --all-features` renders the appended doc paragraph; visual review on docs.rs after publish confirms it lands cleanly.
+- **Wave E** — text-only edits; markdown lint clean, no broken links (`README.md` and `hypomnesis-brief.md` links checked manually).
+
+**Live-hardware tests** (`tests/live_gpu.rs`) remain untouched — Wave A's builder is for offline fixtures, not hardware mocking. The existing live-test suite continues to validate the real backends.
+
+**Publish flow** unchanged from v0.1.0 / v0.2.0 — commit → dry-run CI → push → watch → `cargo publish --dry-run` → tag → watch → verify, per `reference_publish_flow.md` in the Claude Code project memory.
+
+## After v0.2.1 (gestures only — not commitments)
+
+These are likely candidates for v0.3.0+ if a real consumer or hardware path surfaces:
+
+- **`format_summary` / `format_free_used_total`** — promote one of the deferred Wave C options when a second `report`-feature consumer asks.
+- **Builders for `ProcessGpuInfo`, `Snapshot`, `GpuProcessEntry`** under `test-helpers` — add per type as downstream tests demand.
+- **Long-lived NVML context** — perf work, would land alongside any other performance-sensitive infrastructure for v0.3.
+- **AMD ROCm backend, Apple Metal backend** — still gated on hardware access.
+- **`HypomnesisError` localization helpers** — only if a real CLI / GUI consumer is doing non-English rendering.
+
+`#[non_exhaustive]` keeps every one of these additive — none requires a 1.0 bump.
+
+## Decisions settled (this roadmap, 2026-05-12)
+
+1. **0.2.1 patch, not 0.3.0** — every item is additive; no minor bump warranted.
+2. **`test-helpers` feature gate over `#[doc(hidden)] pub fn`** — feature gate is the honest idiom for "public-but-not-the-real-API." `#[doc(hidden)]` is still public for semver.
+3. **Builder over positional `synthetic(...)` constructor** — a positional constructor partially defeats `#[non_exhaustive]`. Builder absorbs new fields via new defaulted setters.
+4. **Option (a) `format_total` / `format_used` over (b) `format_summary` and (c) tuple-return** — parity extension of the existing `format_free`; smallest API surface to defend in review.
+5. **`"unknown GPU"` as the `name_or_unknown` fallback, documented as English-only** — settles consumer divergence (`hf-fm` vs `candle-mi` would otherwise pick different phrases), defers localization to v0.3+.
+6. **`Display` = default English one-liner, structured fields = canonical source** — the contract is doc-only and matches the convention every error-rich library converges on.
+7. **All five waves in one 0.2.1 release** — bundling reduces release overhead; any controversial item can be peeled into 0.2.2 in review.
+8. **No `print_total` / `print_used` companions** — wait for a real motivating consumer, the way `print_free` had one.
+
+## One crate, one job — still
+
+> *Tell you what's currently in this process's memory, precisely, across Windows and Linux.*
+
+v0.2.1 stays inside that motto. It does not widen the matrix, add a backend, or change the answer to the central question — it polishes the way callers ask and the way consumers test against the answer.
+
+---
+
+# `hypomnesis` v0.2.2 — roadmap
+
+Source: https://github.com/pcfvw/hypomnesis/blob/main/docs/roadmap-v0.2.2.md
+
+# `hypomnesis` v0.2.2 — roadmap
+
+> *Truer, not wider. Same `hmn ps` — fewer silent omissions on Windows.*
+
+## Why v0.2.2 (and not v0.3.0)
+
+Every item in this roadmap is **additive and patch-safe** under the `#[non_exhaustive]` policy already in place. No public type changes shape, no existing method changes signature, no default feature flips that downstream consumers would notice at the `Cargo.toml` line. The release exists to close a *measurement honesty* gap — `hmn ps` on consumer Windows / `WDDM` currently reports `0 compute processes found` while 27 processes are using the GPU, because `nvidia-smi --query-compute-apps` returns `[N/A]` for `used_memory` and the parser silently drops every row.
+
+**v0.2.2 is the right vehicle, not v0.3.0.** A new backend behind a new Cargo feature, a dispatcher tweak, and a docs refresh do not warrant a minor bump:
+
+1. No new public type — `GpuProcessEntry::used_bytes` stays `u64`. No `Option<u64>` reshape (that would be v0.3.0).
+2. No structural API shape change — the new code is a fourth Windows backend slotted into the existing dispatcher chain alongside `NVML` / `DXGI` / `nvidia-smi`.
+3. New default-on Cargo feature (`pdh`) follows the same shape as the existing `dxgi` feature: target-conditional dependency, no-op on non-Windows, included by default so the common case is zero-config.
+
+The fix exists at the kernel-data-source layer, not at the API surface. That is exactly what a patch release is for.
+
+## Scope
+
+Three waves, ordered code-first then docs. The maintainer's existing hardware (Windows + Ryzen 9 5950X + RTX 5060 Ti, `WDDM` driver `32.0.15.9186`; Ubuntu WSL2 + RTX 5060 Ti) covers verification on the affected platform. Non-Windows targets remain unchanged.
+
+### Wave A — `src/gpu/pdh.rs`: PDH FFI bindings and counter enumeration
+
+**Motivation.** Consumer Windows / `WDDM 2.0`+ moved per-process GPU memory accounting authority from the GPU vendor's driver to the Windows kernel's `VidMm`. `NVML` returns `NVML_VALUE_NOT_AVAILABLE`. `IDXGIAdapter3::QueryVideoMemoryInfo` answers only for the calling process. `nvidia-smi --query-compute-apps` writes `[N/A]`. The data exists — Task Manager's "Dedicated GPU memory" column proves it — but every backend hypomnesis currently queries is blind.
+
+Microsoft exposes the same `VidMm` data through the **Performance Data Helper (PDH)** API. The relevant counter set is `\GPU Process Memory(<instance>)\Dedicated Usage`, with instances of the form `pid_NNNN_luid_0xHHHHHHHH_0xHHHHHHHH_phys_N`. PDH is documented, has a stable C ABI, and is callable from any program — no admin elevation needed for read access.
+
+**Module structure** (`src/gpu/pdh.rs`, new file):
+
+```rust
+//! Windows PDH (Performance Data Helper) per-process VRAM backend.
+//!
+//! Closes the per-process-memory gap on consumer Windows / `WDDM` by
+//! reading `\GPU Process Memory(*)\Dedicated Usage` through `pdh.dll`.
+//! Same `VidMm` data Task Manager surfaces, accessed through a stable
+//! and documented C API.
+//!
+//! ## Known accounting drift (KB 4490156)
+//!
+//! Windows' `GPU Process Memory` counters can over-report per-process
+//! `VRAM` by ~100 MiB per cycle for applications that go through
+//! repeated discard-and-restore of GPU caches (the documented example is
+//! Office in Low Resource Mode). This is a `WDDM 2.0`+ architectural
+//! artifact: `VidMm` asynchronously defers allocation destruction, and
+//! the user-mode driver's discards may not yet be reflected at sample
+//! time. Microsoft considers this a known issue with no fix as of 2026.
+//!
+//! Compute workloads (CUDA, PyTorch, llama.cpp, ollama, candle) do not
+//! exhibit the trigger pattern — they allocate coarse-grained buffers
+//! and hold them for the duration of a run. For the `hmn ps` target use
+//! case the drift is in practice zero. Tools needing byte-exact
+//! accounting for graphics-cache-flush workloads should prefer Task
+//! Manager's Performance pane or `WPR` / `WPA` (ETW-based), both of
+//! which use independent paths through `VidMm` and are unaffected.
+
+pub(super) fn query_per_process_vram(
+    device_index: u32,
+) -> Result<Vec<(u32, u64)>, HypomnesisError> { ... }
+```
+
+**Implementation outline** (one PDH session per call; cheap because no rate counters are involved):
+
+1. `PdhOpenQueryW(NULL, 0, &mut hQuery)` — open a query.
+2. `PdhEnumObjectItemsW(NULL, NULL, L"GPU Process Memory", ...)` — enumerate live counter instances. Cannot construct instance names from `pid` alone; have to enumerate. One extra call per `gpu_processes()` invocation, negligible cost.
+3. For each instance matching `pid_NNNN_...` and (optional v0.2.2-or-later) matching the target adapter `LUID`: `PdhAddCounterW(hQuery, path, 0, &mut hCounter)`.
+4. `PdhCollectQueryData(hQuery)` — single sample (the `Dedicated Usage` counter is an instantaneous gauge, not a rate; one collection suffices).
+5. `PdhGetFormattedCounterValue(hCounter, PDH_FMT_LARGE, NULL, &mut value)` — read each counter as a 64-bit integer.
+6. `PdhCloseQuery(hQuery)` — release.
+
+**Feature gating.** Add a `pdh` Cargo feature, default-on, mirroring `dxgi`:
+
+```toml
+[features]
+default = ["nvml", "nvidia-smi-fallback", "dxgi", "pdh"]
+pdh = ["dep:windows"]   # shares the `windows` dep with `dxgi`
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", optional = true, features = [
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_System_Performance",    # ← new for PDH counters
+    "Win32_System_Threading",      # ← new for OpenProcess + QueryFullProcessImageNameW (name lookup)
+] }
+```
+
+Non-Windows users pay nothing — the entire module is gated on `cfg(all(target_os = "windows", feature = "pdh"))`.
+
+**Device-index attribution.** PDH instance names include the adapter `LUID`. The existing `device_count()` / `device_info()` path enumerates NVIDIA devices via `NVML`. To attribute a PDH row to a hypomnesis `device_index`, we need to correlate `NVML` device → adapter `LUID`. `NVML` exposes `nvmlDeviceGetPciInfo` (returns `bus_id`, not `LUID`) and on Windows `nvmlDeviceGetUUID`. Direct `LUID` mapping requires `DXGI`'s `IDXGIAdapter::GetDesc` (returns `LUID`). The implementation will resolve `device_index → LUID` once at first call via a DXGI walk, cache it, and filter PDH instances by that `LUID`. The `DXGI` path is already in the crate (the calling-process fast path); we reuse the walk.
+
+Single-`GPU` systems — the common case, including the maintainer's machine — bypass this entirely: a single device means the `LUID` filter accepts everything. The multi-`GPU` branch is best-effort and length-tolerant in the smoke test (a wrong `LUID` filter produces an empty result, not a wrong result).
+
+**Errors.** Add `HypomnesisError::Pdh(String)`, following the existing one-variant-per-backend pattern (`Ram`, `Nvml`, `Dxgi`, `NvidiaSmi`). Patch-safe under `#[non_exhaustive]`. Renders as `"PDH error: ..."` via a `#[error("PDH error: {0}")]` derive — matching the wording style of the sibling variants rather than producing awkward `"DXGI error: pdh: ..."` nesting.
+
+**Effort.** Roughly a day. PDH FFI is documented, the C signatures are stable, and the `windows` crate already provides safe wrappers for the relevant entry points under `Win32::System::Performance`. 6–10 inline unit tests covering: instance-name parsing (`pid_24168_luid_..._phys_0` → `(24168, luid)`), the `LUID`-correlation cache, and an `EnumObjectItems` empty-buffer path. Live-hardware verification happens in Wave B.
+
+### Wave B — `src/gpu/mod.rs`: wire PDH into `gpu_processes()`
+
+**Motivation.** Once `pdh::query_per_process_vram(device_index)` works, `gpu_processes()` needs to consume it. The current dispatcher tries `NVML` (Linux primary), then `nvidia-smi` (Windows primary today). PDH slots in as the Windows primary, with **two** distinct paths:
+
+1. **Name lookup via Win32 `QueryFullProcessImageNameW`** — PDH instance names give us `(pid, luid)` but not a process name. The cross-platform precedent is to use the platform's native process-name API: Linux uses `/proc/<pid>/comm` (the existing `read_proc_comm` helper in `src/gpu/mod.rs`), macOS uses `proc_pidpath` (per PR #1). The Windows analog is `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid)` + `QueryFullProcessImageNameW`, then take the path's basename. No subprocess, no NVIDIA-specific dependency, vendor-neutral. Access-denied for cross-user / protected processes yields `name: None`, mirroring how `read_proc_comm` handles unreadable `/proc` entries on Linux.
+2. **Fallback to pure-`nvidia-smi`** — environments without `WDDM 2.0`+ drivers (rare in 2026 but not zero) fall back to the existing `nvidia-smi`-only path. Detection: PDH `PdhEnumObjectItemsW` returns `PDH_CSTATUS_NO_OBJECT` when the `GPU Process Memory` counter set isn't registered. In this fallback the name comes from `nvidia-smi`'s output as today.
+
+**Dispatcher order** (Windows-only branch in `gpu_processes`):
+
+```text
+1. PDH per-process VRAM      → Vec<(pid, luid, used_bytes)>
+2. Win32 process-name lookup → name per PID (None on access-denied)
+3. join + filter by device   → Vec<GpuProcessEntry>
+4. on PDH unavailable: pure nvidia-smi (current path, names included)
+```
+
+Sanity checks remain: the R570 `u64::MAX` sentinel and the `used > device_total` check apply per-row, regardless of source. KB 4490156 drift is **not** sanity-checked — by the time a counter has drifted ~100 MiB it's still within plausible bounds, and the trigger pattern is irrelevant for compute workloads anyway.
+
+**`GpuQuerySource` variant.** Add `GpuQuerySource::Pdh`. The enum is `#[non_exhaustive]`, so this is patch-safe. Rows produced via the PDH path (memory from PDH, name from Win32) get `source: GpuQuerySource::Pdh`; rows from the pure-`nvidia-smi` fallback keep `source: GpuQuerySource::NvidiaSmi`. Downstream consumers can distinguish "data from `VidMm` directly via PDH" from "data inferred via subprocess parsing."
+
+**Effort.** Half a day. Dispatcher wiring + the `Pdh` enum variant + a small `name_from_pid_windows` helper (`OpenProcess` + `QueryFullProcessImageNameW` + basename extraction) + 4–5 inline tests covering: PDH-success-then-name-merge, PDH-success-name-access-denied-yields-`None`, PDH-empty-then-fallback, KB-4490156-sentinel-doesn't-trigger, basename-extraction-from-full-path.
+
+### Wave C — Documentation refresh
+
+**Motivation.** Two user-facing surfaces still describe the broken state:
+
+- **`README.md` `Limitations` for the `hmn` binary** (the bulleted list under the `## Binary (`hmn`)` section) — limitation #4 currently reads "Windows compute-process attribution is `nvidia-smi`-backed... `NVML`'s per-process query returns `NVML_VALUE_NOT_AVAILABLE` under `WDDM`. So `hmn ps` on Windows is honest-but-second-class compared to Linux's clean `NVML` enumeration." After v0.2.2 this becomes "PDH-backed on Windows; falls back to `nvidia-smi` on pre-`WDDM 2.0` systems. Honesty parity with Linux `NVML`." Limitation #1 (compute-only) also needs softening on Windows: PDH sees all GPU users, not just CUDA processes — so the `hmn ps` table will now show graphics apps too, with real memory numbers.
+- **`hmn --help` `Limitations`** — currently lumps Windows and Linux together under "only processes with an active CUDA context appear." After v0.2.2 the Windows bullet splits: Linux/NVML stays compute-only; Windows/PDH lists **all** GPU users (compositor, browsers, games, compute). This is more truthful and matches Task Manager's behavior.
+
+**Module-level doc-comment** (`src/gpu/pdh.rs`) — see Wave A's outline; the KB 4490156 caveat is mandatory.
+
+**`docs/hypomnesis-brief.md`** — the brief's [Capabilities table](hypomnesis-brief.md#why-this-crate) gains a row: "Per-process VRAM on Windows via `PDH` performance counters (consumer `WDDM`) | **hypomnesis (this release)**." Sibling to the existing DXGI calling-process row.
+
+**`CHANGELOG.md`** — `[Unreleased]` → `[0.2.2]` at release time, motto blockquote, intro paragraph, three Added/Changed entries (one per wave).
+
+**Effort.** Two hours. Pure text edits, no code review beyond the prose.
+
+## Out of scope for v0.2.2 (carrying the discipline forward)
+
+| Idea | Why deferred |
+|------|--------------|
+| **Cross-platform "unmeasurable rows" diagnostic** — emit a count of detected-but-unmeasurable processes in the `hmn ps` stderr summary | Probably never needed once v0.2.2 + v0.2.3 ship — both platforms then reliably deliver bytes for every readable PID. Resurfaces only if an adopter reports a process they can't see, or if very-old Windows / `WDDM 1.x` matters to a real user. |
+| **`Option<u64>` for `GpuProcessEntry::used_bytes`** — list (not just count) unmeasurable processes with `VRAM: N/A` | Breaking change → v0.3.0, not patch. Deferred unless a consumer specifically asks to *list* unmeasurable processes. The PDH backend's existence makes this much less likely. |
+| **Segmented per-process VRAM API** — sibling `query_per_process_vram_segmented()` library function + `hmn ps --show-segments` CLI flag | PDH internally exposes per-(`pid`, segment) data via instances like `pid_X_luid_Y_phys_N`; Wave A aggregates by-PID before returning. The internal helper is deliberately structured to be promotable later (promote to `pub(super)`, add a sibling dispatcher entry, no refactor). Gated on a real consumer ask or hardware exhibiting multi-segment behaviour — the maintainer's `RTX 5060 Ti` is single-segment, so the segmented path is not currently exercised against real multi-segment hardware. |
+| **Strict-accounting `D3DKMTQueryStatistics` Windows backend** | "Reserved for system use. Do not use." per Microsoft docs. KB 4490156 drift doesn't bite the compute workloads `hmn ps` actually targets — see module doc-comment in Wave A. Revisit only if a consumer reports drift biting their specific workload. |
+| **ETW-based per-process counters** (`WPR` / `WPA` path) | Heavy session setup, typically admin-required, accurate but overkill for `hmn ps`. PDH is the right ergonomics tier. |
+| **Per-GPU-engine breakdown** (`\GPU Engine(*)\Utilization Percentage`) | A different counter set than memory. `hmn ps` is about *memory*; engine utilization is a separate, future feature. |
+| **Adapter-LUID-correlation cache across calls** | First-call cost is a single `DXGI` walk (~1 ms on the maintainer's machine). Cross-call caching would complicate the no-shared-state model and isn't motivated by a real perf consumer ask. |
+| **`hmn ps` showing PDH-source rows for adapters not in `device_count()`** (e.g., Intel `iGPU`) | The PDH counter is GPU-vendor-neutral, but hypomnesis's device enumeration is NVIDIA-only via `NVML`. Surfacing Intel `iGPU` rows would require expanding `device_count()` to enumerate all `WDDM` adapters — proper minor-version work. |
+| **AMD `ROCm` backend, Apple Metal on Intel Macs, Linux AMD `iGPU`** | Carried over from v0.2.0 / v0.2.1 — still no maintainer hardware access. |
+
+`#[non_exhaustive]` keeps every one of these additive — none requires a 1.0 bump.
+
+## Verification plan
+
+All three waves touch a real Windows backend, so the verification surface includes hardware-attached live tests:
+
+- **Wave A** — Unit tests for instance-name parsing, `LUID`-correlation cache, and `EnumObjectItems`-empty handling run on every platform under `cargo test --features pdh` (the FFI stubs are no-op outside `cfg(windows)`). On the maintainer's Windows host, a `#[ignore]`-gated live test reads `\GPU Process Memory(*)\Dedicated Usage` and asserts ≥ 1 instance is returned.
+- **Wave B** — On the maintainer's Windows host, running `hmn ps` should produce non-empty output where v0.2.1 returned `0 compute processes found`. Specifically: with `ollama serve` loaded, `hmn ps` should show `ollama.exe` with a `VRAM` value within ~50 MiB of `nvidia-smi --query-gpu=memory.used,memory.free --format=csv,noheader,nounits`. With `cargo run --example vocab_scan` running, that PID should appear too.
+- **Wave B regression** — `hmn ps` on Ubuntu WSL2 must produce identical output to v0.2.1 (PDH branch is unreachable; `NVML` path unchanged).
+- **Wave C** — `cargo doc --all-features --no-deps` renders the new module doc-comment cleanly; `markdown` lint on README + brief stays clean; `hmn --help` text update visually reviewed.
+
+**Live-hardware test placement.** A new `tests/live_pdh.rs` mirrors `tests/live_gpu.rs`: `#[ignore]`-gated, runs under `cargo test --features pdh -- --ignored` on Windows. Three test functions covering: PDH instance enumeration non-empty, per-process value plausibility against a known consumer (start `notepad.exe` → expect 0 or a small value; doesn't appear → also acceptable on idle systems), and the calling-process matches DXGI's value within ~1 MiB.
+
+**Publish flow** unchanged from v0.2.0 / v0.2.1 — commit → dry-run CI → push → watch → `cargo publish --dry-run` → tag → watch → verify, per `reference_publish_flow.md` in the Claude Code project memory.
+
+## After v0.2.2 (gestures only — not commitments)
+
+These are likely candidates for v0.2.3 or later releases:
+
+- **v0.2.3 — macOS support** ([PR #1](https://github.com/PCfVW/hypomnesis/pull/1), already committed). Apple Silicon `ledger`-based per-process accounting + `MTLDevice.recommendedMaxWorkingSetSize` for the device-wide budget. Independent of v0.2.2's PDH work; both deliver real `u64` bytes through different kernel-level accounting paths.
+- **Brief & motto refresh in v0.2.3** — update `docs/hypomnesis-brief.md` byline and closing motto from "Windows and Linux" to "Windows, Linux, and macOS." Mirrors v0.2.1 Wave E's brief correction. ROADMAP.md's Principle #6 parenthetical can then drop.
+- **Cross-platform "unmeasurable rows" diagnostic** — only if a real consumer reports a hidden process. Vanishingly unlikely after v0.2.2 + v0.2.3.
+- **AMD `ROCm` / Apple Metal on Intel Macs** — still gated on hardware access.
+
+`#[non_exhaustive]` keeps every one of these additive — none requires a 1.0 bump.
+
+## Decisions settled (this roadmap, 2026-06-01)
+
+1. **v0.2.2 patch, not v0.3.0** — every item is additive; no public-API shape change.
+2. **PDH over `D3DKMTQueryStatistics`** — PDH is documented and public; `D3DKMTQueryStatistics` is officially "Reserved for system use. Do not use." The KB 4490156 drift doesn't bite compute workloads, which is what `hmn ps` actually targets.
+3. **`pdh` Cargo feature, default-on, mirrors `dxgi`** — target-conditional, no-op on non-Windows, shares the `windows` crate dependency, included by default so the common case is zero-config.
+4. **PDH (memory) + Win32 `QueryFullProcessImageNameW` (names) on Windows** — PDH instance names give `(pid, luid)`, not process names. Win32 is the cross-platform-consistent choice: Linux uses `/proc/<pid>/comm` (`read_proc_comm`), macOS uses `proc_pidpath` (per PR #1), Windows uses `OpenProcess` + `QueryFullProcessImageNameW`. No subprocess, no `nvidia-smi` coupling for the PDH path. The pure-`nvidia-smi` fallback retains today's subprocess-name lookup for pre-`WDDM 2.0` environments only.
+5. **`GpuQuerySource::Pdh` variant added** — patch-safe under `#[non_exhaustive]`. Lets downstream consumers tell "from VidMm directly" apart from "inferred via subprocess parsing."
+6. **Add `HypomnesisError::Pdh(String)` variant** — patch-safe under `#[non_exhaustive]`. Follows the existing one-variant-per-backend pattern (`Ram`, `Nvml`, `Dxgi`, `NvidiaSmi`); renders cleanly as `"PDH error: ..."` rather than the awkward `"DXGI error: pdh: ..."` nesting that string-prefix reuse would produce.
+7. **Document KB 4490156 in the module doc-comment** — name the KB explicitly, explain the trigger pattern (graphics-cache-flush), note CUDA / compute workloads are unaffected. Same "documented limitations beat papered-over half-fixes" principle that named the R570 sentinel and the `NVML_VALUE_NOT_AVAILABLE` situation.
+8. **Multi-GPU `LUID` correlation via cached DXGI walk** — first-call cost is one DXGI adapter walk (~1 ms), result cached for the process lifetime. The common single-GPU case bypasses the filter entirely.
+9. **No `hmn ps` UX change beyond what naturally falls out** — the existing table layout absorbs the new rows. Same per-platform `--help` Limitations section, refreshed wording. Compute-only labeling stays for Linux; Windows now lists all GPU users honestly.
+
+## One crate, one job — still
+
+> *Tell you what's currently in this process's memory, precisely, across Windows and Linux.*
+
+v0.2.2 stays inside that motto. It does not widen the matrix, add a backend, or change the answer to the central question — it closes a measurement-honesty gap on Windows that was forcing `hmn ps` to lie about what it could see. The shipped result: the same `hmn ps` command, on the same hardware, now telling the truth.
+
+---
+
+# `hypomnesis` v0.2.4 — roadmap
+
+Source: https://github.com/pcfvw/hypomnesis/blob/main/docs/roadmap-v0.2.4.md
+
+# `hypomnesis` v0.2.4 — roadmap
+
+> *The same total. Now with the carve-out shown.*
+
+## Why v0.2.4 (and not v0.3.0)
+
+Every item in this release is **additive and patch-safe** under the
+`#[non_exhaustive]` policy already in place. `GpuDeviceInfo` gains one new
+field (`reserved_bytes: Option<u64>`); no existing field changes type, no
+method changes signature, no default feature flips. `total_bytes` keeps its
+exact meaning — the usable, `nvidia-smi`-consistent figure from NVML v1
+`nvmlDeviceGetMemoryInfo` — so every existing consumer sees byte-for-byte
+identical behaviour. The new field is *purely additive information*: when a
+backend can't supply it, it is `None`.
+
+**v0.2.4 is the right vehicle, not v0.3.0.** Adding a defaulted field to a
+`#[non_exhaustive]` struct is the canonical patch-safe change (Principle 2).
+The only place the addition is observable is in code that explicitly reads
+`reserved_bytes`, and that code is new by definition.
+
+## Origin — a `candle-mi` dogfooding report
+
+`candle-mi` v0.1.16 migrated `src/memory.rs` to `hypomnesis 0.2.3` (lean
+feature set: `nvml`, `dxgi`, `nvidia-smi-fallback`, `metal`), deleting its
+in-tree measurement FFI. Live validation on the reference `RTX 5060 Ti`
+(16 GiB, Windows / `WDDM`) confirmed per-process used (DXGI), device name,
+and the per-process flag were all correct. The report flagged one
+enhancement, not a defect:
+
+> `device_info().total_bytes` reports **16311 MiB** — the NVML v1 total,
+> which equals `nvidia-smi` (good, ecosystem-consistent). But the card's
+> physical capacity is **16384 MiB** (DXGI `DedicatedVideoMemory`). The
+> **73 MiB** gap is NVIDIA's documented driver/firmware reservation, and a
+> consumer had no way to see the breakdown.
+
+So the report *inferred* `73 reserved` from `DXGI 16384 − NVML 16311`.
+Before v0.2.4 hypomnesis surfaced only the `total`; this release adds the
+carve-out — read **directly** from NVML rather than inferred.
+
+> **Live correction (v0.2.4 validation).** Running the new NVML v2 query on
+> the same `RTX 5060 Ti` (driver 591.86) reports the true reservation as
+> **259 MiB** (`271 581 184` bytes), not the 73 MiB the report inferred.
+> Three sources agree on the real picture:
+>
+> - `nvidia-smi -q -d MEMORY` → `Total: 16311 MiB`, `Reserved: 259 MiB`.
+> - NVML v1 `total` = NVML v2 `total` = `17 103 323 136` B (16311 MiB) —
+>   **identical**; and the raw v2 struct satisfies
+>   `reserved + free + used == total` exactly, so `reserved` is a *subset*
+>   of `total`, not stacked on top of it.
+>
+> The report's 73 MiB is a **different** quantity: `nominal 16384 − NVML
+> total 16311` — board/ECC overhead that sits *below* what NVML reports and
+> which NVML does not expose as a field. It was computed by subtracting two
+> *different* sources (`DXGI DedicatedVideoMemory` minus NVML `total`) that
+> don't even agree on capacity — live `DXGI DedicatedVideoMemory` is itself
+> `16052 MiB` here, not the `16384` the report assumed. This is exactly why
+> the field is sourced from NVML's own v2 query: the carve-out is reported,
+> not reverse-engineered from a cross-source subtraction.
+
+## Scope
+
+Code-first, then docs. The maintainer's `RTX 5060 Ti` (Windows / `WDDM`,
+driver 591.86; Ubuntu WSL2) covers live verification. Non-NVIDIA and
+pre-R510 paths degrade to `reserved_bytes = None` and are unchanged.
+
+### `src/gpu/nvml.rs` — NVML v2 memory query
+
+NVML's v2 query (`nvmlDeviceGetMemoryInfo_v2`) is the only call that breaks
+out the reservation. Its struct differs from v1 only by exposing `reserved`
+separately — **both report the same `total`** (verified live: v1 `total` ==
+v2 `total` == 16311 MiB), satisfying `total = reserved + free + used`. v1
+folds the reservation into `used`; v2 surfaces it as its own field:
+
+| Struct | Fields | `total` semantics |
+|---|---|---|
+| `nvmlMemory_t` (v1) | `total`, `free`, `used` | full framebuffer = `nvidia-smi` `Total`; `reserved` bundled into `used` |
+| `nvmlMemory_v2_t` | `version`, `total`, `reserved`, `free`, `used` | same `total`; `reserved` broken out (`total = reserved + free + used`) |
+
+`reserved` is therefore a **subset** of `total`, never an addition on top —
+allocation headroom is `total − reserved` (and `free` already reflects it).
+
+Two implementation details matter:
+
+1. **The `version` field must be set.** `nvmlMemory_v2_t` carries a leading
+   struct-version tag computed as `size_of::<nvmlMemory_v2_t>() | (2 << 24)`
+   (NVML's `NVML_STRUCT_VERSION(Memory, 2)` macro). An unset or mismatched
+   version yields `NVML_ERROR_INVALID_ARGUMENT`. hypomnesis encodes this as
+   the `NVML_MEMORY_V2_VERSION` constant.
+2. **Pre-R510 fallback is a symbol-absence, not a runtime error.**
+   `nvmlDeviceGetMemoryInfo_v2` is R510+. Because hypomnesis loads symbols
+   via `libloading`, an older driver's `nvml.dll` / `libnvidia-ml.so.1`
+   simply doesn't export the symbol — `lib.get(...)` returns `Err`, mapped
+   to `None`. The documented `NVML_ERROR_FUNCTION_NOT_FOUND` return code
+   belongs to NVML's versioned-pointer dispatch, which we don't use; the
+   net effect (`reserved_bytes = None` on old drivers) is the same and even
+   simpler.
+
+The v1 `total` / `free` / `used` path is untouched. The v2 call is a
+best-effort *add-on*, run after the v1 query succeeds, purely to read
+`reserved`. This keeps `total_bytes` the v1 figure with zero regression
+risk to the existing triplet.
+
+### `src/snapshot.rs` — the additive field + builder
+
+- `GpuDeviceInfo::reserved_bytes: Option<u64>` — `Some` only on the NVML
+  R510+ path; `None` everywhere else (DXGI, nvidia-smi, Metal, pre-R510).
+- `GpuDeviceInfoBuilder::reserved_bytes(Option<u64>)` setter under the
+  `test-helpers` feature, defaulting to `None`.
+
+### `src/gpu/mod.rs` — dispatcher plumbing
+
+All five `GpuDeviceInfo` construction sites populate the field: the NVML
+arm forwards `snap.reserved_bytes`; the Metal, DXGI-alone, `nvidia-smi`,
+and non-NVIDIA-DXGI arms set `None` (none of those sources expose the NVML
+carve-out).
+
+### `hmn` — render the breakdown
+
+The device summary appends a parenthetical when present:
+
+```text
+GPU 0 [NVIDIA GeForce RTX 5060 Ti]: free 13284 MiB / 16311 MiB (259 MiB reserved)
+```
+
+`total` (16311) is the full NVML framebuffer = `nvidia-smi` `Total`; the
+parenthetical reads as "of which 259 MiB is driver-reserved" — a subset,
+matching `nvidia-smi -q`'s separate `Total` / `Reserved` lines, **not** an
+addition on top. Elided on backends that report `None`, so the existing
+line is unchanged where no reserved figure exists.
+
+## Verification
+
+- `cargo test` (unit) — builder round-trip asserts `reserved_bytes` plumbs
+  through and that it is a subset of `total` (`reserved < total`, headroom
+  = `total − reserved`).
+- `tests/live_gpu.rs::device_info_reserved_bytes_is_plausible_when_present`
+  — **live** integration test on the `RTX 5060 Ti`: when `Some`, the
+  carve-out is non-zero and a small slice of the card (`reserved < total`),
+  with `total` within the 1 TiB sanity bound. `#[ignore]`-gated like the other
+  live-GPU tests; run with `cargo test -- --ignored`. Live result on the
+  reference card: `reserved_bytes = Some(271_581_184)` (259 MiB), driver
+  591.86, NVML v2 — confirming the `NVML_MEMORY_V2_VERSION` struct-version
+  tag is correct (a wrong tag would yield `NVML_ERROR_INVALID_ARGUMENT` and
+  `None`).
+
+This release's live run also surfaced and fixed two **pre-existing** stale
+assertions in `tests/live_gpu.rs::gpu_processes_succeeds_on_live_host`
+(unrelated to `reserved_bytes`, latent since the v0.2.2 PDH backend because
+the test is `#[ignore]`-gated and never runs in CI): it rejected the `Pdh`
+source, and it asserted `used_bytes > 0` for every row even though PDH is
+not compute-only and legitimately surfaces 0-dedicated-byte rows. Both now
+match the documented backend semantics (and the `tests/smoke.rs`
+allow-list).
+
+## Downstream payoff
+
+Once `reserved_bytes` lands, `candle-mi` (and `hmn`) render the honest
+breakdown — *total, of which N reserved* — without inventing the figure,
+exactly as `nvidia-smi -q -d MEMORY` prints `Total` next to `Reserved`.
+`reserved_bytes` is a subset of `total_bytes`, so allocation headroom is
+`total_bytes − reserved_bytes` (already reflected in `free_bytes`).
+Consumers that only care about the reported `total` keep reading
+`total_bytes` exactly as before.
+
+## References
+
+- NVML `nvmlMemory_v2_t`: <https://docs.nvidia.com/deploy/nvml-api/structnvmlMemory__v2__t.html>
+- NVML device queries: <https://docs.nvidia.com/deploy/nvml-api/group__nvmlDeviceQueries.html>
+
+---
+
+# hypomnesis — Roadmap
+
+Source: https://github.com/pcfvw/hypomnesis/blob/main/ROADMAP.md
+
+# hypomnesis — Roadmap
+
+> *External RAM and VRAM, measured. Status snapshot — updated continuously as plans change.*
+
+Per-release detail lives in [`docs/roadmap-vX.Y.Z.md`](docs/) (indexed below).
+Shipped history lives in [`CHANGELOG.md`](CHANGELOG.md).
+The crate's *why* lives in [`docs/hypomnesis-brief.md`](docs/hypomnesis-brief.md).
+
+## Current state
+
+**v0.2.4** shipped 2026-06-29 — surfaces NVIDIA's driver/firmware **reserved** memory carve-out. *The same total. Now with the carve-out shown.* A new additive `GpuDeviceInfo::reserved_bytes: Option<u64>` exposes the carve-out NVML holds *within* its reported `total` (`total = reserved + free + used`) — **live-measured at 259 MiB** on the reference `RTX 5060 Ti`, byte-identical to `nvidia-smi -q -d MEMORY`'s `Reserved` line beside `Total: 16311 MiB`. It is a subset of `total_bytes`, so allocation headroom is `total_bytes − reserved_bytes` (which `free_bytes` already reflects). Sourced from NVML's v2 memory query (`nvmlDeviceGetMemoryInfo_v2`, R510+) with a graceful pre-R510 fallback to `None`; `total_bytes` is unchanged (the v1 figure = `nvidia-smi` `Total`). Driven by a [`candle-mi`](https://github.com/PCfVW/candle-mi) v0.1.16 dogfooding report — whose *inferred* 73 MiB carve-out (`DXGI nominal − NVML total`) the live v2 query revealed to be a *different* quantity (board/ECC overhead below NVML's `total`) from the true 259 MiB driver reservation. Detailed plan: [`docs/roadmap-v0.2.4.md`](docs/roadmap-v0.2.4.md).
+
+The preceding **v0.2.3** shipped 2026-06-11 — first-class macOS support on Apple Silicon. *Three platforms. Same contract. Resident-bytes everywhere.* Contributor [@LittleCoinCoin](https://github.com/LittleCoinCoin)'s [PR #1](https://github.com/PCfVW/hypomnesis/pull/1) lands the macOS path: libSystem-only RAM + per-process GPU + compute-process listing (`task_info`, `ledger`, `sysctl`, `proc_listpids`, `proc_pidpath`), with `MTLDevice.recommendedMaxWorkingSetSize` via a minimal `objc2-metal` binding for the device-wide GPU budget. Two dogfooding-driven UX additions rode along: `hmn ps` stderr summary gains a "committed total" figure (signalling the `WDDM` commit-vs-resident distinction without naming it), and a "Composable workflows" `README.md` subsection documents `hmn ps --json` with two `jq` recipes — including a *"Why no `hmn kill`?"* scope-discipline note declining a hmn-side kill subcommand to preserve hypomnesis's measurement-not-control boundary. Field-validated post-release on H100 / GB200 (Linux) and a 48 GiB MacBook Pro alongside the contributor's M3 Pro daily-driver. The [PR #1 body](https://github.com/PCfVW/hypomnesis/pull/1) served as the per-release roadmap.
+
+The preceding **v0.2.2** (2026-06-02) shipped the Windows `PDH` per-process backend — first Rust crate (to the maintainer's knowledge) to expose per-process `VRAM` for foreign processes on consumer Windows / `WDDM`, closing the dogfooding gap where `hmn ps` had silently dropped 27 processes including the maintainer's own `ollama.exe`. Detailed plan: [`docs/roadmap-v0.2.2.md`](docs/roadmap-v0.2.2.md).
+
+## Committed: v0.2.5 — Spill detection (Windows / `WDDM`)
+
+*Goal: surface the `WDDM` dedicated → shared-system-memory paging signal as a first-class measurement, so consumers can diagnose — and react to — the kind of GPU-spill slowdown that is invisible to every per-process `VRAM` counter the crate already exposes.*
+
+Surfaced by the maintainer's own dogfooding on the `Ryzen 9 5950X + RTX 5060 Ti / 16 GiB` reference machine: a model committed beyond dedicated `VRAM`, paged into the `WDDM` shared system memory budget, and the resulting `PCIe` traffic slowed everything down. The closest existing instrument — peak `used_bytes` — clips at `total_bytes` and only tells you "you hit the ceiling," not "you spilled 4 GiB into shared and that is what is slow." The actual signal lives in PDH's `\GPU Process Memory(*)\Shared Usage` counter (sibling to the `Dedicated Usage` counter v0.2.2 already reads). Design discussion (2026-06-11 and 2026-06-13) settled the scope below.
+
+### Why Windows-only
+
+Spill into a separate shared-memory budget is a `WDDM` architectural concept. The asymmetry is honest, not arbitrary:
+
+| Platform | Does "spill" exist? | Measurable per-process? |
+|---|---|---|
+| Windows / `WDDM` | **Yes** — dedicated `VRAM` → shared system memory budget | **Yes** — PDH `\GPU Process Memory(*)\Shared Usage` |
+| Linux / `NVML` | Yes via `UVM` paging | **No** — `nvmlDeviceGetComputeRunningProcesses_v3` caps at `VRAM`; `CUDA UVM` attributes are per-allocation, not per-process |
+| macOS / Apple Silicon `UMA` | **No** — single physical pool, nothing to spill *into* | N/A |
+
+The library surface stays *cross-platform-uniform* — the same `SpillTracker` type compiles on every platform — but an honest `is_spill_measurable() -> bool` hint returns `false` on Linux and macOS, and `has_spilled()` always returns `false` there because there is no shared-memory counter to populate. Lets consumers writing portable code skip the early-stop path entirely on non-Windows targets rather than silently failing to fire. Documented limitation per principle #4.
+
+### Library surface
+
+- **Read the sibling PDH counter.** Add `Shared Usage` to the `src/gpu/pdh.rs` enumeration walk; add a `shared_used_bytes: u64` field to `GpuProcessEntry` (under `#[non_exhaustive]`, additive — no breaking change). Populated only on the Windows / `PDH` path; defaults to `0` on the other arms.
+- **Fold-over-snapshots `SpillTracker`** — cousin of `MemoryReport`. Consumer drives observation timing: `tracker.observe(label)` in their existing inference loop, `tracker.has_spilled()` queries the latest observation (no fresh snapshot needed), `tracker.into_report()` returns peak dedicated + peak shared + first-spill label + spill duration.
+- **Two usage modes via the same struct.**
+  - *End-of-run report* (default): collect everything, return a `SpillReport` at the end with per-label history.
+  - *Early-stop polling*: consumer queries `has_spilled()` between steps and reacts however they want (`break`, drop batch size, switch to CPU, set their own `AtomicBool`, send a `crossbeam::channel` message — hypomnesis stays out of that decision).
+- **Configurable threshold for early warning.** Default threshold is `total_bytes` (real spill). Optional `with_dedicated_threshold(bytes)` lets the consumer fire `has_spilled()` *before* the actual spill — e.g. at 14 GiB on a 16 GiB card — so they can back off proactively (drop batch size, evict cached tensors) rather than reactively after the slowdown has started.
+- **`is_spill_measurable() -> bool`** — honest cross-platform-portability primitive (see *"Why Windows-only"* above).
+
+Consumer-side sketch (exact API shape TBD when scoping enters plan-mode):
+
+```rust
+let mut tracker = SpillTracker::new(device_index)
+    .with_dedicated_threshold(14 * GIB);  // warn at 14, on a 16 GiB card
+
+for step in 0..n_steps {
+    tracker.observe(format!("step_{step}"));
+    if tracker.has_spilled() {
+        // Drop batch size, evict KV cache, switch to CPU — consumer's choice.
+        break;
+    }
+    inference_step();
+}
+let report = tracker.into_report();
+```
+
+### CLI surface
+
+A new `hmn spill -- <command>` subcommand wraps a command (`time(1)`-style — *not* a TUI), polls at a fixed interval (~100 ms) during the wrapped command's lifetime, and prints a `SpillReport` to stderr when the wrapped process exits. Internally sits on the same `SpillTracker` primitive the library exposes — labels become timestamps instead of user-supplied strings.
+
+```sh
+hmn spill -- python train.py
+# ... train.py runs to completion ...
+# SpillReport prints here (stderr — preserves stdout for the wrapped command):
+#   hmn spill: peak dedicated 16.0 GiB / 16.0 GiB
+#              peak shared    4.2 GiB
+#              first spill    +12.4s into run
+#              spill duration 3.8s
+```
+
+The subcommand sidesteps the `hmn watch` rejection in [Carried forward](#carried-forward-out-of-scope-until-specifically-un-gated) — it is not a live TUI, it is a record-on-exit wrapper. The `time(1)` precedent is the canonical Unix shape for this kind of measurement.
+
+On Linux and macOS, `hmn spill` runs the wrapped command and exits with a *"spill not measurable on this platform"* message rather than printing a misleading all-zeros report.
+
+A `--json` flag is planned (mirroring `hmn ps --json`) so a `SpillReport` can compose with `jq` and the platform's native killer — the "Composable workflows" README idiom continues to apply.
+
+### Design discipline (deliberate non-features)
+
+- **Stays measurement-only.** No background thread (consumer polls in their loop; lifetime + cross-process attribution stay clean). No callback closures (`Send` / `Sync` grief, obscures where signaling happens). No opinion on what to do (the queryable struct exposes state; the consumer wires whatever signaling primitive their workload uses).
+- **No `hmn spill --kill` / `--throttle`.** Same scope discipline as the v0.2.3 *"Why no `hmn kill`?"* note — measurement, not control. Consumers who want automatic termination on spill compose `hmn spill --json` with the platform's native killer.
+
+Patch-safe — additive `GpuProcessEntry::shared_used_bytes` field, new `SpillTracker` type, new `hmn spill` subcommand. No breaking changes to existing API. Per-release detail document will land at `docs/roadmap-v0.2.4.md` when scoping enters plan-mode.
+
+## Speculative: v0.3.0
+
+Items that *might* land, gated on real consumer demand:
+
+- **Cross-platform "unmeasurable rows" diagnostic** — emit a count of detected-but-unmeasurable processes in the `hmn ps` stderr summary. Probably **never needed** now that v0.2.2 + v0.2.3 have shipped, because all three platforms reliably deliver bytes for every readable PID. Resurfaces only if an adopter reports a process they can't see, or if very-old Windows / `WDDM 1.x` environments matter to a real user.
+- **`Option<u64>` for `GpuProcessEntry::used_bytes`** — breaking change, would be v0.3.0 not patch. Deferred unless a consumer specifically asks to *list* unmeasurable processes (rather than just count them).
+- **Segmented per-process VRAM API** — sibling library function `query_per_process_vram_segmented()` returning one row per `(pid, segment)` from PDH's `pid_NNNN_luid_X_phys_N` instances, plus a `hmn ps --show-segments` (or similar) CLI flag. The v0.2.2 PDH backend internally enumerates segmented data before collapsing to per-PID totals; a future patch would promote the internal helper to `pub(super)` and add a sibling dispatcher entry. Gated on either a real consumer ask or hardware exhibiting multi-segment behaviour (single-partition GPUs collapse the two paths identically, so the maintainer's `RTX 5060 Ti` can't validate the segmented path).
+- **`format_summary` / `format_free_used_total`** (deferred from v0.2.1 Wave C) — promote when a second `report`-feature consumer validates the shape.
+- **Long-lived `NVML` context** — performance work, deferred from v0.2.0 / v0.2.1, no benchmark-loop consumer asking yet.
+- **Builders for `ProcessGpuInfo`, `Snapshot`, `GpuProcessEntry` under `test-helpers`** — add per type as downstream tests demand.
+
+## Carried forward (out of scope until specifically un-gated)
+
+| Idea | Why deferred | What would un-gate it |
+|------|--------------|----------------------|
+| **AMD `ROCm` backend** (`rocm_smi_lib`) | Maintainer has no AMD dGPU; shipping untested `FFI` violates project discipline | Hardware access **or** a contributor PR with maintainer hardware coverage |
+| **AMD iGPU on Linux** | `NVML` doesn't see it; needs separate Linux `DRM` / `sysfs` path | Same as AMD `ROCm` |
+| **Intel Arc / Intel iGPU on Linux** | No backend in the crate; same Linux-`DRM` problem | Hardware access or contributor PR |
+| **Apple Metal on Intel Macs** (legacy `AMD` / Intel discrete GPUs) | v0.2.3's `ledger` mechanism likely works, but no Intel-Mac test hardware | Intel-Mac test machine or contributor PR |
+| **Strict-accounting `D3DKMTQueryStatistics` Windows backend** | "Reserved for system use. Do not use." per Microsoft docs; undocumented kernel-thunk surface | A real consumer who reports KB 4490156 drift biting their specific workload |
+| **`hmn watch` (TUI live-refresh)** | Shell loop `watch -n 1 hmn` is the Unix answer; `nvtop`-style work belongs elsewhere | A consumer who's tried `watch` and explained why it's insufficient |
+| **`hmn` reading from another machine over SSH / RPC** | Out of scope; users run `ssh host hmn` | Not planned |
+| **TUI / live mode (`hmn top`)** | That's `nvtop`'s job | Not planned |
+
+`#[non_exhaustive]` keeps every one of these additive — none requires a 1.0 bump.
+
+## Per-release detail (index)
+
+- [`docs/roadmap-v0.2.0.md`](docs/roadmap-v0.2.0.md) — shipped 2026-05-06. *Wider, not taller.* `Snapshot::all`, `gpu_processes`, `hmn` CLI, `report`-feature `format_free` / `print_free`.
+- [`docs/roadmap-v0.2.1.md`](docs/roadmap-v0.2.1.md) — shipped 2026-05-13. *Sharper, not wider.* `test-helpers` builder, `name_or_unknown`, `format_total` / `format_used`, `HypomnesisError` `Display` contract, README "Used by" + brief refresh.
+- [`docs/roadmap-v0.2.2.md`](docs/roadmap-v0.2.2.md) — shipped 2026-06-02. *Truer, not wider.* Windows `PDH` per-process backend, `?`-row security-relevant hint, PID 4 rendered as `[kernel]`.
+- *v0.2.3 — no separate per-release document; the [PR #1](https://github.com/PCfVW/hypomnesis/pull/1) body served as the per-release roadmap.*
+- [`docs/roadmap-v0.2.4.md`](docs/roadmap-v0.2.4.md) — shipped 2026-06-29. *The same total. Now with the carve-out shown.* NVML v2 `reserved` carve-out surfaced as additive `GpuDeviceInfo::reserved_bytes`, `hmn` summary parenthetical, pre-R510 graceful fallback.
+- *v0.2.5 — committed; scope lives in the [Committed: v0.2.5](#committed-v025--spill-detection-windows--wddm) section above pending implementation. A `docs/roadmap-v0.2.5.md` per-release detail document will land when scoping enters plan-mode.*
+
+Foundational documents (not per-release):
+
+- [`docs/hypomnesis-brief.md`](docs/hypomnesis-brief.md) — *why this crate exists*: Plato + the v0.1.x VRAM saga + the extraction rationale from `candle-mi`.
+- [`docs/hypomnesis-adoption.md`](docs/hypomnesis-adoption.md) — `hf-fetch-model 0.10.1` dogfooding report (the basis of v0.2.1's wave list).
+
+## Principles
+
+1. **Every patch is informed by at least one real consumer's adoption experience.** Codified in v0.2.1's CHANGELOG intro; v0.2.2 follows it (driven by the `WDDM` `[N/A]` finding on a maintainer's RTX 5060 Ti); v0.2.3 follows it (driven by the contributor's actual macOS adoption); v0.2.4 follows it (driven by a `candle-mi` v0.1.16 dogfooding report asking for the NVML driver-reserved carve-out on the same RTX 5060 Ti); v0.2.5 follows it (driven by the maintainer's own `WDDM` spill scenario on the same RTX 5060 Ti / 16 GiB host).
+2. **Additive-by-default under `#[non_exhaustive]`.** New variants and fields land in patch releases. Type-shape changes (`u64 → Option<u64>`, etc.) are minor bumps, never patches.
+3. **No new hardware backends without maintainer-accessible hardware or a contributor PR.** AMD `ROCm` and Apple Metal sat behind this gate until v0.2.3 (Apple Silicon via PR #1) un-gated half of it.
+4. **Documented limitations beat papered-over half-fixes.** R570 `u64::MAX` sentinel, `WDDM` `NVML_VALUE_NOT_AVAILABLE`, KB 4490156 PDH drift, macOS cross-user `EPERM` — each is named in the source and README rather than hidden.
+5. **`Display` is the default English one-liner; structured fields are canonical.** v0.2.1 Wave D's `HypomnesisError` contract — applies to every future error / measurement variant.
+6. **One crate, one job.** *Tell you what's currently in this process's memory, precisely, across Windows, Linux, and macOS.* (macOS support shipped in v0.2.3 via [PR #1](https://github.com/PCfVW/hypomnesis/pull/1).) Anything that widens the job (system-wide free RAM, GPU temperature trends, live TUI, process termination) belongs in a different crate — see the *"Why no `hmn kill`?"* note in the README for the canonical example of scope discipline in action.
+
+*Living document — update as plans evolve. Last revised 2026-06-29: v0.2.4 shipped (NVML v2 `reserved` carve-out via `GpuDeviceInfo::reserved_bytes`, driven by a `candle-mi` v0.1.16 dogfooding report); spill detection bumped one slot to [Committed: v0.2.5](#committed-v025--spill-detection-windows--wddm) (scope unchanged). Previous revision (2026-06-13) promoted spill detection from Speculative to Committed after the design conversation settled the library `SpillTracker` + CLI `hmn spill -- <command>` wrapper + `is_spill_measurable()` cross-platform-honest hint. Reviewer hint: for **shipped** details, the per-release roadmap (or PR body, for v0.2.3) is the authoritative source; for **forthcoming** plans, this document is the source until a per-release roadmap is drafted.*
+
+---

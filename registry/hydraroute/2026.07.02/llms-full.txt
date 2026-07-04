@@ -1,0 +1,2053 @@
+# HydraRoute
+
+Source: https://github.com/ground-zerro/hydraroute/blob/main/README.md
+
+# HydraRoute
+
+**HydraRoute** — инструмент для раздельной маршрутизации трафика по доменам и CIDR с использованием туннелей на роутерах **Keenetic**.
+
+Трафик к указанным доменам и CIDR отправляется через туннель, всё остальное — напрямую.
+
+## Версии
+
+### Neo
+
+Актуальная версия.
+
+[Подробная документация →](https://git.zerrolabs.org/Ground-Zerro/HydraRoute/tree/main/Neo)
+
+### Classic — EOL
+
+Жизненный цикл завершён. Поддержка прекращена.
+
+[Архив →](https://git.zerrolabs.org/Ground-Zerro/HydraRoute/tree/main/Classic)
+
+### Relic — EOL
+
+Жизненный цикл завершён. Поддержка прекращена.
+
+[Архив →](https://git.zerrolabs.org/Ground-Zerro/HydraRoute/tree/main/Relic)
+
+## Быстрый старт (Neo)
+
+```bash
+opkg update && opkg install curl && curl -Ls "https://git.zerrolabs.org/Ground-Zerro/release/pages/keenetic/install-neo.sh" | sh
+```
+
+> **Требования:** роутер Keenetic с прошивкой выше v4.3.6, установленный Entware.
+
+## Поддержать автора
+
+[Boosty](https://boosty.to/ground_zerro)
+
+---
+
+# HRNeo — техническая документация кодовой базы
+
+Source: https://github.com/ground-zerro/hydraroute/blob/main/Neo/docs/CORE.md
+
+# HRNeo — техническая документация кодовой базы
+
+Исходный код HRNeo (HydraRoute Neo) v3.14.0-1: архитектура, модули, потоки данных, оптимизации.
+
+## 1. Общая архитектура и принцип работы
+
+HRNeo — демон для policy routing на роутерах Keenetic (Entware). Чистый C (без CGO, без внешних библиотек кроме libc и Linux API), единый статически скомпилированный бинарник. Версия 3.12.1-1.
+
+### Два независимых источника имён хостов
+
+- **DNS-канал** (всегда): перехват DNS-ответов dnsmasq через AF_PACKET SOCK_DGRAM + L3-BPF. Работает на интерфейсах любого типа — Ethernet, PPP, ARPHRD_NONE (WireGuard, VPN-сервер, IPsec, туннели). Ловит DNS и LAN-, и VPN-клиентов.
+- **L7-канал** (опционально, `l7CaptureEnabled`): перехват TLS SNI / HTTP Host / QUIC Initial SNI исходящих соединений через NFLOG (пассивное копирование пакета, нетерминирующая цель). Фаза 2 — TCP-реассамблеция длинных ClientHello. QUIC — CRYPTO-walker с дешифровкой Initial-пакета. Подробно — раздел [18](#18-l7-перехват-tls-sni--http-host--tcp-реассамблеция).
+
+### Принцип работы (пошагово)
+
+1. Читается конфигурация из `/opt/etc/HydraRoute/hrneo.conf` (28 параметров; CLI-флаги поверх конфига; недостающие — встроенные дефолты).
+
+2. Если `DirectRouteEnabled=true` — сканируется `/sys/class/net/`, строится карта системных интерфейсов (`drm_scan_interfaces`): для каждого имени читается `/sys/class/net/<name>/operstate` (`up`/`down`/`unknown`). Карта нужна, чтобы при разборе watchlist различать «политика Keenetic» и «сетевой интерфейс для DirectRoute».
+
+3. Парсится watchlist (`domain.conf`). Каждая строка имеет формат `домен1,домен2,geosite:TAG/Цель`. Цель классифицируется через `drm_classify_target` по карте интерфейсов из шага 2:
+   - имя совпало с интерфейсом → цель является интерфейсом (DirectRoute, маршрутизация будет через `ip rule + ip route`)
+   - не совпало → цель является политикой Keenetic (маршрутизация будет через политику роутера с её mark)
+
+   Результат: разделённые массивы `policy_names[]` и `iface_names[]`. Лог: `[INFO] domain.conf: %d policies, %d interfaces`.
+
+4. Опционально (`CIDR=true`): из `CIDRfile` (`ip.list`) извлекаются уникальные заголовки `/Name` через `parse_cidr_policy_headers`. Имена-интерфейсы фильтруются через `drm_classify_target`, остальные добавляются в список политик. Лог на каждое новое имя: `[INFO] CIDR: added policy 'X'`.
+
+5. Опционально (есть `GeoSiteFile`): `parse_geosite_rules` собирает `geosite:TAG/Цель` из watchlist'а; имена-цели добавляются в политики (опять же intf-цели отфильтровываются). Лог: `[INFO] GeoSite: added policy 'X'`.
+
+6. Применяется `PolicyOrder` через `sort_policies` (см. раздел [5](#5-матчинг-доменов-srcwatchlistc)). Сортировка делается дважды: для одних только политик (для шага 7) и для объединённого массива policy + iface (для шага 9). Итог печатается:
+
+   ```
+   [INFO] Target order (N):
+     [0] HydraRoute (policy)
+     [1] nwg0 (interface, fwmark=0x3001)
+     ...
+   ```
+
+7. **Создание/проверка политик Keenetic через RCI** (`rci_create_policies`): hrneo формирует `POST /rci/ HTTP/1.0` с JSON-массивом `[{"parse":"ip policy <name1>"}, {"parse":"ip policy <name2>"}, ...]` и отправляет на `127.0.0.1:79`. Команда `parse` эквивалентна вводу `ip policy <name>` в CLI Keenetic — существующие политики не трогает, отсутствующие создаются пустыми (без VPN-интерфейсов; их администратор присвоит через веб-интерфейс роутера Keenetic). После — безусловный `POST /rci/ {"system":{"configuration":{"save":true}}}` (сохранение в startup-config). Интерфейсы из `iface_names[]` в RCI не отправляются — для них политики Keenetic не нужны. Лог: `[INFO] Policy creation commands executed`. Подробнее — раздел [13](#13-rci-remote-configuration-interface-keenetic-srcrcic).
+
+8. Создаются `ipset`-множества `hash:net` (IPv4 и IPv6 отдельно) для каждой цели (политика или интерфейс): по два сета на target — `<name>` (IPv4) и `<name>v6` (IPv6). Через netlink с `NLM_F_CREATE|NLM_F_EXCL`; существующие сеты не пересоздаются. Таймаут один на все сеты — поле `default_timeout` менеджера ipset (0 = без таймаута). При `clearIPSet=true` — `FLUSH` каждого сета.
+
+9. Опционально (`CIDR=true`): загрузка статических CIDR-блоков в `ipset` (`add_cidr_to_ipsets`). Двухфазная обработка: фаза 1 — пресканирование `geoip:TAG` и автомиграция oversized тегов в disabled-секцию; фаза 2 — собственно `ipset_add_batch` для активных блоков.
+
+10. Опционально (есть `GeoSiteFile`): `build_geosite_domain_map` загружает домены типов `Domain`/`Full` из `.dat`-файлов в хеш-таблицу с приоритетом у `domain.conf` (`ht_insert` НЕ перезаписывает существующие).
+
+11. Если `DirectRoute=true` — `drm_setup_all_routes`:
+
+    ```
+    ip [-6] rule add priority N fwmark 0x<mark> table <T>
+    ip [-6] route add default dev <iface> table <T>   # или blackhole
+    ```
+
+    `fwmark` и `table_id` уникальные, выделяются последовательно от `InterfaceFwMarkStart` (12289) и `InterfaceTableStart` (301).
+
+12. **Извлечение `markID` политик через RCI** + создание `CONNMARK`-правил `iptables` (`apply_unified_connmark_rules`):
+    - `GET /rci/show/ip/policy/` возвращает JSON `{"<Name>":{"mark":"0xNN", ...}, ...}`
+    - hrneo вручную парсит ответ (`find_matching_brace` + `strstr "mark"`), извлекает hex-значение `markID` для каждой политики, снимает префикс `0x`. Лог при `log=console/file`: `[DEBUG] RCI policy: HydraRoute mark=0x21`
+    - Двухуровневая retry-защита: `rci_get_policies_with_retry` (до 5 попыток × 3с) от сетевых ошибок; внутренний loop (до 5 попыток × 4с) от свежесозданных политик без `markID` (роутер назначает его не сразу после `parse`)
+    - Для целей-интерфейсов `markID` не запрашивается — используется назначенный `fwmark`
+    - Для каждой цели в порядке `g_all_sorted[]` формируется пара `CONNMARK`-правил в `mangle/PREROUTING`, через `iptables-restore --noflush` (один вызов на весь батч). Если у политики `mark` пустой после retry — `LOG_WARN "Policy %s has no mark ID, skipping"`, цель пропускается (`ipset` продолжит заполняться, но трафик не маркируется)
+
+13. Инициализируется `AF_PACKET` захват DNS-ответов: два `SOCK_DGRAM/ETH_P_ALL` сокета с L3-BPF (`fd4` для IPv4, `fd6` для IPv6).
+
+14. Опционально (`l7CaptureEnabled=true`): резолв WAN (config или `/proc/net/route`), `init_module(nfnetlink_log+xt_NFLOG)` (при неудаче — L7 отключается, DNS-only), `init_module(xt_connbytes)`, `nflog_capture_init`, `NFLOG`-правила `iptables`/`ip6tables` в `mangle/FORWARD`+`OUTPUT` для TCP 443/80; при `l7TcpReasmEnabled` — `tcp_reasm_init` + `timerfd` GC (1с).
+
+15. Основной epoll-цикл перехватывает DNS-ответы (`AF_PACKET`) и L7-пакеты (`NFLOG`), добавляет IP в `ipset` через netlink. Для L7-канала при **первом** добавлении IP (и при `ConntrackFlush=true`) триггернувшее соединение разрывается точечным удалением его conntrack-записи по полному 5-tuple (`conntrack_delete_conn`) — следующий пакет переоценивает `CONNMARK`-правила, а смена src/NAT через политику вынуждает легитимный реконнект по выбранному маршруту. Полный conntrack-DUMP (шаг 16) из L7-канала не выполняется — L7 использует точечный DELETE без сканирования таблицы.
+
+16. Если `ConntrackFlush=true` И IP добавлен в `ipset` впервые (`NLM_F_EXCL` вернул `err==0`, а не `IPSET_ERR_EXIST`), для каждого такого IP делается `conntrack`-DUMP с DELETE по совпадению dst-IP. Реальное удаление происходит только при наличии активной `conntrack`-записи к этому IP; если соединения к IP ещё нет — DUMP проходит вхолостую, DELETE не отправляется.
+
+17. Обрабатываются сигналы:
+    - `SIGUSR1` — обновление состояния интерфейсов + пересоздание `CONNMARK`-правил (включая повторный `GET /rci/show/ip/policy/` для возможно изменившихся `markID`) + реинсталл L7-правил (idempotent через `iptables -C`). Debounce 5с через `timerfd`
+    - `SIGINT`/`SIGTERM` — штатная остановка: снятие L7 `NFLOG`-правил, удаление `CONNMARK`, удаление `ip rule` + flush таблиц DirectRoute, закрытие netlink-сокетов, удаление PID-файла
+
+### Архитектурная схема (DNS-канал)
+
+```
+DNS-ответ dnsmasq → клиент (любой интерфейс: br0/WG/VPN/PPP/IPsec/туннель)
+   |
+   v
+[dev_queue_xmit_nit() → ptype_all]    ← ETH_P_ALL обязателен
+   |
+   v
+[AF_PACKET SOCK_DGRAM/ETH_P_ALL fd4/fd6
+ ядро отдаёт L3-пакет без канального заголовка]
+   |
+   v
+[L3-BPF: версия IP (ниббл) + proto + sport==53]
+   |
+   v
+[process_dns_packet: парсинг DNS]
+   |
+   v
+[Добавление новых IP в ipset через netlink]
+   |
+(ConntrackFlush=true && новые IP)
+   |
+   v
+[netlink: удаление conntrack-записей для новых IP (DUMP + DELETE if present)]
+
+[Исходящий трафик клиента]
+   → iptables/mangle PREROUTING
+   → CONNMARK set-xmark по ipset dst match
+   → CONNMARK restore-mark
+   → ip rule fwmark → table X → ip route default dev <interface>
+```
+
+### Файловая структура (25 файлов `.c`)
+
+| Файл | Назначение |
+|------|------------|
+| `src/main.c` | Точка входа, event loop (epoll), обработка DNS |
+| `src/packet_capture.c` | AF_PACKET SOCK_DGRAM захват DNS (L3-BPF) |
+| `src/iptables.c` | CONNMARK-правила, unified targets |
+| `src/routing.c` | DirectRoute: ip rule, ip route, интерфейсы |
+| `src/watchlist.c` | Парсинг domain.conf, матчинг доменов, sort_policies |
+| `src/config.c` | Парсинг hrneo.conf + config_generate |
+| `src/args.c` | Парсинг CLI, наложение на config |
+| `src/params.c` | PARAMS[] — таблица описания параметров (single source of truth для config/args/help/genconfig) |
+| `src/ipset_nl.c` | Низкоуровневая работа с ipset через netlink |
+| `src/conntrack.c` | Сброс conntrack-записей через netlink: DUMP+DELETE по dst-IP (DNS-канал) и точечный DELETE по 5-tuple (L7-канал, TCP и UDP/QUIC) |
+| `src/dns.c` | Парсинг DNS-ответов (A, AAAA, CNAME) |
+| `src/log.c` | Логирование (console/file/syslog/off) |
+| `src/util.c` | Хеш-таблица доменов, chunked pool, fork/exec |
+| `src/rci.c` | HTTP/JSON взаимодействие с API Keenetic |
+| `src/signal_handler.c` | `signal_mgr_t` (signalfd + timerfd manager) |
+| `src/geodat.c` | Парсинг GeoIP/GeoSite .dat файлов (protobuf) |
+| `src/probe_tls.c` | Stateless парсер TLS ClientHello → SNI |
+| `src/probe_http.c` | Stateless парсер HTTP request → Host |
+| `src/probe_quic.c` | QUIC CRYPTO-walker: дешифровка Initial-пакета (v1/v2), HKDF + AES-128-CTR, ACK-frame skip → SNI |
+| `src/quic_crypto.c` | Pure-C SHA-256, HMAC-SHA256, HKDF-Expand-Label, AES-128-ECB/CTR (без AF_ALG, без libcrypto) |
+| `src/bogon.c` | Фильтр служебных IPv4/IPv6 диапазонов |
+| `src/nflog_capture.c` | NFLOG через raw NETLINK_NETFILTER (subsys ULOG=4, без libnetfilter_log) |
+| `src/l7_dispatch.c` | Fail-fast диспетчер пакетов → probe → reasm; UDP/443 ветка для QUIC |
+| `src/l7_firewall.c` | WAN-резолв, init_module, iptables NFLOG-правила (FORWARD+OUTPUT, TCP + UDP/QUIC) |
+| `src/tcp_reasm.c` | 5-tuple TCP-реассамблеция длинных ClientHello |
+| `include/hrneo.h` | Основные структуры, константы, inline `fnv1a_hash` |
+| `include/*.h` | Заголовочные файлы для каждого модуля |
+| `Makefile` | Сборка для mipsel, mips, aarch64, native |
+
+## 2. Точка входа: `src/main.c`
+
+### Константы (`include/hrneo.h`)
+
+| Константа | Значение | Назначение |
+|-----------|----------|------------|
+| `DEFAULT_CONFIG_PATH` | `"/opt/etc/HydraRoute/hrneo.conf"` | путь к конфигу |
+| `DEFAULT_PID_FILE` | `"/var/run/hrneo.pid"` | путь к PID-файлу |
+| `DEFAULT_API_PORT` | `79` | порт RCI |
+| `IPSET_HASH_TYPE` | `"hash:net"` | тип создаваемых ipset |
+| `SOCKET_READ_BUFFER` | 1 МБ | `SO_RCVBUF` для AF_PACKET |
+| `SIGUSR1_DEBOUNCE_SEC` | `5` | debounce SIGUSR1 (`signal_mgr_arm_timer`) |
+| `RCI_TIMEOUT_SEC` | `10` | таймаут RCI-запроса |
+| `POLICY_API_MAX_RETRIES` | `5` | попыток на `GET /rci/show/ip/policy/` |
+| `POLICY_API_RETRY_DELAY` | `3` | секунды между попытками |
+| `IPSET_CHUNK_SIZE` | `256` | размер батча ipset |
+| `IPSET_DEFAULT_MAXELEM` | `262144` | fallback при `IpsetMaxElem=0` в `add_cidr_to_ipsets` |
+| `POOL_CHUNK_SIZE` | `256 * 1024` | размер одного чанка string pool |
+| `IPSET_ERR_EXIST` | `4103` | netlink-код «запись уже есть» |
+| `IPSET_ERR_HASH_FULL` | `4101` | netlink-код «лимит maxelem» |
+| `MAX_CNAME_CHAIN` | `16` | глубина BFS по CNAME |
+| `DOMAIN_HT_BUCKETS` | `8192` | бакетов в хеш-таблице доменов |
+| `MAX_GEO_FILES` | `16` | максимум `GeoIPFile`/`GeoSiteFile` |
+| `MAX_POLICY_ORDER` | `64` | максимум целей в `PolicyOrder` |
+| `MAX_INTERFACES` | `64` | максимум интерфейсов DirectRoute |
+
+> В `hrneo.h` **НЕТ** `arena_t` / `ARENA_SIZE` — все временные буферы статические/на стеке.
+
+### `config_t` (28 полей)
+
+См. `src/params.c` и `docs/HRNEO.CONF.md`. Поля:
+
+`auto_start`, `watchlist_path`, `clear_ipset`, `cidr_enabled`, `cidr_file_path`, `ipset_enable_timeout`, `ipset_timeout`, `log_level`, `log_file_path`, `direct_route_enabled` (default 1), `interface_fwmark_start` (12289), `interface_table_start` (301), `global_routing`, `conntrack_flush` (1), `ipset_maxelem` (262144), `geo_ip_files[16][512]`+counter, `geo_site_files[16][512]`+counter, `policy_order[64][64]`+counter, `l7_capture_enabled` (0), `l7_nflog_group` (210), `l7_enable_tls` (1), `l7_enable_http` (1), `l7_connbytes_max` (8), `l7_wan_interface[32]`, `l7_tcp_reasm_enabled` (1), `l7_tcp_reasm_max_entries` (256), `l7_tcp_reasm_ttl_sec` (5), `l7_enable_quic` (1).
+
+### Глобальные переменные `main.c`
+
+```c
+config_t                g_config;
+domain_hashtable_t     *g_all_targets;
+ipset_manager_t         g_ipset_mgr;
+volatile int            g_shutdown;
+direct_route_manager_t  g_drm;
+int                     g_drm_active;
+unified_target_t        g_all_sorted[MAX_POLICY_ORDER + MAX_INTERFACES];
+int                     g_all_sorted_count;
+conntrack_mgr_t         g_conntrack = { .fd = -1, .del_fd = -1 };
+rci_client_t            g_rci;
+nflog_capture_t         g_nflog;
+int                     g_l7_active;
+char                    g_l7_wan[MAX_INTERFACE_NAME];
+tcp_reasm_t             g_reasm;
+int                     g_reasm_active;
+```
+
+### `main()` — последовательность старта
+
+1. `args_parse(argc, argv)` — парсинг CLI
+   - `--version`/`-v`: `return 1` (`main → 0`)
+   - `--help`/`-h`: `return 2 → 0`
+   - `--genconfig [path]`: `return 3 → main` вызывает `config_generate(args.genconfig_target)`
+   - ошибка: `return -1 → 1`
+2. `sigprocmask(SIG_BLOCK)` для `SIGINT`/`SIGTERM`/`SIGUSR1`
+3. `config_read()` — путь из `args.config_path` или `DEFAULT_CONFIG_PATH`; явный `--config` при недоступном файле → выход 1
+4. `args_apply()` — наложение CLI-флагов (только `set_mask`-биты)
+5. Если `!auto_start` → `return 0`
+6. `log_setup()` + `LOG_INFO "HRNeo v%s starting"` + `create_pid_file()`
+7. `ht_create()` — создание хеш-таблицы доменов
+8. Если DirectRoute: `drm_init()`, `drm_scan_interfaces()`, `parse_watchlist_classified()` → для каждого iface: `drm_allocate_fwmark()`, `drm_allocate_table_id()`, `drm_register_route()`. Иначе: `parse_watchlist()`, `get_unique_names()`
+9. `CIDR=true`: `parse_cidr_policy_headers()` — добавляет политики из заголовков `/Name` CIDR-файла; intf-цели отфильтровываются через `drm_classify_target`; `LOG_INFO "CIDR: added policy 'X'"` для каждой новой
+10. GeoSite файлы заданы: `parse_geosite_rules()` — добавляет политики из `geosite:`-правил watchlist; intf-цели отфильтровываются; `LOG_INFO "GeoSite: added policy 'X'"` для каждой новой
+11. `sort_policies()` для `policy_names` с учётом `PolicyOrder`
+12. `g_all_sorted[]`: `all_names = policy_names + iface_names`, `sort_policies()` на объединении; `unified_target_t = {pair (ipv4/ipv6 имена), is_interface, fwmark}`
+13. `LOG_INFO "Target order (%d):"` — вывод порядка целей
+14. `rci_client_init(&g_rci)` — выделение `raw_buf` + `response_buf` (~1 МБ + 1 МБ)
+15. `rci_create_policies()` — только для `policy_names` (POST + save)
+16. `ipset_manager_init()` + установка `g_ipset_mgr.default_timeout` (из `IpsetEnableTimeout`/`IpsetTimeout`) + `initialize_ipsets()` — создание/очистка ipset-пар для всех `g_all_sorted`
+17. `add_cidr_to_ipsets()` — если `CIDR=true` и `cidr_file_path` задан
+18. `build_geosite_domain_map()` — если `gs_count > 0` (правила `geosite:` распарсены один раз на шаге 10 и переиспользуются)
+19. `drm_setup_all_routes()` — `ip rule` + `ip route` для DirectRoute
+20. `apply_unified_connmark_rules()`
+21. Если `conntrack_flush` — `conntrack_mgr_init()` (при ошибке flush отключается)
+22. `pkt_capture_init()` — два `AF_PACKET SOCK_DGRAM/ETH_P_ALL` сокета (`fd4`, `fd6`)
+23. Если `l7_capture_enabled`: `l7_firewall_resolve_wan` (при неудаче — L7 отключается с `LOG_WARN`, DNS-only); `l7_firewall_load_nflog_modules` (`nfnetlink_log`+`xt_NFLOG` через `init_module(2)`; при неудаче — L7 отключается, DNS-only, **без fallback**). Иначе: `l7_firewall_load_kmod("xt_connbytes")`; `l7_dispatch_set_enable` (с флагами tls/http/quic); при `l7_tcp_reasm_enabled` — `tcp_reasm_init` + `l7_dispatch_set_reasm` (`g_reasm_active=1`); `nflog_capture_init`; `l7_firewall_install` (NFLOG в `mangle/FORWARD`+`OUTPUT` для TCP 443/80 и при `l7_enable_quic` — UDP 443 с `--length 1200:`). `g_l7_active=1` при успехе
+24. `signal_mgr_init()` — `sigprocmask` + `signalfd` + `timerfd`
+25. `epoll_create1()` — регистрация `cap.fd4`, `cap.fd6`, `signals.sig_fd`, `signals.timer_fd`; при `g_l7_active` — `nflog_fd`; при `g_reasm_active` — `reasm_gc_fd` (`timerfd` 1s)
+26. Основной цикл `epoll_wait` (`events[8]`)
+27. **Cleanup:** `signal_mgr_close` → `l7_firewall_remove` + `nflog_capture_close` → `tcp_reasm_close` (если `g_reasm_active`) → `pkt_capture_close` → `conntrack_mgr_close` → `drm_cleanup_all_routes` → `cleanup_connmark_rules` → `ipset_manager_close` → `rci_client_close` → `ht_destroy` → `remove_pid_file` → `log_close`
+
+## 3. DNS-детекция: AF_PACKET захват
+
+**Файл:** `src/packet_capture.c`, `include/packet_capture.h`
+
+### `pkt_capture_t` (структура)
+
+| Поле | Тип | Назначение |
+|------|-----|------------|
+| `fd4` | `int` | AF_PACKET сокет с L3-BPF для IPv4 DNS |
+| `fd6` | `int` | AF_PACKET сокет с L3-BPF для IPv6 DNS |
+| `callback` | `pkt_capture_cb` | колбэк `(const uint8_t *pkt, int pkt_len, void *user_data)` |
+| `user_data` | `void *` | произвольный контекст |
+| `recv_buf` | `uint8_t[65536]` | буфер приёма |
+
+### `pkt_capture_init(cap, cb, user_data)`
+
+1. Создаёт два сокета через `open_capture_socket()`:
+
+   ```c
+   socket(AF_PACKET, SOCK_DGRAM | SOCK_CLOEXEC, htons(ETH_P_ALL))
+   ```
+
+2. `SO_RCVBUF = SOCKET_READ_BUFFER` (1 МБ)
+3. `SO_ATTACH_FILTER` с классической BPF-программой
+
+### Почему `SOCK_DGRAM` (а не `SOCK_RAW`)
+
+Ядро снимает канальный (L2) заголовок и отдаёт пакет с сетевого (IP) уровня единообразно для интерфейсов любого типа — Ethernet (`br0`), PPP, `ARPHRD_NONE` (WireGuard `nwg0`, VPN-сервер `t2s*`, IPsec `xfrms*`), туннели. Поэтому DNS-ответы VPN-клиентам (не-Ethernet интерфейсы, нет 14-байтного Ethernet-заголовка) больше не теряются. Фильтры работают от смещения 0 (IP-заголовок), а не от Ethernet.
+
+### BPF-фильтры (L3, данные начинаются с IP-заголовка)
+
+- **`bpf_v4_dns`:** версия IP по верхнему нибблу байта 0 == 4, proto (байт 9) == UDP(17) или TCP(6), `src_port == 53` (индексированная загрузка halfword по `X=IHL×4`)
+- **`bpf_v6_dns`:** версия IP == 6, `next_header` (байт 6) == UDP(17) или TCP(6), `src_port` читается из halfword по фиксированному смещению 40 (IPv6-заголовок) == 53 (extension-заголовки не разбираются — поведение как у прежнего фильтра)
+
+### Почему `ETH_P_ALL`
+
+Ядро Linux доставляет исходящие пакеты через `dev_queue_xmit_nit()` только обработчикам `ptype_all`. `ETH_P_IP`/`ETH_P_IPV6` регистрируются в `ptype_base` и не получают исходящие пакеты физических интерфейсов. `ETH_P_ALL` регистрируется в `ptype_all` → перехватывает DNS-ответы dnsmasq → клиентам.
+
+### `pkt_capture_process(cap, fd)`
+
+- `recvfrom()` с `sockaddr_ll` (адресный буфер; `sll_hatype` не анализируется)
+- При `SOCK_DGRAM` канального заголовка нет ни для одного типа интерфейса → смещение не вычисляется, callback вызывается с `recv_buf` (IP-пакет со смещения 0)
+
+### `pkt_capture_close(cap)`
+
+Закрывает `fd4` и `fd6`.
+
+## 4. Обработка DNS-пакетов: `src/dns.c` + `src/main.c`
+
+### Структуры DNS (`include/dns.h`)
+
+```c
+dns_answer_t { domain[256]; ip[16]; family; }   // один A/AAAA-ответ
+dns_cname_t  { source[256]; target[256]; }      // одна CNAME-запись
+dns_result_t {
+    answers[DNS_MAX_ANSWERS]; answer_count;
+    cnames[DNS_MAX_CNAMES];   cname_count;
+}
+
+#define DNS_MAX_ANSWERS  128
+#define DNS_MAX_CNAMES    32
+```
+
+### `extract_dns_payload(pkt, pkt_len, dns_len)`
+
+1. Определяет версию IP (4/6), вычисляет `ip_hdr_len` и `transport_offset`
+2. Проверяет `src_port == 53`
+3. Определяет протокол (UDP/TCP)
+4. TCP: пропускает 2-байтовый length prefix, `dns_len = MIN(prefix, pkt_remaining)`
+5. Возвращает указатель на DNS-данные
+
+### `dns_parse_response(dns_data, dns_len, result)`
+
+1. Проверяет `DNS_FLAG_QR` (response)
+2. Пропускает Question-секцию
+3. Итерирует Answer-секцию: `TypeA` → `answers[]`, `TypeAAAA` → `answers[]`, `TypeCNAME` → `cnames[]`
+4. `dns_decode_name`: декодирует DNS-имена с поддержкой compression pointers (до 128 hop защиты)
+
+### `process_dns_packet(pkt, pkt_len, user_data)` (`main.c`)
+
+1. `extract_dns_payload` + `dns_parse_response` → `dns_result_t` (статическая переменная в функции)
+2. Итерирует уникальные домены (`processed[64][256]` на стеке) — для каждого:
+   - Сбор IPv4/IPv6 батчей из `answers` (до 32 каждого семейства)
+   - `process_hostname_event(domain, result.cnames, result.cname_count, ..., "DNS")` — общий хелпер с L7-каналом; CNAME-записи передаются как `dns_cname_t` напрямую из результата парсинга, без промежуточного копирования
+
+### `process_hostname_event(domain, cnames, ipv4_batch, ipv4_count, ipv6_batch, ipv6_count, source_tag, allow_conntrack_flush)`
+
+Возвращает `int` — число реально добавленных (новых) IP (`all_new_count`).
+
+1. `match_domain_with_cname` → `ipset_name` (или `NULL` — пропуск)
+2. `LOG_MATCH "[<tag>] <domain> -> <ipset>"` (или `"<domain> via <matched_domain> -> <ipset>"` при CNAME)
+3. `ipset_add_batch` для IPv4 (`setname`, `with_timeout=1`)
+4. `ipset_add_batch` для IPv6 (`setname + "v6"`, `with_timeout=1`)
+5. `LOG_PROCESSED` для каждого реально добавленного (нового) IP
+6. `conntrack_flush_for_ips()` если `allow_conntrack_flush=1` И `conntrack_flush=1` И есть новые IP (для каждого нового IP DUMP+DELETE по dst; DELETE отправляется только при существующих conntrack-записях к этому IP, иначе DUMP вхолостую). DNS-канал передаёт `allow_conntrack_flush=1`; L7-канал — `0` (полный DUMP за L7 не выполняется, вместо него — точечный DELETE по 5-tuple в `process_hostname_event_l7`).
+
+### `process_hostname_event_l7(host, proto, conn)`
+
+Обёртка из L7-канала (вызывается из `l7_dispatch.c`). Принимает `const l7_conn_t *conn` (семейство, IP/порты клиента и сервера). Строит `parsed_cidr_t` из `conn->server_ip`/`conn->family`, вызывает `process_hostname_event(..., /*allow_conntrack_flush*/0)` с тегом `"TLS-SNI"` / `"HTTP-Host"`. Если возврат `> 0` (IP добавлен впервые) И `conntrack_flush=1` — `conntrack_delete_conn(&g_conntrack, conn)`: точечное удаление conntrack-записи триггернувшего соединения по полному 5-tuple (client↔server, TCP-порты). L7 ловит ClientHello уже **установленного** соединения, поэтому запись всегда существует и удаление надёжно вынуждает реконнект по политике (см. §18.3). Полного DUMP таблицы здесь нет — один netlink-DELETE, O(1).
+
+## 5. Матчинг доменов: `src/watchlist.c`
+
+### `match_domain(ht, policy_order, order_count, domain, domain_len)`
+
+1. Точное совпадение через `ht_lookup()`
+2. Суффиксный поиск: для каждой точки в домене проверяет parent-домен
+3. Приоритет: `policy_order` (меньше индекс = важнее); тай-брейкер по специфичности (длиннее = специфичнее)
+4. Точное: `specificity = domain_len + 1`; суффиксное: `specificity = suffix_len`
+
+### `match_domain_with_cname(ht, policy_order, order_count, domain, cnames, cname_count, matched_domain)`
+
+BFS-обход CNAME-цепочки (до `MAX_CNAME_CHAIN=16` шагов). Поиск двунаправленный: для каждого текущего домена проверяются как `cnames[i].from == current` (forward), так и `cnames[i].to == current` (backward). Защита от циклов через `visited_hashes` (FNV-1a). Возвращает первый совпавший `ipset_name` и `matched_domain` (через out-параметр).
+
+### `parse_watchlist_lines(path, on_target, on_domain, user)`
+
+Единый построчный разборщик `domain.conf`:
+
+- Строки читаются через `getline()` (динамический буфер) — длина строки не ограничена
+- Цель (после последнего `/`) копируется в `target_buf[64]`; домены-часть режется in-place и разбивается `strtok_r` по запятой
+- `on_target` вызывается один раз на строку; `on_domain` — для каждого не-`geosite` домена (уже lowercase)
+- `geosite:`-записи пропускаются на этом этапе
+
+### `parse_watchlist(path, ht)`
+
+Обёртка над `parse_watchlist_lines`; `ht_insert(match_subs=1)` для каждого домена.
+
+### `parse_watchlist_classified` (`routing.c`)
+
+`on_target` классифицирует через `drm_classify_target` и сортирует в `policy_names[]`/`iface_names[]`; `on_domain` делает `ht_insert`. Итог: `LOG_INFO "domain.conf: %d policies, %d interfaces"`.
+
+### `sort_policies(names, count, order, order_count)`
+
+- Каждому имени присваивается приоритет: индекс в `order` (отсутствует → `order_count`)
+- Один `qsort` по составному ключу `(priority, strcmp)`: элементы из `order` идут первыми в его порядке, остальные — алфавитно
+- Буферы рассчитаны на `MAX_POLICY_ORDER + MAX_INTERFACES` (128) элементов — функция безопасна для объединённого массива policy + iface
+- Элементы `order`, отсутствующие в `names` → `LOG_WARN`
+
+> `parse_cidr_policy_headers` перенесён в `src/geodat.c` — вся грамматика CIDRfile живёт в одном модуле (см. раздел 12).
+
+### PolicyOrder — единственный механизм приоритезации целей
+
+Работает на **ДВУХ уровнях независимо**:
+
+**1) Порядок CONNMARK-правил в `iptables/mangle/PREROUTING`**
+
+`main` вызывает `sort_policies` дважды: для `policy_names` (для `rci_create_policies`) и для объединённого `all_names` (policy + iface вместе) — результат пишется в `g_all_sorted[]`. `apply_unified_connmark_rules` итерирует этот массив последовательно и добавляет правила `CONNMARK` в этом порядке через `iptables-restore --noflush`. Поскольку `iptables` проверяет правила сверху вниз и берёт первое совпадение, при попадании пакета в несколько `ipset` одновременно (например, IP принадлежит сразу `/HydraRoute` и `/RU` в `ip.list`, или один IP пришёл в DNS-ответах разных доменов разных политик) выигрывает цель, стоящая раньше в `PolicyOrder`.
+
+**2) Выбор политики при матчинге домена (`match_domain` через `get_policy_priority`)**
+
+Если домен зарегистрирован сразу в нескольких целях (например, в watchlist прописано `google.com/HydraRoute` и `mail.google.com/RU`, или CNAME-цепочка проходит через домены разных политик), `match_domain` среди всех совпадений выбирает с минимальным индексом в `policy_order`; при равных priority — с большей `specificity` (длина совпавшего суффикса; точное совпадение = `len+1`, выигрывает над любым суффиксным). Цели не из `policy_order` получают `priority=order_count` («последние»).
+
+Имена политик Keenetic и имена сетевых интерфейсов смешиваются в одном `PolicyOrder`; hrneo автоматически различает их через `drm_classify_target` по `/sys/class/net`.
+
+`SIGUSR1` не перечитывает `hrneo.conf` и сам `PolicyOrder`; `apply_unified_connmark_rules` пересоздаёт правила в **уже** загруженном порядке `g_all_sorted[]`. Для применения нового `PolicyOrder` требуется `neo restart`.
+
+## 6. Хеш-таблица доменов: `src/util.c`
+
+### `pool_chunk_t`
+
+```c
+struct pool_chunk {
+    struct pool_chunk *next;          // следующий чанк
+    size_t             used;          // байт занято в чанке
+    char               data[POOL_CHUNK_SIZE];  // 256 КБ данных
+};
+```
+
+### `domain_hashtable_t`
+
+| Поле | Назначение |
+|------|------------|
+| `buckets[8192]` | цепочки `domain_node_t` |
+| `count` | количество записей |
+| `pool_head`, `pool_tail` | linked list чанков (аллокатор строк и нод) |
+| `ipset_name_cache[MAX_POLICY_ORDER][64]` | кэш строк-имён политик |
+| `ipset_name_ptrs[MAX_POLICY_ORDER]` | соответствующие указатели в pool |
+| `ipset_name_count` | размер кэша |
+
+### Функции
+
+**`ht_create()`** — создаёт таблицу + первый `pool_chunk_t`.
+
+**`ht_insert(ht, domain, domain_len, ipset_name, match_subs)`:**
+
+- FNV-1a хеш → индекс бакета
+- Проверка дубликата домена (возврат 0 без изменений)
+- Дедупликация `ipset_name`: поиск в `ipset_name_cache[]` (`O(MAX_POLICY_ORDER)`), переиспользует ptr
+- Нода и строки хранятся в `pool_chunk_t` через `ht_pool_alloc()`
+- Возвращает `1` при вставке, `0` при дубле, `-1` при ошибке аллокации
+
+**`ht_lookup(ht, domain, domain_len)`** — `O(1)` средний.
+
+**`ht_destroy(ht)`** — освобождает чанки linked list + сам `ht`.
+
+### Вспомогательные функции
+
+- `to_lower_inplace()` — ASCII lowercase in-place
+- `trim_whitespace()` — обрезка пробелов
+- `fnv1a_hash()` — inline в `hrneo.h`
+- `mkdir_p()` — рекурсивное создание каталогов
+- `run_command_output()` — `fork`/`execvp` с захватом `stdout`+`stderr`
+- `run_command_stdin()` — `fork`/`execvp` с подачей `stdin`
+
+## 7. Управление ipset: `src/ipset_nl.c`
+
+### `ipset_manager_t`
+
+| Поле | Назначение |
+|------|------------|
+| `fd` `int` | netlink-сокет (`NETLINK_NETFILTER`, long-lived) |
+| `seq`, `pid` | для netlink-сообщений |
+| `default_timeout` | единый timeout (сек) для DNS-path ADD всех сетов; 0 = без timeout. Устанавливается в `main` из `IpsetEnableTimeout`/`IpsetTimeout` |
+| `set_names[IPSET_MAX_SETS=512][64]` | кэш имён существующих ipset |
+| `set_count` | количество кэшированных имён |
+
+### `ipset_create(mgr, name, type, family, timeout, maxelem)`
+
+- `ipset_query_revision()` — `IPSET_CMD_TYPE` через netlink: отправляет TYPE-запрос, парсит ответ, извлекает `IPSET_ATTR_REVISION` (при ошибке → 0)
+- `IPSET_CMD_CREATE` через netlink с флагами `NLM_F_CREATE | NLM_F_EXCL`; атрибуты: `PROTOCOL`, `SETNAME`, `TYPENAME`, `REVISION`, `FAMILY`
+- DATA-атрибут добавляется если `timeout > 0` OR `maxelem > 0`
+- `errno=17` (`EEXIST`) → `LOG_DEBUG "Set %s already exists"`, добавляет в кэш, возвращает 0
+- Прочие ошибки: `LOG_ERROR` + возврат `errno`
+- При успехе: `LOG_DEBUG "Set %s created"`, добавляет в `set_names` кэш
+
+### `ipset_flush(mgr, name)`
+
+`IPSET_CMD_FLUSH` через netlink.
+
+### `ipset_add_batch(mgr, set_name, entries, count, with_timeout, new_count, new_indices)`
+
+1. `has_timeout = mgr->default_timeout > 0`
+2. Фильтрует service IP через `is_service_ip()` (`LOG_FILTERED`)
+3. Формирует netlink-сообщения через `build_ipset_add_msg()`: `TIMEOUT`-атрибут добавляется при `has_timeout=1`; значение = `default_timeout` при `with_timeout=true`, иначе явный `0` (постоянная запись CIDR-пути)
+4. Чанки по `IPSET_CHUNK_SIZE=256`: send все сообщения чанка, затем recv все ответы
+5. `with_timeout=true`: `NLM_F_EXCL` (повторное добавление → `IPSET_ERR_EXIST` без обновления `timeout`); `new_indices` заполняется только при `with_timeout=true`
+6. `with_timeout=false`: `NLM_F_CREATE` без `NLM_F_EXCL`; `new_indices` не заполняется
+7. Обработка ошибок netlink ack:
+   - `err->error == 0` → запись добавлена, индекс пишется в `new_indices` при `with_timeout=1`
+   - `IPSET_ERR_HASH_FULL` (4101) → `LOG_WARN "ipset '%s' full"`
+   - `IPSET_ERR_EXIST` (4103) → молча игнорируется
+   - Прочие коды → `LOG_DEBUG "Netlink ADD error: errno=%d"`
+
+### Прочие функции
+
+- `ipset_refresh_set_list()` — `ipset list -n` → заполняет `set_names`
+- `ipset_set_exists()` — линейный поиск по `set_names`
+- `ipset_add_to_cache()` — добавляет имя в `set_names`
+
+### `is_service_ip()`
+
+- IPv4: первый октет == 0 или 127
+- IPv6: `::` (unspecified), `::1` (loopback)
+
+## 8. Маршрутизация и маркировка
+
+### A) Policy-Based (через политики Keenetic)
+
+**Файл:** `src/iptables.c`, функция `apply_unified_connmark_rules()`.
+
+1. `get_br0_global_ipv6()`: `ip addr show br0` — получает IPv6-сеть `scope global` (нужна только она: IPv6-правила для политик ставятся лишь при её наличии)
+2. Внутренний retry loop (до 5 попыток, sleep 4s): `rci_get_policies_with_retry()` + проверка наличия `mark` для каждой не-interface цели. Если хотя бы одна политика без `mark` — повтор через 4 секунды
+3. Оба семейства обрабатываются единым кодом через массив дескрипторов `connmark_family_t[2]` (`{ipt_cmd, restore_cmd, rules_cache, batch}`: `iptables`/`iptables-restore` и `ip6tables`/`ip6tables-restore`); для каждого семейства кэшируются текущие правила `-w -t mangle -S PREROUTING`
+4. Для каждого `unified_target` × семейство:
+   - **Интерфейс:** `mark = fwmark` (hex); **Политика:** `mark` из RCI-ответа; если `mark` пуст — цель пропускается с `[WARN]`
+   - `find_mark_in_rules()` по кэшу семейства; правило актуально → пропуск
+   - IPv6-правило для политики не создаётся, если у `br0` нет глобального IPv6
+   - Если `mark` изменился — `remove_connmark_rules_for()`, пара правил добавляется в batch семейства
+5. Каждый непустой batch → один вызов `iptables-restore --noflush` / `ip6tables-restore --noflush`
+
+#### Правила CONNMARK (`GlobalRouting=false`)
+
+```
+-A PREROUTING -m mark ! --mark 0xffffaa0/0xffffff0
+   -m connmark --mark 0x0/0xffff0000
+   -m set --match-set <ipset> dst
+   -j CONNMARK --set-xmark 0x<mark>/0xffffffff
+
+-A PREROUTING -m set --match-set <ipset> dst
+   -j CONNMARK --restore-mark --nfmask 0xffffffff --ctmask 0xffffffff
+```
+
+`GlobalRouting=true`: условие `! --mark 0xffffaa0/0xffffff0` убирается.
+
+#### `unified_target_t` (`include/iptables.h`)
+
+| Поле | Тип | Назначение |
+|------|-----|------------|
+| `pair` | `ipset_pair_t` | ipv4/ipv6 имена |
+| `is_interface` | `int` | флаг интерфейса DirectRoute |
+| `fwmark` | `int` | назначенный fwmark (для интерфейсов) |
+
+`g_all_sorted[]` объединяет политики и интерфейсы в единый отсортированный массив.
+
+`cleanup_connmark_rules(pairs, count)`: удаляет CONNMARK-правила из `mangle/PREROUTING`.
+
+### Б) DirectRoute (прямая маршрутизация на интерфейс)
+
+**Файл:** `src/routing.c`.
+
+#### `direct_route_manager_t`
+
+| Поле | Назначение |
+|------|------------|
+| `config` | `*config_t` |
+| `interfaces[MAX_INTERFACES=64]` | `interface_info_t (name, state)` |
+| `interface_count` | счётчик интерфейсов |
+| `routes[MAX_INTERFACES]` | `interface_route_t (interface_name, ipset_pair, fwmark, table_id)` |
+| `route_count` | счётчик маршрутов |
+| `next_fwmark`, `next_table_id` | следующий свободный fwmark/table_id |
+
+#### Инициализация
+
+1. `parse_watchlist_classified()` → раздельные `policy_names[]`, `iface_names[]`
+2. Для каждого `iface`: `drm_allocate_fwmark()` + `drm_allocate_table_id()` + `drm_register_route()` (создаёт `ipset_pair`: `ipv4 = iface_name`, `ipv6 = iface_name + "v6"`)
+
+#### Активность интерфейса
+
+`drm_iface_active(state)`: `"up"` или `"unknown"` — активен. DOWN → `blackhole`-маршрут в таблице. Установка маршрута по состоянию инкапсулирована в `drm_install_route(iface, table_id, active, ipv6)` — единая функция и для стартовой настройки, и для реакции на смену состояния.
+
+#### Настройка маршрутов (`drm_setup_all_routes`)
+
+```
+ip [-6] rule  add priority N fwmark 0x<mark> table <tableID>
+ip [-6] route add default dev <interface> table <tableID>   # или blackhole если DOWN
+```
+
+`"can't find device"` → `blackhole` вместо ошибки.
+
+**IP Rule Priority:** `9 - (table_id - table_start)`, минимум 1.
+
+#### Прочие функции
+
+- `drm_scan_interfaces()` — читает `/sys/class/net/`, для каждого только `operstate`
+- `drm_classify_target()` — линейный поиск по имени в `interfaces[]`
+- `drm_lookup_state()` — состояние интерфейса по имени (`"unknown"` если не найден)
+- `drm_update_used_states()` — обновляет `operstate` только для `routes[]`
+- `drm_get_states(drm, states, count)` — снимок текущих состояний `routes[]` перед обновлением
+- `drm_handle_state_changes(drm, old_states, old_count)` — сравнивает старые и новые; при изменении — `drm_update_route_on_state_change(iface, table_id, new_state)`: `drm_flush_routing_table(table_id)` + `drm_install_route` для обоих семейств
+
+## 9. Обработчик сигналов: `src/signal_handler.c`
+
+`signal_mgr_t { sig_fd, timer_fd }` — один контейнер для `signalfd` и debounce-`timerfd`.
+
+### `signal_mgr_init(m)`
+
+- `sigprocmask(SIG_BLOCK, ...)` повторно (`main` уже блокирует) — защита
+- `signalfd(SFD_CLOEXEC)` → `m->sig_fd`
+- `timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC)` → `m->timer_fd`
+
+### Прочие функции
+
+- `signal_mgr_close(m)` — close обоих `fd`
+- `signal_mgr_arm_timer(m, seconds)` — one-shot через `timerfd_settime`
+- `signal_mgr_read_timer(m)` — `read()` expirations
+
+### Логика обработки (`main.c`, epoll loop)
+
+**`SIGUSR1`:**
+
+- `timer_active=false`: `perform_update()` (при `g_drm_active` — `drm_get_states` + `drm_update_used_states` + `drm_handle_state_changes`; всегда — `apply_unified_connmark_rules`; при `g_l7_active && g_l7_wan[0]` — `l7_firewall_install`); `signal_mgr_arm_timer(SIGUSR1_DEBOUNCE_SEC)`; `timer_active=1`
+- `timer_active=true`: `pending_update=1`
+
+**Debounce timer expired:**
+
+- `signal_mgr_read_timer`; если `pending_update=1` → повторный `perform_update()`; сброс `timer_active=0` и `pending_update=0`
+
+**`SIGINT`/`SIGTERM`:** `g_shutdown=1` → выход из epoll loop → cleanup.
+
+## 10. Файл конфигурации: `src/config.c` + `src/params.c`
+
+Формат: `key=value`, комментарии `#`, пустые строки игнорируются. `GeoIPFile` и `GeoSiteFile` могут повторяться (до `MAX_GEO_FILES=16`). `PolicyOrder` — через запятую, до `MAX_POLICY_ORDER=64`.
+
+Описание параметров — таблица `PARAMS[]` в `src/params.c` (`param_def_t`: `config_key`, `cli_flag`, `type`, offset-ы в `config_t`, `set_bit`, `default_int`, `help_arg`, `help_text`, `help_default`). Один ряд на параметр, драйвит `config_read`, `args_parse`, `args_apply`, `print_help`, `config_generate`. Типы: `PT_BOOL`, `PT_INT`, `PT_INT_POS`, `PT_STRING`, `PT_PATH`, `PT_REPEAT_PATH`, `PT_POLICY_ORDER`.
+
+Применение значения — единая функция `param_apply(cfg, p, val, strict)` (там же, в `params.c`): её используют и парсер конфига (`strict=0` — невалидное значение → `LOG_WARN`, остаётся дефолт; `PT_BOOL` лояльно трактует всё, кроме `true`, как `false`), и CLI (`strict=1` — невалидное значение → ошибка и выход 1). Числовые значения валидируются полностью (`strtol` + проверка остатка строки).
+
+### `config_read(path, cfg)`
+
+- `memset(cfg, 0)` + применение `default_int` / `help_default` для каждого `PARAMS[i]`
+- `fopen(path)`; при ошибке возвращает `-1` (но `main` продолжит, если путь дефолтный)
+- Построчно `key=value` через `param_apply(cfg, p, val, 0)`; невалидное значение → `LOG_WARN "Invalid %s value"` + дефолт
+
+### `config_generate(target)`
+
+- `target` пустой → `hrneo.conf` рядом с бинарём (`readlink /proc/self/exe → dirname`)
+- `target`-каталог (или со слешем) → `<dir>/hrneo.conf`
+- `target`-файл → записывается ровно по пути
+- Записывает все 27 ключей с дефолтами; пустые multi-value ключи как `Key=`
+
+> Полное описание ключей и поведения — в `docs/HRNEO.CONF.md`.
+
+### Формат watchlist (`domain.conf`)
+
+```
+домен1,домен2,.суффикс,geosite:TAG/ПолитикаИлиИнтерфейс
+```
+
+Пример: `googlevideo.com,youtube.com,geosite:google/HydraRoute`
+
+### Формат CIDR (`ip.list`)
+
+```
+##Описание блока (необязательно)
+/ПолитикаИлиИнтерфейс
+103.224.0.2/32
+104.16.0.0/12
+geoip:ru
+
+##Отключённый блок
+#/ПолитикаИлиИнтерфейс
+45.67.123.19/32
+```
+
+#### Синтаксис блоков
+
+- Активный блок начинается с `/ИмяПолитики` и завершается: пустой строкой, строкой `##...`, новым `/...` или новым `#/...`
+- `##...` — одновременно комментарий и терминатор текущего блока
+- `/...` — заголовок нового активного блока и терминатор предыдущего
+- `#/...` — заголовок нового отключённого блока; записи внутри игнорируются
+- Пустая строка — терминатор блока
+
+#### Автоматически добавляемый раздел при превышении лимита ipset
+
+```
+##impossible to use
+#/Too-big-geoip-tag
+geoip:ru
+```
+
+## 11. CLI аргументы: `src/args.c`
+
+### `cli_args_t` (`include/args.h`)
+
+| Поле | Назначение |
+|------|------------|
+| `config_path` `char[512]` | путь к конфигу (`--config`); пусто = использовать `DEFAULT_CONFIG_PATH` |
+| `genconfig_target` `char[512]` | путь для `--genconfig` |
+| `set_mask` `uint32_t` | битовая маска: по одному биту на каждый параметр |
+| `overlay` `config_t` | scratch-конфиг, в который CLI-флаги парсятся тем же `param_apply`, что и файл; дублирующего набора полей нет |
+
+### `args_parse(argc, argv, out)`
+
+- `memset(out, 0)` в начале
+- `--version`/`-v`: `printf "hrneo vVERSION"`, возвращает 1
+- `--help`/`-h`: выводит справку, возвращает 2
+- `--config <path>`: парсит путь, продолжает
+- `--genconfig [path]`: возвращает 3 (`main → config_generate`)
+- Для всех остальных флагов — поиск по `PARAMS[]`; неизвестный → `"unknown option"`, `return -1`
+- Значение применяется в `out->overlay` через `param_apply(&out->overlay, p, val, 1)`; невалидное → `"invalid value"`, `return -1`
+- При успехе `set_mask |= p->set_bit`
+- Возвращает `0` (успех), `1` (`--version`), `2` (`--help`), `3` (`--genconfig`), `-1` (ошибка)
+
+### `args_apply(args, cfg)`
+
+- Для каждого `PARAMS[i]` с `set_mask & p->set_bit` — копирует поле из `args->overlay` в `cfg` по `cfg_offset` (один и тот же offset для обоих, т.к. overlay — тоже `config_t`)
+- `PT_REPEAT_PATH` / `PT_POLICY_ORDER` заменяют массив полностью (копируются `count` элементов + счётчик)
+
+> Полный список флагов — `docs/HRNEO.CONF.md`.
+
+## 12. GeoSite и GeoIP: `src/geodat.c`
+
+### Типы данных
+
+```c
+geoip_entry_t    { ip[16], prefix uint32, ip_len uint8 }
+geosite_domain_t { type uint32, value char* }
+```
+
+### `geosite_domain_t.type`
+
+| Значение | Тип | Поведение |
+|----------|-----|-----------|
+| `0` | Plain (keyword) | пропускается с `[WARN]` |
+| `1` | Regex | пропускается с `[WARN]` |
+| `2` | Domain (домен + поддомены) | `ht_insert` с `match_subs=1` |
+| `3` | Full (только точное имя) | `ht_insert` с `match_subs=0` |
+
+### Парсинг `.dat`-файлов
+
+- Формат: v2ray/xray protobuf, потоковое чтение (`setvbuf 64КБ`)
+- `read_varint()` / `read_varint_stream()` для streaming
+- `pb_next_field(data, len, &pos, &field)` — единый итератор protobuf-полей (varint / length-delimited, неизвестные wire-type → стоп); все парсеры построены на нём, дублирующейся skip-логики нет
+- `scan_dat_file(file, target_upper, visitor, ctx)` — generic stream-сканер (visitor-pattern: `count_geoip_visitor` / `extract_geoip_visitor` / `extract_geosite_visitor`)
+- `for_each_geoip_cidr(body, len, fn, ctx)` — обход CIDR-сообщений тега; подсчёт (`count_geoip_entry`) и извлечение (`append_geoip_entry`) — два callback'а одного обходчика
+- `extract_geoip_cidrs(file, country)` / `extract_geosite_domains(file, tag)` — полный скан до EOF
+- `parse_cidr_body()`, `parse_geosite_body()`, `parse_geosite_domain()` — тонкие switch'и по номеру protobuf-поля поверх `pb_next_field`
+- Хелперы: `upcase_inplace`/`upcase_buf` (единственное место ASCII-uppercase), `extract_geoip_country` (разбор `geoip:<tag>`: trim + копия), `cidr_classify` + `copy_block_name` (грамматика строк CIDRfile: BLANK / DISABLED / HEADER / ENTRY — один классификатор для сканера, мигратора и `parse_cidr_policy_headers`)
+
+### `deduplicate_domains(domains, count)`
+
+1. Фильтрует только `Type=2` и `Type=3`
+2. Сортирует по количеству точек (от меньшего к большему — root → leaf)
+3. Удаляет поддомены через временную хеш-таблицу: если домен суффикс уже принятого — отбрасывается
+
+### `parse_geosite_rules(watchlist_path, rules, max_rules)`
+
+- Читает `domain.conf` через `getline()`, собирает все `geosite:`-записи
+- Возвращает `geosite_rule_t[]` (`tag + policy_name`)
+
+### `build_geosite_domain_map(filePaths, fileCount, rules, ruleCount, ht)`
+
+- Для каждого `rule.tag` обходит все `filePaths`, объединяет домены, `deduplicate`
+- `Type=2`: `ht_insert(val, match_subs=1)`
+- `Type=3`: `ht_insert(val, match_subs=0)`
+- `ht_insert` не перезаписывает существующие → приоритет у `domain.conf`
+
+### `parse_cidr_policy_headers(path, names, max_names)`
+
+- Собирает уникальные имена из заголовков `/ИмяПолитики` (классификация строк через `cidr_classify`)
+- `##...` и `#/...` строки пропускаются
+
+### `add_cidr_to_ipsets(mgr, cidr_path, geoip_files, geoip_count, maxelem)`
+
+`effective_limit = (maxelem > 0) ? maxelem : IPSET_DEFAULT_MAXELEM (262144)`.
+
+#### Фаза 1 (пресканирование CIDRfile при `geoip_count > 0`)
+
+- `scan_cidrfile_blocks(verbose=0)` + `phase1_on_entry`
+- Собирает все уникальные `geoip:TAG` из активных блоков
+- Для каждого нового тега → `count_geoip_cidrs_all_files()` → `geoip_tag_count_t` кэш
+- `migrate_threshold = effective_limit > CIDR_MIGRATE_HEADROOM ? effective_limit − CIDR_MIGRATE_HEADROOM : 0` (`CIDR_MIGRATE_HEADROOM=5000`)
+- **Oversized:** в том же проходе `tag.ipv4 > migrate_threshold || tag.ipv6 > migrate_threshold` → `LOG_WARN`, тег копится в `oversized[]` (детекция совмещена с подсчётом в `phase1_on_entry`, без отдельного цикла)
+- После прохода при наличии oversized → `cidrfile_migrate_oversized()` → `LOG_INFO`
+
+#### `cidrfile_migrate_oversized(path, oversized[], count)`
+
+- Читает все строки через `getline()` в динамически растущий массив `cidr_line_t` (старт 4096, ×2 при заполнении), сохраняя `strdup`
+- **Pass 1:** присваивает `block_id`, помечает oversized geoip-строки `keep=0`, считает активные записи на блок
+- **Pass 2:** блоки без активных записей → заголовок `keep=0`, предшествующие `##` и пустые строки `keep=0`
+- Записывает `keep=1` в `.tmp`, дописывает секцию:
+
+  ```
+  ##impossible to use
+  #/Too-big-geoip-tag
+  geoip:<tag>
+  ...
+  ```
+
+- `rename(.tmp → path)` атомарно
+
+#### Фаза 2 (основная)
+
+- `ipset_refresh_set_list()`
+- `scan_cidrfile_blocks(verbose=1)` + `phase2_on_entry`
+- Блок активен если `ipset_set_exists()` для ipv4 ИЛИ ipv6 имени
+- Oversized теги пропускаются
+- Для каждого `geoip:TAG`: cumulative check `usage[v4_target].count + cached_ipv4 > effective_limit` → `LOG_WARN` + `allow_v4=0`; аналогично IPv6
+- GeoIP-записи и статические CIDR группируются в `batch_t` по `target_set` (`batch_find_or_add` через open-addressed FNV-1a индекс, `NAME_INDEX_SLOTS=256`)
+- Статические CIDR: `usage[target_set].count + 1 > effective_limit` → одно `LOG_WARN` (`warned` флаг), пропуск
+- Все батчи отправляются через `ipset_add_batch(with_timeout=0)` → постоянные записи
+
+`usage[]`/`batches[]` адресуются через общий open-addressed FNV-1a индекс `name_index_t` (`NAME_INDEX_SLOTS=256`): один `name_index_lookup` с callback-доступом к имени (`name_at_fn`) обслуживает оба массива — заменяет `O(n)` линейный скан при большом числе целей.
+
+## 13. RCI (Remote Configuration Interface) Keenetic: `src/rci.c`
+
+### Архитектурное решение
+
+hrneo взаимодействует с роутером Keenetic **исключительно через RCI HTTP/JSON API** на `127.0.0.1:79`. **НЕ используются:** `ndmc`, `ndmq`, `curl`, `wget`, `jq`, `python` и любые другие userspace-утилиты роутера. Весь HTTP-клиент и JSON-парсер — самописные, целиком в `src/rci.c` (~262 строки). Это:
+
+- убирает зависимость от наличия и версий системных утилит на роутере
+- устраняет `fork`/`exec` на каждое обращение (важно на `SIGUSR1`, где `apply_unified_connmark_rules` может делать до 5 запросов подряд)
+- сохраняет совместимость со статической сборкой (никаких `libcurl`/`cJSON` в `LIBS`)
+- даёт предсказуемые таймауты через `SO_RCVTIMEO`/`SO_SNDTIMEO`
+
+### Константы (`include/rci.h`)
+
+| Константа | Значение | Назначение |
+|-----------|----------|------------|
+| `RCI_PORT` | `DEFAULT_API_PORT` (79) | захардкожен, параметра конфига нет |
+| `RCI_MAX_RESPONSE` | `1024 * 1024` (1 МБ) | буфер выделяется через `malloc` при `rci_client_init` |
+| `POLICY_API_MAX_RETRIES` | `5` | попыток на `GET /rci/show/ip/policy/` |
+| `POLICY_API_RETRY_DELAY` | `3` (секунды) | интервал между попытками |
+| `RCI_TIMEOUT_SEC` | `10` | `SO_RCVTIMEO` и `SO_SNDTIMEO` |
+
+### `rci_client_t { raw_buf, response_buf }`
+
+- `raw_buf` — сырой HTTP-приём (`RCI_MAX_RESPONSE + 4096`; +4096 для заголовков)
+- `response_buf` — буфер тела ответа после парсинга (`RCI_MAX_RESPONSE`)
+- Оба выделяются в `rci_client_init()` и переиспользуются весь lifetime демона. Никаких `malloc` при `SIGUSR1` → нет фрагментации heap, нет latency
+
+`rci_client_close`: `free` обоих буферов.
+
+### Сетевой клиент
+
+#### `rci_connect()`
+
+- `socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0)`
+- `SO_RCVTIMEO` / `SO_SNDTIMEO` = 10 секунд (отдельно для send и recv)
+- `connect` к `127.0.0.1:79` (`INADDR_LOOPBACK` через `htonl`)
+- HTTP/1.0 `Connection: close` (по умолчанию) — каждый запрос = новое TCP-соединение, ответ читается до EOF (закрытия сокета сервером)
+
+#### `rci_request(c, method, path, body, body_len, response, response_max)`
+
+1. `rci_connect`; при неудаче — `LOG_ERROR` + `return -1`
+2. Формирование HTTP-заголовка через `snprintf` (не `fork+printf`):
+
+   ```http
+   <METHOD> <PATH> HTTP/1.0
+   Host: localhost
+   Content-Type: application/json     # только при body
+   Content-Length: <N>                # только при body
+
+   ```
+
+3. `send` заголовка; при `body` — отдельный `send` цикла `body_len` байт
+4. `recv` цикл в `c->raw_buf` (до `RCI_MAX_RESPONSE+4096-1` байт или EOF/0)
+5. Парсинг ответа:
+   - `strstr("\r\n\r\n")` — граница заголовков и тела
+   - `strncmp(raw, "HTTP/", 5)` — sanity-check
+   - `strchr(raw, ' ') + atoi` — код статуса; не 200 → `LOG_ERROR` + `return -1`
+6. `memcpy` тела в `response` (обрезка до `response_max-1`)
+
+### Парсер JSON ответа `/rci/show/ip/policy/`
+
+Ответ имеет стабильный формат (политики Keenetic — простая структура, безопасно парсить вручную):
+
+```json
+{
+  "HydraRoute": {"description":"...", "mark":"0x21", ...},
+  "RU":        {"description":"...", "mark":"0x22", ...}
+}
+```
+
+#### `find_matching_brace(open_brace)` — сканер с подсчётом фигурных скобок
+
+- `depth++` на `{`, `depth--` на `}`; возврат при `depth==0`
+- `in_string`-флаг переключается на не-экранированной `"`; внутри строки скобки игнорируются (защита от литералов вида `"value with {}"`)
+- Не полноценный JSON-парсер (нет обработки escape-последовательностей внутри значений, нет валидации синтаксиса); достаточно для формата RCI
+
+#### `rci_get_policies(c, policies, max_policies)`
+
+1. `rci_request GET /rci/show/ip/policy/`
+2. Поиск первого `{` (root)
+3. Цикл по парам `{key: {...}}`:
+   - `strchr('"')` / `strchr('"')` — извлечение имени политики (`key`)
+   - `strchr('{')` + `find_matching_brace` — границы объекта
+   - В объекте: `strstr("\"mark\"")` → `strchr(':')` → `strchr('"')` → `strchr('"')` — извлечение значения `mark`
+   - Префикс `"0x"`/`"0X"` в начале значения удаляется (для прямой подстановки в `--set-xmark`)
+   - `policy_mark_t { name[MAX_POLICY_NAME=64], mark[16] }` заполняется
+   - `LOG_DEBUG "RCI policy: %s mark=0x%s"`
+4. Возврат `count` политик
+
+Политики **БЕЗ** ключа `"mark"` (например, только что созданные роутером, у которых ещё не назначен идентификатор маркировки) пропускаются — будут дозаявлены на следующей итерации retry-loop.
+
+#### `rci_get_policies_with_retry(c, policies, max_policies)`
+
+- До `POLICY_API_MAX_RETRIES=5` попыток с интервалом `POLICY_API_RETRY_DELAY=3` секунды; `LOG_WARN` при неудаче, `LOG_ERROR` при исчерпании
+- Этот wrapper защищает от транзитных проблем сети/перегрузки `ndmsv`; если roundtrip <10s — все 5 попыток успеют до общего timeout
+
+### Создание политик
+
+#### `rci_create_policies(c, names, count)`
+
+1. Формирование тела `POST` вручную:
+
+   ```json
+   [{"parse":"ip policy <name1>"},
+    {"parse":"ip policy <name2>"},
+    ...]
+   ```
+
+   (массив до 4 КБ; ~50 байт на политику, до ~80 политик в одном запросе). Команда `parse` эквивалентна вводу строки в CLI Keenetic — `ip policy <name>` создаёт пустую политику если её нет, no-op если есть.
+2. `POST /rci/` с этим body
+3. `LOG_INFO "Policy creation commands executed"`
+4. Безусловный вызов `rci_save_config()` — иначе изменения не сохранятся в startup-config роутера и пропадут при перезагрузке
+
+#### `rci_save_config(c)`
+
+- `POST /rci/` с `{"system":{"configuration":{"save":true}}}`
+- Эквивалент `system configuration save` в CLI
+
+### Интеграция с остальным кодом
+
+#### `main.c` (порядок старта)
+
+- 14. `rci_client_init(&g_rci)` — однократное выделение буферов
+- 15. `rci_create_policies(&g_rci, policy_names, policy_count)` — создание политик для всех целей-политик (интерфейсы DirectRoute сюда не попадают)
+- 20. `apply_unified_connmark_rules(&g_rci, ...)` — первое применение правил
+
+#### `iptables.c::apply_unified_connmark_rules` — вызывается при старте и на `SIGUSR1`
+
+Шаг 2: retry loop (до 5, sleep 4s) — внутри `rci_get_policies_with_retry` + проверка наличия `mark` для каждой не-interface цели. Если хотя бы у одной политики `mark` пустой (только что создана, роутер ещё не назначил `markID`) → повтор всего блока через 4 секунды. Двухуровневая защита: `rci_get_policies_with_retry` ловит сетевые ошибки/таймауты, apply-loop ловит «политика создана, но без `markID`».
+
+Если после всех попыток `markID` не появился — `LOG_WARN "Policy %s has no mark ID, skipping"`. Цель пропускается в этой итерации правил, но `ipset` продолжает заполняться DNS/L7-каналами. На следующем `SIGUSR1` цикл повторяется.
+
+> **Главное правило:** hrneo не молчит при проблемах с RCI, но и не валится — при недоступности роутера демон продолжает работать в degraded-режиме (`ipset` заполняется, конкретные политики временно без CONNMARK-правил).
+
+### Системные требования
+
+- Демон запущен от root (доступ к `loopback:79` + локальная аутентификация NDM, для root прозрачна)
+- RCI на роутере включён (на всех современных прошивках Keenetic v3+ — да, по умолчанию)
+
+## 14. Netlink Conntrack: `src/conntrack.c`
+
+`conntrack_mgr_t { fd, del_fd }` — два long-lived `NETLINK_NETFILTER` сокета (init однократно в `main`, оба закрываются при выходе). `fd` несёт DUMP-поток, `del_fd` — DELETE-операции: разделение сокетов исключает чтение DELETE-ACK из недочитанного DUMP-потока (рассинхрон). Инициализатор в `main.c` — `{ .fd = -1, .del_fd = -1 }`.
+
+### `conntrack_flush_for_ips(m, new_ips, count)`
+
+1. Разбивает на `ipv4_set[64][16]` и `ipv6_set[64][16]` по семейству
+2. Для непустых множеств вызывает `ct_flush_family(m, ...)`
+
+### `ct_flush_family(m, family, targets, target_count, ip_len)`
+
+1. `IPCTNL_MSG_CT_GET + NLM_F_DUMP` через `m->fd` — все conntrack-записи семейства
+2. Для каждой записи: `ct_extract_orig_tuple()` → dst IP → `memcmp` с `targets`
+3. `ct_delete_entry(m->del_fd, ...)` при совпадении (`IPCTNL_MSG_CT_DELETE` с тем же `orig tuple` на отдельном сокете); счётчик удалений в `LOG_DEBUG`
+
+### `conntrack_delete_conn(m, conn)` — точечный DELETE для L7-канала
+
+Удаляет ровно одну запись по известному 5-tuple `l7_conn_t`, **без DUMP таблицы** (O(1)). Строит `IPCTNL_MSG_CT_DELETE` через `m->del_fd` с собранным вручную `CTA_TUPLE_ORIG`:
+
+- `CTA_TUPLE_IP` (nested): `CTA_IPV4_SRC`/`CTA_IPV6_SRC` = `client_ip`, `CTA_IPV4_DST`/`CTA_IPV6_DST` = `server_ip` (направление original = клиент→сервер, до SNAT — NFLOG-хук стоит на `FORWARD`+`OUTPUT`);
+- `CTA_TUPLE_PROTO` (nested): `CTA_PROTO_NUM`=`c->proto` (IPPROTO_TCP для TLS/HTTP, IPPROTO_UDP для QUIC), `CTA_PROTO_SRC_PORT`=`htons(client_port)`, `CTA_PROTO_DST_PORT`=`htons(server_port)`.
+
+Хелперы построения nested-атрибутов: `ct_put_attr` / `ct_nest_begin` / `ct_nest_end` (флаг `NLA_F_NESTED`). На успех (`nlmsgerr.error==0`) — `LOG_DEBUG "conntrack: deleted L7 conn (family N)"`; запись не найдена (`-ENOENT`) → молча `0`. Удаление коллатерально не затрагивает другие соединения к тому же IP (в отличие от DUMP-по-dst в DNS-канале).
+
+### Прочие функции
+
+- `ct_extract_orig_tuple()` — ищет `CTA_TUPLE_ORIG` (маска `NLA_TYPE_MASK=0x7FFF`)
+- `ct_extract_dst_ip()` — из `CTA_TUPLE_IP` → `CTA_IPV4_DST`/`CTA_IPV6_DST`
+
+## 15. Логирование: `src/log.c`
+
+Глобально: `int log_enabled`, `static int log_syslog`, `static FILE *log_fp`. Сборщика статистики (`monitor_stats_t`) нет.
+
+### Уровни логирования (макросы в `include/log.h`)
+
+- `[DEBUG]` / `[INFO]` / `[MATCH]` / `[PROCESSED]` / `[FILTERED]` — выводятся только при `log_enabled=1`
+- `[WARN]` / `[ERROR]` — выводятся всегда (не зависят от `log_enabled`); при `log_syslog=1` → `vsyslog(LOG_INFO)` (режимы `syslog` и `off`/иное), иначе → `log_fp` (`stdout` для `console`, файл для `file`). `stderr` остаётся только в вырожденном случае `log=file` с пустым `logfile` (`log_fp=NULL`, syslog не открыт)
+
+### `log_setup(cfg)`
+
+| Значение `log` | Поведение |
+|----------------|-----------|
+| `console` | `log_fp=stdout`, `log_enabled=1` |
+| `file` + `log_file_path[0]!=0` | `mkdir_p` + `fopen(append)`, `log_enabled=1`; пустой путь → `log_enabled=0`, `return 0` |
+| `syslog` | `openlog("hrneo", LOG_PID|LOG_NDELAY, LOG_DAEMON)`; `log_syslog=1`, `log_enabled=1` |
+| default (`off` и любое другое) | `openlog("hrneo", LOG_PID\|LOG_NDELAY, LOG_DAEMON)`, `log_syslog=1`, `log_fp=NULL`, `log_enabled=0` — отладочные уровни выключены, но `[WARN]`/`[ERROR]` уходят в syslog |
+
+`log_close()`: `fclose()` если `log_fp` не `stdout`/`stderr`; `closelog()` если `log_syslog=1`.
+
+### О счётчиках L7
+
+Диагностических счётчиков в L7-подсистеме нет: прежние `static`-счётчики `l7_dispatch.c`, поля `stat_*`/`count` в `tcp_reasm_t`, `stat_recv`/`stat_err` в `nflog_capture_t` и функция `l7_dispatch_dump_stats()` удалены как мёртвый код (инкрементировались, но никогда не читались и не выводились). Видимая диагностика L7 — события `LOG_MATCH`/`LOG_PROCESSED` с тегами `[TLS-SNI]`/`[HTTP-Host]` и `LOG_WARN` при `ENOBUFS`.
+
+## 16. Система сборки: Makefile
+
+**Версия:** 3.14.0-1
+**Язык:** C (без CGO, без внешних библиотек)
+
+### Кросс-компиляция
+
+| Цель | Компилятор | Флаги |
+|------|------------|-------|
+| `mipsel` | `mipsel-linux-muslsf-gcc` | `-march=mips32r2 -mtune=1004kc -EL -msoft-float -mno-check-zero-division -mno-shared -mno-plt`, static `-no-pie` |
+| `mips` | `mips-linux-muslsf-gcc` | `-march=mips32r2 -mtune=1004kc -msoft-float -mno-check-zero-division -mno-shared -mno-plt`, static `-no-pie` |
+| `aarch64` | `aarch64-linux-musl-gcc` | `-march=armv8-a -mno-outline-atomics -fno-exceptions`, static `-no-pie -Wl,-z,norelro` |
+| `native` | `gcc` | dynamic linking |
+
+### Общие флаги
+
+```
+-Os -Wall -Wextra -Wno-unused-parameter
+-ffunction-sections -fdata-sections
+-fno-unwind-tables -fno-asynchronous-unwind-tables
+-fomit-frame-pointer
+-fno-strict-aliasing
+```
+
+**Линковка:** `-Wl,--gc-sections -s`; static: `-static -static-libgcc`. Макрос `VERSION` передаётся через `-DVERSION`.
+
+25 исходных файлов (`src/*.c`), заголовочные в `include/`. Никаких `LIBS`/`LDFLAGS` для L7 — `NFLOG` через стандартный kernel-заголовок `<linux/netfilter/nfnetlink.h>` (формат сообщений `NFULNL_*` задан локально в `nflog_capture.c`). Криптография QUIC (`quic_crypto.c`) — pure-C целочисленная арифметика, MIPS soft-float safe.
+
+### Целевые платформы
+
+- `mipsel-3.4` (linux/mipsle)
+- `mips-3.4` (linux/mips)
+- `aarch64-3.10` (linux/arm64)
+
+## 17. Интеграция с Keenetic (сборка IPK)
+
+- **Init-скрипт:** `/opt/etc/init.d/S99hrneo` — стандартный Entware init (`rc.func`), `ENABLED=yes`, `PROCS=hrneo`, `PIDFILE=/var/run/hrneo.pid`
+- **Netfilter hook:** `/opt/etc/ndm/netfilter.d/015-hrneo.sh` — тонкий хук: читает `/var/run/hrneo.pid`; если процесс живёт в `/proc` — `kill -USR1`
+- **Symlink:** `/opt/bin/neo` → `/opt/etc/init.d/S99hrneo` (создаётся в `postinst`)
+- **postinst:** вставляет `[ $ACTION = start ] && sleep 10` в `rc.unslung` перед запуском, чтобы дать Keenetic поднять интерфейсы (извините, но это решает кучу проблем в т.ч. для другого софта...)
+- **UPX:** не применяется ни к одной архитектуре — снижение ложных срабатываний антивирусов (UPX поверх static-stripped ELF — главный триггер эвристик Mirai/Gafgyt).
+- **ELF-гигиена:** GNU build-id (`-Wl,--build-id=sha1` в `COMMON_LDFLAGS`) — стабильный идентификатор и note-секция вместо «голого» ELF
+- **Зависимости ipk:** `libc`, `ipset`, `iptables`, `ip-full`
+- **conffiles:** `/opt/etc/HydraRoute/{hrneo.conf, domain.conf, ip.list}`
+- В пакете: минимальный `hrneo.conf` (`log=off`, `logfile=...`, `PolicyOrder=HydraRoute`; остальные ключи возьмут встроенные дефолты), стартовый `domain.conf` (Youtube/Google/Telegram/AI/Other/2ip), `ip.list` с CIDR Telegram
+
+## 18. L7-перехват: TLS SNI / HTTP Host / QUIC Initial / TCP-реассамблеция
+
+Второй источник имён хостов параллельно DNS-каналу. По умолчанию **выключен** (`l7CaptureEnabled=false`); включается `l7CaptureEnabled=true`. Закрывает слепые зоны DNS-only схемы: клиенты с DoH/DoT/DoQ, hardcoded-IP TLS, легаси-HTTP, тёплый DNS-кэш устройства, QUIC/HTTP-3.
+
+### 18.1 Цепочки
+
+**TLS/HTTP (TCP):**
+```
+[Клиент LAN→WAN TCP 443/80]
+    → iptables/ip6tables mangle/FORWARD + mangle/OUTPUT -o WAN -p tcp --dport 443|80
+      --tcp-flags SYN,ACK ACK -m connbytes 2:N -m length 60: -j NFLOG --nflog-group G
+    → nflog_capture (raw NETLINK_NETFILTER, пассивная копия — без verdict)
+    → l7_dispatch_packet (fail-fast IP/TCP/dport)
+    → probe_tls/probe_http (stateless парсеры) + tcp_reasm (фаза 2)
+    → bogon_check → process_hostname_event_l7 → общий путь DNS-канала
+      (match_domain_with_cname → ipset_add_batch; полный conntrack-DUMP НЕ вызывается — L7 передаёт allow_conntrack_flush=0)
+    → при первом добавлении IP (и ConntrackFlush=true): conntrack_delete_conn(proto=TCP) → точечный DELETE по 5-tuple (реконнект через политику)
+```
+
+**QUIC (UDP):**
+```
+[Клиент LAN→WAN UDP/443, пакет ≥ 1200 байт]
+    → iptables/ip6tables mangle/FORWARD + mangle/OUTPUT -o WAN -p udp --dport 443
+      -m length --length 1200: -j NFLOG --nflog-group G
+    → nflog_capture → l7_dispatch_packet (fail-fast IP/UDP/dport)
+    → quic_extract_sni: Long Header detect → версия v1/v2 → Initial-тип
+      → DCID → HKDF-Extract(salt, DCID) → client_secret → key/iv/hp
+      → header protection removal (AES-128-ECB(hp, sample)) → PN unmask
+      → payload decrypt (AES-128-CTR, nonce=iv XOR pn, ctr_start=2)
+      → frame walker: PADDING/PING skip, ACK/ACK_ECN full parse (ACK-frame skip)
+      → CRYPTO frame (offset=0) → fake TLS record → tls_extract_sni
+    → bogon_check → process_hostname_event_l7(tag="QUIC-SNI")
+    → при первом добавлении IP (и ConntrackFlush=true): conntrack_delete_conn(proto=UDP) → точечный DELETE по 5-tuple UDP
+```
+
+`NFLOG` — **нетерминирующая** цель: пакет копируется в netlink-группу и
+продолжает обход цепочки. hrneo только читает копию, пакет не трогает и вердикт
+не выносит. Поэтому правило hrneo не может «перехватить» трафик у соседних
+NFQUEUE-десинхронизаторов (zapret2/nfqws2/tpws) — они работают на той же машине
+без конфликта.
+
+Логи различают источник тегом: `[DNS]` / `[TLS-SNI]` / `[HTTP-Host]` / `[QUIC-SNI]`.
+
+### 18.2 Модули
+
+- **`src/probe_tls.c`:** `tls_quick_check` (`d[0]=0x16, d[1]=0x03, d[2]<=0x03, d[5]=0x01`), `tls_extract_sni` (record→handshake→ext→SNI type 0, partial-OK, lowercase).
+- **`src/probe_http.c`:** case-insensitive `"\nHost:"`, порт обрезается, IPv6-литерал `[::1]` поддержан.
+- **`src/probe_quic.c`:** QUIC CRYPTO-walker для QUIC v1 (RFC 9001) и v2 (RFC 9369). Long Header detect: бит `0xC0`, версия `0x00000001`/`0x6b3343cf`. Initial-тип: `(pkt[0]&0x30)==0x00` (v1) или `==0x10` (v2). HKDF-цепочка: `initial_secret=HKDF-Extract(salt, DCID)` → `client_secret=HKDF-Expand-Label(is, "client in", 32)` → `key`(16B)/`iv`(12B)/`hp`(16B). Header protection: `mask=AES-128-ECB(hp, sample[pn_offset+4:+20])`, first_byte `&=0x0F` (Long Header), PN-байты XOR mask[1..pn_len]. Payload: AES-128-CTR `nonce=iv XOR pn_be` с `ctr_start=2` (GCM-конвенция). Frame walker: PADDING(0x00)/PING(0x01) skip; ACK(0x02)/ACK_ECN(0x03) — полный разбор через `read_varint` (largest_ack, delay, range_count, first_range, alt-ranges, ECN counts) вместо bail — **ключевое отличие от netwatch**; CRYPTO(0x06) offset==0 → fake TLS record `0x16 0x03 0x01 len[2]` → `tls_extract_sni`. Статические буферы на стеке: `plain[2048]`, `rec[4096]`.
+- **`src/quic_crypto.c`:** SHA-256 (ctx: `state[8]`, `count`, `buf[64]`, `buf_len`; `sha256_compress` с полным schedule), HMAC-SHA256 (ipad/opad через два ctx-прохода), `hkdf_extract` = HMAC-SHA256(salt, IKM), `hkdf_expand_label` (HkdfLabel = `uint16(len)||uint8(6+label_len)||"tls13 "+label||0x00||0x01`). AES-128: 256-байтовый SBOX, 10-байтовый RCON, `aes_key_schedule` (44 слова, 11 round-keys), `aes_encrypt_block` (SubBytes+ShiftRows+MixColumns через `xtime`+AddRoundKey, column-major layout `s[row+4*col]`), `aes128_ecb_encrypt`, `aes128_ctr_xor` (single key schedule, big-endian counter bytes 12-15). Только целочисленные операции — MIPS soft-float safe.
+- **`src/bogon.c`:** служебные IPv4 (`0/8, 10/8, 127/8, 169.254/16, 172.16/12, 192.168/16, >=224`) и IPv6 (`ff00::/8, fc00::/7, fe80::/10, ::, ::1, ::ffff:0:0/96`).
+- **`src/nflog_capture.c`:** свой NFLOG-клиент без `libnetfilter_log` (subsys `NFLOG_SUBSYS=4` = `NFNL_SUBSYS_ULOG`, `PF_BIND`→`CFG_CMD_BIND`→`CFG_MODE` с `copy_range`+`NLBUFSIZ`, `recv MSG_DONTWAIT`, **без verdict** — поток односторонний). `nflog_capture_t { fd, group, seq, portid, callback, user_data, recv_buf[NFLOG_RECV_BUF_SIZE=128KB] }`. Парсинг атрибута `NFULA_PAYLOAD`. Защита от `ENOBUFS` (`LOG_WARN`, копии теряются — мягкая деградация, трафик клиента не страдает).
+- **`src/l7_firewall.c`:** `l7_firewall_resolve_wan` (config + `stat /sys/class/net`, иначе `/proc/net/route Destination==00000000`), `l7_firewall_load_kmod` / `l7_firewall_load_nflog_modules` (`nfnetlink_log`+`xt_NFLOG` через `init_module(2)`, нет `modprobe` на Keenetic), `install/remove` (`fork+exec iptables -w`, `-C ... || -A` для идемпотентности; `-D` в цикле). Правила TCP ставятся в обе цепочки `FORWARD`+`OUTPUT` × `iptables`/`ip6tables`. При `l7_enable_quic` — дополнительно UDP/443 с `--length 1200:` (длина ≥1200 байт — признак QUIC Initial, обязательно padded по RFC 9000). Для `dport 80` `connbytes_max` ужимается до `min(N, 4)`.
+- **`src/l7_dispatch.c`:** UDP-ветка (до TCP-проверки): `l4_proto==IPPROTO_UDP`, `dport==443`, `quic_extract_sni`, `conn.proto=IPPROTO_UDP`; TCP-ветка: `conn.proto=IPPROTO_TCP` + `try_tls_extract` (fast-path/reasm). `l7_dispatch_set_enable(tls, http, quic)`. `l7_conn_t` (`include/l7_dispatch.h`): поля `family`, `proto`, `client_ip[16]`, `server_ip[16]`, `client_port`, `server_port` — контекст нужен для точечного conntrack-DELETE по 5-tuple с корректным proto.
+- **`src/tcp_reasm.c`** (фаза 2): 5-tuple хеш (`TCP_REASM_BUCKETS=64`), пул `calloc-on-init` (`l7TcpReasmMaxEntries × TCP_REASM_BUF_SIZE=16KB`), `start/feed/complete/get/destroy/gc`, seq-упорядочивание (gap→drop, retransmit→no-op), LRU-eviction (`evict_lru` возвращает освобождённый слот — без повторного скана пула), `timerfd` GC (TTL `l7TcpReasmTtlSec`).
+
+### 18.3 Архитектурные решения
+
+- Вся системная логика в C-демоне; shell-хук `015-hrneo.sh` «тонкий» (только `kill -USR1`). Нет «зомби-скриптов» при остановленном демоне. `S99hrneo` минимальный.
+- Один NFLOG-сокет; диспетчер разводит по `dport`.
+- **NFLOG вместо NFQUEUE:** L7 только читает SNI/Host, пакет не модифицирует — назначение NFLOG, а не NFQUEUE. Нетерминирующая цель устраняет конкуренцию за трафик с zapret2/nfqws2. Нет verdict-сообщений → нагрузка ниже, чем у прежней NFQUEUE-схемы. Без fallback: нет модулей NFLOG → L7 выключается (`LOG_WARN`), демон работает на DNS-канале.
+- **Хуки FORWARD+OUTPUT, не POSTROUTING:** `FORWARD` покрывает forwarded LAN→WAN (после routing-decision доступен `-o WAN`), `OUTPUT` — соединения самого роутера. Ранний по ходу пакета хук даёт чистый ClientHello до десинхронизации соседнего NFQUEUE-демона.
+- Идемпотентность к DNS: `ipset_add_batch` с `NLM_F_EXCL` → двойное добавление IP no-op. Два источника (DNS + L7) безопасно пересекаются.
+- **Conntrack-реконнект L7 (`conntrack_delete_conn`):** L7 видит SNI/Host уже после установления TCP-соединения, выпущенного через WAN (до попадания dst-IP в ipset). Чтобы соединение пошло по политике, hrneo при **первом** добавлении IP (`process_hostname_event` вернул `> 0`, т.е. `NLM_F_EXCL`-новый) и при `ConntrackFlush=true` точечно удаляет conntrack-запись этого соединения по полному 5-tuple. Следующий пакет переоценивает `CONNMARK`-правила, смена src/NAT через политику вынуждает легитимный реконнект. Ранее здесь использовалась инъекция spoof-RST клиенту (`l7_rst.c`, удалён): RST как in-band-пакет обязан совпасть с `rcv_nxt` (RFC 5961, strict) и проигрывал гонку с ответом сервера — на практике соединение не рвалось и шло мимо политики. conntrack-DELETE действует на состоянии ядра, проверки seq-окна нет → надёжно. Удаляется только триггернувшее соединение (точно по 5-tuple, без коллатерали); полный conntrack-DUMP из L7 не вызывается — это прерогатива DNS-канала.
+- **GRO coalescing:** на роутере с GRO ядро склеивает TCP-сегменты до netfilter → NFLOG копирует CH целиком даже Kyber-размера → fast-path. Реассамблеция фазы 2 — страховочная сетка (GRO off / разные CPU / MSS-clamp / PMTU-дробление).
+
+### 18.4 Известные gaps (НЕ реализовано)
+
+- **QUIC v2 Initial type detection** — версия v2 определяется по `version==0x6b3343cf`; реализована. Не реализовано: Retry-пакеты (DCID меняется на Retry Token), QUIC over IPv6 Extension Headers с нестандартным next_header. На практике Initial packets без Retry — подавляющее большинство случаев.
+- **ECH (Encrypted ClientHello)** — нерешаемо без MITM
+- **iCloud Private Relay** — зашифрованный туннель, SNI релея (by design не наш)
+
+## 19. Реализованные оптимизации
+
+> Бо́льшая часть сведений потеряна т.к. не документировалась.
+
+- **Однопоточная event-driven архитектура.** epoll-цикл: `cap.fd4` + `cap.fd6` + `signals.sig_fd` + `signals.timer_fd` + (опц.) `nflog_fd` + `reasm_gc_fd`. Без GC, без потоков, без каналов.
+- **Netlink вместо `fork`/`exec` для ipset.** Все `CREATE`, `FLUSH`, `ADD` через прямой netlink-сокет (`NETLINK_NETFILTER`, long-lived).
+- **Батчевая отправка ipset через netlink.** `ipset_add_batch()`: чанки по 256 — send N сообщений, затем recv N ответов. Kernel обрабатывает очередь параллельно с чтением ответов.
+- **`iptables-restore` для batch-правил.** `apply_unified_connmark_rules()`: все `CONNMARK`-правила одним вызовом `iptables-restore --noflush`.
+- **Хеш-таблица доменов с chunked pool.** 8192 бакетов, FNV-1a, цепочки. Chunked pool 256КБ с автоматическим расширением — ноды и строки в одном аллокаторе. Дедупликация `ipset_name` через `ipset_name_cache[]`.
+- **Суффиксный матчинг через хеш-таблицу.** Для каждой точки в домене проверяется parent-домен — `O(количество точек)`, каждая `O(1)` средний.
+- **Кэш ipset-списков и единый timeout.** `set_names[]` (cache `ipset list -n` при старте) + одно поле `default_timeout` менеджера (timeout одинаков для всех сетов) — в `ipset_add_batch` нет ни хеширования имени, ни риска коллизий.
+- **Общий open-addressed FNV-1a индекс.** `name_index_t` в `geodat` для `batches[]` и `usage[]` (`NAME_INDEX_SLOTS=256`, доступ к имени через `name_at_fn`) — заменяет `O(n)` линейный поиск при большом числе целей.
+- **Debounce SIGUSR1.** `timerfd`: повторный `SIGUSR1` во время обработки откладывается на 5 секунд.
+- **Conntrack flush через netlink.** Два long-lived netlink-сокета (init однократно): `fd` для DUMP-потока, `del_fd` для DELETE — разделение исключает рассинхрон (чтение DELETE-ACK из недочитанного DUMP). Один DUMP на семейство + DELETE по совпадению. Без `fork`/`exec`.
+- **Стриминговый парсинг .dat-файлов.** Потоковое чтение через `setvbuf(64KB)`. В памяти хранятся только извлечённые записи. Visitor-pattern (`scan_dat_file`).
+- **Статическая аллокация в hot path.** `dns_result_t` (static в `process_dns_packet`), `processed[]`, `ipv4_batch[]`, `ipv6_batch[]`, `all_new[]` — на стеке, без `malloc`. CNAME-записи передаются в матчер как `dns_cname_t` напрямую из результата парсинга — промежуточного копирования на каждый DNS-ответ нет.
+- **Unified targets.** `g_all_sorted[]` объединяет политики и интерфейсы в единый отсортированный массив. `apply_unified_connmark_rules()` обрабатывает все цели одним проходом.
+- **Дедупликация указателей `ipset_name`.** `ht_insert()` ищет существующий указатель через `ipset_name_cache[]` перед аллокацией нового.
+- **AF_PACKET SOCK_DGRAM + L3-BPF в ядре.** BPF-фильтры на сокетах через `SO_ATTACH_FILTER`. Ядро отбрасывает нерелевантные пакеты до копирования в userspace — только DNS-ответы достигают `process_dns_packet`. `SOCK_DGRAM` отдаёт пакет с IP-уровня единообразно для всех типов интерфейсов, поэтому фильтр работает по IP-версии/протоколу/порту без привязки к Ethernet-кадру.
+- **Контроль maxelem.** Единый проход подсчёта geoip-записей (счётный callback `for_each_geoip_cidr`, без аллокаций) с совмещённой детекцией oversized: тег с числом записей больше `IpsetMaxElem − CIDR_MIGRATE_HEADROOM (5000)` мигрирует в disabled-секцию `CIDRfile` (атомарно через `.tmp + rename`); при загрузке суммарный размер каждого ipset ограничивается `IpsetMaxElem` с переиспользованием тех же подсчётов.
+- **Table-driven config.** `PARAMS[]` (`src/params.c`) — одно описание параметра обслуживает `config_read`, `args_parse`/`args_apply`, `print_help`, `config_generate`.
+- **L7 fail-fast каскад.** Длина → IP-версия → TCP → флаги → dport → 1-байтовая сигнатура TLS/HTTP → парсер. Реассамблеция запускается только для фрагментированных CH (fast-path для коротких). Один NFLOG-сокет.
+
+## Резюме
+
+**HRNeo v3.14.0-1** — компактный однопоточный policy routing демон для роутеров Keenetic, написанный на чистом C.
+
+Два источника имён хостов:
+
+- **DNS-канал** — перехват DNS-ответов через AF_PACKET SOCK_DGRAM + L3-BPF, два fd; работает на интерфейсах любого типа (Ethernet, PPP, ARPHRD_NONE, туннели), поэтому ловит DNS LAN- и VPN-клиентов одним кодом
+- **L7-канал** — TLS SNI / HTTP Host / QUIC Initial SNI исходящих соединений через собственный NFLOG-клиент на raw netlink (пассивное копирование, совместимо с zapret2/nfqws2), при `l7CaptureEnabled`; фаза 2 — TCP-реассамблеция фрагментированных ClientHello; QUIC: CRYPTO-walker с полной HKDF + AES-128-CTR дешифровкой Initial-пакета; при первом добавлении IP (и `ConntrackFlush=true`) триггернувшее соединение разрывается точечным удалением conntrack-записи по 5-tuple (TCP или UDP) для мгновенного реконнекта через политику
+
+Извлекает IP-адреса и добавляет в `ipset` через netlink, маркирует трафик в `iptables/mangle` для policy routing. Поддерживает маршрутизацию через политики Keenetic (mark через RCI API) и прямую на интерфейсы (`fwmark` + `ip rule` + `ip route`). GeoIP/GeoSite из `.dat` v2ray/xray с потоковым protobuf-парсингом.
+
+Event-driven архитектура на `epoll` (`cap.fd4` + `cap.fd6` + `signalfd` + `timerfd` + `nflog_fd` + `reasm_gc_fd`).
+
+**28 параметров конфига**, все доступны через CLI-флаги (`--flag value`) + `--config <path>`, `--version`/`-v`, `--help`/`-h`, `--genconfig [path]`; приоритет: CLI > конфиг > дефолты. Описание параметров — единая таблица `PARAMS[]` в `src/params.c`, драйвит `config_read`, args, `--help`, `--genconfig`.
+
+**Оптимизирован:** батчевый netlink (send N / recv N), хеш-таблица доменов 8192 бакетов с chunked pool (256КБ чанки), unified targets, batch `iptables-restore`, debounce сигналов, conntrack flush через netlink с long-lived сокетом, статическая аллокация в hot path, двунаправленный CNAME BFS, BPF-фильтрация в ядре, `ipset CREATE` с автоматическим запросом kernel-revision, контроль `maxelem` с автомиграцией oversized `geoip:TAG` в disabled-секцию `CIDRfile`.
+
+---
+
+# HRNeo — конфигурация и CLI
+
+Source: https://github.com/ground-zerro/hydraroute/blob/main/Neo/docs/HRNEO.CONF.md
+
+# HRNeo — конфигурация и CLI
+
+Справочник по параметрам конфигурационного файла `hrneo.conf`, CLI-флагам и формату вспомогательных файлов (`domain.conf`, `ip.list`).
+
+**Версия кода:** hrneo 3.14.0-1
+
+## Запуск
+
+```bash
+hrneo [OPTIONS]
+```
+
+Все параметры конфигурационного файла можно передать флагами при запуске.
+
+**Приоритет:** `флаги командной строки` > `конфигурационный файл` > `встроенные значения по умолчанию`.
+
+Флаги можно указывать частично — недостающие значения берутся из конфигурационного файла или дефолтов.
+
+## Служебные флаги
+
+| Флаг | Назначение |
+|------|------------|
+| `--version`, `-v` | Вывести версию и выйти |
+| `--help`, `-h` | Вывести справку по флагам и выйти |
+| `--config <path>` | Путь к конфигурационному файлу |
+| `--genconfig [path]` | Создать файл конфигурации со всеми параметрами по умолчанию и выйти |
+
+### `--config <path>`
+
+- по умолчанию: `/opt/etc/HydraRoute/hrneo.conf`
+- если указан явно и файл недоступен — ошибка и выход
+- если путь по умолчанию недоступен — продолжение с дефолтами + флаги
+
+### `--genconfig [path]`
+
+Поведение по аргументу:
+
+- **без аргумента** — `hrneo.conf` рядом с исполняемым файлом (каталог бинарника, не дефолтный путь)
+- **аргумент-каталог** (или со слешем) — `<dir>/hrneo.conf`
+- **аргумент-файл** — записать ровно по этому пути
+
+Пустые multi-value ключи пишутся как `GeoIPFile=`, `GeoSiteFile=`, `PolicyOrder=`, `l7WanInterface=`.
+
+> Все параметры имеют встроенное значение по умолчанию (см. колонку «default» в `--help`). Отсутствие любого ключа в конфиге **ИЛИ** среди флагов → используется дефолт (включая строковые пути `watchlistPath` / `CIDRfile` / `logfile` / `log`). Невалидное числовое значение ключа в конфиге (нечисловое, число с мусором, ≤0 для строго положительных) → `[WARN] Invalid <key> value` + дефолт; у булевых ключей любое значение, кроме `true`, трактуется как `false`. Невалидное значение **CLI-флага** — ошибка и выход с кодом 1. Падения при отсутствии ключей нет.
+
+## Флаги параметров
+
+Полное зеркало конфига:
+
+```
+--autoStart <true|false>
+--watchlistPath <path>
+--clearIPSet <true|false>
+--CIDR <true|false>
+--CIDRfile <path>
+--IpsetEnableTimeout <true|false>
+--IpsetTimeout <seconds>
+--log <console|file|syslog|off>
+--logfile <path>
+--DirectRouteEnabled <true|false>
+--InterfaceFwMarkStart <int>
+--InterfaceTableStart <int>
+--GlobalRouting <true|false>
+--ConntrackFlush <true|false>
+--IpsetMaxElem <int>
+--GeoIPFile <path>              # повторяется; при наличии заменяет все GeoIPFile= из конфига
+--GeoSiteFile <path>            # повторяется; при наличии заменяет все GeoSiteFile= из конфига
+--PolicyOrder <p1,p2,...>
+--l7CaptureEnabled <true|false>
+--l7NflogGroup <int>
+--l7EnableTLS <true|false>
+--l7EnableHTTP <true|false>
+--l7WanInterface <ifname>
+--l7ConnbytesMax <int>
+--l7TcpReasmEnabled <true|false>
+--l7TcpReasmMaxEntries <int>
+--l7TcpReasmTtlSec <seconds>
+--l7EnableQUIC <true|false>
+```
+
+## Основные параметры
+
+### `autoStart=true`
+
+Разрешить запуск программы.
+
+- если `false` — программа немедленно завершается после чтения конфига, `iptables` и `ipset` не трогаются
+- используется init-скриптом `S99hrneo` для управления запуском без изменения конфига
+
+### `watchlistPath=/opt/etc/HydraRoute/domain.conf`
+
+Путь к файлу с доменами и политиками.
+
+- формат строки: `domain1,domain2,.suffix,geosite:TAG/ПолитикаИлиИнтерфейс`
+- любой домен (например, `youtube.com`) → точное совпадение и автоматический суффиксный матч всех его поддоменов
+- `geosite:TAG` — загружает домены из GeoSite-файла для данного тега
+- несколько geosite-тегов и обычные домены можно смешивать в одной строке в любом порядке
+- если цель (после `/`) совпадает с именем сетевого интерфейса — используется DirectRoute, иначе — политика Keenetic
+- строки, начинающиеся с `#` или `##`, являются комментариями
+- длина строки не ограничена: список из тысяч доменов через запятую одной строкой обрабатывается целиком (чтение через `getline`)
+- DNS-запросы перехватываются у клиентов на интерфейсах любого типа, включая VPN-клиентов роутера (WireGuard / VPN-сервер / IPsec / туннели), а не только LAN
+
+### `clearIPSet=true`
+
+Очищать содержимое `ipset` при запуске.
+
+- `true` — при старте все `ipset`-множества программы сбрасываются (`flush`), CIDR и DNS-кэш теряются
+- `false` — сохранять накопленные IP между перезапусками; не совместимо с изменением таймаута `ipset`
+
+## CIDR
+
+### `CIDR=true`
+
+Включить поддержку статических IP/подсетей.
+
+- при включении читается `CIDRfile` и все записи загружаются в `ipset` при старте
+- одиночный IP с маской `/32` или `/128` добавляется как хост, иначе как подсеть
+
+### `CIDRfile=/opt/etc/HydraRoute/ip.list`
+
+Путь к файлу с CIDR-записями.
+
+- формат секции: `/ПолитикаИлиИнтерфейс` (заголовок), далее IP/CIDR построчно
+- `#/ПолитикаИлиИнтерфейс` — отключённая секция, содержимое игнорируется
+- `##` — комментарий
+- директива `geoip:CC` внутри секции — загружает CIDR для страны из GeoIP-файлов
+- пустая строка завершает текущую секцию
+- длина строки не ограничена (чтение через `getline`)
+
+### `GeoIPFile=`
+
+Путь к файлу базы GeoIP в формате v2ray/xray `.dat`. Параметр повторяемый:
+
+```
+GeoIPFile=/opt/etc/x-ui/bin/geoip_RU.dat
+GeoIPFile=/opt/etc/x-ui/bin/geoip.dat
+```
+
+- используется совместно с директивой `geoip:cc` в файле `ip.list` (например `geoip:ru`, `geoip:cn`)
+- при обработке директивы программа обходит все указанные файлы и собирает CIDR из каждого
+- файлы читаются потоково без кэширования, в памяти хранятся только извлечённые CIDR-записи
+- поиск тега в файле выполняется полным сканированием независимо от порядка записей в файле
+- если параметр не задан, директивы `geoip:` в `ip.list` игнорируются с предупреждением `[WARN]`
+- если ни один файл не содержит запрошенного кода, выводится предупреждение `[WARN]`
+- GeoIP-диаппазоны загружаются однократно при старте; `SIGUSR1` их не перечитывает
+
+## GeoSite
+
+### `GeoSiteFile=`
+
+Путь к файлу базы GeoSite в формате v2ray/xray `.dat`. Параметр повторяемый:
+
+```
+GeoSiteFile=/opt/etc/HydraRoute/geosite.dat
+GeoSiteFile=/opt/etc/x-ui/bin/geosite.dat
+```
+
+- используется совместно с директивой `geosite:TAG` в файле `domain.conf` (например `geosite:google`)
+- при обработке программа обходит все указанные файлы и объединяет домены из каждого
+- файлы читаются потоково без кэширования, в памяти хранятся только извлечённые домены
+- поиск тега в файле выполняется полным сканированием независимо от порядка записей в файле
+- поддерживаются типы доменов: **Domain** (домен + поддомены) и **Full** (только точное имя)
+- типы **Plain** (keyword-матч) и **Regex** не поддерживаются — пропускаются с предупреждением `[WARN]`
+- домены автоматически дедуплицируются: если загружены `google.com` и `mail.google.com`, сохраняется только `google.com` (родительский домен покрывает все поддомены)
+- запись `domain.conf` имеет приоритет над GeoSite: если домен присутствует в обоих источниках, используется политика из `domain.conf`
+- если параметр не задан, директивы `geosite:` в `domain.conf` игнорируются с предупреждением `[WARN]`
+- если ни один файл не содержит запрошенного тега, выводится предупреждение `[WARN]`
+- GeoSite-домены загружаются однократно при старте; `SIGUSR1` их не перечитывает
+
+## IPSet
+
+### `IpsetEnableTimeout=true`
+
+Включить автоматическое удаление записей по таймауту.
+
+- `true` — `ipset`-множества создаются с поддержкой timeout; записи удаляются по истечении `IpsetTimeout`
+- `false` — записи хранятся бессрочно до перезапуска или ручной очистки
+- изменение этого параметра требует `clearIPSet=true` при следующем запуске
+
+### `IpsetTimeout=21600`
+
+Таймаут записей в секундах (применяется только при `IpsetEnableTimeout=true`).
+
+- `21600` = 6 часов, `86400` = 24 часа
+- при повторном добавлении существующего IP таймаут не обновляется (используется флаг `NLM_F_EXCL`)
+
+### `IpsetMaxElem=262144`
+
+Максимальное количество записей в одном `ipset`-множестве.
+
+- дефолт `262144` = встроенное ядерное значение; передаётся в `ipset CREATE` как атрибут `IPSET_ATTR_MAXELEM`
+- значение задаёт жёсткий лимит на каждое `ipset`-множество; IP сверх лимита не добавляются (kernel вернёт `IPSET_ERR_HASH_FULL` → `[WARN]`)
+- применяется при `CREATE`; изменение лимита требует `clearIPSet=true` и перезапуска
+- управляет двумя механизмами защиты ipset от переполнения с общим подсчётом записей: **автомиграция** — `geoip:TAG` с числом записей больше `IpsetMaxElem − 5000` (запас `CIDR_MIGRATE_HEADROOM`) отключается переносом в `#/Too-big-geoip-tag` в `ip.list` (атомарная перезапись через `.tmp + rename`) с `[WARN]`; **лимит загрузки** — суммарное число записей в каждом `ipset` не превышает `IpsetMaxElem`, теги/записи сверх лимита пропускаются с `[WARN]`
+
+## Логирование
+
+### `log=off`
+
+Режим логирования (дефолт `off` — отладочные уровни отключены, но `[WARN]`/`[ERROR]` идут в системный лог).
+
+| Значение | Поведение |
+|----------|-----------|
+| `console` | весь вывод в `stdout` процесса, включая `[DEBUG]`-сообщения |
+| `file` | запись в файл `logfile`, включая `[DEBUG]`-сообщения |
+| `syslog` | отправка через `openlog`/`vsyslog` в `LOG_DAEMON` с тегом `"hrneo"`; `logfile` игнорируется |
+| `off` или иное | отладочные уровни (`[DEBUG]`/`[INFO]`/`[MATCH]`/`[PROCESSED]`/`[FILTERED]`) отключены; `[WARN]`/`[ERROR]` направляются в системный лог (`openlog`/`vsyslog`, `LOG_DAEMON`, тег `"hrneo"`) — чтобы критичные сообщения не терялись в `stderr` демона |
+
+**Уровни логов:**
+
+- `[DEBUG]` — детали операций
+- `[INFO]` — штатные события
+- `[MATCH]` — совпадение домена
+- `[PROCESSED]` — добавление IP в ipset
+- `[FILTERED]` — отклонение служебного IP
+- `[WARN]` — некритичные проблемы
+- `[ERROR]` — ошибки
+
+### `logfile=/opt/var/log/LOGhrneo.log`
+
+Путь к файлу логов.
+
+- используется только при `log=file`; при пустом значении логирование отключается
+- директория создаётся автоматически если не существует
+- файл открывается в режиме `append`; старые записи не удаляются
+
+## Direct Routing
+
+### `DirectRouteEnabled=true`
+
+Включить прямую маршрутизацию трафика на сетевые интерфейсы.
+
+- при старте программа сканирует `/sys/class/net/` и строит список доступных интерфейсов
+- если цель в `domain.conf` совпадает с именем интерфейса — настраивается `ip rule + ip route` для данного интерфейса; иначе цель считается политикой Keenetic
+- если интерфейс DOWN при старте — создаётся `blackhole`-маршрут; при изменении состояния интерфейса маршрут обновляется по сигналу `SIGUSR1`
+- `false` — все цели в `domain.conf` считаются политиками Keenetic, DirectRoute не настраивается
+
+### `InterfaceFwMarkStart=12289`
+
+Начальный `fwmark` для интерфейсов (`0x3001`).
+
+- каждому интерфейсу назначается уникальный `fwmark` начиная с этого значения
+- используется в правилах `iptables CONNMARK` и `ip rule fwmark`
+
+### `InterfaceTableStart=301`
+
+Начальный номер таблицы маршрутизации для интерфейсов.
+
+- каждому интерфейсу назначается уникальная таблица начиная с этого номера
+- в таблице создаётся маршрут `default dev <интерфейс>` или `blackhole default`
+
+## Conntrack
+
+### `ConntrackFlush=true`
+
+Сбрасывать соединения `conntrack` при первом добавлении IP в `ipset`. Флаг управляет обоими каналами (DNS и L7), но механизм сброса у них разный.
+
+- `true` (по умолчанию):
+  - **DNS-канал** — при первом добавлении IP (`NLM_F_EXCL` вернул `err=0`) hrneo делает netlink-DUMP `conntrack`-таблицы и отправляет `DELETE` для каждой записи, у которой dst-IP совпадает с только что добавленным. Это нужно, чтобы уже установленное соединение к этому IP получило новый `fwmark` при следующем пакете и ушло через нужный туннель/интерфейс
+  - **L7-канал** (TLS-SNI / HTTP-Host) — при первом добавлении IP удаляет **одну** conntrack-запись триггернувшего соединения точечно по полному 5-tuple (`conntrack_delete_conn`, без DUMP таблицы, без коллатерали для чужих соединений к тому же IP). L7 ловит ClientHello уже установленного соединения, поэтому запись всегда существует и удаляется
+- фактический сброс происходит **ТОЛЬКО** при одновременном выполнении условий:
+  1. `ConntrackFlush=true`
+  2. IP добавлен в `ipset` впервые (повторное добавление того же IP no-op — `NLM_F_EXCL` → `IPSET_ERR_EXIST`)
+  3. (DNS) существует активная `conntrack`-запись с `dst==этот IP`; для L7 это условие выполняется по построению
+
+  Для DNS, если соединения к IP ещё нет — DUMP проходит вхолостую, DELETE не отправляется.
+- `false` — не выполнять `conntrack`-сброс **ни на одном канале**; соединения, установленные ДО добавления IP в `ipset`, продолжат идти с прежним `fwmark` до переподключения. Для L7 это означает, что трафик к свежеопознанному хосту останется в обход политики до реконнекта приложением
+- ранее L7-канал вместо conntrack использовал инъекцию TCP RST (`l7_rst.c`), не зависевшую от `ConntrackFlush`. Механизм удалён: spoof-RST как in-band-пакет проигрывал гонку seq-окна (RFC 5961) и на практике не рвал соединение. Теперь L7 использует надёжный conntrack-DELETE, единообразно подчинённый флагу `ConntrackFlush`
+- `fork/exec` не используется — всё через прямые netlink-сокеты (`NETLINK_NETFILTER`, long-lived, открыты один раз при старте): отдельный сокет под DUMP-поток и отдельный под `DELETE` (исключает рассинхрон чтения ответа из недочитанного DUMP)
+
+## Порядок правил и приоритет политик
+
+### `PolicyOrder=HydraRoute,RU,CN`
+
+Единый управляемый приоритет политик/интерфейсов hrneo. Решает коллизии маршрутизации, когда один и тот же IP или один и тот же домен попадает сразу в несколько целей (политик и/или DirectRoute-интерфейсов) watchlist'а.
+
+#### Синтаксис
+
+- значение — список имён через запятую (имена политик Keenetic и имена сетевых интерфейсов одинаково; hrneo их различает автоматически через `drm_classify_target` по `/sys/class/net`)
+- пробелы вокруг запятых обрезаются (`trim_whitespace`)
+- до `MAX_POLICY_ORDER=64` элементов
+- если параметр отсутствует или пустой — все цели сортируются строго алфавитно
+
+#### Правила сортировки (`sort_policies`)
+
+- цели из `PolicyOrder` выстраиваются в указанном порядке первыми
+- остальные цели (есть в watchlist/CIDRfile/geosite, но нет в `PolicyOrder`) добавляются после них алфавитно (`qsort`)
+- цели из `PolicyOrder`, отсутствующие во всех источниках (watchlist + CIDRfile + geosite-правила) — пропускаются с предупреждением:
+
+  ```
+  [WARN] PolicyOrder: policy 'X' not found, skipping
+  ```
+
+- полный порядок печатается в лог при старте:
+
+  ```
+  [INFO] Target order (N):
+    [0] HydraRoute (policy)
+    [1] nwg0 (interface, fwmark=0xNNNN)
+    ...
+  ```
+
+#### Где порядок реально применяется (ДВА независимых уровня)
+
+**1) Порядок правил `iptables/mangle/PREROUTING`**
+
+hrneo проходит по итоговому отсортированному массиву `g_all_sorted[]` и добавляет правила `CONNMARK` по одной паре на цель — в порядке массива. `iptables-restore --noflush` сохраняет этот порядок при apply. Поскольку iptables проверяет правила сверху вниз и берёт **первое** совпадение, при попадании пакета в несколько `ipset` одновременно (например, IP сразу в `HydraRoute` и в `RU`) победит та цель, чьё правило добавлено раньше — то есть стоящая раньше в `PolicyOrder`.
+
+**2) Выбор политики при матчинге домена**
+
+При резолве DNS-ответа или L7-имени hrneo ищет домен в хеш-таблице и обходит все суффиксы; если один домен присутствует в нескольких целях (например, в watchlist прописано):
+
+```
+google.com/HydraRoute       # родитель
+mail.google.com/RU          # поддомен в другой политике
+```
+
+или CNAME-цепочка проходит через домены разных политик — выбор делается по двум критериям:
+
+- `priority` = индекс цели в `PolicyOrder` (отсутствующие = `order_count`, то есть «последние»)
+- `specificity` = длина совпавшего суффикса (точное совпадение = `len+1`, выше всех)
+
+Меньший `priority` побеждает; при равных `priority` выбирается более специфичный (более длинный) суффикс. То есть `PolicyOrder` влияет и на **выбор** ipset для конкретного DNS-ответа, а не только на порядок правил.
+
+#### Практически
+
+Положите в начало `PolicyOrder` те политики, в которые надо направлять трафик при коллизиях (например, узкие/более специфичные туннели), а оставшиеся (общие, fallback) — в конце или вне списка.
+
+#### Обновление при SIGUSR1
+
+- `SIGUSR1` **НЕ** перечитывает `hrneo.conf` и сам `PolicyOrder` из памяти; но `apply_unified_connmark_rules` вызывается заново и пересоздаёт правила в текущем порядке `g_all_sorted[]` (то есть пересборка iptables идёт в том же порядке, что и при старте — это снимает рассинхронизацию правил с актуальными mark'ами политик, полученными от RCI)
+- для применения нового `PolicyOrder` нужен перезапуск (`neo restart`)
+
+## Глобальная маршрутизация
+
+### `GlobalRouting=false`
+
+Режим обработки политик роутера.
+
+- `false` (по умолчанию) — уважать существующие политики роутера (`NoVPN`, `Policy0` и т.д.); правила HydraRoute/интерфейсов применяются только к пакетам без установленной политики; устройства с назначенными политиками роутера сохраняют свою маршрутизацию
+- `true` — перезаписывать все политики роутера; правила применяются ко всем пакетам независимо от их политик роутера
+
+## Взаимодействие с роутером через RCI
+
+**RCI** (Remote Configuration Interface) Keenetic.
+
+hrneo **НЕ** вызывает системные утилиты Keenetic (`ndmc` / `ndmq` / `curl` / `wget` / `jq` / `python`) для общения с роутером. Вместо этого внутри бинаря реализован собственный минимальный HTTP/JSON-клиент к локальному эндпойнту `ndmsv` (TCP `127.0.0.1:79`).
+
+Это значит:
+
+- нулевые runtime-зависимости от userspace утилит роутера
+- никаких `fork`/`exec` на каждое обращение → меньше latency и пиков CPU
+- статическая сборка остаётся самодостаточной; конфигурация роутера читается и изменяется напрямую через netlink-подобный по простоте JSON API
+- параметра конфига для RCI нет — endpoint захардкожен (`localhost:79` — стандартный порт RCI на всех современных прошивках Keenetic v3+)
+
+### Что hrneo делает через RCI
+
+**1. Создание отсутствующих политик доступа (при старте)**
+
+Для всех уникальных политик из watchlist + CIDRfile + geosite-правил hrneo формирует JSON-массив команд:
+
+```http
+POST /rci/ HTTP/1.0
+Content-Type: application/json
+
+[{"parse":"ip policy HydraRoute"},
+ {"parse":"ip policy RU"},
+ {"parse":"ip policy CN"}]
+```
+
+- если политика уже существует — команда no-op на стороне роутера
+- если политики нет — создаётся пустая (без VPN-интерфейсов; их присваивает администратор вручную через веб-интерфейс Keenetic → Приоритеты подключений → Политики доступа или через HRWeb)
+- После — `POST /rci/` с `{"system":{"configuration":{"save":true}}}` (эквивалент `system configuration save` — записывает изменения в startup-config роутера)
+- Лог: `[INFO] Policy creation commands executed`
+- Имена политик с интерфейсами не смешиваются: цели, классифицированные `drm_classify_target` как сетевые интерфейсы (DirectRoute), в RCI не отправляются — для них правила маршрутизации настраиваются через `ip rule + ip route`, а не через политики Keenetic
+
+**2. Получение `markID` каждой политики (при старте и по SIGUSR1)**
+
+`GET /rci/show/ip/policy/` возвращает JSON вида:
+
+```json
+{"HydraRoute":{"mark":"0x21", ...},
+ "RU":{"mark":"0x22", ...}, ...}
+```
+
+- hrneo вручную парсит ответ: проход по парам `{policy_name: {... "mark": "0xNN" ...}}` через подсчёт фигурных скобок с учётом строковых литералов (`find_matching_brace`), внутри каждого объекта ищет ключ `"mark"` через `strstr`, извлекает hex-значение и снимает префикс `0x` (хранится как строка для прямой подстановки в `iptables --set-xmark 0xNN`)
+- Лог при `log=console/file`: `[DEBUG] RCI policy: HydraRoute mark=0x21`
+- `markID` используется в правилах `CONNMARK` для связи `ipset` → политика
+
+**3. Retry-логика markID**
+
+- `rci_get_policies_with_retry`: до `POLICY_API_MAX_RETRIES=5` попыток с интервалом `POLICY_API_RETRY_DELAY=3` секунды между попытками
+- В `apply_unified_connmark_rules` дополнительный внутренний цикл (до 5 попыток, sleep 4s): если хотя бы у одной политики `mark` пустой — повтор всего блока (роутер может не сразу присвоить `markID` свежесозданной политике)
+- Если после всех попыток у политики нет `mark` — `LOG_WARN "Policy %s has no mark ID, skipping"`, цель пропускается (правила `CONNMARK` для неё не создаются; `ipset` продолжает заполняться, но трафик не маркируется)
+
+**4. Сетевые параметры**
+
+- TCP к `127.0.0.1:79` (`INADDR_LOOPBACK`), `SO_RCVTIMEO`/`SO_SNDTIMEO` = `RCI_TIMEOUT_SEC=10` секунд (для send и recv отдельно)
+- HTTP/1.0 (`Connection: close` по умолчанию — каждый запрос = новый TCP-сокет, ответ читается до EOF)
+- Заголовки формируются вручную через `snprintf`
+- Ответ читается в буфер `RCI_MAX_RESPONSE+4096` (~1 МБ + headroom), парсинг тела — `strstr("\r\n\r\n")` + проверка `"HTTP/"` и кода 200
+- Буферы `raw_buf` (~1 МБ + 4 КБ) и `response_buf` (~1 МБ) выделяются один раз через `rci_client_init` и переиспользуются всё время жизни демона (никаких `malloc` на hot path при `SIGUSR1`)
+
+**5. JSON-парсер**
+
+- самописный, без внешних библиотек (cJSON / json-c / jansson не подключены)
+- `find_matching_brace`: подсчёт `{`/`}` с учётом строковых литералов (двойные кавычки, экранирование `\"`)
+- извлечение полей `"mark"` через простые `strstr` — формат ответа RCI Keenetic стабилен и компактен, полноценный JSON-парсер не нужен
+- размер: ~250 строк всего файла `src/rci.c`
+
+### Системные требования
+
+- демон запущен от root (доступ к `loopback:79` + локальной аутентификации NDM, которая для root прозрачна)
+- RCI на роутере включён (на всех современных прошивках Keenetic — да, по умолчанию слушает `127.0.0.1:79` для управления через веб-интерфейс и системные утилиты)
+
+## Сигналы управления
+
+### `SIGUSR1`
+
+Обновить правила `iptables` и состояние интерфейсов без перезапуска.
+
+- пересоздаёт `CONNMARK`-правила в `mangle/PREROUTING` на текущей конфигурации в памяти (config, watchlist и GeoSite не перечитываются)
+- обновляет состояние интерфейсов (`up`/`down`) для DirectRoute и корректирует маршруты
+- если `l7CaptureEnabled=true` и L7-перехват успешно стартовал — заново ставит `NFLOG`-правила для портов 80/443 на WAN-интерфейс в `mangle/FORWARD`+`OUTPUT` (idempotent через `iptables -C`); при `l7CaptureEnabled=false` шаг пропускается
+- **debounce:** повторный `SIGUSR1` во время обработки предыдущего откладывается на 5 секунд
+- отправляется автоматически хуком `/opt/etc/ndm/netfilter.d/015-hrneo.sh` при изменении `mangle`-таблицы роутером Keenetic
+
+### `SIGTERM` / `SIGINT`
+
+Штатная остановка:
+
+- удаляются `iptables`/`ip6tables` `CONNMARK`-правила
+- снимаются L7 `NFLOG`-правила (если были установлены)
+- удаляются `ip rule` и `ip route` для DirectRoute-интерфейсов
+- закрывается `ipset` netlink-сокет
+- удаляется PID-файл
+
+## L7-перехват HTTP/HTTPS
+
+### `l7CaptureEnabled=false`
+
+Главный выключатель L7-механизма (TLS SNI + HTTP Host).
+
+- `false` (по умолчанию) — поведение идентично релизам без L7: DNS-only мониторинг, `NFLOG`-правила не ставятся, netlink-сокет не открывается, kernel-модули `nfnetlink_log`/`xt_NFLOG`/`xt_connbytes` не загружаются, дополнительной CPU-нагрузки нет
+- `true` — параллельно с DNS-каналом hrneo:
+  1. резолвит WAN-интерфейс (см. `l7WanInterface`); при неудаче — L7 отключается, DNS-only
+  2. загружает kernel-модули `nfnetlink_log` и `xt_NFLOG` через syscall `init_module` (пути `/lib/modules/$(uname -r)/*.ko`); **fallback отсутствует** — если модули недоступны, L7 полностью отключается с `[WARN]`, демон продолжает работу только на DNS-канале
+  3. загружает `xt_connbytes` (если ещё не загружен)
+  4. открывает `NFLOG`-сокет через `NETLINK_NETFILTER` на группе `l7NflogGroup`
+  5. добавляет в `iptables`/`ip6tables` `mangle/FORWARD` и `mangle/OUTPUT` правила копирования первых 2..N пакетов TCP-потока (`dport 443` и `80`) в `NFLOG`-группу
+  6. на каждую копию парсит TLS ClientHello (SNI) либо HTTP Host
+  7. при совпадении имени с watchlist — destination-IP попадает в соответствующий `ipset` так же, как DNS-ответ; дальше обычная цепочка `CONNMARK`/маршрутизации
+  8. при **первом** добавлении этого IP (он был выпущен через WAN до попадания в ipset) и при `ConntrackFlush=true` hrneo точечно удаляет conntrack-запись триггернувшего соединения по 5-tuple — соединение реконнектится через политику, а не остаётся в обход неё до таймаута
+- `NFLOG` — нетерминирующая цель: пакет только копируется и продолжает обычный путь, hrneo его не модифицирует. Это делает L7-канал совместимым с DPI-десинхронизаторами (zapret2 / nfqws2 / tpws), которые используют `NFQUEUE` на той же машине, — взаимного «голодания» по трафику нет (разбор — `CONFLICT_ZAPRET2.md`)
+- разрыв триггернувшего соединения подчинён флагу `ConntrackFlush` (см. раздел «Conntrack»): при `ConntrackFlush=false` L7 не сбрасывает соединение, и трафик к хосту остаётся в обход политики до реконнекта приложением. Удаляется только триггернувшее соединение, точечно по 5-tuple, без полного DUMP таблицы
+- закрывает «слепые зоны» DNS-only схемы: клиенты с DoH/DoT/DoQ, hardcoded-IP с TLS SNI, легаси-HTTP, QUIC/HTTP-3 (Safari/iCloud/h3)
+- расшифровка DoH/DoT/DoQ/ECH невозможна (требует MITM) и не делается
+- горячее переключение не поддерживается; смена флага требует `/opt/etc/init.d/S99hrneo restart`
+
+### `l7NflogGroup=210`
+
+Номер `NFLOG`-группы для L7-перехвата.
+
+- пространство групп `NFLOG` отдельное от номеров `NFQUEUE` (общего конфликта с zapret/nfqws/tpws нет); при совпадении с другим потребителем NFLOG на этой же машине задать любое непересекающееся значение (диапазон `0..65535`)
+- группу `0` лучше не использовать: её часто занимает штатный лог/ulogd
+
+### `l7EnableTLS=true`
+
+Парсить TLS ClientHello на `dport 443`.
+
+- `false` — пакеты порта 443 проходят через диспетчер без вызова `tls_extract_sni` и без матчинга по watchlist; правило firewall при этом всё равно установлено (трафик проходит через очередь и сразу `ACCEPT`-ится)
+- имеет эффект только при `l7CaptureEnabled=true`
+
+### `l7EnableHTTP=true`
+
+Парсить HTTP Host на `dport 80`.
+
+- `false` — пакеты порта 80 не анализируются (см. `l7EnableTLS`)
+- имеет эффект только при `l7CaptureEnabled=true`
+
+### `l7WanInterface=`
+
+Имя WAN-интерфейса для firewall-правил L7.
+
+- пусто (по умолчанию) — hrneo определяет автоматически по таблице маршрутизации: читает `/proc/net/route`, ищет строку с `Destination=00000000` (маршрут по умолчанию) и берёт имя интерфейса из колонки 0
+- явное значение (например, `l7WanInterface=eth3`) — отключает автодетект и подставляется в правила как есть
+- если интерфейс невозможно определить (ни конфиг, ни автодетект) — L7-перехват отключается с предупреждением `[WARN]`, DNS-канал продолжает работать
+
+### `l7ConnbytesMax=8`
+
+Верхняя граница окна `connbytes` для правила `dport 443`.
+
+- правило:
+
+  ```
+  -m connbytes --connbytes-dir=original --connbytes-mode=packets --connbytes 2:N
+  ```
+
+- нижняя граница фиксирована (`2`) — пропускаем SYN, ловим со второго пакета
+- для `dport 80` значение автоматически ужимается до `min(l7ConnbytesMax, 4)` — HTTP-запрос укладывается в первые пакеты, большее окно избыточно
+- увеличение помогает при сильно фрагментированном TLS ClientHello (Kyber/MLKEM)
+
+## TCP-реассамблеция длинных ClientHello
+
+Современные браузеры Chrome/Firefox при включённом post-quantum keyshare (X25519MLKEM768) отправляют ClientHello размером ~3.5 KB. TCP MSS обычно 1460 байт, поэтому ClientHello разрезается на 2–3 TCP-сегмента. SNI extension в первом сегменте обычно отсутствует — для его извлечения hrneo буферизует фрагменты в памяти до сборки полного TLS record'а.
+
+### `l7TcpReasmEnabled=true`
+
+Включить буферизацию неполных ClientHello.
+
+- `true` (по умолчанию) — для каждого TLS-соединения, у которого в первом полученном пакете `record_len > payload_len`, создаётся запись в хеш-таблице по 5-tuple (`saddr:sport:daddr:dport:family`). Последующие пакеты с правильным следующим TCP `seq` дописываются; при достижении `record_len` запускается `tls_extract_sni` на собранном буфере, и при совпадении с watchlist destination-IP попадает в `ipset` с тегом `[TLS-SNI]`
+- `false` — длинные ClientHello (Kyber/MLKEM) игнорируются; fast-path для коротких CH (помещающихся в один TCP-сегмент) продолжает работать. Можно использовать для regression-сравнения или экономии памяти на маломощных роутерах
+- имеет эффект только при `l7CaptureEnabled=true` и `l7EnableTLS=true`
+- **out-of-order TCP-сегменты** (`next seq > expected`): запись удаляется. На стабильных каналах client→server такое практически не встречается; out-of-order reasm с heap'ом отложен в подфазу 2.1
+- **ретрансмиссии** (`seq < expected`): тихо игнорируются
+
+### `l7TcpReasmMaxEntries=256`
+
+Максимум одновременно буферизуемых соединений.
+
+- допустимый диапазон `1..256` (`TCP_REASM_MAX_ENTRY`)
+- память: ~16 KB на запись (`TCP_REASM_BUF_SIZE`) + ~80 байт overhead. При `max=256` hrneo занимает дополнительно ~4 MB heap. При `max=64` — 1 MB
+- при достижении лимита срабатывает LRU-eviction: удаляется самая старая запись по `ts_added`. Под нормальной нагрузкой (50–200 conn/s) eviction не должен происходить — это индикатор настройки слишком маленького `max` или нагрузки выше ожидаемой
+- установка в `0` или отсутствие параметра — используется значение по умолчанию `256`
+
+### `l7TcpReasmTtlSec=5`
+
+TTL неполных записей в секундах.
+
+- раз в секунду срабатывает `timerfd`, hrneo сканирует все buckets и удаляет записи старше TTL
+- 5 сек с запасом покрывают типичный TLS handshake; больше не нужно, т.к. правило firewall пропускает только первые 2..8 пакетов flow
+- частые удаления по TTL (недособранные ClientHello) — индикатор проблем сети (RTT, потери); в норме их быть почти не должно
+
+## QUIC-перехват (UDP/443)
+
+### `l7EnableQUIC=true`
+
+Парсить QUIC Initial SNI на UDP `dport 443`.
+
+- `true` (по умолчанию) — при `l7CaptureEnabled=true` hrneo устанавливает дополнительные правила NFLOG для UDP/443 с фильтром длины `--length 1200:` (QUIC Initial обязательно padded до ≥1200 байт по RFC 9000). Для каждого попавшего пакета запускается QUIC CRYPTO-walker (`probe_quic.c`):
+  1. Проверка Long Header (`pkt[0] & 0xC0 == 0xC0`) и версии (v1: `0x00000001`, v2: `0x6b3343cf`)
+  2. Определение Initial-типа: `(pkt[0] & 0x30) == 0x00` (v1) или `== 0x10` (v2)
+  3. Извлечение DCID → вывод ключей через HKDF-Extract + 3× HKDF-Expand-Label
+  4. Снятие Header Protection (AES-128-ECB) → расшифровка payload (AES-128-CTR)
+  5. Frame walker с полным разбором ACK-фреймов → CRYPTO frame → SNI
+  6. Результат добавляется в watchlist-ipset с тегом `[QUIC-SNI]`
+- `false` — UDP/443 не перехватывается; UDP NFLOG-правила не устанавливаются; `quic_extract_sni` не вызывается
+- имеет эффект только при `l7CaptureEnabled=true`
+- QUIC-соединения имеют conntrack-записи с `proto=17` (UDP); при `ConntrackFlush=true` и первом добавлении IP — точечный DELETE по 5-tuple UDP, как и для TCP
+
+**Ключевые детали реализации:**
+
+- **Соли:** QUIC v1 RFC 9001 `38762cf7f55934b34d179ae6a4c80cadccbb7f0a`, v2 RFC 9369 `0dede3def700a6db819381be6e269dcbf9bd2ed9`
+- **Дешифровка:** AES-128-CTR, не GCM (верификация тега пропускается) — достаточно для извлечения SNI
+- **ACK-frame skip:** в отличие от простых парсеров, hrneo полностью разбирает ACK(0x02)/ACK_ECN(0x03) через varint-поля, не прерываясь на них — позволяет найти CRYPTO-фрейм, идущий после ACK
+- **Криптография:** pure-C SHA-256, HMAC, HKDF, AES-128 в `src/quic_crypto.c`; только целочисленные операции — работает на MIPS soft-float без аппаратного FPU
+
+## Системные требования для `l7CaptureEnabled=true`
+
+- `iptables`/`ip6tables` с поддержкой матчей `connbytes`, `length`, `tcp`, `udp` + target `NFLOG`
+- kernel-модули `nfnetlink_log`, `xt_NFLOG` — на Keenetic присутствуют в `/lib/modules`, но не автозагружаются; hrneo подгружает сам через syscall `init_module` (порядок: `nfnetlink_log`, затем `xt_NFLOG`). Если их нет — L7 отключается **без fallback**, демон работает на DNS-канале
+- kernel-модуль `xt_connbytes` — аналогично, hrneo подгружает сам через `init_module`
+- демон запущен от root (доступ к `NETLINK_NETFILTER` для NFLOG и conntrack-DELETE, `AF_PACKET`, `init_module`)
+
+### Лог-сообщения L7 при старте
+
+```
+[INFO]  L7 WAN interface: eth3
+[INFO]  kmod nfnetlink_log loaded
+[INFO]  kmod xt_NFLOG loaded
+[INFO]  kmod xt_connbytes loaded
+[INFO]  L7 firewall rules installed (new=12, already present=0, wan=eth3, nflog-group=210)
+[INFO]  L7 capture enabled via NFLOG group #210 (TLS=1 HTTP=1 QUIC=1)
+[WARN]  L7 capture: WAN interface unknown; L7 disabled, DNS-only mode
+[WARN]  L7 capture: NFLOG kernel modules unavailable; L7 disabled, DNS-only mode
+[WARN]  L7 firewall install failed; closing NFLOG, DNS-only mode
+[MATCH] [TLS-SNI] target.example -> HydraRoute
+[PROCESSED] [TLS-SNI] target.example -> 1.2.3.4 [HydraRoute]
+[DEBUG] conntrack: deleted L7 conn (family 2)
+[MATCH] [QUIC-SNI] quic.example -> HydraRoute
+[PROCESSED] [QUIC-SNI] quic.example -> 1.2.3.4 [HydraRoute]
+[MATCH] [HTTP-Host] legacy.example -> Other
+[MATCH] [DNS] target.example -> HydraRoute
+```
+
+> Теги `[DNS]` / `[TLS-SNI]` / `[HTTP-Host]` / `[QUIC-SNI]` различают источник во всех логах.
+
+## Примеры использования GeoSite в `domain.conf`
+
+```
+## Одна категория GeoSite
+geosite:google/HydraRoute
+
+## Несколько категорий GeoSite в одной строке
+geosite:google,geosite:netflix/HydraRoute
+
+## GeoSite и обычные домены вместе, порядок не важен
+geosite:google,youtube.com,youtu.be/HydraRoute
+youtu.be,youtube.com,geosite:netflix/HydraRoute
+
+## Обычные домены без GeoSite
+youtube.com,youtu.be/HydraRoute
+
+## Прямая маршрутизация на интерфейс
+youtube.com/nwg0
+
+## Блокировка через отдельную политику
+geosite:CATEGORY-ADS-ALL/Block
+```
+
+### Лог-сообщения GeoSite при старте
+
+```
+[DEBUG] geosite:google: M entries total, K Domain/Full before dedup, L after dedup
+[WARN]  geosite:google: X Plain-type entries skipped
+[WARN]  geosite:google: Y Regex-type entries skipped (not implemented)
+[WARN]  GeoSite total: X Plain and Y Regex entries skipped
+```
+
+## Популярные категории GeoSite/GeoIP (примеры)
+
+| Тег | Содержимое |
+|-----|------------|
+| `google` | Google, YouTube и связанные сервисы |
+| `netflix` | Netflix и CDN |
+| `facebook` | Facebook, Instagram, WhatsApp |
+| `twitter` | Twitter, TikTok |
+| `telegram` | Telegram и зеркала |
+| `category-tracker-all` | трекеры и аналитика (для блокировки) |
+| `ru` | российские сервисы (Yandex, VK, Mail.ru и т.д.) |
+| `us` | американские сервисы |
+
+> Полный список доступных категорий зависит от используемого файла `geosite.dat`.
+
+---
+
+# Предельные размеры watchlist в hrneo
+
+Source: https://github.com/ground-zerro/hydraroute/blob/main/Neo/docs/WATCHLIST_LIMITS.md
+
+# Предельные размеры watchlist в hrneo
+
+**Версия кода:** hrneo 3.12.1-1
+**Источник:** статический анализ `src/*.c`, `include/*.h`
+
+## 1. Жёсткие лимиты, заданные в коде
+
+### 1.1 Основные лимиты (`include/hrneo.h`)
+
+| Параметр | Значение | Назначение |
+|----------|----------|------------|
+| `DOMAIN_HT_BUCKETS` | 8192 | Бакетов в хеш-таблице доменов |
+| `POOL_CHUNK_SIZE` | 256 КБ | Размер одного чанка пула (linked list растёт без верхнего предела) |
+| `MAX_POLICY_ORDER` | 64 | Максимум уникальных политик |
+| `MAX_INTERFACES` | 64 | Максимум интерфейсов DirectRoute |
+| `MAX_GEO_FILES` | 16 | Максимум файлов `GeoIPFile` / `GeoSiteFile` |
+| `MAX_TAG_LEN` | 64 | Максимум длины имени geosite/geoip тега (с `\0`) |
+| `MAX_POLICY_NAME` | 64 | Максимум длины имени политики (с `\0`) |
+| `MAX_PATH_LEN` | 512 | Максимум длины путей (`watchlistPath`, `CIDRfile`, `logfile`, `GeoIPFile=`, `GeoSiteFile=`) |
+| `MAX_INTERFACE_NAME` | 32 | Максимум длины имени интерфейса (`l7WanInterface`, `interface_info_t.name`) |
+| `MAX_CNAME_CHAIN` | 16 | Глубина BFS по CNAME-цепочке |
+| `IPSET_DEFAULT_MAXELEM` | 262 144 | Записей на один ipset (kernel-default, fallback при `IpsetMaxElem=0`) |
+| `IPSET_CHUNK_SIZE` | 256 | Размер батча `ipset_add_batch` (send N → recv N) |
+| `SOCKET_READ_BUFFER` | 1 МБ | `SO_RCVBUF` для AF_PACKET-сокетов |
+
+### 1.2 ipset-менеджер (`include/ipset_nl.h`)
+
+| Параметр | Значение | Назначение |
+|----------|----------|------------|
+| `IPSET_MAX_SETS` | 512 | Кэш имён существующих ipset (`set_names[512][64]` в `ipset_manager_t`) |
+| `set_has_timeout[256]` | 256 | Кэш timeout-режима по FNV-1a индексу (`name & 0xFF`) |
+| `ipset_name_cache[MAX_POLICY_ORDER]` | 64 | Уникальных имён ipset в хеш-таблице доменов |
+
+### 1.3 GeoIP/GeoSite + CIDR-миграция (`src/geodat.c`)
+
+| Параметр | Значение | Назначение |
+|----------|----------|------------|
+| `NAME_INDEX_SLOTS` | 256 | Open-addressed FNV-1a индексы для `batches[]` / `usage[]` |
+| `CIDR_MIGRATE_HEADROOM` | 5 000 | Запас под `IpsetMaxElem` для порога автомиграции oversized geoip |
+| `CIDR_MIGRATE_MAX_BLOCKS` | 512 | Лимит блоков `/Name` в `ip.list` при автомиграции |
+| `geosite_rule_t gs_rules[256]` | 256 | Лимит строк `geosite:TAG/...` в `domain.conf` (буфер в `main.c`) |
+
+### 1.4 DNS-канал (`include/dns.h`)
+
+| Параметр | Значение | Назначение |
+|----------|----------|------------|
+| `DNS_MAX_ANSWERS` | 128 | Максимум A/AAAA-записей в одном DNS-ответе |
+| `DNS_MAX_CNAMES` | 32 | Максимум CNAME-записей в одном DNS-ответе |
+| `recv_buf` | 65 536 | Буфер приёма AF_PACKET (`pkt_capture_t.recv_buf[]`) |
+
+### 1.5 L7-канал и TCP-реассамблеция
+
+| Параметр | Значение | Файл | Назначение |
+|----------|----------|------|------------|
+| `TCP_REASM_BUCKETS` | 64 | `tcp_reasm.h` | Бакетов в хеш-таблице реассамблеции |
+| `TCP_REASM_MAX_ENTRY` | 256 | `tcp_reasm.h` | Жёсткий потолок одновременно буферизуемых соединений (значение `l7TcpReasmMaxEntries` clamp'ится сюда) |
+| `TCP_REASM_BUF_SIZE` | 16 КБ | `tcp_reasm.h` | Буфер на одну реассемблируемую запись |
+| `NFLOG_RECV_BUF_SIZE` | 128 КБ | `nflog_capture.h` | Буфер приёма NFLOG (`nflog_capture_t.recv_buf[]`) |
+| `NFLOG_NLBUFSIZ` | 128 КБ | `nflog_capture.h` | Размер кольца NFLOG-группы на стороне ядра (`NFULA_CFG_NLBUFSIZ`) |
+| `NFLOG_COPY_RANGE` | 0xFFFF | `nflog_capture.h` | Сколько байт пакета копировать из ядра в userspace |
+
+### 1.6 RCI-клиент (`include/rci.h`)
+
+| Параметр | Значение | Назначение |
+|----------|----------|------------|
+| `RCI_MAX_RESPONSE` | 1 МБ | Размер буферов `raw_buf` и `response_buf` |
+| `RCI_TIMEOUT_SEC` | 10 | `SO_RCVTIMEO` / `SO_SNDTIMEO` |
+| `POLICY_API_MAX_RETRIES` | 5 | Максимум попыток `GET /rci/show/ip/policy/` |
+| `POLICY_API_RETRY_DELAY` | 3 | Секунды между попытками |
+
+> **Жёстких лимитов на число доменов в коде нет** — пул растёт через цепочку чанков по 256 КБ.
+> **Длина строки в `domain.conf` и `ip.list` не ограничена** — оба файла читаются через `getline()` (динамический буфер). Прежнего лимита 4096 байт нет.
+> Только `hrneo.conf` (`src/config.c`) читается через `fgets` с буфером 4096 байт — но это про **одну строку** `key=value`, что более чем достаточно.
+
+## 2. Расход памяти на один домен
+
+В `domain_node_t` через `ht_pool_alloc` (выравнивание по 8):
+
+- `domain_node_t` ≈ **40 байт** (на 64-bit: `char *domain` + `size_t domain_len` + `domain_entry_t{char*, int}` + `struct domain_node *next` = 8 + 8 + 16 + 8)
+- Строка домена + `\0`, выровнено по 8: средняя длина 20 → **24 байта**
+- Указатель `ipset_name` — переиспользуется через `ipset_name_cache` (политик ≤ 64), отдельная аллокация только для первой записи каждой политики
+
+**Итого ≈ 64–72 байта на домен** в установившемся режиме.
+
+### 2.1 Базовый расход (без watchlist)
+
+| Структура | Размер | Условие |
+|-----------|--------|---------|
+| Один пустой `pool_chunk_t` | 256 КБ | всегда (создаётся `ht_create()`) |
+| `domain_hashtable_t` | ~68 КБ | `buckets[8192]` (64 КБ) + `ipset_name_cache[64][64]` (4 КБ) + `ipset_name_ptrs[64]` (512 байт) |
+| `ipset_manager_t` | ~34 КБ | `set_names[512][64]` (32 КБ) + `set_has_timeout[256]` (1 КБ) + `timeout_value[256]` (1 КБ) |
+| `rci_client_t` буферы | ~2 МБ | `raw_buf` (1 МБ + 4 КБ) + `response_buf` (1 МБ); выделяются при старте, переиспользуются весь lifetime |
+| `nflog_capture_t.recv_buf` | 128 КБ | только при `l7CaptureEnabled=true` |
+| `tcp_reasm_t` пул | до 4 МБ | `l7TcpReasmMaxEntries × TCP_REASM_BUF_SIZE` = до 256 × 16 КБ; **при `l7TcpReasmEnabled=false` память не выделяется вообще** |
+| `g_all_sorted[]` | ~17 КБ | `unified_target_t[128]` (`MAX_POLICY_ORDER + MAX_INTERFACES`) |
+
+**Итого базовый расход при дефолтном конфиге** (`l7CaptureEnabled=false` — L7-канал выключен по умолчанию): ≈ **2.5 МБ heap/data** (без NFLOG-буфера и без `tcp_reasm` пула).
+
+При `l7CaptureEnabled=true` (`l7TcpReasmMaxEntries=256`): ≈ **6.5 МБ** (добавляются 128 КБ NFLOG-буфера и до 4 МБ пула `tcp_reasm`).
+
+## 3. Предельные размеры domain.conf
+
+Динамический предел = (свободная RAM) ÷ ~64 байта на домен.
+
+| RAM роутера | Теоретический максимум доменов |
+|-------------|--------------------------------|
+| 64 МБ (старые) | ~500 тыс. — реально 100–200 тыс. с учётом ядра/сервисов Keenetic и базового расхода hrneo (~6 МБ при L7) |
+| 128 МБ | ~1 млн — реально 300–500 тыс. |
+| 256 МБ | ~2–4 млн — реально 1–2 млн |
+
+### 3.1 Деградация производительности раньше OOM
+
+- 8192 бакета → при 100 тыс. доменов средняя цепочка ≈ 12 элементов, `match_domain` остаётся `O(1)` на практике
+- При 1 млн доменов цепочка ≈ 122 элементов, `match_domain` для домена `a.b.c.d.example.com` делает 5 lookup-ов × проход по цепочке → ощутимый CPU-удар на каждом DNS-пакете
+
+### 3.2 Практический потолок без переписывания
+
+200–500 тыс. доменов на 128 МБ. Выше — нужно увеличивать `DOMAIN_HT_BUCKETS` (рекомендация: `65 536` при > 500 тыс. записей).
+
+### 3.3 Жёсткие ограничения domain.conf
+
+- Не более **64 уникальных политик** **И** не более **64 уникальных интерфейсов** (`MAX_POLICY_ORDER` = 64, `MAX_INTERFACES` = 64 — раздельные счётчики)
+- Не более **256 строк с `geosite:TAG/...`** во всём файле (буфер `geosite_rule_t gs_rules[256]` в `main.c`)
+- Длина имени политики/интерфейса ≤ **63 байта** (`MAX_POLICY_NAME - 1`)
+- Длина одной строки **не ограничена** — читается через `getline()` (динамический буфер); список из тысяч доменов через запятую одной строкой обрабатывается целиком
+- Глубина CNAME-цепочки при матчинге ≤ **16** (`MAX_CNAME_CHAIN`); дальше BFS останавливается
+
+## 4. Предельные размеры geo.dat (GeoSite)
+
+Загружается в ту же `domain_hashtable_t`, поэтому делит общий бюджет памяти с `domain.conf`.
+
+### 4.1 Per-tag процесс в `build_geosite_domain_map`
+
+1. `extract_geosite_domains` — `malloc` всех доменов одного тега из всех файлов: пиковая аллокация (`capacity` стартует с 4096 и удваивается через `realloc`)
+2. `deduplicate_domains` — создаёт временную хеш-таблицу `ht_create()` (минимум один 256 КБ-чанк, растёт по мере вставки)
+3. `ht_insert` в основную таблицу
+
+**Пиковая память на тег** ≈ `(N доменов × ~50 байт) × 2` (исходный массив + временная таблица дедупа) + чанки основной таблицы.
+
+| Размер тега | Пиковая RAM |
+|-------------|-------------|
+| 10 000 доменов | ~1 МБ |
+| 100 000 доменов | ~10 МБ |
+| 500 000 доменов | ~50 МБ |
+| 1 000 000 доменов | ~100 МБ (рискованно на 128 МБ роутере) |
+
+### 4.2 Лимиты geo.dat
+
+- Не более **16 файлов** `GeoSiteFile=` (`MAX_GEO_FILES`)
+- Не более **256 правил `geosite:TAG/Policy`** во всём `domain.conf` (`gs_rules[256]`)
+- Длина имени тега ≤ **63 байта** (`MAX_TAG_LEN - 1`)
+- Размер самого `.dat`-файла **не ограничен** (потоковое чтение через `setvbuf(64 КБ)` + посимвольный `read_varint_stream`)
+- Поддерживаются типы доменов **Domain** и **Full**; **Plain** и **Regex** пропускаются с `[WARN]`
+
+### 4.3 Реальный потолок
+
+Для одного тега: 200–500 тыс. доменов. Для всей суммы тегов — общий бюджет watchlist (см. таблицу выше).
+
+## 5. Предельные размеры ip.list (CIDR)
+
+### 5.1 Лимиты при автомиграции oversized geoip
+
+Срабатывает фаза 1 в `add_cidr_to_ipsets` при `geoip_count > 0`. Тег с числом
+записей больше `IpsetMaxElem − 5000` (`CIDR_MIGRATE_HEADROOM`) переносится в
+disabled-блок `#/Too-big-geoip-tag`:
+
+- Строки читаются полностью в динамически растущий массив (`getline()`, старт 4096, ×2), лимита числа строк нет
+- Не более **512 блоков** `/Name` или `#/Name` (`CIDR_MIGRATE_MAX_BLOCKS`)
+- Превышение числа блоков → миграция возвращает `-1` без переписывания файла
+
+### 5.2 Лимиты при обычной загрузке
+
+- Длина строки **не ограничена** (`getline()`)
+- Записей на один `ipset` ≤ `IpsetMaxElem` (дефолт `262 144`); при превышении — `[WARN]` и оставшиеся записи пропускаются
+- Длина имени блока `/Name` ≤ 63 байта (буфер `cidr_block_t.name[64]`)
+- Глубина FNV-1a-индекса `batches[]` / `usage[]` — **256 слотов** (`NAME_INDEX_SLOTS`); при `MAX_POLICY_ORDER * 2 = 128` целях load factor < 50%, коллизии единичные
+
+## 6. Лимиты L7-канала
+
+При `l7CaptureEnabled=true`:
+
+- Одновременно буферизуемых TCP-соединений (фрагментированных ClientHello): **`l7TcpReasmMaxEntries`** (default 256, clamp до `TCP_REASM_MAX_ENTRY=256`)
+- Размер буфера на одно соединение: **16 КБ** (`TCP_REASM_BUF_SIZE`); если ClientHello превышает 16 КБ → `stat_too_big`, запись освобождается
+- TTL неполных записей: **`l7TcpReasmTtlSec`** секунд (default 5)
+- Кольцо NFLOG-группы на стороне ядра: **128 КБ** (`NFLOG_NLBUFSIZ`); переполнение → `ENOBUFS` → `LOG_WARN`, копии теряются (мягкая деградация — трафик клиента не страдает), не fatal
+- Окно `connbytes` для `dport 443`: первые **`l7ConnbytesMax`** пакетов после SYN (default 8); для `dport 80` ужимается до `min(N, 4)`
+- WAN-интерфейс **один** (`l7WanInterface` или автодетект из `/proc/net/route`)
+- RST-инъекция (`src/l7_rst.c`): два raw-сокета (v4 `IPPROTO_RAW`, v6 `IPPROTO_TCP`) **без буферов и без лимитов** — RST крафтится на стеке (40 байт v4 / 60 байт v6) и отправляется единичным `sendto`; на потолок watchlist не влияет
+
+## 7. Бутылочные горлышки в порядке появления
+
+При росте watchlist первым упрётесь в:
+
+1. **`MAX_POLICY_ORDER = 64`** — если в `domain.conf` более 64 разных политик. Жёсткий лимит, лишние молча отбрасываются (`add_unique_name` проверяет `*count < max`).
+2. **256 строк `geosite:`** в `domain.conf` — жёсткий лимит (`gs_rules[256]`).
+3. **Деградация `match_domain`** при > 100 тыс. доменов (бакетов всего 8192).
+4. **Память** — на маленьких роутерах. OOM-killer убьёт процесс без диагностики. Базовый расход + ~2 МБ на буферы RCI + до 4 МБ на L7-реассамблецию + ~64 байта × N доменов.
+5. **Стартовое время** — `build_geosite_domain_map` линейно по числу доменов × числу `.dat`-файлов; 500 тыс. × 3 файла ≈ 30–60 секунд парсинга на mipsel-роутере.
+
+## 8. Итоговая сводная таблица
+
+| Источник | Теоретический максимум | Практически рекомендуемый максимум |
+|----------|------------------------|-------------------------------------|
+| **`domain.conf`** (явные домены) | Память ÷ 64 байта | 100–200 тыс. на 128 МБ; 300–500 тыс. на 256 МБ |
+| **`geo.dat`** (один тег) | Пиково ≈ 100 байт/домен | 200–500 тыс. доменов на тег |
+| **`geo.dat`** (все теги суммарно) | Память ÷ 64 байта | Тот же общий бюджет, что у `domain.conf` |
+| **`ip.list`** (при миграции oversized) | без лимита строк / 512 блоков | потоковое чтение, динамический массив |
+| **Политик** | 64 (`MAX_POLICY_ORDER`) | 64 (жёстко) |
+| **Интерфейсов DirectRoute** | 64 (`MAX_INTERFACES`) | 64 (жёстко) |
+| **`geosite:` строк в `domain.conf`** | 256 | 256 (жёстко) |
+| **`GeoIPFile=` / `GeoSiteFile=`** | 16 каждый (`MAX_GEO_FILES`) | 16 (жёстко) |
+| **IP в одном ipset** | `IpsetMaxElem` (default 262 144) | 262 144 (kernel-default) |
+| **Кэш существующих ipset** | 512 (`IPSET_MAX_SETS`) | 512 (жёстко) |
+| **TCP-реассамблеция (L7)** | 256 одновременных соединений × 16 КБ = 4 МБ | управляется `l7TcpReasmMaxEntries` (1..256) |
+| **Глубина CNAME** | 16 шагов BFS (`MAX_CNAME_CHAIN`) | 16 (жёстко) |
+| **DNS-ответов в одном пакете** | 128 A/AAAA + 32 CNAME | (жёстко, лишние молча игнорируются) |
+
+## 9. Рекомендации по расширению лимитов
+
+Если требуется обслуживать больше доменов:
+
+- **`DOMAIN_HT_BUCKETS`** в `include/hrneo.h` — увеличить до `32 768` или `65 536` (степень двойки, маска `& (DOMAIN_HT_BUCKETS - 1)` работает корректно)
+- **`MAX_POLICY_ORDER`** — увеличить если нужно > 64 политик (затронет несколько массивов и `set_has_timeout[256]`-кэш — последний рекомендуется увеличить пропорционально, чтобы load factor оставался разумным)
+- **`POOL_CHUNK_SIZE`** — увеличить до 1 МБ для меньшего числа аллокаций при очень большом watchlist
+- **`gs_rules[256]`** в `src/main.c` (два места: шаг сбора политик и шаг `build_geosite_domain_map`) — расширить при необходимости > 256 `geosite:`-строк; одновременно увеличить второй параметр в вызове `parse_geosite_rules(..., 256)`
+- **`l7TcpReasmMaxEntries`** в конфиге — увеличить (до 256) при большом числе одновременных TLS-соединений с long ClientHello; либо `TCP_REASM_MAX_ENTRY` в `include/tcp_reasm.h`, если 256 мало
+- **`IPSET_MAX_SETS`** в `include/ipset_nl.h` — увеличить, если число активных ipset на роутере превышает 512 (актуально только в нестандартной интеграции с другими ipset-пользователями)
+
+---
