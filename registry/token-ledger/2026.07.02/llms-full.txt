@@ -1,0 +1,1214 @@
+# TokenLedger
+
+Source: https://github.com/wuliwong/token_ledger/blob/main/README.md
+
+# TokenLedger
+
+A double-entry accounting ledger for managing token balances in Ruby on Rails applications. Provides atomic transactions, idempotency, audit trails, and thread-safe operations.
+
+## Features
+
+- **Double-entry accounting** - Every transaction is balanced (debits = credits)
+- **Atomic operations** - All-or-nothing transactions with automatic rollback
+- **Thread-safe** - Pessimistic locking (`lock!`) on account rows prevents race conditions and overdrafts
+- **Idempotency** - Duplicate transaction prevention using external IDs
+- **Audit trail** - Complete transaction history with metadata
+- **Reserve/Capture/Release** - Handle external API calls safely
+- **Polymorphic owners** - Support multiple owner types (User, Team, etc.)
+- **Balance caching** - Fast balance lookups with reconciliation tools
+
+## Double-Entry Accounting Fundamentals
+
+TokenLedger implements traditional double-entry accounting with explicit semantics.
+
+### Core Invariants
+
+1. **`ledger_entries.amount`** - Always a positive integer (never zero, never negative). Enforced by database CHECK constraint.
+2. **`entry_type`** - Either `"debit"` or `"credit"` (no other values allowed). Enforced by database CHECK constraint.
+3. **Balance Formula** - `balance = sum(debits) - sum(credits)` (asset-style accounting)
+4. **Account Balance** - `LedgerAccount.current_balance` uses the same formula as `Balance.calculate`
+5. **Integer-Only Amounts** - TokenLedger operates strictly on **positive integers**. If your tokens have decimal values (e.g., $10.50), you must store them in base units/cents (e.g., 1050) and format them in the view layer. Never use floats for financial amounts.
+
+### Account Types and Normal Balances
+
+**Accounting Perspective:** These accounts are modeled from the **token holder's perspective**. A User Wallet is treated as an **Asset** (the user owns the tokens). From the platform's perspective, user balances are technically liabilities, but for clarity and intuition, we model them as assets from the user's viewpoint.
+
+**Asset accounts** (wallets, reserved): Normal balance is DEBIT (positive)
+- Increase with debits
+- Decrease with credits
+- Examples: `wallet:user_123`, `wallet:user_123:reserved`
+
+**Liability accounts** (sources): Normal balance is CREDIT (typically negative under debits-minus-credits)
+- Increase with credits
+- Decrease with debits
+- Examples: `source:stripe`, `source:promo`
+- Represents the system's liability to the token issuer
+
+**Expense/Consumption accounts** (sinks): Normal balance is DEBIT (positive)
+- Increase with debits
+- Decrease with credits
+- Examples: `sink:consumed`, `sink:refunded`
+- Tracks where tokens have been spent/consumed
+
+### Worked Examples
+
+Each operation creates two balanced entries (debits = credits).
+
+#### Deposit (100 tokens)
+
+```ruby
+TokenLedger::Manager.deposit(owner: user, amount: 100, description: "Token purchase")
+```
+
+**Entries created:**
+```
+Entry 1: Debit  wallet:user_123         100  (balance delta: +100)
+Entry 2: Credit source:stripe           100  (balance delta: -100)
+```
+
+**Result:** User balance = 100, Source balance = -100 (liability to token issuer)
+
+#### Spend (50 tokens)
+
+```ruby
+TokenLedger::Manager.spend(owner: user, amount: 50, description: "Service consumed")
+```
+
+**Entries created:**
+```
+Entry 1: Credit wallet:user_123         50   (balance delta: -50)
+Entry 2: Debit  sink:consumed           50   (balance delta: +50)
+```
+
+**Result:** User balance = 50, Consumed = 50
+
+#### Reserve (30 tokens)
+
+```ruby
+TokenLedger::Manager.reserve(owner: user, amount: 30, description: "Hold for API call")
+```
+
+**Entries created:**
+```
+Entry 1: Credit wallet:user_123         30   (balance delta: -30)
+Entry 2: Debit  wallet:user_123:reserved 30  (balance delta: +30)
+```
+
+**Result:** Available = 20, Reserved = 30, Total still 50
+
+#### Capture (30 tokens from reservation)
+
+```ruby
+TokenLedger::Manager.capture(reservation_id: reservation_id, description: "API call succeeded")
+```
+
+**Entries created:**
+```
+Entry 1: Credit wallet:user_123:reserved 30  (balance delta: -30)
+Entry 2: Debit  sink:consumed           30   (balance delta: +30)
+```
+
+**Result:** Available = 20, Reserved = 0, Consumed = 80
+
+#### Release (30 tokens back to wallet)
+
+```ruby
+TokenLedger::Manager.release(reservation_id: reservation_id, description: "API call failed")
+```
+
+**Entries created:**
+```
+Entry 1: Credit wallet:user_123:reserved 30  (balance delta: -30)
+Entry 2: Debit  wallet:user_123         30   (balance delta: +30)
+```
+
+**Result:** Available = 50, Reserved = 0
+
+## Requirements
+
+- Ruby 3.0+
+- Rails 7.0+
+- PostgreSQL (recommended for production) or SQLite (development/testing)
+
+## Installation
+
+Add to your Gemfile:
+
+```ruby
+gem "token_ledger"
+```
+
+If you want the latest unreleased code from GitHub:
+
+```ruby
+gem "token_ledger", git: "https://github.com/wuliwong/token_ledger", branch: "main"
+```
+
+Install and generate migrations:
+
+```bash
+bundle install
+rails generate token_ledger:install
+rails db:migrate
+```
+
+The generator creates two migrations automatically:
+- `db/migrate/XXXXXX_create_ledger_tables.rb` - Core ledger tables with all constraints
+- `db/migrate/XXXXXX_add_cached_balance_to_users.rb` - Cached balance column for your owner model
+
+**Custom owner model:** If you're using a different owner model (not `User`), specify it:
+
+```bash
+rails generate token_ledger:install --owner-model=Team
+```
+
+This will create `add_cached_balance_to_teams.rb` instead.
+
+## Migrating from Simple Integer Columns
+
+If you already have a `users.credits` or similar integer column tracking balances, you can migrate to TokenLedger:
+
+```ruby
+# db/migrate/XXXXXX_migrate_to_token_ledger.rb
+class MigrateToTokenLedger < ActiveRecord::Migration[7.0]
+  def up
+    # Ensure TokenLedger tables exist
+    # (Run `rails generate token_ledger:install` first)
+
+    # Migrate existing balances
+    User.find_each do |user|
+      next if user.credits.zero? # Skip users with no balance
+
+      TokenLedger::Manager.deposit(
+        owner: user,
+        amount: user.credits,
+        description: "Balance migration from legacy credits column",
+        external_source: "migration",
+        external_id: "user_#{user.id}_migration",
+        metadata: {
+          legacy_credits: user.credits,
+          migrated_at: Time.current.iso8601
+        }
+      )
+    end
+
+    # Optional: Remove old column after verifying migration
+    # remove_column :users, :credits
+  end
+
+  def down
+    # Restore credits from ledger if needed
+    User.find_each do |user|
+      wallet = TokenLedger::LedgerAccount.find_by(code: "wallet:#{user.id}")
+      user.update_column(:credits, wallet&.current_balance || 0) if wallet
+    end
+  end
+end
+```
+
+**Verification:**
+
+```ruby
+# Verify migration accuracy
+User.find_each do |user|
+  legacy = user.credits
+  ledger = TokenLedger::LedgerAccount.find_by(code: "wallet:#{user.id}")&.current_balance || 0
+
+  if legacy != ledger
+    puts "MISMATCH: User #{user.id} - Legacy: #{legacy}, Ledger: #{ledger}"
+  end
+end
+```
+
+## Configuration
+
+### 1. Add to your owner model (User, Team, etc.):
+
+```ruby
+class User < ApplicationRecord
+  has_many :ledger_transactions,
+           as: :owner,
+           class_name: "TokenLedger::LedgerTransaction"
+
+  # Optional: Add helper method for balance
+  def balance
+    cached_balance
+  end
+end
+```
+
+### 2. Create seed accounts (recommended):
+
+```ruby
+# db/seeds.rb or db/seeds/token_ledger.rb
+
+# TOKEN SOURCES (where tokens enter the system)
+TokenLedger::LedgerAccount.find_or_create_by!(code: "source:stripe") do |account|
+  account.name = "Tokens Purchased via Stripe"
+end
+
+TokenLedger::LedgerAccount.find_or_create_by!(code: "source:paypal") do |account|
+  account.name = "Tokens Purchased via PayPal"
+end
+
+TokenLedger::LedgerAccount.find_or_create_by!(code: "source:promo") do |account|
+  account.name = "Promotional Token Grants"
+end
+
+TokenLedger::LedgerAccount.find_or_create_by!(code: "source:referral") do |account|
+  account.name = "Referral Bonuses"
+end
+
+TokenLedger::LedgerAccount.find_or_create_by!(code: "source:admin") do |account|
+  account.name = "Admin Manual Credits"
+end
+
+# TOKEN SINKS (where tokens leave the system)
+TokenLedger::LedgerAccount.find_or_create_by!(code: "sink:consumed") do |account|
+  account.name = "Tokens Consumed (Service Delivered)"
+end
+
+TokenLedger::LedgerAccount.find_or_create_by!(code: "sink:refunded") do |account|
+  account.name = "Tokens Refunded"
+end
+
+TokenLedger::LedgerAccount.find_or_create_by!(code: "sink:expired") do |account|
+  account.name = "Tokens Expired"
+end
+```
+
+Run seeds:
+
+```bash
+rails db:seed
+```
+
+## Data Integrity Guarantees
+
+TokenLedger enforces correctness at the database level, not just in application code.
+
+### Database-Level Constraints
+
+All constraints are enforced by the database itself (PostgreSQL or SQLite):
+
+#### CHECK Constraints
+
+1. **Positive amounts**: `ledger_entries.amount > 0`
+   - Prevents zero or negative amounts
+   - Financial entries must always be positive (sign is determined by entry_type)
+
+2. **Valid entry types**: `ledger_entries.entry_type IN ('debit', 'credit')`
+   - Only allows "debit" or "credit"
+   - Prevents typos or invalid values
+
+3. **Valid transaction types**: `ledger_transactions.transaction_type IN ('deposit', 'spend', 'reserve', 'capture', 'release', 'adjustment')`
+   - Only allows the 6 supported operation types
+   - Ensures consistency across the application
+
+4. **External ID consistency**: `(external_source IS NULL AND external_id IS NULL) OR (external_source IS NOT NULL AND external_id IS NOT NULL)`
+   - Prevents `external_source` without `external_id` (which would break idempotency)
+   - Prevents `external_id` without `external_source` (which would be ambiguous)
+
+#### Foreign Key Constraints
+
+1. **Immutable transactions**: `on_delete: :restrict`
+   - `ledger_entries.account_id` → `ledger_accounts.id`
+   - `ledger_entries.transaction_id` → `ledger_transactions.id`
+   - Prevents deletion of accounts or transactions that have entries
+   - Enforces the audit trail: transactions are immutable financial records
+
+2. **Parent-child relationships**: `on_delete: :restrict` (enforces strict immutability)
+   - `ledger_transactions.parent_transaction_id` → `ledger_transactions.id`
+   - Prevents deletion of parent reservations that have child transactions
+   - For development/test flexibility, you can change to `:nullify` in the generated migration before running it
+
+### Uniqueness Constraints
+
+1. **Account codes**: `ledger_accounts.code` (unique index)
+   - Prevents duplicate account codes
+   - Ensures each account has a unique identifier
+
+2. **External tracking**: `[external_source, external_id]` (unique partial index where `external_source IS NOT NULL`)
+   - Prevents duplicate transactions from the same external source
+   - Enables idempotency for Stripe invoices, PayPal transactions, etc.
+
+### Immutability
+
+Transactions are immutable:
+- No `update` operations on ledger_transactions or ledger_entries
+- Foreign key constraints with `on_delete: :restrict` prevent accidental deletion
+- Creates a permanent, tamper-proof audit trail
+
+If you need to correct a mistake, create a **reversing transaction** by posting the opposite entries:
+
+```ruby
+# Wrong: Don't do this
+transaction.destroy  # Will fail due to FK constraint
+
+# Right: Create a reversing transaction by swapping debit/credit on same accounts
+original_transaction = TokenLedger::LedgerTransaction.find(transaction_id)
+
+TokenLedger::Manager.adjust(
+  owner: original_transaction.owner,
+  description: "Reversal of transaction ##{original_transaction.id}",
+  entries: original_transaction.ledger_entries.map { |entry|
+    {
+      account_code: entry.account.code,
+      account_name: entry.account.name,
+      type: entry.entry_type == 'debit' ? :credit : :debit,  # Swap entry type
+      amount: entry.amount
+    }
+  }
+)
+```
+
+## Usage
+
+### Basic Operations
+
+#### Deposit (Add Tokens)
+
+```ruby
+# Simple deposit
+TokenLedger::Manager.deposit(
+  owner: user,
+  amount: 100,
+  description: "Token purchase"
+)
+
+# Deposit with external tracking (for idempotency)
+TokenLedger::Manager.deposit(
+  owner: user,
+  amount: 100,
+  description: "Subscription renewal",
+  external_source: "stripe",
+  external_id: "inv_123456",  # Prevents duplicate processing
+  metadata: { plan: "pro", period: "monthly" }
+)
+
+# Will raise DuplicateTransactionError if called again with same external_source + external_id
+```
+
+#### Spend (Deduct Tokens)
+
+**Safe by design** - simply deducts tokens immediately. For external API calls that need rollback protection, use the Reserve/Capture/Release pattern below.
+
+```ruby
+# Simple spend - deducts tokens immediately
+TokenLedger::Manager.spend(
+  owner: user,
+  amount: 5,
+  description: "Image generation"
+)
+
+# With metadata for tracking
+TokenLedger::Manager.spend(
+  owner: user,
+  amount: 10,
+  description: "Video processing",
+  metadata: { resolution: "1080p", duration: 30 }
+)
+
+# Raises InsufficientFundsError if balance is too low
+```
+
+**⚠️ IMPORTANT:** `.spend` deducts tokens immediately and cannot be rolled back. For operations involving external APIs (payment processors, AI services, etc.), use the Reserve/Capture/Release pattern below to handle failures safely.
+
+### Advanced: Reserve/Capture/Release Pattern
+
+For external API calls that can't be rolled back (like third-party services), use the reserve/capture/release pattern:
+
+**Invariants:**
+- A reservation can be captured or released (partially or fully), but the total captured + released cannot exceed the reserved amount
+- Once a reservation is fully captured or fully released, it is closed
+- Each reserve, capture, and release operation creates its own immutable ledger transaction - the original reservation is never modified
+- Capture and release transactions link back to their parent reservation via `parent_transaction_id` for complete audit trails
+- Use `external_source` + `external_id` in capture/release for idempotency when handling external API callbacks
+
+```ruby
+# Step 1: Reserve tokens (makes them unavailable but not consumed)
+reservation_id = TokenLedger::Manager.reserve(
+  owner: user,
+  amount: 50,
+  description: "Reserve for API call",
+  metadata: { job_id: "job_123" }
+)
+
+begin
+  # Step 2: Call external API (this can't be rolled back)
+  result = ExternalAPI.expensive_operation(job_id: "job_123")
+
+  # Step 3: Capture the reserved tokens (mark as consumed)
+  # For idempotency with external job systems, use external_source/external_id
+  TokenLedger::Manager.capture(
+    reservation_id: reservation_id,
+    description: "API call completed",
+    external_source: "job_runner",
+    external_id: "job_123:capture"  # Prevents duplicate capture on retry
+  )
+rescue => e
+  # Step 3b: Release reserved tokens back to wallet on failure
+  TokenLedger::Manager.release(
+    reservation_id: reservation_id,
+    description: "API call failed - refund",
+    external_source: "job_runner",
+    external_id: "job_123:release",
+    metadata: { error: e.message }
+  )
+  raise e
+end
+```
+
+Or use the convenience method that handles this automatically:
+
+```ruby
+result = TokenLedger::Manager.spend_with_api(
+  owner: user,
+  amount: 50,
+  description: "External API call"
+) do
+  # This block is NOT in a database transaction
+  # If it fails, tokens are automatically released
+  ExternalAPI.expensive_operation
+end
+```
+
+**Transaction Linkage:** Each reserve, capture, and release creates its own `LedgerTransaction` row with its own `external_source` + `external_id` for idempotency. Capture and release transactions link back to the original reservation via `parent_transaction_id` for complete audit trails:
+
+```ruby
+# Find a reservation and its child transactions
+reservation = TokenLedger::LedgerTransaction.find(reservation_id)
+captures = TokenLedger::LedgerTransaction.where(
+  parent_transaction_id: reservation_id,
+  transaction_type: "capture"
+)
+releases = TokenLedger::LedgerTransaction.where(
+  parent_transaction_id: reservation_id,
+  transaction_type: "release"
+)
+
+# Find the parent of a capture
+capture_txn = TokenLedger::LedgerTransaction.find_by(transaction_type: "capture")
+parent = TokenLedger::LedgerTransaction.find(capture_txn.parent_transaction_id) if capture_txn.parent_transaction_id
+```
+
+**Optional:** If you prefer convenient association methods like `child_transactions` and `parent_transaction`, add these to the `LedgerTransaction` model in your application:
+
+```ruby
+# Add to gems/token_ledger/app/models/token_ledger/ledger_transaction.rb
+class TokenLedger::LedgerTransaction < ApplicationRecord
+  belongs_to :parent_transaction,
+             class_name: "TokenLedger::LedgerTransaction",
+             optional: true
+
+  has_many :child_transactions,
+           class_name: "TokenLedger::LedgerTransaction",
+           foreign_key: :parent_transaction_id
+end
+```
+
+Then you can use:
+```ruby
+reservation.child_transactions.where(transaction_type: "capture")
+capture_txn.parent_transaction
+```
+
+### Balance Operations
+
+#### Balance Hierarchy
+
+TokenLedger maintains two balance caches with a clear hierarchy:
+
+```
+Source of Truth:     LedgerAccount.current_balance (for any account)
+                            ↓
+Optional Mirror:     owner.cached_balance (denormalized for convenience)
+```
+
+**Important Invariant:**
+
+After any successful ledger write:
+```ruby
+user.cached_balance == LedgerAccount.find_by(code: "wallet:#{user.id}").current_balance
+```
+
+**Atomicity Guarantee:** Both `LedgerAccount.current_balance` and `owner.cached_balance` are updated atomically in the same database transaction. The `Manager` methods use `ActiveRecord::Base.transaction` to ensure that either both caches are updated or neither is (all-or-nothing).
+
+**When to use which:**
+
+- ✅ **Use `user.cached_balance`** for fast reads (no JOIN required)
+- ✅ **Use `LedgerAccount.current_balance`** if you need account-level granularity (e.g., reserved balance)
+- ⚠️ **Use `Balance.calculate`** only for reconciliation or verification
+
+#### Usage Examples
+
+```ruby
+# Get current balance (from cache - fast)
+user.cached_balance  # or user.balance if you added the helper method
+
+# Calculate balance from ledger entries (slow but accurate)
+actual_balance = TokenLedger::Balance.calculate("wallet:#{user.id}")
+
+# Reconcile cached balance with calculated balance
+TokenLedger::Balance.reconcile_user!(user)
+user.reload
+user.cached_balance  # Now matches calculated balance
+```
+
+**Reconciliation:**
+
+If you suspect drift between the caches:
+```ruby
+TokenLedger::Balance.reconcile_user!(user)
+# This updates BOTH caches from the ledger entries
+```
+
+### Query Transactions
+
+```ruby
+# Get user's transaction history
+user.ledger_transactions.order(created_at: :desc).limit(20)
+
+# Filter by type
+user.ledger_transactions.where(transaction_type: "deposit")
+user.ledger_transactions.where(transaction_type: "spend")
+
+# Find specific transaction
+txn = TokenLedger::LedgerTransaction.find_by(
+  external_source: "stripe",
+  external_id: "inv_123"
+)
+
+# Get entries for a transaction
+txn.ledger_entries.each do |entry|
+  puts "#{entry.account.name}: #{entry.entry_type} #{entry.amount}"
+end
+```
+
+## Integration with Stripe and Pay Gem
+
+### Option 1: With Pay Gem (Recommended)
+
+Install Pay gem:
+
+```ruby
+# Gemfile
+gem 'pay'
+
+bundle install
+rails pay:install
+rails db:migrate
+```
+
+Add to User model:
+
+```ruby
+class User < ApplicationRecord
+  pay_customer
+
+  has_many :ledger_transactions,
+           as: :owner,
+           class_name: "TokenLedger::LedgerTransaction"
+end
+```
+
+Set up webhook handler:
+
+```ruby
+# config/routes.rb
+post "/webhooks/stripe", to: "webhooks/stripe#create"
+
+# app/controllers/webhooks/stripe_controller.rb
+class Webhooks::StripeController < ApplicationController
+  skip_before_action :verify_authenticity_token
+
+  def create
+    event = Stripe::Webhook.construct_event(
+      request.body.read,
+      request.env['HTTP_STRIPE_SIGNATURE'],
+      ENV['STRIPE_WEBHOOK_SECRET']
+    )
+
+    case event.type
+    when 'invoice.payment_succeeded'
+      handle_subscription_payment(event.data.object)
+    when 'checkout.session.completed'
+      handle_onetime_purchase(event.data.object)
+    end
+
+    head :ok
+  rescue Stripe::SignatureVerificationError
+    head :bad_request
+  end
+
+  private
+
+  def handle_subscription_payment(invoice)
+    user = User.find_by(pay_customer_id: invoice.customer)
+    return unless user
+
+    # Get token amount from Price metadata
+    credits = invoice.lines.data.first.price.metadata['monthly_credits'].to_i
+
+    TokenLedger::Manager.deposit(
+      owner: user,
+      amount: credits,
+      description: "Subscription: #{invoice.lines.data.first.price.nickname}",
+      external_source: "stripe",
+      external_id: invoice.id,  # Prevents duplicate credits
+      metadata: {
+        invoice_id: invoice.id,
+        subscription_id: invoice.subscription,
+        plan: invoice.lines.data.first.price.nickname
+      }
+    )
+  end
+
+  def handle_onetime_purchase(session)
+    user = User.find_by(pay_customer_id: session.customer)
+    return unless user
+
+    # Get token amount from session metadata
+    credits = session.metadata['token_amount'].to_i
+
+    TokenLedger::Manager.deposit(
+      owner: user,
+      amount: credits,
+      description: "Token purchase",
+      external_source: "stripe",
+      external_id: session.id,
+      metadata: {
+        session_id: session.id,
+        amount_paid: session.amount_total / 100.0
+      }
+    )
+  end
+end
+```
+
+Set up Stripe Products with metadata:
+
+```ruby
+# In Stripe Dashboard or via API, add metadata to Price objects:
+# metadata: { monthly_credits: "1000" }
+# metadata: { monthly_credits: "3500" }
+# metadata: { monthly_credits: "12500" }
+```
+
+### Option 2: Direct Stripe Integration (Without Pay Gem)
+
+Add Stripe gem:
+
+```ruby
+# Gemfile
+gem 'stripe'
+```
+
+Add stripe_customer_id to User:
+
+```bash
+rails generate migration AddStripeCustomerIdToUsers stripe_customer_id:string
+rails db:migrate
+```
+
+Set up webhook handler (similar to above but without Pay gem dependency):
+
+```ruby
+class Webhooks::StripeController < ApplicationController
+  skip_before_action :verify_authenticity_token
+
+  def create
+    event = Stripe::Webhook.construct_event(
+      request.body.read,
+      request.env['HTTP_STRIPE_SIGNATURE'],
+      ENV['STRIPE_WEBHOOK_SECRET']
+    )
+
+    case event.type
+    when 'invoice.payment_succeeded'
+      handle_payment(event.data.object)
+    end
+
+    head :ok
+  end
+
+  private
+
+  def handle_payment(invoice)
+    user = User.find_by(stripe_customer_id: invoice.customer)
+    return unless user
+
+    credits = invoice.lines.data.first.price.metadata['monthly_credits'].to_i
+
+    TokenLedger::Manager.deposit(
+      owner: user,
+      amount: credits,
+      description: "Payment received",
+      external_source: "stripe",
+      external_id: invoice.id,
+      metadata: { invoice_id: invoice.id }
+    )
+  end
+end
+```
+
+### Option 3: Without Stripe (Manual Credits, Other Payment Processors)
+
+TokenLedger is completely payment-processor agnostic. You can credit tokens from any source:
+
+```ruby
+# Admin manually credits user
+TokenLedger::Manager.deposit(
+  owner: user,
+  amount: 500,
+  description: "Admin credit - customer support",
+  external_source: "admin",
+  external_id: "admin_#{current_admin.id}_#{Time.now.to_i}",
+  metadata: { admin_id: current_admin.id, reason: "Apology for service issue" }
+)
+
+# PayPal webhook
+TokenLedger::Manager.deposit(
+  owner: user,
+  amount: 1000,
+  description: "PayPal purchase",
+  external_source: "paypal",
+  external_id: paypal_transaction_id
+)
+
+# Promotional bonus
+TokenLedger::Manager.deposit(
+  owner: user,
+  amount: 100,
+  description: "Welcome bonus",
+  external_source: "promo",
+  external_id: "signup_bonus_#{user.id}"
+)
+
+# Referral credit
+TokenLedger::Manager.deposit(
+  owner: referrer,
+  amount: 50,
+  description: "Referral bonus",
+  external_source: "referral",
+  external_id: "referral_#{referred_user.id}",
+  metadata: { referred_user_id: referred_user.id }
+)
+```
+
+## API Reference
+
+### TokenLedger::Manager
+
+#### `.deposit(owner:, amount:, description:, external_source: nil, external_id: nil, metadata: {})`
+
+Adds tokens to owner's wallet.
+
+**Parameters:**
+- `owner` (required) - The owner object (User, Team, etc.)
+- `amount` (required) - Integer amount of tokens to add
+- `description` (required) - String description of transaction
+- `external_source` (optional) - String identifier for source system (e.g., "stripe", "paypal")
+- `external_id` (optional) - String unique ID from external system (enables idempotency)
+- `metadata` (optional) - Hash of additional data to store with transaction
+
+**Returns:** Transaction ID (Integer)
+
+**Raises:**
+- `DuplicateTransactionError` if external_source + external_id combination already exists
+
+---
+
+#### `.spend(owner:, amount:, description:, metadata: {})`
+
+Deducts tokens immediately. Safe by design - no block means no risk of unsafe rollback.
+
+**Parameters:**
+- `owner` (required) - The owner object
+- `amount` (required) - Integer amount of tokens to deduct
+- `description` (required) - String description
+- `metadata` (optional) - Hash of additional data
+
+**Returns:** Transaction ID
+
+**Raises:**
+- `InsufficientFundsError` if balance is too low
+
+**Example:**
+```ruby
+TokenLedger::Manager.spend(owner: user, amount: 10, description: "Image generation")
+```
+
+**Note:** For external API calls that need rollback protection, use `.spend_with_api` or the manual reserve/capture/release pattern instead.
+
+---
+
+#### `.spend_with_api(owner:, amount:, description:, metadata: {}, &block)`
+
+Reserve/capture/release pattern for external API calls. Automatically handles failures.
+
+**Parameters:** Same as `.spend`
+
+**Returns:** Return value of the block
+
+**Behavior:**
+1. Reserves tokens (moves to reserved account)
+2. Executes block (NOT in database transaction)
+3. On success: Captures reserved tokens
+4. On failure: Releases tokens back to wallet
+
+---
+
+#### `.reserve(owner:, amount:, description:, metadata: {})`
+
+Reserves tokens (moves from wallet to reserved account).
+
+**Returns:** Transaction ID
+
+**Raises:** `InsufficientFundsError` if balance is too low
+
+---
+
+#### `.capture(reservation_id:, amount: nil, description:, external_source: nil, external_id: nil, metadata: {})`
+
+Captures reserved tokens (marks as consumed). Targets a specific reservation by ID.
+
+**Parameters:**
+- `reservation_id` (required) - ID of the reservation transaction to capture
+- `amount` (optional) - Amount to capture (defaults to full reserved amount)
+- `description` (required) - Description of the capture
+- `external_source` (optional) - String identifier for external system (e.g., "job_runner")
+- `external_id` (optional) - String unique ID from external system (enables idempotency)
+- `metadata` (optional) - Additional metadata
+
+**Returns:** Transaction ID
+
+**Raises:**
+- `DuplicateTransactionError` if external_source + external_id combination already exists
+- `ArgumentError` if reservation not found or amount exceeds reserved amount
+
+---
+
+#### `.release(reservation_id:, amount: nil, description:, external_source: nil, external_id: nil, metadata: {})`
+
+Releases reserved tokens back to wallet. Targets a specific reservation by ID.
+
+**Parameters:**
+- `reservation_id` (required) - ID of the reservation transaction to release
+- `amount` (optional) - Amount to release (defaults to full reserved amount)
+- `description` (required) - Description of the release
+- `external_source` (optional) - String identifier for external system (e.g., "job_runner")
+- `external_id` (optional) - String unique ID from external system (enables idempotency)
+- `metadata` (optional) - Additional metadata
+
+**Returns:** Transaction ID
+
+**Raises:**
+- `DuplicateTransactionError` if external_source + external_id combination already exists
+- `ArgumentError` if reservation not found or amount exceeds reserved amount
+
+---
+
+#### `.adjust(owner:, entries:, description:, external_source: nil, external_id: nil, metadata: {})`
+
+Creates an adjustment transaction with custom entries. Used for reversals, corrections, and manual adjustments.
+
+**Parameters:**
+- `owner` (required) - The owner object
+- `entries` (required) - Array of entry specifications, each with:
+  - `account_code` - Account code string
+  - `account_name` - Account name string
+  - `type` - `:debit` or `:credit`
+  - `amount` - Positive integer amount
+- `description` (required) - Description of the adjustment
+- `external_source` (optional) - String identifier for source system
+- `external_id` (optional) - String unique ID from external system (enables idempotency)
+- `metadata` (optional) - Additional metadata
+
+**Returns:** Transaction ID
+
+**Raises:**
+- `DuplicateTransactionError` if external_source + external_id combination already exists
+- `ImbalancedTransactionError` if debits don't equal credits
+
+**Note:** Adjustment transactions can post to any accounts. Unlike `spend` and `reserve` which enforce non-negative wallet balances, `adjust` allows negative balances - use with caution for manual corrections.
+
+**Example:**
+```ruby
+# Reverse a transaction by swapping debit/credit on same accounts
+original = TokenLedger::LedgerTransaction.find(txn_id)
+TokenLedger::Manager.adjust(
+  owner: original.owner,
+  description: "Reversal of transaction ##{original.id}",
+  entries: original.ledger_entries.map { |e|
+    {
+      account_code: e.account.code,
+      account_name: e.account.name,
+      type: e.entry_type == 'debit' ? :credit : :debit,
+      amount: e.amount
+    }
+  }
+)
+```
+
+---
+
+### TokenLedger::Balance
+
+#### `.calculate(account_or_code)`
+
+Calculates actual balance from ledger entries.
+
+**Parameters:**
+- `account_or_code` - LedgerAccount object or account code string
+
+**Returns:** Integer balance (debits - credits)
+
+---
+
+#### `.reconcile!(account_or_code)`
+
+Updates cached balance to match calculated balance.
+
+**Parameters:**
+- `account_or_code` - LedgerAccount object or account code string
+
+**Returns:** Integer calculated balance
+
+---
+
+#### `.reconcile_user!(user)`
+
+Reconciles both the account's cached balance and the user's cached_balance.
+
+**Parameters:**
+- `user` - User object
+
+**Raises:** `AccountNotFoundError` if wallet account doesn't exist
+
+---
+
+### TokenLedger::Account
+
+#### `.find_or_create(code:, name:)`
+
+Finds existing account or creates new one. Thread-safe.
+
+**Parameters:**
+- `code` (required) - Unique account code (e.g., "wallet:123")
+- `name` (required) - Account name
+
+**Returns:** LedgerAccount object
+
+---
+
+## Error Handling
+
+```ruby
+begin
+  TokenLedger::Manager.spend(owner: user, amount: 100, description: "Image generation")
+rescue TokenLedger::InsufficientFundsError => e
+  # Handle insufficient balance
+  flash[:error] = "Not enough tokens. Please purchase more."
+rescue TokenLedger::DuplicateTransactionError => e
+  # Already processed this transaction
+  Rails.logger.warn "Duplicate transaction: #{e.message}"
+rescue TokenLedger::ImbalancedTransactionError => e
+  # Internal error - debits don't equal credits
+  Rails.logger.error "Ledger imbalance: #{e.message}"
+  Bugsnag.notify(e)
+end
+```
+
+## Account Codes Convention
+
+Use hierarchical account codes for organization:
+
+```ruby
+# Wallets (user-specific)
+"wallet:#{user.id}"           # Main balance
+"wallet:#{user.id}:reserved"  # Reserved tokens
+
+# Token Sources (system-wide - where tokens enter)
+"source:stripe"               # Purchased via Stripe
+"source:paypal"               # Purchased via PayPal
+"source:promo"                # Promotional grants
+"source:referral"             # Referral bonuses
+"source:admin"                # Manual admin credits
+
+# Token Sinks (system-wide - where tokens leave)
+"sink:consumed"               # Tokens consumed for service delivery
+"sink:refunded"               # Refunded to customer
+"sink:expired"                # Tokens expired
+```
+
+**Important:** These are NOT accounting revenue/expense accounts. They track token flow:
+- **Sources** = tokens added to the system (liability increases)
+- **Sinks** = tokens removed from the system (liability decreases)
+- `sink:consumed` represents tokens consumed for service delivery, which corresponds to when your money accounting system would recognize revenue
+
+**Note on adjustments:** Adjustment transactions (created via `Manager.adjust`) can post to any accounts - they don't require a dedicated `sink:adjustment` account. Most reversals will post to the same accounts as the original transaction with swapped debit/credit entries.
+
+## Testing
+
+The gem includes comprehensive tests for all functionality including thread safety and concurrency.
+
+Run tests:
+
+```bash
+cd gems/token_ledger
+bundle exec rake test
+```
+
+### Writing Tests
+
+```ruby
+# test/services/my_service_test.rb
+require 'test_helper'
+
+class MyServiceTest < ActiveSupport::TestCase
+  setup do
+    @user = users(:one)
+
+    # Ensure system accounts exist
+    TokenLedger::LedgerAccount.find_or_create_by!(code: "source:test") do |account|
+      account.name = "Test Token Source"
+    end
+
+    TokenLedger::LedgerAccount.find_or_create_by!(code: "sink:consumed") do |account|
+      account.name = "Tokens Consumed"
+    end
+  end
+
+  test "credits user on purchase" do
+    initial_balance = @user.cached_balance
+
+    TokenLedger::Manager.deposit(
+      owner: @user,
+      amount: 100,
+      description: "Test purchase",
+      external_source: "test"
+    )
+
+    @user.reload
+    assert_equal initial_balance + 100, @user.cached_balance
+  end
+end
+```
+
+## Performance Considerations
+
+### Concurrency and Locking
+
+TokenLedger uses **pessimistic locking** to ensure thread safety:
+
+- Each transaction acquires a row-level lock on affected account records using `account.lock!`
+- This prevents race conditions when multiple processes try to modify the same balance
+- Locks are held for the duration of the database transaction, then released automatically
+- PostgreSQL handles concurrent transactions more efficiently than SQLite
+
+**Production tip:** Under high concurrency, ensure your connection pool size is appropriate to avoid lock contention.
+
+### Balance Caching
+
+Always use `user.cached_balance` for reads. Only use `TokenLedger::Balance.calculate` when you need to verify accuracy or during reconciliation.
+
+```ruby
+# Fast (uses cached value)
+if user.cached_balance >= cost
+  # proceed
+end
+
+# Slow (calculates from all entries)
+if TokenLedger::Balance.calculate("wallet:#{user.id}") >= cost
+  # proceed
+end
+```
+
+### Batch Operations
+
+When crediting multiple users, use transactions:
+
+```ruby
+ActiveRecord::Base.transaction do
+  users.each do |user|
+    TokenLedger::Manager.deposit(
+      owner: user,
+      amount: 50,
+      description: "Promotional credit"
+    )
+  end
+end
+```
+
+### Index Optimization
+
+Ensure you have appropriate indexes for your query patterns:
+
+```ruby
+# For transaction history queries
+add_index :ledger_transactions, [:owner_type, :owner_id, :created_at]
+
+# For transaction type filtering
+add_index :ledger_transactions, [:transaction_type, :created_at]
+
+# For account balance lookups
+add_index :ledger_accounts, :current_balance
+```
+
+## Production Recommendations
+
+1. **Use PostgreSQL** - Better concurrency handling than SQLite or MySQL
+2. **Monitor balance drift** - Periodically reconcile cached balances
+3. **Archive old transactions** - Move old ledger entries to archive tables
+4. **Set up alerts** - Monitor for `ImbalancedTransactionError` (should never happen)
+5. **Backup regularly** - Ledger data is financial data
+6. **Use idempotency keys** - Always provide `external_id` for webhook-triggered deposits
+7. **Log all transactions** - Send ledger transactions to logging service
+8. **Rate limit deposits** - Prevent abuse of promotional bonuses
+
+## Troubleshooting
+
+### Balance doesn't match expectations
+
+```ruby
+# Check actual balance from entries
+actual = TokenLedger::Balance.calculate("wallet:#{user.id}")
+cached = user.cached_balance
+
+if actual != cached
+  puts "Balance drift detected: actual=#{actual}, cached=#{cached}"
+
+  # Fix it
+  TokenLedger::Balance.reconcile_user!(user)
+end
+```
+
+### Find duplicate transactions
+
+```ruby
+# Find transactions with same external_id
+TokenLedger::LedgerTransaction
+  .where(external_source: "stripe", external_id: "inv_123")
+  .count
+# Should be 1 or 0, never more
+```
+
+### Audit specific user's transactions
+
+```ruby
+user.ledger_transactions.order(created_at: :desc).each do |txn|
+  puts "#{txn.created_at} | #{txn.transaction_type.ljust(10)} | #{txn.description.ljust(30)} | #{txn.metadata}"
+
+  txn.ledger_entries.each do |entry|
+    sign = entry.entry_type == 'debit' ? '+' : '-'
+    puts "  #{sign}#{entry.amount} #{entry.account.name}"
+  end
+end
+```
+
+## License
+
+MIT. See `LICENSE` for full text.
+
+---

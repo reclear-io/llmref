@@ -1,0 +1,1205 @@
+# Chiasmus
+
+Source: https://github.com/yogthos/chiasmus/blob/main/README.md
+
+# Chiasmus
+
+MCP server that gives LLMs access to formal verification via Z3 (SMT solver) and SWI-Prolog (via `prolog-wasm-full`, includes `library(clpfd)`), plus tree-sitter-based source code analysis. Translates natural language problems into formal logic using a template-based pipeline, verifies results with mathematical certainty, and analyzes call graphs for reachability, dead code, and impact analysis.
+
+### Example use cases
+
+- **"Can our RBAC rules ever conflict?"** → Z3 finds the exact role/action/resource triple where allow and deny both fire
+- **"Find compatible package versions"** → Z3 solves dependency constraints with incompatibility rules, returns a valid assignment or proves none exists
+- **"Can user input reach the database?"** → Prolog traces all paths through the call graph, flags taint flows to sensitive sinks
+- **"Are our frontend and backend validations consistent?"** → Z3 finds concrete inputs that pass one but fail the other (e.g. age=15 passes frontend min=13 but fails backend min=18)
+- **"Does our workflow have dead-end or unreachable states?"** → Prolog checks reachability from the initial state, identifies orphaned and terminal nodes
+- **"What's the dead code in this module?"** → tree-sitter parses source files, Prolog finds functions unreachable from any entry point
+- **"What breaks if I change this function?"** → call graph impact analysis shows all transitive callers
+- **"Do a full code review of these files"** → `chiasmus_review` returns a phased recipe of graph analyses + verification templates, and you execute it step-by-step
+
+## Setup
+
+```bash
+npm install -g chiasmus
+```
+
+### Claude Code
+
+```bash
+claude mcp add chiasmus -- npx -y chiasmus
+```
+
+Or add to `~/.claude/settings.json`:
+
+```json
+{
+  "mcpServers": {
+    "chiasmus": {
+      "command": "npx",
+      "args": ["-y", "chiasmus"]
+    }
+  }
+}
+```
+
+### Crush
+
+Add to `crush.json`:
+
+```json
+{
+  "mcp": {
+    "chiasmus": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "chiasmus"]
+    }
+  }
+}
+```
+
+### OpenCode
+
+Add to `opencode.json`:
+
+```json
+{
+  "mcp": {
+    "chiasmus": {
+      "type": "local",
+      "command": ["npx", "-y", "chiasmus"]
+    }
+  }
+}
+```
+
+## Tools
+
+**`chiasmus_verify`** — Submit raw SMT-LIB or Prolog, get a verified result. Z3 UNSAT results include an `unsatCore` showing which assertions conflict. Prolog supports `explain=true` for derivation traces showing which rules fired.
+
+```
+chiasmus_verify solver="z3" input="
+  (declare-const x Int)
+  (assert (! (> x 10) :named gt10))
+  (assert (! (< x 5) :named lt5))
+"
+→ { status: "unsat", unsatCore: ["gt10", "lt5"] }
+```
+
+```
+chiasmus_verify solver="prolog"
+  input="parent(tom, bob). parent(bob, ann). ancestor(X,Y) :- parent(X,Y). ancestor(X,Y) :- parent(X,Z), ancestor(Z,Y)."
+  query="ancestor(tom, Who)."
+  explain=true
+→ { status: "success", answers: [...], trace: ["ancestor(tom,bob)", "ancestor(bob,ann)", "ancestor(tom,ann)"] }
+```
+
+**`chiasmus_verify`** also accepts `format="mermaid"` with `solver="prolog"` to parse Mermaid flowcharts and state diagrams directly into Prolog facts:
+
+```
+chiasmus_verify solver="prolog" format="mermaid"
+  input="graph TD\n  UserInput --> Validator\n  Validator --> DB\n  Validator --> Logger"
+  query="reaches(userinput, db)."
+→ { status: "success", answers: [{}] }
+
+chiasmus_verify solver="prolog" format="mermaid"
+  input="stateDiagram-v2\n  Idle --> Active : start\n  Active --> Done : finish"
+  query="can_reach(idle, done)."
+→ { status: "success", answers: [{}] }
+```
+
+**`chiasmus_graph`** — Analyze source code call graphs via tree-sitter + Prolog. Parses source files, extracts cross-module call graphs, runs formal analyses.
+
+Built-in language support: **TypeScript**, **JavaScript**, **Python**, **Go**, **Rust**, **Clojure/ClojureScript**. Additional languages can be added via [custom adapters](#custom-language-adapters).
+
+```
+chiasmus_graph files=["src/server.ts", "src/db.ts"] analysis="callers" target="query"
+→ { analysis: "callers", result: ["handleRequest"] }
+
+chiasmus_graph files=["src/**/*.ts"] analysis="dead-code"
+→ { analysis: "dead-code", result: ["unusedHelper", "legacyParser"] }
+
+chiasmus_graph files=["app.py", "db.py"] analysis="reachability" from="handle" to="connect"
+→ { analysis: "reachability", result: { reachable: true } }
+
+chiasmus_graph files=["main.go", "handler.go"] analysis="impact" target="Query"
+→ { analysis: "impact", result: ["Handle", "main"] }
+```
+
+Analyses: `summary`, `callers`, `callees`, `reachability`, `dead-code`, `cycles`, `path`, `impact`, `layer-violation`, `communities`, `hubs`, `bridges`, `surprises`, `diff`, `entry-points`, `facts`.
+
+Reachability-heavy analyses (`cycles`, `reachability`, `path`, `impact`, `dead-code`, `callers`, `callees`) run on native O(V+E) graph algorithms and scale to codebases with thousands of functions. `communities` uses Louvain; `bridges` uses exact betweenness centrality. The `facts` analysis emits raw Prolog for use with `chiasmus_verify`, capped at 10 MB — above that limit the result is `{ error, size, limit }` rather than a program string, so narrow the file set or call a specific analysis directly. Opt in to `include_insights=true` on `facts` to also emit `community/2`, `cohesion/2`, `hub/2`, `bridge/2` predicates.
+
+TS/JS calls also carry qualified-name hints when the receiver's class can be inferred (`CallsFact.calleeQN = "Class.method"`), and imports are resolved through `tsconfig.json` path aliases and the batch's file layout (`ImportsFact.resolved = "<repo-relative path>"`). Both surface as additive Prolog facts — `calls_qn/3` and `imports_resolved/3` — so back-compat queries over `calls/2` and `imports/3` keep working.
+
+### Persistent cache and PR diff
+
+Pass `cache=true` on `chiasmus_graph` to enable a per-file content-hash cache — unchanged files skip re-parsing across calls. On a 42-file TypeScript repo, warm hits run at ~2.5ms vs ~170ms cold (60× speedup). Cache lives under `$CHIASMUS_CACHE_DIR` (default `~/.cache/chiasmus`) with an LRU budget per repo.
+
+```
+chiasmus_graph files=[...] analysis="summary" cache=true save_snapshot="main"
+→ extracts + saves the current graph as the "main" baseline
+
+# After branch changes:
+chiasmus_graph files=[...] analysis="diff" against="main" cache=true
+→ { addedNodes, removedNodes, addedEdges, removedEdges, summary }
+```
+
+`chiasmus_review` accepts `delta_against="<snapshot>"` — when set, a phase 0 diffs against the snapshot, impact-checks removed symbols, and scopes later phases to what the PR actually changed.
+
+**`chiasmus_map`** — Pre-built codebase map for agents to consult **before** bulk file reads. Reuses the same tree-sitter extraction + cache as `chiasmus_graph`; returns a compact outline so an LLM can answer "what's in this repo" / "what does this file expose" / "where is X defined" without opening source.
+
+```
+chiasmus_map files=["src/**/*.ts"]
+→ markdown outline: per-file headlines, exports with signatures,
+  token estimates, leading doc comments
+
+chiasmus_map files=[...] mode="file" path="src/server.ts" format="json"
+→ { exports, imports grouped by source, all top-level symbols }
+
+chiasmus_map files=[...] mode="symbol" name="handleRequest"
+→ { defines: [{file, line, signature}], callers, callees }
+```
+
+Modes: `overview` (default), `file`, `symbol`. Output: `markdown` (default) or `json`. `include` globs and `max_exports` (clamped to ≥0) scope the overview. `cache=true` reuses the shared per-file cache.
+
+**`chiasmus_skills`** — Search the template library. Ships with 8 starter templates covering authorization, configuration, dependency resolution, validation, rule inference, and graph reachability. By-name lookups include related template suggestions.
+
+**`chiasmus_formalize`** — Find the best template for a problem, get slot-filling instructions plus suggestions for related verification checks. Fill the slots using your context, then call `chiasmus_verify`.
+
+**`chiasmus_solve`** — End-to-end: selects template, fills slots via LLM, runs lint and correction loops with enriched feedback (unsat cores, structured error classification), returns a verified result. Optional — the same result is achieved by using `chiasmus_formalize` → fill slots → `chiasmus_verify`, which is the recommended workflow since the calling LLM has full conversation context.
+
+**`chiasmus_craft`** — Create a new template and add it to the skill library. The calling LLM designs the template — no API key needed. Describe a problem type, then submit a skeleton with `{{SLOT:name}}` markers, slot definitions, and normalization recipes. Validates slot/skeleton consistency and name uniqueness. Optionally tests the example through the solver.
+
+```
+chiasmus_craft name="api-rate-limit" domain="configuration" solver="z3"
+  signature="Check if rate limit configs across services are consistent"
+  skeleton="{{SLOT:declarations}}\n(assert (not (= {{SLOT:limit_a}} {{SLOT:limit_b}})))"
+  slots=[{name: "declarations", ...}, {name: "limit_a", ...}, {name: "limit_b", ...}]
+  normalizations=[{source: "YAML config", transform: "Map rate limits to Int constants"}]
+→ { created: true, template: "api-rate-limit", slots: 3 }
+```
+
+After creation, the template appears in `chiasmus_skills` searches and `chiasmus_formalize`.
+
+**`chiasmus_review`** — Returns a phased code-review recipe: which chiasmus tools and templates to run, in what order, and what to look for. No side effects — pure scaffolding. Execute phases sequentially using the named tools, then produce a final report per the `reporting` section.
+
+```
+chiasmus_review files=["src/handler.ts", "src/db.ts"] focus="all"
+→ {
+    phases: [
+      { phase: "1. Structural overview", actions: [{tool: "chiasmus_graph", args: {analysis: "summary"}, interpret: "..."}] },
+      { phase: "2. Architecture health", actions: [dead-code, cycles, layer-violation] },
+      { phase: "3. Security — data flow and taint", actions: [facts + chiasmus_formalize taint-propagation] },
+      { phase: "4. Resource safety", actions: [association-rule-check] },
+      { phase: "5. Authorization", actions: [policy-contradiction] },
+      { phase: "6. Correctness — invariants, boundaries, state machines", actions: [...] },
+      { phase: "7. Impact analysis on flagged functions", actions: [chiasmus_graph impact] },
+    ],
+    suggestedTemplates: [...],
+    reporting: { format: "Numbered issue list with severity", severityLevels: ["CRITICAL","HIGH","MEDIUM","LOW","INFO"] }
+  }
+```
+
+Focus modes subset the phases: `all` (default, 7 phases), `quick` (overview + architecture), `architecture` (structural defects + impact), `security` (taint + resource pairing + auth), `correctness` (invariants + boundaries + state machines).
+
+Each action carries an `interpret` field describing how to score the result. After all phases, emit a numbered issue list with severity labels and file:line references.
+
+**`chiasmus_search`** — Semantic code search over a set of files. Finds functions and methods whose *meaning* matches a natural-language query (e.g. "where do we refresh OAuth tokens", "rate-limit logic"). Uses embeddings + cosine similarity over callable defines; returns a ranked list with `{name, file, line, signature, leadingDoc, score}`.
+
+```
+chiasmus_search query="refresh OAuth tokens" files=["src/**/*.ts"] top_k=5
+→ { hits: [
+    { name: "refreshAccessToken", file: "src/auth/token.ts", line: 42, score: 0.78, ... },
+    { name: "rotateSession", file: "src/auth/session.ts", line: 118, score: 0.71, ... },
+    ...
+  ] }
+```
+
+Opt-in: needs an embedding provider via env (`OPENAI_API_KEY`, `DEEPSEEK_API_KEY`, or `OPENROUTER_API_KEY`). Override the model with `CHIASMUS_EMBED_MODEL` (default `text-embedding-3-small`), base URL with `CHIASMUS_EMBED_URL`, and dimension with `CHIASMUS_EMBED_DIM`. Embeddings are cached by content SHA-256 under `$CHIASMUS_HOME/embeddings` — unchanged code is not re-embedded.
+
+### Local embeddings (no API key)
+
+`chiasmus_search` and `chiasmus_formalize` can run embeddings entirely on-device via [node-llama-cpp](https://github.com/withcatai/node-llama-cpp) — e.g. `Qwen3-Embedding-0.6B`. `node-llama-cpp` ships as an `optionalDependency`, so it is installed automatically alongside chiasmus (via `npm`, `pnpm`, or `npx`). The GGUF model is downloaded from HuggingFace on first use and cached under `$CHIASMUS_HOME/models`.
+
+If the optional install was skipped (e.g. an unsupported platform where the fetch failed), install it manually:
+
+```bash
+npm install node-llama-cpp   # or: pnpm add node-llama-cpp
+```
+
+Then opt in. Either set `localEmbeddings` in `~/.chiasmus/config.json`:
+
+```json
+{
+  "localEmbeddings": {
+    "enabled": true,
+    "model": "hf:Qwen/Qwen3-Embedding-0.6B-GGUF",
+    "dimension": 1024
+  }
+}
+```
+
+…or use env vars:
+
+```bash
+export CHIASMUS_LOCAL_EMBED=1
+export CHIASMUS_LOCAL_EMBED_MODEL=hf:Qwen/Qwen3-Embedding-0.6B-GGUF
+export CHIASMUS_LOCAL_EMBED_DIM=1024        # optional; else discovered on first embed
+```
+
+When enabled, local takes priority over cloud embedding providers. `model` accepts an `hf:` repo URI, a bare Hugging Face repo id (`org/repo`), a local `.gguf` path, or an `http(s)` URL. Env vars override the config block per field; `CHIASMUS_LOCAL_EMBED_DIR` overrides the download directory (default `$CHIASMUS_HOME/models`) and `CHIASMUS_LOCAL_EMBED_BATCH` the texts-per-call batch size (default 32).
+
+**`chiasmus_learn`** — Extract a reusable template from a verified solution. Candidates get promoted after 3+ successful reuses.
+
+**`chiasmus_lint`** — Fast structural validation of specs without running the solver.
+
+## Recommended Workflow
+
+The calling LLM (GLM, GPT, etc.) drives the process — no API key needed:
+
+1. `chiasmus_formalize problem="Can our RBAC rules ever conflict?"` → get template + slot instructions
+2. Fill the template slots using your knowledge of the user's codebase
+3. `chiasmus_verify solver="z3" input="(filled spec)"` → get verified result
+4. If error → read the error, fix the spec, call `chiasmus_verify` again
+
+## When to Use
+
+Use a solver when the LLM alone can't guarantee correctness:
+
+- **"Does this hold for ALL inputs?"** — solvers prove universally, LLMs just check examples
+- **"Do these rules ever conflict?"** — contradiction detection over combinatorial spaces
+- **"Can X reach Y through any path?"** — transitive closure / reachability
+- **Access control, configs, dependencies** — where correctness is non-negotiable
+
+Use `chiasmus_graph` when you need structural reasoning about code:
+
+- **"What calls this function?"** — impact analysis before refactoring
+- **"What's dead code?"** — find functions unreachable from entry points
+- **"Can user input reach this SQL query?"** — taint analysis via call graph reachability
+- **"What breaks if I change X?"** — blast radius via reverse reachability
+- **"Are there circular dependencies?"** — cycle detection in call graphs
+
+## Why `chiasmus_graph` over grep
+
+When an LLM needs to understand code structure, it typically greps for function names and manually traces call chains. This works for direct references but breaks down for transitive questions. Here's a real comparison using chiasmus's own codebase:
+
+**Question: "What's the blast radius of changing `lintSpec`?"**
+
+With grep, this takes multiple rounds — first find direct callers, then callers of those callers, reconstructing the chain manually:
+
+```
+grep lintSpec src/**/*.ts     → found in engine.ts (lintLoop) and mcp-server.ts (handleLint)
+grep lintLoop src/**/*.ts     → called from solve() at lines 75 and 87
+grep handleSolve src/**/*.ts  → called from createChiasmusServer switch...
+```
+
+Three rounds of grep, manual reasoning at each step, and you've still only traced part of the chain. With `chiasmus_graph`, one call gives the complete transitive answer:
+
+```
+chiasmus_graph analysis="impact" target="lintSpec"
+→ ["lintLoop", "handleLint", "solve", "correctionLoop",
+   "handleVerify", "handleSolve", "handleGraph",
+   "createChiasmusServer", "runAnalysis", "runAnalysisFromGraph"]
+```
+
+10 affected functions found in a single call — including paths through `correctionLoop` and `runAnalysis` that the grep approach missed entirely.
+
+The same applies to other structural questions:
+
+| Question | Grep | chiasmus_graph |
+|----------|------|----------------|
+| Impact of changing X | Multiple greps + manual trace; misses transitive paths | 1 call, complete transitive chain |
+| Dead code detection | Grep every function name against all call sites — impractical | 1 call, definitive answer |
+| Can A reach B? | Manually reconstruct call chain across files | 1 call, true/false |
+| Call chain A→B | Multiple greps, mentally reconstruct path | 1 call, exact chain e.g. `[handleSolve,solve,lintLoop,lintSpec]` |
+
+The key difference: grep finds string matches, `chiasmus_graph` answers structural questions. Transitive reachability, dead code, and impact analysis are formally impossible with grep alone.
+
+## Custom Language Adapters
+
+Add tree-sitter support for any language by publishing an npm package named `chiasmus-adapter-<language>`. Chiasmus auto-discovers these at startup.
+
+```ts
+// chiasmus-adapter-rust/index.ts
+import type { LanguageAdapter } from "chiasmus/graph";
+
+const adapter: LanguageAdapter = {
+  language: "rust",
+  extensions: [".rs"],
+  grammar: { package: "tree-sitter-rust" },
+  extract(rootNode, filePath) {
+    const defines = [];
+    const calls = [];
+    // Walk the tree-sitter AST and populate defines, calls, imports, etc.
+    // ... your language-specific extraction logic ...
+    return { defines, calls, imports: [], exports: [], contains: [] };
+  },
+};
+
+export default adapter;
+```
+
+Install alongside chiasmus and enable adapter discovery in `~/.chiasmus/config.json`:
+
+```bash
+npm install chiasmus-adapter-rust
+```
+
+```json
+{
+  "adapterDiscovery": true
+}
+```
+
+Adapter discovery is **off by default** to keep startup fast. Enable it when you have custom adapters installed.
+
+### searchPaths
+
+An adapter can export `searchPaths` to point to directories containing additional adapter modules (`.js`/`.mjs` files). This is useful for loading adapters from non-standard locations:
+
+```ts
+export default {
+  language: "rust",
+  extensions: [".rs"],
+  grammar: { package: "tree-sitter-rust" },
+  extract(rootNode, filePath) { /* ... */ },
+  searchPaths: ["/shared/company-adapters"],
+};
+```
+
+### Adapter interface
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `language` | `string` | Language identifier (e.g., `"rust"`) |
+| `extensions` | `string[]` | File extensions (e.g., `[".rs"]`) |
+| `grammar` | `object` | Tree-sitter grammar: `{ package, moduleExport? }` for native or `{ package, wasmFile, wasm: true }` for WASM |
+| `extract` | `(rootNode, filePath) => CodeGraph` | Walks the AST and returns `{ defines, calls, imports, exports, contains }` |
+| `searchPaths` | `string[]` (optional) | Additional directories to scan for adapter modules |
+
+Built-in languages always take precedence over adapters with the same extensions.
+
+## Library Usage
+
+Chiasmus can be used as a library in any Node.js project:
+
+```bash
+npm install chiasmus
+```
+
+### Quick Start
+
+```ts
+import { SolverSession, lintSpec, SkillLibrary, FormalizationEngine } from "chiasmus";
+```
+
+Or import from specific subpaths:
+
+```ts
+import { createZ3Solver, createPrologSolver } from "chiasmus/solvers";
+import { extractGraph, runAnalysis } from "chiasmus/graph";
+import { lintSpec, FormalizationEngine } from "chiasmus/formalize";
+import { SkillLibrary, SkillLearner } from "chiasmus/skills";
+import { createLLMFromEnv } from "chiasmus/llm";
+```
+
+### Solvers
+
+```ts
+import { SolverSession } from "chiasmus/solvers";
+
+const session = await SolverSession.create("z3");
+try {
+  const result = await session.solve({
+    type: "z3",
+    smtlib: `(declare-const x Int) (assert (> x 5))`,
+  });
+  if (result.status === "sat") {
+    console.log("Satisfiable:", result.model);
+  }
+} finally {
+  session.dispose();
+}
+```
+
+### Graph Analysis
+
+```ts
+import { extractGraph, runAnalysis } from "chiasmus/graph";
+
+const result = await runAnalysis(
+  ["src/server.ts", "src/db.ts"],
+  { analysis: "dead-code" }
+);
+console.log(result.result);
+```
+
+### Lint & Validation
+
+```ts
+import { lintSpec } from "chiasmus/formalize";
+
+const { spec, fixes, errors } = lintSpec(rawSpec, "z3");
+if (errors.length > 0) {
+  console.error("Lint errors:", errors);
+}
+```
+
+### Skill Library
+
+```ts
+import { SkillLibrary } from "chiasmus/skills";
+import { join } from "node:path";
+import { homedir } from "node:os";
+
+const library = await SkillLibrary.create(join(homedir(), ".chiasmus"));
+const results = library.search("access control policy conflict");
+console.log(results);
+library.close();
+```
+
+### Exports
+
+| Subpath | Exports |
+|---------|---------|
+| `chiasmus` | All public APIs (barrel export) |
+| `chiasmus/solvers` | `SolverSession`, `createZ3Solver`, `createPrologSolver`, `correctionLoop`, solver types |
+| `chiasmus/graph` | `extractGraph`, `runAnalysis`, `runAnalysisFromGraph`, `buildFactsResult`, `graphToProlog`, `parseMermaid`, `detectCommunities`, `detectHubs`, `detectBridges`, `detectSurprisingConnections`, `detectEntryPoints`, `graphDiff`, `saveSnapshot`/`loadSnapshot`/`listSnapshots`, cache APIs, adapter registry, graph types |
+| `chiasmus/formalize` | `lintSpec`, `classifyFeedback`, `extractPrologQuery`, `FormalizationEngine`, result types |
+| `chiasmus/skills` | `SkillLibrary`, `SkillLearner`, `craftTemplate`, `validateTemplate`, skill types |
+| `chiasmus/llm` | `createLLMFromEnv`, `createEmbeddingFromEnv`, `AnthropicAdapter`, `OpenAICompatibleAdapter`, `OpenAICompatibleEmbeddingAdapter`, `LocalEmbeddingAdapter`, `resolveLocalEmbeddingConfig`, LLM types |
+| `chiasmus/mcp` | `createChiasmusServer`, `getChiasmusHome` |
+
+## Configuration
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `CHIASMUS_HOME` | `~/.chiasmus/` | Database, skill storage, and config |
+| `CHIASMUS_CACHE_DIR` | `~/.cache/chiasmus` | Per-file extraction cache + graph snapshots (when `cache=true`) |
+| `CHIASMUS_CACHE_MAX_PER_REPO` | `67108864` (64 MB) | Per-repo cache byte budget — LRU eviction above this |
+| `ANTHROPIC_API_KEY` | — | Optional: Anthropic provider for autonomous mode |
+| `DEEPSEEK_API_KEY` | — | Optional: DeepSeek provider for autonomous mode |
+| `OPENAI_API_KEY` | — | Optional: OpenAI provider for autonomous mode |
+| `CHIASMUS_API_URL` | per provider | Override API base URL (e.g. for local models via Ollama) |
+| `CHIASMUS_MODEL` | per provider | Override model name |
+| `CHIASMUS_EMBED_MODEL` | `text-embedding-3-small` | Embedding model name (cloud providers) |
+| `CHIASMUS_EMBED_URL` | per provider | Embedding API base URL |
+| `CHIASMUS_EMBED_DIM` | discovered | Embedding dimension (else learned on first call; local skips the first-call cache miss) |
+| `CHIASMUS_LOCAL_EMBED` | — | Opt in to on-device embeddings (`1`/`true`/`yes`/`on`). See [Local embeddings](#local-embeddings-no-api-key) |
+| `CHIASMUS_LOCAL_EMBED_MODEL` | — | Model id (`hf:org/repo`, bare repo id, local `.gguf`, or URL) |
+| `CHIASMUS_LOCAL_EMBED_DIM` | discovered | Fixed embedding dimension (else discovered on first call) |
+| `CHIASMUS_LOCAL_EMBED_DIR` | `$CHIASMUS_HOME/models` | Where downloaded models are cached |
+| `CHIASMUS_LOCAL_EMBED_BATCH` | `32` | Texts per embedding backend call |
+
+Providers are checked in order: Anthropic → DeepSeek → OpenAI. Only one key is needed for autonomous mode (`chiasmus_solve`, `chiasmus_learn`). When used from Claude Code, Crush, or OpenCode, no API key is needed — the calling LLM handles template filling directly.
+
+Embedding provider selection (first match wins): local embeddings (when `CHIASMUS_LOCAL_EMBED` is set and a model is configured) → Azure OpenAI → OpenAI → DeepSeek → OpenRouter. When enabled without a model, a warning is logged and cloud providers are used instead.
+
+### `~/.chiasmus/config.json`
+
+| Key | Default | Purpose |
+|-----|---------|---------|
+| `adapterDiscovery` | `false` | Scan `node_modules` for `chiasmus-adapter-*` packages at startup |
+| `localEmbeddings` | — | Opt in to on-device embeddings via node-llama-cpp. Object with `enabled`, `model`, `dimension`, `modelsDir`. See [Local embeddings](#local-embeddings-no-api-key) |
+
+## License
+
+Apache-2.0
+
+---
+
+# AGENTS.md — Chiasmus
+
+Source: https://github.com/yogthos/chiasmus/blob/main/AGENTS.md
+
+# AGENTS.md — Chiasmus
+
+## Project Overview
+
+Chiasmus is an MCP (Model Context Protocol) server that gives LLMs access to formal verification via **Z3** (SMT solver) and **SWI-Prolog** (via `prolog-wasm-full`, including `library(clpfd)`). It also provides tree-sitter-based source code call graph analysis. The server translates natural language problems into formal logic using a template-based pipeline, verifies results with mathematical certainty, and analyzes call graphs for reachability, dead code, and impact analysis.
+
+- **Language**: TypeScript (strict mode, ESM)
+- **Runtime**: Node.js ≥20
+- **License**: Apache-2.0
+- **Package**: npm package `chiasmus`, exposes a CLI binary
+
+## Commands
+
+```bash
+pnpm build          # Compile TypeScript (tsc) → dist/
+pnpm typecheck      # Type-check only (tsc --noEmit)
+pnpm test           # Run tests in watch mode (vitest)
+pnpm test:run       # Run tests once (vitest run)
+pnpm test:coverage  # Run tests with V8 coverage report
+pnpm mcp            # Run MCP server locally via tsx
+```
+
+### CI Pipeline
+
+CI runs on push/PR to `main` (`.github/workflows/test.yml`):
+1. `pnpm install --frozen-lockfile`
+2. `pnpm typecheck`
+3. `pnpm test:run`
+
+Tested on Node 20 and 22.
+
+## Code Organization
+
+```
+src/
+├── mcp-server.ts          # Entry point — MCP server, all tool handlers, CLI bootstrap
+├── config.ts              # Loads ~/.chiasmus/config.json
+├── solvers/
+│   ├── types.ts           # SolverType, SolverResult (discriminated union), Solver, SolverInput
+│   ├── session.ts         # SolverSession — factory for Z3/Prolog solver instances
+│   ├── z3-solver.ts       # Z3 WASM wrapper (z3-solver npm), auto-strips check-sat/get-model
+│   ├── prolog-solver.ts   # SWI-Prolog (prolog-wasm-full) wrapper, derivation tracing via assertz
+│   └── correction-loop.ts # Bounded repair loop (delegates to repl-sandbox)
+├── formalize/
+│   ├── engine.ts          # FormalizationEngine — template selection, LLM slot-filling, solve pipeline
+│   ├── validate.ts        # lintSpec — structural validation, auto-fixes for SMT-LIB/Prolog
+│   └── feedback.ts        # classifyFeedback — converts SolverResult to human-readable feedback
+├── skills/
+│   ├── types.ts           # SkillTemplate, SlotDef, Normalization, SkillMetadata
+│   ├── library.ts         # SkillLibrary — SQLite-backed template storage, BM25 search
+│   ├── starters.ts        # 8 built-in starter templates (5 Z3, 3 Prolog)
+│   ├── bm25.ts            # BM25 keyword search for template retrieval
+│   ├── craft.ts           # craftTemplate — user-created template validation + storage
+│   ├── learner.ts         # SkillLearner — LLM-driven template extraction from solutions
+│   └── relationships.ts   # Template relationship/suggestion graph
+├── graph/
+│   ├── types.ts           # CodeGraph, LanguageAdapter, FileNode, Hyperedge, DefinesFact, CallsFact.calleeQN, ImportsFact.resolved, FileTypeInfo
+│   ├── parser.ts          # tree-sitter lang registry + sync/async parse for TS/JS/Py/Go/Rust/Clojure
+│   ├── extractor.ts       # AST walking + per-language call graph extraction + TS/JS collectTypeInfo
+│   ├── facts.ts           # graphToProlog — CodeGraph → Prolog facts (incl. calls_qn/3, imports_resolved/3)
+│   ├── analyses.ts        # runAnalysis — dispatches all graph analyses
+│   ├── native-analyses.ts # O(V+E) cycles/reachability/impact/dead-code/callers/callees
+│   ├── graph-util.ts      # Shared helpers: buildUndirectedGraph, forEachUndirectedEdge, undirectedDegree
+│   ├── community.ts       # Louvain community detection + cohesion score
+│   ├── insights.ts        # detectHubs, detectBridges, detectSurprisingConnections
+│   ├── diff.ts            # graphDiff — set diff on nodes + (src,tgt) edge keys
+│   ├── entry-points.ts    # Heuristic entry-point detection (zero-in-degree exports)
+│   ├── cache.ts           # SHA256 per-file cache + LRU eviction + named snapshots (proper-lockfile)
+│   ├── mermaid.ts         # parseMermaid — Mermaid flowcharts/state diagrams → Prolog facts
+│   ├── type-env.ts        # TS/JS three-tier type inference + class field/method extraction
+│   ├── resolve-calls.ts   # Project-wide QN resolution: inheritance-aware field/method registry
+│   ├── tsconfig-aliases.ts # Parses tsconfig.json paths/baseUrl with JSONC + extends chain
+│   ├── suffix-index.ts    # Suffix index over batch files for relative import resolution
+│   └── adapter-registry.ts # Auto-discovery of chiasmus-adapter-* npm packages
+├── search/
+│   ├── engine.ts          # buildSearchCorpus + runSearch — cosine-sim code search
+│   ├── vector-store.ts    # In-process linear-scan store; serializable
+│   ├── embedding-cache.ts # SHA-256-keyed persistent cache, atomic writes
+│   └── index.ts           # Module exports
+├── llm/
+│   ├── types.ts           # LLMAdapter + EmbeddingAdapter interfaces, LLMMessage
+│   ├── anthropic.ts       # Anthropic/DeepSeek/OpenAI provider factories (createLLMFromEnv, createEmbeddingFromEnv)
+│   ├── openai-compatible.ts # OpenAI-compatible chat + embedding adapters
+│   └── mock.ts            # Mock LLM + MockEmbeddingAdapter for testing
+tests/                      # Unit tests (mirrors src/ structure)
+benchmark/                  # Benchmark problems (5 problems × traditional + chiasmus implementations)
+```
+
+## Key Types and Patterns
+
+### SolverResult (discriminated union)
+
+The core result type — always check `status` first:
+
+```typescript
+type SolverResult =
+  | { status: "sat"; model: Record<string, string> }        // Z3 found satisfying assignment
+  | { status: "unsat"; unsatCore?: string[] }                // Z3 proved unsatisfiable
+  | { status: "unknown" }                                    // Z3 couldn't determine
+  | { status: "success"; answers: PrologAnswer[]; trace?: string[] }  // Prolog query succeeded
+  | { status: "error"; error: string }                       // Solver/parse error
+```
+
+### SolverInput (discriminated union)
+
+```typescript
+type SolverInput =
+  | { type: "z3"; smtlib: string }
+  | { type: "prolog"; program: string; query: string; explain?: boolean }
+```
+
+### LLMAdapter
+
+```typescript
+interface LLMAdapter {
+  complete(system: string, messages: LLMMessage[]): Promise<string>;
+}
+
+interface EmbeddingAdapter {
+  embed(texts: string[]): Promise<number[][]>;
+  dimension(): number;
+}
+```
+
+LLM provider priority: `ANTHROPIC_API_KEY` → `DEEPSEEK_API_KEY` → `OPENAI_API_KEY`.
+
+Embedding provider priority (Anthropic has no embeddings): `OPENAI_API_KEY` → `DEEPSEEK_API_KEY` → `OPENROUTER_API_KEY`. Override the model via `CHIASMUS_EMBED_MODEL` (default `text-embedding-3-small`), URL via `CHIASMUS_EMBED_URL`, and dimension via `CHIASMUS_EMBED_DIM`.
+
+## Conventions
+
+### Import Style
+
+- All imports use `.js` extension (ESM with NodeNext module resolution):
+  ```typescript
+  import { SolverSession } from "./solvers/session.js";
+  import type { SolverResult } from "./solvers/types.js";
+  ```
+- Type-only imports use `import type { ... }`.
+
+### Module System
+
+- **ESM only** (`"type": "module"` in package.json)
+- `"module": "NodeNext"`, `"moduleResolution": "NodeNext"` in tsconfig.json
+- Source in `src/`, compiled output in `dist/`, tests in `tests/` (not included in build)
+
+### Code Style
+
+- 2-space indentation
+- Discriminated unions for result types (check `status` / `type` field)
+- Classes use `private` constructor + `static async create()` pattern for async init (see `SolverSession`, `SkillLibrary`)
+- Solver instances always call `dispose()` in `finally` blocks
+- Error handling: catch and return `{ status: "error", error: msg }` rather than throwing
+- `as const` used for tool schema type assertions
+
+### Naming
+
+- Files: kebab-case (`correction-loop.ts`, `z3-solver.ts`)
+- Classes: PascalCase (`SolverSession`, `SkillLibrary`, `FormalizationEngine`)
+- Functions: camelCase (`createZ3Solver`, `lintSpec`, `classifyFeedback`)
+- Types/Interfaces: PascalCase (`SolverResult`, `SkillTemplate`, `CodeGraph`)
+- Template names: kebab-case (`policy-contradiction-check`)
+
+## Testing
+
+- **Framework**: Vitest with `globals: true` — use `describe`/`it`/`expect` directly
+- **Test location**: `tests/` directory, mirrors `src/` structure
+- **Also included**: `benchmark/tests/` for benchmark test suites
+- **Timeout**: 30 seconds per test (Z3 WASM init is slow)
+- **Coverage**: V8 provider, covers `src/**/*.ts`
+
+### Test Patterns
+
+```typescript
+import { describe, it, expect, afterEach } from "vitest";
+
+describe("Z3Solver", () => {
+  let solver: Solver;
+  afterEach(() => { solver?.dispose(); });
+
+  it("returns sat with a model", async () => {
+    solver = await createZ3Solver();
+    const result = await solver.solve({ type: "z3", smtlib: `...` });
+    expect(result.status).toBe("sat");
+    if (result.status === "sat") {  // TypeScript narrowing
+      expect(result.model).toHaveProperty("x");
+    }
+  });
+});
+```
+
+- Always narrow discriminated unions with `if (result.status === "sat")` before accessing status-specific fields
+- Solver instances created per-test, disposed in `afterEach`
+- Import paths from tests use `../src/...` with `.js` extension
+
+## MCP Tools
+
+11 tools exposed via MCP (defined in `src/mcp-server.ts`):
+
+| Tool | Requires LLM? | Purpose |
+|------|:---:|---------|
+| `chiasmus_verify` | No | Submit raw SMT-LIB or Prolog → verified result. Also accepts `format="mermaid"` → parses flowchart/stateDiagram into Prolog facts automatically. |
+| `chiasmus_skills` | No | Search/list formalization templates |
+| `chiasmus_formalize` | No* | Find template + slot-filling instructions |
+| `chiasmus_solve` | Yes | End-to-end: template → fill → lint → verify → correct |
+| `chiasmus_learn` | Yes | Extract reusable template from verified solution |
+| `chiasmus_lint` | No | Fast structural validation without running solver |
+| `chiasmus_graph` | No | Source code call graph analysis (tree-sitter + Prolog / native O(V+E)). 16 analyses; see below. Supports per-file content-hash cache (`cache=true`) + named graph snapshots (`save_snapshot`, `against`). TS/JS carry qualified callees (`calleeQN`) and resolved imports (`resolved`) when inferable. |
+| `chiasmus_map` | No | Pre-built codebase map: repo outline, per-file detail, or symbol lookup. Share with an LLM **before** bulk file reads to cut redundant reads/greps. Three modes (`overview`/`file`/`symbol`), markdown or JSON. Reuses the same tree-sitter extraction + per-file cache as `chiasmus_graph`. |
+| `chiasmus_search` | Embed† | Semantic code search over a set of files. NL query → ranked list of callable defines via embeddings + cosine similarity. Caches embeddings by content SHA-256 under `$CHIASMUS_HOME/embeddings`. |
+| `chiasmus_craft` | No | Create new template from LLM-designed spec |
+| `chiasmus_review` | No | Return phased code-review recipe (graph analyses + verification templates). `delta_against=<snapshot>` enables PR-scoped review: a phase 0 diffs against the snapshot and scopes later phases to changed symbols. |
+
+*`chiasmus_formalize` uses a dummy LLM that returns "" when no API key is set — it still selects the template.
+†`chiasmus_search` needs an embedding provider, picked up from `OPENAI_API_KEY` / `DEEPSEEK_API_KEY` / `OPENROUTER_API_KEY` (overridable via `CHIASMUS_EMBED_MODEL`, `CHIASMUS_EMBED_URL`, `CHIASMUS_EMBED_DIM`).
+
+### `chiasmus_graph` analyses
+
+Defined by `GRAPH_ANALYSES` in `src/mcp-server.ts` and dispatched by `runAnalysis` in `src/graph/analyses.ts`:
+
+| Analysis | Required args | Purpose |
+|---|---|---|
+| `summary` | — | Overview counts (nodes, edges, languages) |
+| `callers` | `target` | Direct callers of `target` |
+| `callees` | `target` | Direct callees of `target` |
+| `reachability` | `from`, `to` | Boolean: can `from` reach `to`? |
+| `path` | `from`, `to` | Shortest call chain `from → … → to` |
+| `impact` | `target` | Transitive callers (who is affected by a change) |
+| `dead-code` | *(opt.)* `entry_points` | Symbols unreachable from entry points; auto-detects exports when omitted |
+| `cycles` | — | Circular call dependencies |
+| `layer-violation` | — | Calls that skip layers (e.g. handler → db bypassing service) |
+| `communities` | — | Louvain clusters (seed=42) with cohesion scores |
+| `hubs` | — | Top-degree nodes |
+| `bridges` | — | Top betweenness — nodes connecting otherwise-separate subgraphs |
+| `surprises` | — | Cross-community + peripheral → hub edges |
+| `diff` | `against` | Current graph vs a saved snapshot; covers nodes, edges, imports, exports, hyperedges |
+| `entry-points` | — | Zero-in-degree exports (feeds `dead-code`) |
+| `facts` | *(opt.)* `include_insights` | Raw Prolog facts for `chiasmus_verify`. `include_insights=true` also emits `community/2`, `cohesion/2`, `hub/2`, `bridge/2` |
+
+Cache + snapshot workflow:
+
+- `cache=true` enables the SHA256 per-file extraction cache (`~/.cache/chiasmus` or `$CHIASMUS_CACHE_DIR`). Unchanged files skip re-parsing across calls.
+- `save_snapshot="main"` persists the extracted `CodeGraph` under a name; requires `cache=true`.
+- `analysis="diff"` + `against="main"` compares current extraction to that snapshot.
+- Guard: `save_snapshot` and `against` naming the same snapshot is rejected — otherwise the save would clobber the baseline before the diff runs.
+
+### `chiasmus_map` modes
+
+Returns a compact projection of the tree-sitter graph. Implemented in `src/graph/map.ts`, wired in `handleMap` (`src/mcp-server.ts`). Purpose: hand an LLM a pre-built outline so it doesn't re-read/grep files to learn what's there.
+
+| Mode | Required args | Output |
+|---|---|---|
+| `overview` *(default)* | `files` | Dir-grouped outline: per-file headlines with language, line count, token estimate, leading doc, exports with signatures |
+| `file` | `files`, `path` | Single-file detail: exports, imports grouped by source, all top-level symbols |
+| `symbol` | `files`, `name` | Where `name` is defined (file + line + signature) plus direct callers and callees |
+
+Options:
+- `format`: `"markdown"` *(default)* or `"json"`. Markdown is optimised for LLM consumption; JSON for programmatic use.
+- `include`: array of glob patterns to filter overview (`**`, `*`, `?` supported). E.g. `["**/src/**"]`.
+- `max_exports`: cap on exports-per-file surfaced in overview (default 8; negative values clamp to 0).
+- `cache=true`: reuse the shared per-file extraction cache (same directory and invalidation as `chiasmus_graph`).
+
+Data sources (added to `CodeGraph` for this feature):
+- `FileNode.fileDoc` — language-specific, idiomatic doc only: TS/JS JSDoc `/** */`, Python `"""..."""` module docstring, Go `//` package-doc comments, Rust `///` and `//!` doc comments. Plain `//` line comments in TS/JS, `#` comments in Python, and `;` comments in Clojure are intentionally rejected (usually license/shebang noise).
+- `FileNode.tokenEstimate` — `ceil(content.length / 3.5)` so an agent can read-budget.
+- `FileNode.lineCount` — newline-count with trailing-line adjustment.
+- `DefinesFact.signature` — params + return type (TS/JS/Python/Go/Rust); arglist vector for Clojure `defn` and `defprotocol`/`definterface` methods.
+- TypeScript exports now also include `interface`, `type`, and `enum` declarations, so `exportCount` reflects the full public surface.
+- Cache schema is currently `"3"` (bumped when `CodeGraph._typeInfo` and `CallsFact.calleeQN` landed). Older caches auto-invalidate on upgrade.
+
+### TS/JS qualified-name resolution
+
+Two passes, both best-effort (failure never blocks the base graph):
+
+1. **Per-file** (`collectTypeInfo` in `src/graph/extractor.ts`) — walks each TS/JS AST to extract:
+   - class/interface `extends` edges (both `class_heritage > extends_clause` and the interface-direct `extends_type_clause` shape),
+   - class/interface fields (`extractClassFields` in `type-env.ts`) + methods (`method_definition` and interface `method_signature`),
+   - pending call sites with their receiver chain (e.g. `['this', 'svc']` + `login`),
+   - per-scope local variable types (Tier 0 annotation → Tier 1 `new` → Tier 2 assignment-chain inference).
+   Wrapped in try/catch — an unexpected AST shape drops only the QN data for that file.
+
+2. **Project-wide** (`resolveCallsWithRegistry` in `src/graph/resolve-calls.ts`) — merges per-file type info into:
+   - `ClassFieldRegistry` with inheritance propagation (child fields shadow parent).
+   - `ClassMethodRegistry` exposing `{ own, flat, parents }` so the resolver can verify a method exists on the receiver type *and* walk up to find the declaring class (`Child.run()` → `Svc.run` when `run` is only defined on `Svc`).
+   - `JS_BUILTIN_TYPES` blacklist rejects builtins (`Map`, `Promise`, `any`, `string`, `ReadonlySet`, …) so their prototype methods don't leak into QNs.
+   - Fallbacks: (a) unique method owner via `graph.contains`, (b) unique flat-registry owner. Ambiguous names stay without a QN rather than guess.
+
+Matching `CallsFact`s get their `calleeQN = "Class.method"`. Emitted as `calls_qn/3` Prolog facts alongside back-compat `calls/2`.
+
+### Import resolution
+
+`extractGraph(files, { repoPath })` resolves each `ImportsFact.source` to a repo-relative `resolved` path when possible:
+- `tsconfig-aliases.ts` parses `tsconfig.json` (JSONC + `extends`, cycle-safe) and rewrites `@/foo` → `src/foo`.
+- `suffix-index.ts` builds a suffix index over the batch file paths. Relative imports (`./foo`, `../foo`) resolve **exactly** from the importing file's directory — no fallback to shorter suffixes, so a stale batch doesn't silently match an unrelated same-basename file.
+- External packages and bare specifiers stay `resolved=undefined`.
+- If `repoPath` is omitted, the longest common ancestor of the batch is used. Emitted as `imports_resolved/3` Prolog facts.
+
+### Semantic search (`chiasmus_search`)
+
+- Corpus = one entry per callable define (function or method) — text is `name + signature + fileDoc + 6-line body snippet`, capped at 2000 chars.
+- `VectorStore` — linear-scan cosine similarity; L2-normalized on query; serializable. Correct up to ~10k vectors; swap in an HNSW backing if the corpus grows.
+- `EmbeddingCache` — SHA-256(content) keyed, one JSON file per dimension under `$CHIASMUS_HOME/embeddings/dN.json`. Atomic writes via `.tmp + rename`. Dimension mismatch on load silently discards (clean model swap).
+- `OpenAICompatibleEmbeddingAdapter` batches 96 inputs per request and preserves order via the response `index` field.
+- First call with unknown dimension (no `CHIASMUS_EMBED_DIM` set) skips the cache — dimension is learned from the response and subsequent calls cache normally.
+
+## Gotchas
+
+### Z3 Solver
+- Z3 WASM init loads ~30MB — cached in module scope (`z3Promise` singleton)
+- Input is sanitized: `(check-sat)`, `(get-model)`, `(set-logic)`, `(exit)` are auto-stripped
+- Use `(assert (! expr :named label))` for readable UNSAT cores
+- Use `(= flag (or ...))` NOT `(=> ... flag)` — implication is trivially SAT
+- No `(define-fun)` with args — breaks model extraction; use `(declare-const)` + `(assert (=))` instead
+- Solver timeout: 30 seconds
+- Empty input after sanitization returns `{ status: "sat", model: {} }`
+
+### Prolog Solver
+- Backed by `prolog-wasm-full` (SWI-Prolog 10.1.4 in WebAssembly, includes `library(clpfd)`)
+- Single global SWI instance (Emscripten factory invalidates after first instantiation); per-`solve()` isolation via temp-file consult + `abolish/1` cleanup
+- Max 1000 answers per query, default 100,000 inference budget (`maxInferences` overrides; goal wrapped in `call_with_inference_limit/3`)
+- Derivation tracing instruments rules by injecting `assertz(trace_goal(head))` into each rule body
+- Errors during consult are captured via a `user:message_hook/3` that asserts to `'$chiasmus_msg'/2`; query syntax errors are pre-validated via `read_term_from_atom/3` (the stock query API doesn't propagate parse errors)
+- Prolog clauses must end with periods
+
+### General
+- `SolverSession.create()` is async (Z3 init) — always `await` it
+- `SkillLibrary.create()` is async (SQLite init) — always `await` it
+- Correction loop delegates to `repl-sandbox` package's generic `correctionLoop`
+- `chiasmus_solve` falls back to `chiasmus_formalize` when no API key is set
+- Test imports use `../src/solvers/z3-solver.js` (not `../../dist/...`)
+- Template slots use `{{SLOT:name}}` markers in skeleton strings
+- Lint tool (`formalize/validate.ts`) auto-fixes markdown fences, `(check-sat)`, `(get-model)`, `(set-logic)` before reporting errors
+
+### Graph cache
+- `saveFileCache` serializes all manifest read-modify-writes through `proper-lockfile` on `<repoDir>/.lock` — concurrent MCP dispatches don't tear the manifest
+- Per-file writes are atomic via `.tmp` + rename, parallelized with `Promise.all` inside the single lock acquisition
+- Eviction is folded into the save lock block with a manifest-sum fast path: the O(N) `fs.readdir`/`fs.stat` sweep only runs when the manifest-tracked total exceeds the per-repo budget
+- LRU uses file `mtime`; `checkFileCache` bumps it via `fs.utimes` on hits (best-effort, concurrent eviction is tolerated by the read path)
+- Snapshot names are validated against `/`, `\`, `..`, `\0` — path traversal rejected at every entry point
+- Cache schema versioned via `CACHE_SCHEMA_VERSION` in the manifest; mismatch silently invalidates all entries rather than throwing
+
+---
+
+# Chiasmus: Neurosymbolic Verification Engine
+
+Source: https://github.com/yogthos/chiasmus/blob/main/architecture.md
+
+# Chiasmus: Neurosymbolic Verification Engine
+
+## Vision
+
+Chiasmus is an MCP server that gives language models access to formal verification. The LLM acts as a semantic translator — it understands what the user means and maps that understanding onto formal logic that a solver can verify with mathematical certainty. The solver's answer is provably correct, not probabilistically likely.
+
+The core insight: LLMs are bad at logical reasoning but good at translation. Solvers are perfect at logical reasoning but can't understand natural language. Chiasmus bridges the gap with a template-based formalization pipeline that gets better over time.
+
+## Architecture Overview
+
+```
+User prompt
+  │
+  ▼
+┌─────────────────────────────────┐
+│  Phase 1: NORMALIZE             │
+│  LLM classifies problem type,   │
+│  maps domain-specific inputs to │
+│  common intermediate format     │
+└──────────────┬──────────────────┘
+               │
+               ▼
+┌─────────────────────────────────┐
+│  Phase 2: FORMALIZE             │
+│  Embed problem signature,       │
+│  retrieve matching template,    │
+│  LLM fills slots in skeleton    │
+│  (or generates from scratch     │
+│   using closest as few-shot)    │
+└──────────────┬──────────────────┘
+               │
+               ▼
+┌─────────────────────────────────┐
+│  Phase 3: VERIFY                │
+│  Submit to solver (Z3 / Tau     │
+│  Prolog), catch errors, feed    │
+│  back to LLM for correction     │
+│  (max 5 rounds), return result  │
+└──────────────┬──────────────────┘
+               │
+               ▼
+┌─────────────────────────────────┐
+│  Phase 4: EXTRACT (optional)    │
+│  Generalize solved problem into │
+│  candidate skill template for   │
+│  future reuse                   │
+└─────────────────────────────────┘
+```
+
+## Why Templates, Not Free-Form Generation
+
+Research on autoformalization (Draft-Sketch-Prove, Baldur, LEGO-Prover, DeepSeek-Prover) shows:
+
+- **Single-pass LLM formalization accuracy: 15-30%** for nontrivial problems
+- **Template/structured prompting** reduces compilation errors by 30-50%
+- **Retrieval of similar past formalizations** is the single biggest accuracy boost
+- **Verifier-in-the-loop repair** (3-5 rounds) pushes success to 50-70%
+
+Free-form SMT-LIB or Prolog generation is unreliable. The LLM's job is narrowed to: find the right template, normalize the inputs, fill the slots. This is a translation task, which LLMs are good at.
+
+## Target Domains
+
+Ranked by frequency in day-to-day coding work and validated by production systems that already use solvers under the hood:
+
+| Domain | Solver | Production precedent |
+|--------|--------|---------------------|
+| Policy/authorization verification | Z3 or Prolog | AWS Cedar, OPA/Rego, Teleport |
+| Configuration validation | Z3 | Azure firewall verification |
+| Dependency/version constraints | Z3 | Conda/libsolv, Spack/Clingo |
+| Data validation rule consistency | Z3 | JSON schema analysis |
+| Rule engine / business logic | Prolog | OPA, compliance engines |
+| Static analysis patterns | Prolog/Datalog | CodeQL, Soufflé |
+
+**When to use a solver instead of just asking the LLM:**
+- Universal quantification needed ("does this hold for ALL inputs?")
+- Combinatorial explosion (too many possibilities to enumerate)
+- Correctness is non-negotiable (security, access control)
+- Contradiction/inconsistency detection
+- Recursive reachability / transitive closure
+
+## Formalization Templates (Skills)
+
+A template is a parameterized formal specification:
+
+```yaml
+name: policy-contradiction-check
+domain: authorization
+solver: z3
+signature: "Check if a set of allow/deny rules can ever conflict"
+skeleton: |
+  (declare-datatypes ((Principal 0) (Resource 0) (Action 0)) ...)
+  (declare-fun allow (Principal Resource Action) Bool)
+  (declare-fun deny (Principal Resource Action) Bool)
+  {{SLOT: rule_assertions}}
+  (assert (exists ((p Principal) (r Resource) (a Action))
+    (and (allow p r a) (deny p r a))))
+  (check-sat)
+normalizations:
+  - source: "AWS IAM JSON"
+    transform: "map Statement[].{Effect, Principal, Action, Resource} to triples"
+  - source: "Django permissions"
+    transform: "extract user as principal, permission as action, app as resource"
+  - source: "Kubernetes RBAC"
+    transform: "expand rules[].{verbs, resources} into action/resource pairs"
+  - source: "natural language"
+    transform: "extract entities, classify as principal/resource/action"
+metadata:
+  reuse_count: 0
+  success_rate: 0.0
+  last_used: null
+  promoted: false
+```
+
+### Starter Templates (Ship With These)
+
+**Z3:**
+1. Policy contradiction detection — do allow/deny rules ever conflict?
+2. Policy reachability — can principal X ever access resource Y?
+3. Configuration equivalence — are two configs functionally identical?
+4. Constraint satisfiability — find a solution given version/dependency constraints
+5. Schema consistency — are validation rules contradictory or redundant?
+
+**Prolog:**
+1. Rule chain inference — given facts + rules, what conclusions follow?
+2. Graph reachability — can node A reach node B through any path?
+3. Permission derivation — given role hierarchy + rules, what can user X do?
+
+### Skill Library Lifecycle
+
+```
+Solved problem
+  → LLM abstracts concrete values into typed parameters
+  → Generates signature + normalization schemas
+  → Stored as candidate skill (promoted=false, reuse_count=0)
+  → After N successful reuses → promoted=true
+  → Unused for M sessions → demoted or pruned
+  → Before adding: check embedding similarity against existing (merge if >0.9)
+```
+
+Lessons from LEGO-Prover (ICLR 2024): their library grew to 20,000+ skills but a 2025 analysis found most were single-use. We track reuse rigorously and prune aggressively. 50 well-validated templates beat 5,000 cached one-offs.
+
+### Normalization Layer (Transfer Learning)
+
+The normalization layer is what makes templates reusable across contexts. Each template defines mappings from domain-specific formats to its expected inputs. The LLM's translation job:
+
+1. Recognize that an AWS IAM policy, a Django permission check, and a K8s RBAC rule are all instances of the same abstract pattern
+2. Apply the appropriate normalization schema (or create a new one)
+3. Produce the common intermediate format the template expects
+
+New normalization patterns discovered during use get saved back to the template, so the system learns to handle more input formats over time.
+
+## MCP Tool Surface
+
+| Tool | Purpose | LLM required? |
+|------|---------|---------------|
+| `chiasmus_solve` | End-to-end: normalize → formalize → verify → return result | Yes |
+| `chiasmus_verify` | Submit raw SMT-LIB or Prolog directly, get solver result | No |
+| `chiasmus_formalize` | Find template + return slot-filling instructions for the calling LLM | No* |
+| `chiasmus_craft` | Create a new template (LLM-designed, validated server-side) | No |
+| `chiasmus_skills` | Search/list templates in the skill library | No |
+| `chiasmus_learn` | Extract a new candidate skill from a verified solution | Yes |
+| `chiasmus_lint` | Fast structural validation without running the solver | No |
+| `chiasmus_graph` | Source-code call-graph analysis (16 analyses incl. communities, hubs, bridges, diff, entry-points). TS/JS emits `calleeQN` + `imports.resolved` when inferable. | No |
+| `chiasmus_map` | Pre-built codebase outline for pre-read agent context (overview / file / symbol) | No |
+| `chiasmus_search` | Semantic code search over a file set (embeddings + cosine similarity) | Embedding† |
+| `chiasmus_review` | Phased code-review recipe with optional PR-delta scope | No |
+
+*`chiasmus_formalize` selects the template server-side; the calling LLM fills slots.
+†`chiasmus_search` needs an embedding provider via env (`OPENAI_API_KEY` / `DEEPSEEK_API_KEY` / `OPENROUTER_API_KEY`).
+
+## Solver Engines
+
+**Z3** via `z3-solver` npm package. WebAssembly build of Microsoft's SMT solver, runs entirely in Node. Handles satisfiability modulo theories — the LLM outputs SMT-LIB format or constructs JS API calls. Covers: integer/real arithmetic, bitvectors, arrays, datatypes, quantifiers.
+
+**SWI-Prolog** via `prolog-wasm-full` npm package. SWI-Prolog 10.1.4 in WebAssembly with `library(clpfd)` included. The LLM outputs Prolog facts and rules as a string, consulted into a temp file and queried with `call_with_inference_limit/3` for runaway protection. Covers: rule-based deduction, backtracking search, recursive queries, unification, finite-domain constraints. Token-efficient syntax that LLMs generate accurately.
+
+Both run entirely within the host process. No external API calls. Isolated, stateful contexts spin up instantly.
+
+## Error Correction Loop
+
+```
+LLM generates formal spec
+  → Solver attempts compilation/execution
+  → On error: extract stack trace / error message
+  → Feed error back into LLM prompt with original spec
+  → LLM patches and resubmits
+  → Repeat (max 5 rounds)
+  → On convergence: return verified result
+  → On failure to converge: return best attempt + diagnostics
+```
+
+Bounded at 5 rounds based on research showing diminishing returns past 3-5 iterations. On failure, return partial results with the error trace so the caller can decide next steps — never silently hang.
+
+## Integration With Existing Systems
+
+### From Matryoshka (direct code reuse)
+- **SessionDB** (`src/persistence/session-db.ts`) — in-memory SQLite, FTS5 search
+- **HandleRegistry** (`src/persistence/handle-registry.ts`) — handle-based token savings
+- **HandleOps** (`src/persistence/handle-ops.ts`) — server-side operations on handles
+- **CheckpointManager** (`src/persistence/checkpoint.ts`) — session persistence
+- **NucleusEngine patterns** (`src/engine/`) — REPL execution model, error interception
+
+### From Ori-Mnemos (direct code reuse)
+- **Embedding infrastructure** — `@huggingface/transformers` all-MiniLM-L6-v2 for template retrieval
+- **BM25 search** — keyword matching for template discovery
+- **Retrieval patterns** — Q-value tracking for skill quality signals
+
+### Not Reimplemented
+- No new SQLite layer — use Matryoshka's SessionDB
+- No new embedding system — use Ori's
+- No new search fusion — use existing BM25 + semantic from either project
+- No new handle system — use Matryoshka's HandleRegistry
+
+## Configuration
+
+Database location controlled by environment variable:
+
+```
+CHIASMUS_HOME=~/.chiasmus/   # default
+```
+
+Directory structure:
+```
+~/.chiasmus/
+├── chiasmus.db              # SQLite — skill metadata, embeddings, reuse tracking
+├── skills/
+│   ├── z3/                  # Z3 templates (.smt2.tmpl)
+│   ├── prolog/              # Prolog templates (.pl.tmpl)
+│   └── learned/             # Auto-extracted candidates, not yet promoted
+└── sessions/                # Ephemeral session state (checkpoints)
+```
+
+## Implementation Phases
+
+Each phase follows strict TDD: write tests first, verify they fail, implement, verify they pass. Code review after each phase to catch bugs and design issues. After review, dogfood the tool to confirm it provides real value — if it doesn't, stop and rethink before moving on.
+
+### Phase 1: Solver Sandbox
+
+**Goal:** Get Z3 and SWI-Prolog running in isolated, stateful contexts with clean input/output interfaces.
+
+**Delivers:**
+- `chiasmus_verify` MCP tool — submit raw SMT-LIB or Prolog, get result
+- Solver abstraction layer (common interface over Z3 and SWI-Prolog)
+- Error capture and structured error reporting
+- Session isolation (concurrent solver contexts)
+
+**Tests:**
+- Z3: submit valid SMT-LIB, get SAT/UNSAT + model
+- Z3: submit invalid SMT-LIB, get structured error
+- SWI-Prolog: load facts + rules, query, get derivation
+- SWI-Prolog: submit malformed program, get structured error
+- Concurrent sessions don't interfere with each other
+
+**Review + Dogfood:** Can I (the LLM) submit formal specs directly and get useful verified results? Is the error reporting clear enough to self-correct?
+
+### Phase 2: Error Correction Loop
+
+**Goal:** Wire the solver sandbox into a bounded repair loop that takes an initial formalization attempt and iteratively fixes it.
+
+**Delivers:**
+- Correction loop engine (submit spec → get error → patch → resubmit, max 5 rounds)
+- Structured prompts for each solver type's error format
+- Convergence detection (solver returns valid result)
+- Failure reporting (best attempt + error history on non-convergence)
+
+**Tests:**
+- Spec with minor syntax error converges within 2 rounds
+- Spec with semantic error (wrong types) converges within 5 rounds
+- Deliberately unfixable spec hits max rounds and returns diagnostics
+- Loop correctly distinguishes solver errors from valid UNSAT results
+
+**Review + Dogfood:** Given a rough but close formalization, does the loop reliably fix it? Are the error prompts informative enough? What's the typical round count?
+
+### Phase 3: Skill Library + Template Retrieval
+
+**Goal:** Persistent template storage with embedding-based retrieval. Ship the starter template set.
+
+**Delivers:**
+- `chiasmus_skills` MCP tool — search/list templates
+- SQLite schema for template metadata and embeddings
+- Embedding-based similarity search (reuse Ori's infrastructure)
+- Starter template set (5 Z3 + 3 Prolog templates, hand-crafted)
+- Template loading and slot identification
+
+**Tests:**
+- Store a template, retrieve by embedding similarity
+- Retrieve correct template for each target domain
+- Templates parse correctly and identify their slots
+- Metadata tracking (reuse count, success rate) works
+- `CHIASMUS_HOME` env var respected, defaults to `~/.chiasmus/`
+
+**Review + Dogfood:** Does retrieval find the right template for real problems? Are the starter templates well-designed? Is the slot structure clear enough for an LLM to fill?
+
+### Phase 4: Normalize + Formalize Pipeline
+
+**Goal:** The full LLM-driven pipeline: classify problem, find template, normalize inputs, fill slots, send to solver with error correction.
+
+**Delivers:**
+- `chiasmus_solve` MCP tool — end-to-end pipeline
+- `chiasmus_formalize` MCP tool — normalize + formalize without execution
+- Problem type classification
+- Normalization layer (domain-specific → common intermediate format)
+- Template slot-filling with LLM
+- Integration of phases 1-3 into the complete pipeline
+
+**Tests:**
+- Natural language policy question → correct Z3 template selected → verified result
+- Natural language rule question → correct Prolog template selected → verified result
+- Problem with no matching template → falls back to few-shot generation using closest templates
+- Normalization correctly maps different input formats to same template
+
+**Review + Dogfood:** End-to-end test on real problems from each target domain. Does the classification pick the right solver? Does normalization handle varied input formats? Is the full pipeline faster/more reliable than just asking the LLM to reason directly?
+
+### Phase 5: Skill Learning + Quality Tracking
+
+**Goal:** Extract new templates from verified solutions. Track reuse. Promote/prune over time.
+
+**Delivers:**
+- `chiasmus_learn` MCP tool — extract candidate skill from solution
+- Template abstraction (concrete → parameterized)
+- Normalization schema generation
+- Reuse tracking and promotion logic
+- Pruning of unused/low-quality templates
+- Deduplication (merge if >0.9 embedding similarity)
+
+**Tests:**
+- Solve a novel problem → extract template → solve similar problem using extracted template
+- Reuse counter increments on successful use
+- Template promoted after N successful reuses
+- Duplicate detection prevents near-identical templates
+- Unused templates decay and get pruned
+
+**Review + Dogfood:** Does the extraction produce genuinely reusable templates, or single-use caches? Test the LEGO-Prover failure mode: after accumulating some learned templates, are they actually being retrieved and reused for new problems?
+
+## Design Principles
+
+1. **Translation, not generation.** The LLM translates intent into a known formal structure. It doesn't generate novel formal logic from scratch.
+2. **Templates over free-form.** Constrained slot-filling succeeds where unconstrained generation fails.
+3. **Reuse over reimplementation.** Matryoshka's persistence, Ori's retrieval, existing solver packages. We glue, not rebuild.
+4. **Bounded everything.** Max 5 correction rounds. Timeouts on solver calls. Graceful degradation with partial results.
+5. **Earn trust through use.** Each phase must prove its value through dogfooding before the next phase begins. If it's not useful, stop and redesign.
+6. **Skills must prove themselves.** Track reuse, success rate, recency. Prune aggressively. A small library of proven templates beats a large library of cached guesses.
+
+---

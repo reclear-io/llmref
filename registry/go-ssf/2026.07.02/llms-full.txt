@@ -1,0 +1,514 @@
+# go-ssf
+
+Source: https://github.com/hstern/go-ssf/blob/main/README.md
+
+# go-ssf
+
+A Go implementation of the
+[OpenID Shared Signals Framework 1.0](https://openid.net/specs/openid-sharedsignals-framework-1_0.html)
+— the vendor-neutral wire protocol for transporting Security Event
+Tokens (SETs) between an event Transmitter and an event Receiver, over
+both push (RFC 8935) and poll (RFC 8936) delivery.
+
+`go-ssf` provides:
+
+- `http.Handler` constructors over a `Transmitter` interface for the
+  server side of the framework — stream configuration, status, subjects,
+  verification, and the poll endpoint.
+- A push-mode delivery driver that signs each event as a SET and
+  POSTs it to the configured Receiver endpoint.
+- A `Sink` interface plus push `http.Handler` and a poll-mode
+  `Poller` for the Receiver side.
+- A typed HTTP client wrapping the Transmitter endpoints, used by
+  Receivers to manage stream configuration.
+- The full type surface for every spec-defined message, with
+  byte-stable JSON round-trip on open extension fields.
+- `/.well-known/ssf-configuration` metadata document support.
+
+The library is **library-vendor-neutral**: it implements the spec,
+nothing more. It does not include a CAEP or RISC event-payload schema,
+an opinion about how Transmitter and Receiver authenticate to each
+other beyond what the framework specifies, or a vendor-specific
+adapter. Those belong in downstream consumers.
+
+## Status
+
+Pre-publication. The first tagged release will be `v0.1.0`. The wire
+surface, the codec layer, and the conformance harness against the
+OpenID Shared Signals Framework interop suite are settled; the public
+API is unstable until that tag lands. See
+[`CHANGELOG.md`](CHANGELOG.md) for what has shipped.
+
+Spec version tracked: **OpenID Shared Signals Framework 1.0**
+(Final, 2026), exposed as `ssf.SpecVersion`.
+
+## Install
+
+```
+go get github.com/hstern/go-ssf
+```
+
+```go
+import "github.com/hstern/go-ssf"
+```
+
+## Compatibility
+
+- **Go**: 1.26+
+- **Runtime dependencies**: [`github.com/hstern/go-subjectid`](https://github.com/hstern/go-subjectid)
+  (RFC 9493 Subject Identifier types) and
+  [`github.com/go-jose/go-jose/v4`](https://github.com/go-jose/go-jose)
+  (JWS / SET signing and verification). No others.
+- **Spec**: OpenID Shared Signals Framework 1.0 (Final, 2026).
+
+## Architecture
+
+The library is split into five packages, each owning one concern.
+
+- **`ssf`** (root) — wire types for every spec-defined message
+  (`StreamConfig`, `StatusResponse`, `AddSubjectRequest`,
+  `VerificationRequest`, `PollRequest`/`PollResponse`, etc.), the
+  `SETSigner` / `SETVerifier` interfaces and their go-jose-backed
+  implementations, the `StreamStore` interface, the delivery-method
+  registry, sentinel errors, and `SpecVersion`.
+- **`transmitter`** — the Transmitter-side HTTP surface. Defines the
+  `Transmitter` business-logic interface (one Go method per spec
+  endpoint), the per-endpoint `http.Handler` constructors, the
+  composed `MuxHandler`, the `/.well-known/ssf-configuration`
+  handler, and the `PushDriver` that signs SETs and POSTs them to a
+  Receiver per RFC 8935.
+- **`receiver`** — the Receiver-side surface. Defines the `Sink`
+  interface, the `PushHandler` that verifies POSTed SETs and hands
+  them to a Sink per RFC 8935, the `Poller` that drives a Sink
+  against a Transmitter's poll endpoint per RFC 8936, and the
+  `VerificationChallenger` that orchestrates the SSF §10
+  verification flow.
+- **`client`** — a typed HTTP client over the Transmitter endpoint
+  set. Receivers use it to create/update streams, manage subjects,
+  trigger verification, and (in poll-mode deployments) drain events.
+- **`memstore`** — an in-memory `StreamStore` for tests, demos, and
+  the loopback interop harness. Production deployments back the
+  `StreamStore` interface with their own storage.
+
+## Quickstart
+
+The four blocks below cover every cell of the
+Transmitter+push, Transmitter+poll, Receiver+push, Receiver+poll
+matrix. Each block stands alone.
+
+### Transmitter — push delivery
+
+Sign a Security Event Token and POST it to a Receiver's push
+endpoint. The `PushDriver` is stateless: a Transmitter persists
+undelivered events in its `StreamStore` and feeds them to `Deliver`
+one at a time.
+
+```go
+package main
+
+import (
+	"context"
+
+	"github.com/go-jose/go-jose/v4"
+	ssf "github.com/hstern/go-ssf"
+	"github.com/hstern/go-ssf/transmitter"
+)
+
+func push(ctx context.Context, key []byte, payload []byte) error {
+	opts := (&jose.SignerOptions{}).WithType(ssf.SETMediaType)
+	js, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.HS256, Key: key}, opts)
+	if err != nil {
+		return err
+	}
+	signer, err := ssf.NewJOSESetSigner(js)
+	if err != nil {
+		return err
+	}
+
+	driver := transmitter.NewPushDriver(signer)
+	target := transmitter.Target{
+		EndpointURL:         "https://receiver.example/events",
+		AuthorizationHeader: "Bearer s3cret",
+	}
+	return driver.Deliver(ctx, target, payload)
+}
+```
+
+### Transmitter — poll delivery
+
+Mount the spec's Transmitter endpoints on an `http.ServeMux`. The
+poll endpoint drains queued SETs to a Receiver that POSTs to it.
+Consumers implement `transmitter.Transmitter` over their own
+storage; the snippet below delegates the methods it needs to
+`memstore.InMemoryStore` and embeds `NotImplementedTransmitter`
+for everything else.
+
+```go
+package main
+
+import (
+	"context"
+	"net/http"
+
+	ssf "github.com/hstern/go-ssf"
+	"github.com/hstern/go-ssf/memstore"
+	"github.com/hstern/go-ssf/transmitter"
+)
+
+type myTx struct {
+	transmitter.NotImplementedTransmitter
+	store *memstore.InMemoryStore
+}
+
+func (t *myTx) CreateConfig(ctx context.Context, c *ssf.StreamConfig) (*ssf.StreamConfig, error) {
+	return t.store.CreateStream(ctx, c)
+}
+
+func serveTransmitter() {
+	store := memstore.NewInMemoryStore()
+	// Enqueue a SET the Receiver will later drain via PollEvents.
+	_ = store.EnqueueSET(context.Background(), "stream-1", "eyJ.compact.jws")
+
+	mux := transmitter.MuxHandler(&myTx{store: store}, transmitter.AlwaysAllow)
+	_ = http.ListenAndServe(":8080", mux)
+}
+```
+
+### Receiver — push delivery
+
+Accept POSTs from a Transmitter on `application/secevent+jwt`,
+verify the JWS against the Transmitter's published JWKS, and hand
+the payload bytes to a `Sink`. A nil return ack-202s the delivery;
+a non-nil return 503s for retry (or 400s when wrapping
+`receiver.ErrPermanent`).
+
+```go
+package main
+
+import (
+	"context"
+	"net/http"
+
+	"github.com/go-jose/go-jose/v4"
+	ssf "github.com/hstern/go-ssf"
+	"github.com/hstern/go-ssf/receiver"
+)
+
+func servePush(jwks jose.JSONWebKeySet) {
+	verifier := ssf.NewJOSESetVerifier(jwks)
+	sink := receiver.SinkFunc(func(ctx context.Context, payload []byte) error {
+		// Decode the SET claims set, route on the event type, persist.
+		return nil
+	})
+	http.Handle("/events", receiver.PushHandler(verifier, sink))
+	_ = http.ListenAndServe(":9090", nil)
+}
+```
+
+### Receiver — poll delivery
+
+Drive a `Sink` against a Transmitter's poll endpoint. `Poller.Run`
+loops: POST a `PollRequest`, verify each returned SET, deliver to
+the Sink, ack consumed JTIs on the next poll. Cancel the context to
+stop.
+
+```go
+package main
+
+import (
+	"context"
+
+	"github.com/go-jose/go-jose/v4"
+	ssf "github.com/hstern/go-ssf"
+	"github.com/hstern/go-ssf/receiver"
+)
+
+func poll(ctx context.Context, jwks jose.JSONWebKeySet) error {
+	verifier := ssf.NewJOSESetVerifier(jwks)
+	sink := receiver.SinkFunc(func(ctx context.Context, payload []byte) error {
+		return nil
+	})
+	p := receiver.NewPoller(
+		"https://transmitter.example/streams/poll",
+		verifier, sink,
+		receiver.WithAuthorizationHeader("Bearer s3cret"),
+		receiver.WithMaxEvents(50),
+	)
+	return p.Run(ctx)
+}
+```
+
+## Stability
+
+Pre-1.0. The wire types (`StreamConfig`, `StatusResponse`, every
+spec-defined message) are pinned to the OpenID Shared Signals
+Framework 1.0 spec and round-trip byte-stable on open extension
+fields; those will not churn. The Go-surface around them
+(constructor signatures, option names, package boundaries) may
+still change before `v0.1.0`. Breaking changes between pre-1.0
+tags are called out in [`CHANGELOG.md`](CHANGELOG.md).
+
+After `v0.1.0`:
+
+- The library SemVer is independent of the spec version; spec
+  revisions arrive as minor bumps when they are wire-additive and as
+  major bumps when they are not.
+- Post-1.0 major bumps live on a `vN` branch, no versioned
+  subdirectory in the module path — the go-jose precedent. The
+  `main` branch carries the latest major.
+- The merge style on this repo is merge commits (not squash); each
+  PR's full review history is preserved in `git log --first-parent`.
+
+## Contributing
+
+See [`AGENTS.md`](AGENTS.md) for the contributor conventions — they
+are written as guidance for AI coding assistants, but humans will
+find the same conventions useful. The short version: standard Go
+style (`gofmt`, `go vet`, `staticcheck`, `golangci-lint` all run in
+CI), table-driven tests, and a strong preference for wire fidelity
+over ergonomic shortcuts. New exported API surface and new
+dependencies go through review.
+
+## License
+
+Apache License 2.0. See [`LICENSE`](LICENSE).
+
+---
+
+# AGENTS.md
+
+Source: https://github.com/hstern/go-ssf/blob/main/AGENTS.md
+
+# AGENTS.md
+
+Guidance for AI coding agents (Claude Code, Cursor, Aider, Copilot
+Workspace, etc.) working on `go-ssf`. Human contributors will get
+more out of `CONTRIBUTING.md` once it exists; this file captures the
+things that are easy for an agent to get wrong if it doesn't know them
+up front.
+
+## What this project is
+
+`go-ssf` is a Go implementation of the
+[OpenID Shared Signals Framework 1.0](https://openid.net/specs/openid-sharedsignals-framework-1_0.html)
+— the wire protocol for transporting Security Event Tokens between an
+event Transmitter and an event Receiver, over both push (RFC 8935) and
+poll (RFC 8936) delivery. The library is **library-vendor-neutral**:
+it implements the spec, nothing more. It provides:
+
+- `http.Handler` constructors over a `Transmitter` interface
+  (Transmitter role).
+- A push-mode delivery driver and a Receiver-side `Sink` plus push
+  `http.Handler` and a `Poller` for poll mode (Receiver role).
+- HTTP client wrapping the Transmitter endpoints, used by Receivers
+  to manage stream configuration.
+- Full type surface for every spec-defined message.
+- `/.well-known/ssf-configuration` metadata document support.
+
+It does NOT provide CAEP or RISC event-payload schemas, an opinion
+about how Transmitter and Receiver authenticate beyond what the
+framework specifies, or a vendor-specific adapter. Those belong in
+downstream consumers.
+
+Spec version: **1.0 Final**, published 2026. Tracked in source as
+`const SpecVersion = "1.0"`.
+
+## Repository scope rules
+
+These rules are absolute. They are not preferences; they're correctness
+constraints for what lands in the repo.
+
+1. **The library is the subject.** Code, comments, docs, commit
+   messages, and CI artifacts describe what the library does for an
+   anonymous Go developer who found it via a search engine. They do not
+   describe what the maintainer is using it for, where it is being
+   developed, who is tracking which task, or how it relates to anything
+   outside this repository.
+2. **No private infrastructure references.** No internal hostnames,
+   internal Git hosts, internal issue trackers, internal documentation
+   sites, or any URL pointing at non-public infrastructure. If you find
+   yourself wanting to cite `*.someprivate.tld`, the answer is: don't.
+3. **No private-tracker identifiers.** Ticket short-codes, project
+   IDs, page UUIDs, board names from any private tracker — none of it
+   in source, README, CHANGELOG, or commit messages. When public issue
+   tracking exists (GitHub Issues), reference its public URL only.
+4. **No interim hosting paths.** `go.mod` declares the eventual
+   publication module path. The interim location of the repo during
+   private development MUST NOT appear in `go.mod`, README, comments,
+   or CI configuration.
+5. **No references to sibling private libraries.** "Matches the
+   pattern in [internal-library-X]" is fine framing in a private
+   conversation but MUST NOT land in the repo. Public libraries
+   (`go-jose`, `go-subjectid`, `golang.org/x/oauth2`) may be cited by
+   name.
+
+If you are unsure whether something is safe to write, default to
+omitting it and ask. The cost of asking is low; the cost of leaking
+context that can't be deleted from git history is high.
+
+## Copyright header
+
+Every Go source file gets exactly this two-line header, first thing,
+before the `package` declaration:
+
+```go
+// Copyright 2026 The go-ssf Authors
+// SPDX-License-Identifier: Apache-2.0
+```
+
+- `The go-ssf Authors` is the collective copyright holder; contributors
+  are listed in git history.
+- The SPDX tag is the machine-readable license reference; license
+  detectors and SBOM tools read it. The full license text is in
+  `LICENSE` at the repo root.
+- Year is the first publication year (`2026`). Don't roll it forward
+  annually — that produces noisy churn for no legal benefit.
+
+The header applies to every `.go` file, including tests. `AGENTS.md`,
+`README.md`, `CHANGELOG.md`, workflow YAML, and `Dockerfile` files do
+NOT carry the header — they aren't source files and SPDX tags add
+noise without benefit.
+
+## Go conventions for this codebase
+
+### Dependencies
+
+Two non-test runtime dependencies:
+
+- `github.com/hstern/go-subjectid` — RFC 9493 Subject Identifier
+  types. The framework uses these throughout the subjects endpoint
+  and verification event shapes; they belong in their own library so
+  every spec that consumes subject identifiers can share one
+  implementation.
+- `github.com/go-jose/go-jose/v4` — JWS / SET signing and
+  verification. Security Event Tokens are JWS-signed JSON payloads
+  per RFC 8417; a hand-rolled JOSE implementation here would be the
+  wrong call.
+
+Nothing else. The library exposes interfaces (`StreamStore`,
+`SETSigner`, `SETVerifier`, `AuthFunc`, `Sink`, `HTTPDoer`) and
+consumers plug their own implementations.
+
+Test-only dependencies (e.g. `github.com/stretchr/testify`) may be
+added if a real need arises; keep them under `_test.go` files.
+
+### Style
+
+- `gofmt`, `go vet`, `staticcheck`, `golangci-lint` all run in CI and
+  must pass.
+- Receivers: short, lowercase, consistent within a type.
+- Errors: lowercase sentence, no trailing punctuation, wrap with
+  `%w` when adding context.
+- Exported symbols have godoc comments. Short, link-rich. Name the
+  spec section the symbol implements.
+- Examples live in `_test.go` as `Example*` functions and render in
+  godoc.
+
+### Validation posture
+
+Lenient on unmarshal, strict at the marshal boundary. The library
+validates required fields when a message is being sent over the wire,
+not when it is being received. Consumers who want stricter input
+validation call the explicit `Validate(...)` helper for the relevant
+message type.
+
+### JSON / wire fidelity
+
+- Open extension fields are `json.RawMessage`, NOT `map[string]any`.
+  Reason: byte-stable round-trip; Go's map iteration order is
+  randomized and Shared Signals Framework interop pins exact JSON
+  bytes.
+- `method` (Delivery) and `format` (Subject Identifier) are
+  discriminator-first in marshal output. The spec does not mandate
+  ordering, but every published example puts them first; the library
+  matches for byte-stable interop fixtures.
+- SET signing uses `typ: secevent+jwt` per RFC 8417 §2.2. Not `JWT`.
+  Some verifiers strict-check this header.
+- `alg: none` is forbidden on SETs per RFC 8417 §2.2. The library
+  rejects it at both sign and verify boundaries.
+- Unknown delivery methods parse into `UnknownDelivery{Method, Raw}`,
+  not an error. The IANA delivery-method registry is the source of
+  truth; the library's built-in methods are a snapshot, and forward
+  compatibility is a hard requirement.
+
+### Interfaces vs structs
+
+- One `Transmitter` interface, nine methods, one per Transmitter
+  endpoint. Implementations embed `NotImplementedTransmitter` (a
+  zero-value type whose methods all return `ErrNotImplemented`) and
+  override the methods they support — the "embed and override"
+  pattern that mirrors `http.ServeMux` extension.
+- One `Sink` interface, one method (`DeliverSET`), for the Receiver
+  side. Push handler and `Poller` both call it; the receiver does not
+  need to know which delivery mode produced the event.
+- Transport is pluggable via an `HTTPDoer` interface (shape:
+  `Do(*http.Request) (*http.Response, error)`). Server side ships
+  `http.Handler` only; no framework adapters in the core library.
+
+## Testing
+
+- Table-driven tests for wire round-trips. Each spec-defined message
+  has a round-trip test against the example payloads in Shared Signals
+  Framework §7.
+- `httptest.NewServer` for handler tests; `httptest.NewRecorder` is
+  fine for unit tests that don't need a full server.
+- `go test -race -shuffle=on ./...` is the CI test invocation.
+- No network calls in unit tests by default. The interop tests are
+  gated behind a build tag so they don't flake CI when the public
+  reference harness is unreachable.
+
+## Commit messages
+
+- Imperative present tense ("add stream config marshaller", not
+  "added").
+- Reference public artifacts only — public RFC numbers, spec section
+  numbers, public PRs / issues, public commit SHAs. Do not reference
+  private trackers (see rule 3 above).
+- One logical change per commit. The phased build plan is structured
+  so each phase fits in one PR (or a small series).
+- Detailed bodies: explain why this change exists, what was considered
+  and rejected (if non-obvious), what is NOT changing (if a careless
+  reader might think it is), and any known follow-ups. The reader who
+  needs this commit message is reading it because git blame led them
+  here.
+
+## CI
+
+GitHub Actions, two workflows:
+
+- `.github/workflows/ci.yml` — pinned tool versions, fan-out parallel
+  jobs (`static`, `test`, `lint`, `interop`). One CI run surfaces
+  every failure at once, not just the first.
+- `.github/workflows/vuln.yml` — separate, non-blocking, runs on
+  `main` push and a daily cron. `govulncheck` against `./...`.
+
+Required checks on every `pull_request`:
+
+- `static`: `gofmt -l`, `go vet ./...`, `go mod tidy -diff`
+- `test`: `go test -race -shuffle=on ./...`
+- `lint`: `golangci-lint run ./...`
+- `interop`: the Shared Signals Framework interop suite,
+  Transmitter and Receiver sides, both push and poll cells. Stubbed
+  in phase 1; live in phase 7.
+
+## Branch protection
+
+`main` is protected. Direct push is rejected; all changes land via
+PR with the required CI checks above passing. Branch must be up to
+date with `main` before merge. Phase 1 (repo bootstrap) is the only
+exception — branch protection goes live after the phase 1 gate, once
+CI is wired and green on the empty surface.
+
+## When to ask vs when to proceed
+
+- Bug fix, refactor, doc tweak, test addition for an existing feature:
+  proceed. Reference the spec section that motivates the change in the
+  commit message.
+- New exported API surface, new dependency, change to an interface
+  signature, anything that affects backwards compatibility: ask first.
+  These are forever-decisions once the library is published.
+- Anything that might cross the scope rules above (1–5): ask. The
+  cost of a quick check is far less than the cost of force-pushing
+  history after a leak.
+
+---

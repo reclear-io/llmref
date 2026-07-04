@@ -1,0 +1,1325 @@
+# mdstream
+
+Source: https://github.com/latias94/mdstream/blob/main/README.md
+
+# mdstream
+
+
+`mdstream` is a **streaming-first Markdown middleware** for Rust.
+
+It targets LLM token-by-token / chunk-by-chunk output and helps downstream UIs (egui, gpui/Zed, TUI, etc.) avoid the classic **O(n²)** re-parse + re-render pattern that causes latency and flicker.
+
+## When to use
+
+Use `mdstream` when you:
+
+- Receive Markdown incrementally (LLM streaming) and want to avoid re-parsing the full document every tick.
+- Need stable cache keys for UI rendering (blocks are immutable once committed).
+- Want a render-agnostic “middleware” that can feed any renderer (Rust UI frameworks, terminal output, etc.).
+
+You probably **don’t** need `mdstream` if you only parse static Markdown once, or if you already have a renderer that handles incremental updates internally.
+
+## API at a glance
+
+- `MdStream`: streaming block splitter (`append` / `finalize`) that produces `Update`.
+- `MdStream::append_ref` / `finalize_ref`: borrowed update views (`UpdateRef`) for high-frequency UIs
+  that want to avoid cloning the pending tail on every tick.
+- `MdStream::snapshot_blocks(&mut self)`: take a best-effort snapshot (may run stateful transformers).
+- `Update`: `committed + pending` plus signals like `reset` and `invalidated`.
+- `UpdateRef`: `committed + pending` (borrowed) plus `reset` and `invalidated`.
+- `Block`: carries `id`, `kind`, `raw`, and optional `display` (pending-only).
+- `PendingBlockRef`: a borrowed view of the current pending block (`raw` + optional `display`).
+- `DocumentState`: a UI-friendly container to apply `Update` safely (recommended).
+- Optional adapter: `PulldownAdapter` behind the `pulldown` feature.
+
+## Goals
+
+- **Fix the O(n²) problem**: only the *new* part should be processed on each chunk.
+- **Render-agnostic**: no rendering; provide stable, incremental building blocks that any UI can consume.
+- **Handle the dirty work**: deal with chunk boundaries and incomplete Markdown so downstream parsers/renderers behave predictably.
+- **Match capabilities of Streamdown + Incremark** in streaming Markdown handling and edge-case coverage.
+
+## Non-goals
+
+- Not a Markdown renderer.
+- Not a full CommonMark/GFM conformance test suite (we prioritize streaming stability and practical compatibility).
+- Not a hard dependency on a specific parser (pulldown-cmark integration is optional).
+
+## Core Model (high level)
+
+- The input stream is represented as a sequence of **blocks**:
+  - **Committed blocks**: stable, never change again (safe for UI to cache by `BlockId`).
+  - A single **pending block**: may change while streaming (UI updates only this block).
+- Some scope-driven transitions require a full reset (e.g. switching into single-block footnote mode):
+  - `append()` may return `Update { reset: true, .. }` to tell consumers to drop cached blocks.
+- A **pending pipeline** can optionally produce a `display` view for the pending block:
+  - Markdown terminator (remend-like) for incomplete constructs near the tail.
+  - Custom transforms via `PendingTransformer` (eg placeholders, sanitizers).
+    - `PendingTransformer` is stateful: `transform(&mut self, ...)` and `reset(&mut self)`.
+    - Consequently, `MdStream::snapshot_blocks` requires `&mut self`.
+
+### Borrowed updates (`append_ref`) and async usage
+
+`append_ref` is intended for the common UI architecture where the **UI thread owns the stream**
+and receives chunks via a channel:
+
+- It avoids cloning large pending buffers (especially large code fences).
+- The returned `UpdateRef` borrows from the stream; it is **not** suitable for sending across
+  threads/tasks.
+- If you must send updates across tasks, use `append()` (owned `Update`) or convert a borrowed view
+  via `UpdateRef::to_owned()` (this may allocate).
+
+## Installation
+
+```toml
+[dependencies]
+mdstream = "0.2.0"
+```
+
+Optional Tokio glue (delta coalescing + helpers):
+
+```toml
+[dependencies]
+mdstream-tokio = "0.2.0"
+```
+
+Backpressure policy (producer side):
+
+- `Block`: never drop; safest for real content.
+- `DropNew`: drop when UI is slow; good for best-effort signals.
+- `CoalesceLocal`: buffer locally and flush opportunistically; good for high-frequency token streams.
+
+Practical examples:
+
+1) Agent CLI (chat transcript, LLM token streaming)
+
+- Goal: keep all text, avoid per-token UI updates, avoid unbounded memory.
+- Recommended: bounded channel + `CoalesceLocal` on the producer, and `CoalescingReceiver` on the UI side.
+
+```rust
+use mdstream_tokio::{BackpressurePolicy, CoalescePreset, CoalescingReceiver, DeltaSender};
+use tokio::sync::mpsc;
+
+let (tx, rx) = mpsc::channel::<String>(64);
+let mut sender = DeltaSender::new(tx, BackpressurePolicy::CoalesceLocal);
+let mut rx = CoalescingReceiver::new(rx, CoalescePreset::Balanced.options());
+
+// producer task: sender.send(token_or_chunk).await
+// UI task: if let Some(chunk) = rx.recv().await { stream.append(&chunk); }
+```
+
+2) Agent CLI (progress / typing indicator / spinner)
+
+- Goal: keep UI responsive; old updates are not important.
+- Recommended: `DropNew` (or a separate small channel just for status).
+
+```rust
+let (tx, rx) = mpsc::channel::<String>(1);
+let mut sender = DeltaSender::new(tx, BackpressurePolicy::DropNew);
+// producer: sender.send("thinking...").await;  // may be dropped if UI is busy
+```
+
+3) “Tool output” streaming (logs, ANSI output, file watcher)
+
+- Goal: preserve output; losing lines is bad.
+- Recommended: `Block` with a bounded channel (natural backpressure), optionally with receiver-side coalescing.
+
+```rust
+let (tx, rx) = mpsc::channel::<String>(256);
+let mut sender = DeltaSender::new(tx, BackpressurePolicy::Block);
+// producer: sender.send(line).await; // waits if UI falls behind
+```
+
+Rule of thumb:
+
+- If the message is user-visible content that must not be lost → `Block` or `CoalesceLocal`.
+- If the message is “state” and newer replaces older → `DropNew`.
+
+## Quick Start (UI Integration)
+
+Recommended: keep UI state in `DocumentState` and apply each `Update` to it. This makes `reset`
+handling hard to get wrong.
+
+```rust
+use mdstream::{DocumentState, MdStream, Options};
+
+let mut stream = MdStream::new(Options::default());
+let mut state = DocumentState::new();
+
+let u = stream.append("# Title\n\nHello **wor");
+let applied = state.apply(u);
+
+if applied.reset {
+    // Drop any external caches derived from old blocks.
+}
+// If you enable invalidation (see below), `applied.invalidated` tells you which committed blocks to refresh.
+
+for b in state.committed() {
+    // Render stable blocks once.
+    let text = b.display_or_raw();
+    let _ = text;
+}
+if let Some(p) = state.pending() {
+    // Render/update the pending block each tick.
+    let text = p.display_or_raw();
+    let _ = text;
+}
+```
+
+If you prefer to manage your own `(Vec<Block>, Option<Block>)`, you can apply updates with
+`Update::apply_to`.
+
+## Examples
+
+```sh
+cargo run -p mdstream --example minimal
+cargo run -p mdstream --example footnotes_reset
+cargo run -p mdstream --example stateful_transformer
+cargo run -p mdstream --example tui_like
+cargo run -p mdstream --features pulldown --example pulldown_incremental
+```
+
+Tokio + ratatui demo (agent-style streaming):
+
+```sh
+cargo run -p mdstream-tokio --example agent_tui
+```
+
+You can also choose a producer-side backpressure policy:
+
+```sh
+cargo run -p mdstream-tokio --example agent_tui -- --policy coalesce-local
+cargo run -p mdstream-tokio --example agent_tui -- --policy drop-new
+cargo run -p mdstream-tokio --example agent_tui -- --policy block
+```
+
+Keys:
+
+- `q`: quit
+- `j/k` or `↑/↓`: scroll
+- `g/G`: top/bottom
+- `f`: toggle follow-tail
+- `c`: cycle coalescing mode
+- `[` / `]`: adjust pending code tail lines
+
+## Optional: Reference Definitions Invalidation (Best-effort)
+
+Markdown reference-style links/images can be defined *after* they are used:
+
+- usage: `See [docs][ref].` or `See [ref].`
+- definition (often later): `[ref]: https://example.com`
+
+In streaming UIs that parse/render **each committed block independently**, late-arriving reference
+definitions can require re-parsing earlier blocks so they turn into real links.
+
+`mdstream` provides an **opt-in** invalidation signal for this:
+
+- Enable: `opts.reference_definitions = ReferenceDefinitionsMode::Invalidate`
+- When a reference definition is **committed**, `Update.invalidated` contains the `BlockId`s of
+  previously committed blocks that likely used the label.
+- Consumers/adapters can re-parse only those blocks instead of re-parsing the entire document.
+
+This is intentionally **best-effort** (optimized for LLM streaming), not a full CommonMark/GFM
+reference definition implementation:
+
+- Only single-line definitions are recognized (`^[ ]{0,3}[label]: ...`), footnotes (`[^x]:`) are excluded.
+- Label matching is normalized (trim, collapse whitespace, case-insensitive).
+- Usage extraction over-approximates: false positives may cause extra invalidations; the goal is to
+  avoid missing invalidations.
+- Definitions inside fenced code blocks do not trigger invalidations.
+
+Example:
+
+```rust
+use mdstream::{MdStream, Options, ReferenceDefinitionsMode};
+
+let mut opts = Options::default();
+opts.reference_definitions = ReferenceDefinitionsMode::Invalidate;
+
+let mut s = MdStream::new(opts);
+let u1 = s.append("See [ref].\n\n");
+assert!(u1.committed.is_empty());
+
+let u2 = s.append("[ref]: https://example.com\n\nNext\n");
+assert!(u2.invalidated.contains(&mdstream::BlockId(1)));
+```
+
+## Optional: `pulldown-cmark` Adapter (`pulldown` feature)
+
+`mdstream` is render-agnostic. If you want to reuse the Rust ecosystem around `pulldown-cmark`
+(egui, gpui/Zed, TUI renderers), enable the adapter feature:
+
+```toml
+[dependencies]
+mdstream = { version = "0.2.0", features = ["pulldown"] }
+```
+
+When `reference_definitions` invalidation is enabled, the adapter can re-parse only the invalidated
+blocks:
+
+```rust
+use mdstream::adapters::pulldown::{PulldownAdapter, PulldownAdapterOptions};
+use mdstream::{MdStream, Options, ReferenceDefinitionsMode};
+
+let mut opts = Options::default();
+opts.reference_definitions = ReferenceDefinitionsMode::Invalidate;
+
+let mut stream = MdStream::new(opts);
+let mut adapter = PulldownAdapter::new(PulldownAdapterOptions::default());
+
+stream.append("See [ref].\n\n");
+let u1 = stream.append("[ref]: https://example.com\n");
+adapter.apply_update(&u1);
+
+stream.append("\n");
+let u2 = stream.append("Next\n");
+adapter.apply_update(&u2);
+
+// `u2.invalidated` tells you which committed blocks should be re-rendered.
+```
+
+## Release notes
+
+- Changelog: `CHANGELOG.md`
+- Release checklist: `RELEASE_CHECKLIST.md`
+- Note: This project may prune `docs/` during releases; user-facing guidance lives in this README.
+
+## Design notes (in-repo)
+
+- `docs/ADR_0001_STREAMING_CONCURRENCY.md`
+- Feature proposal/preview: `sync` (opt-in) for `Send + Sync` extension points.
+
+## Credits
+
+- Inspired by Vercel's `streamdown`: https://github.com/vercel/streamdown
+- Also informed by `incremark`: https://github.com/kingshuaishuai/incremark
+
+## Status
+
+Initial MVP implementation is in progress:
+
+- `MdStream` core state machine (blocks: committed + pending)
+- Pending terminator (Streamdown/remend-inspired)
+- Streaming boundary tests (Streamdown/Incremark-inspired)
+- Reference-style link definitions invalidation (opt-in, for adapters)
+- Optional `pulldown-cmark` adapter via the `pulldown` feature
+
+Try the demo:
+
+`cargo run -p mdstream --example tui_like`
+
+Try the `pulldown-cmark` incremental demo:
+
+`cargo run -p mdstream --features pulldown --example pulldown_incremental`
+
+---
+
+# Adapters
+
+Source: https://github.com/latias94/mdstream/blob/main/docs/ADAPTERS.md
+
+# Adapters
+
+`mdstream` is renderer-agnostic. Adapters allow downstream consumers to reuse existing ecosystems (eg pulldown-cmark) without sacrificing streaming performance.
+
+## pulldown-cmark (optional)
+
+This adapter is implemented behind the `pulldown` Cargo feature.
+
+### Demo
+
+```sh
+cargo run -p mdstream --features pulldown --example pulldown_incremental
+```
+
+### Why adapter instead of core dependency
+
+- `mdstream` aims to support multiple render targets and parsers.
+- pulldown-cmark is a great baseline for Rust, but binding core to it reduces flexibility.
+
+### Recommended adapter design
+
+- Parse **committed blocks** once, cache results by `BlockId`.
+- Re-parse **pending block** on each update.
+- Expose events per block instead of a single monolithic iterator:
+  - `events_for_block(id) -> &[Event]`
+  - `iter_committed_events() -> impl Iterator<Item = (BlockId, Event)>`
+
+### Cross-block semantics
+
+Reference-style links and footnotes can require earlier content to be interpreted differently after a new definition arrives.
+
+Two possible behaviors:
+
+1. **Stability-first (default)**: do not re-parse earlier blocks; interpretation may be delayed.
+2. **Invalidate mode (opt-in)**: when a definition arrives, `mdstream` emits `invalidated` IDs; adapter re-parses those blocks and updates caches.
+
+The `PulldownAdapter` consumes `Update.invalidated` and re-parses invalidated blocks. For reference-style link definitions, it prepends the currently-known `[...] : ...` definition lines before parsing blocks so `pulldown-cmark` can resolve shortcut references.
+
+## Other adapters (future)
+
+- `markdown-it` style token streams are out-of-scope for Rust, but a similar strategy applies.
+- A TUI adapter can render directly from blocks without a full Markdown AST by using a lightweight inline parser (future exploration).
+
+---
+
+# ADR 0001: Streaming Ownership, Concurrency, and Optional `sync` / async Glue
+
+Source: https://github.com/latias94/mdstream/blob/main/docs/ADR_0001_STREAMING_CONCURRENCY.md
+
+# ADR 0001: Streaming Ownership, Concurrency, and Optional `sync` / async Glue
+
+## Status
+
+Proposed
+
+## Context
+
+`mdstream` is designed for token-by-token / chunk-by-chunk Markdown streams (LLM output).
+In real UIs, the hot path is not parsing once, but updating *very frequently*:
+
+- If consumers re-parse and re-render the whole document on each tick, they hit the classic **O(n²)**
+  latency and visible flicker.
+- UI frameworks often have a single “UI thread” or render loop. Background tasks (network/model)
+  should not mutate UI state directly.
+- Some ecosystems require “state objects” to be `Send + Sync`, which can tempt library authors to
+  force `Send + Sync` bounds on everything.
+
+However, the core `mdstream` type (`MdStream`) is an in-memory state machine that is mutated through
+`&mut self`. Making extension traits `Send + Sync` does not automatically make streaming safe or
+useful to call from multiple threads concurrently.
+
+We want an API that is:
+
+- **Ergonomic by default** for UI use (especially TUI / agent CLIs).
+- **Fast** (avoid per-tick allocations for the pending tail).
+- **Composable** with async runtimes without forcing an async dependency.
+- **Optionally compatible** with `Send + Sync` constraints via feature flags.
+
+## Decision
+
+### 1) Single-owner model (default)
+
+The recommended architecture is:
+
+- The **UI thread owns `MdStream`** (and typically a `DocumentState`).
+- Background tasks send deltas to the UI over a **channel**.
+- The UI applies deltas with `append_ref()` (borrowed update) or `append()` (owned update).
+
+This keeps the API simple and matches common “agent CLI” streaming practices (coalescing + stable
+UI updates).
+
+### 2) Borrowed vs owned updates
+
+- `append_ref()` / `finalize_ref()` return `UpdateRef`, which borrows from the stream and avoids
+  cloning large pending buffers. This is the preferred UI hot path.
+- `append()` / `finalize()` return `Update` (owned). Use this when updates must cross thread/task
+  boundaries.
+- `UpdateRef::to_owned()` is an explicit escape hatch (allocates) when a borrowed update needs to be
+  queued or sent elsewhere.
+
+### 3) Async is a “feeding strategy”, not a core requirement
+
+`mdstream` stays runtime-agnostic. Instead of making the core async, we provide a recommended
+pattern (and optional glue) for coalescing and sending deltas into the UI thread.
+
+### 4) Optional `sync` feature (proposal)
+
+We propose a `sync` Cargo feature that makes extension points compatible with `Send + Sync` state
+containers:
+
+- Under `sync`, traits like `PendingTransformer` / `BoundaryPlugin` require `Send + Sync`.
+- Default build keeps the current ergonomic, single-thread model without forcing `Send + Sync`.
+
+This balances ergonomics (default) and compatibility (opt-in).
+
+## Consequences
+
+- Pros:
+  - Default usage is simple and matches real UI architectures.
+  - High-frequency updates avoid unnecessary allocations (`append_ref`).
+  - Async users can integrate cleanly via channels.
+  - `Send + Sync` requirements do not break existing transformer/plugin implementations unless the
+    user opts in.
+- Cons:
+  - Some frameworks may prefer “everything `Send + Sync` by default”. They will need to enable the
+    `sync` feature (once implemented) or use an actor wrapper (see future work).
+
+## Recommended UI Pattern (TUI / agent CLI)
+
+In practice, updating on every token is still too frequent. Coalesce deltas before applying them:
+
+- Flush on newline (`\n`) when possible (newline-gated).
+- Add a small time-based fallback (e.g. 30–100ms) to avoid “no progress” when the model streams long
+  lines without newlines.
+
+This reduces flicker and stabilizes scrolling.
+
+## Future Work
+
+### A) `sync` feature (compatibility)
+
+- Add `sync` feature with `Send + Sync` bounds on extension traits.
+- Provide a migration guide for common patterns (interior mutability, shared caches).
+
+### B) Optional async glue (ergonomics)
+
+Provide optional helpers behind `tokio` (or `async`) features:
+
+- `Coalescer` utilities (newline-gated + time-window flush).
+- An **actor** wrapper that owns `MdStream` on a dedicated task/thread and accepts deltas over a
+  channel, emitting owned `Update` for consumers that cannot keep the stream on the UI thread.
+
+### C) Pending rendering policies
+
+Expose enough pending metadata to let UIs choose better pending rendering, e.g.:
+
+- For large pending code fences: render only the last N lines + a “generating…” indicator.
+- For tables/lists in-progress: avoid premature reflow that causes jumping.
+
+### D) Performance and regression testing
+
+- Add benchmarks for long pending blocks (especially code fences).
+- Keep a regression suite of streaming edge cases (chunk boundaries, fence markers, nested lists).
+
+
+---
+
+# Architecture
+
+Source: https://github.com/latias94/mdstream/blob/main/docs/ARCHITECTURE.md
+
+# Architecture
+
+This document defines the architecture and contracts of `mdstream`.
+
+## Why `mdstream`
+
+In LLM streaming scenarios, the naive approach is:
+
+1. Append chunk to the accumulated Markdown string.
+2. Re-parse the full string.
+3. Re-render the full UI tree.
+
+This produces the familiar **O(n²)** behavior and causes visible flicker.
+
+`mdstream` fixes this by modeling the stream as:
+
+- `committed` blocks: stable, never change
+- `pending` block: the only piece that can change between ticks
+
+Downstream UIs can:
+
+- append new committed blocks to their view
+- update only the last pending block
+
+## Core Principles
+
+1. **Committed blocks are immutable**: once committed, a block's `raw` text never changes.
+2. **Incremental updates are local**: each `append()` call must be ~O(len(chunk)) and should not rescan the full history.
+3. **Render-agnostic output**: the library outputs blocks and optional metadata; it does not render.
+4. **Streaming-friendly incomplete handling**: the pending block can be transformed into a `display` string so downstream parsers don’t choke on incomplete syntax.
+
+## Public Types (conceptual)
+
+### BlockId
+
+- A monotonically increasing identifier for stable caching in UIs.
+
+### BlockStatus
+
+- `Committed`
+- `Pending`
+
+### BlockKind (hint)
+
+Block kind is a **best-effort hint** for UIs and adapters; it is not a strict grammar guarantee.
+
+Typical variants:
+
+- `Paragraph`, `Heading`, `List`, `BlockQuote`, `CodeFence`, `HtmlBlock`, `Table`, `ThematicBreak`
+- `MathBlock` (`$$ ... $$`)
+- `FootnoteDefinition`
+- `Unknown`
+
+### Block
+
+- `id: BlockId`
+- `status: BlockStatus`
+- `kind: BlockKind`
+- `raw: String` (always present)
+- `display: Option<String>` (only for `Pending`, optional)
+
+### Update
+
+- `committed: Vec<Block>`: new stable blocks emitted in this update
+- `pending: Option<Block>`: the current pending block (if any)
+- `invalidated: Vec<BlockId>`: optional list of previously committed blocks that should be re-parsed by adapters (see below)
+
+`invalidated` exists to support cross-block semantics without breaking the “committed text is immutable” rule.
+
+## State Machine Overview
+
+Internally we maintain:
+
+- `buffer`: accumulated text (optionally capped)
+- newline normalization: accept `\n`, `\r\n`, and legacy `\r` and normalize to `\n` (including CRLF split across chunk boundaries)
+- `line index`: incremental line splitting to avoid re-splitting the whole buffer
+- `context`: line-scoped context (code fence state, container state, list/blockquote depth, etc.)
+- `pending_start`: where the current pending block begins
+- `next_block_id`
+
+### Stable boundary detection
+
+The stable boundary detector scans only new lines and advances a “stable boundary” when the previous block can no longer change.
+
+Key contexts (inspired by Incremark):
+
+- fenced code blocks: keep pending until closing fence arrives
+- containers (optional): keep pending until container end marker arrives
+- footnote definitions: handle continuation indentation
+- block quotes & lists: conservative boundary rules to avoid splitting nested structures
+- HTML blocks: tag-stack based closure (best-effort) to avoid merging following paragraphs
+
+### Streaming transforms (pending pipeline)
+
+The pending pipeline runs only on the pending block and produces `display`.
+
+Default design is inspired by Streamdown `remend` but implemented in Rust:
+
+- only scans a tail window (eg 16KiB) to keep per-tick cost bounded
+- never modifies committed text
+
+Note: `mdstream` does not include domain-specific transforms (eg tool-call JSON repair).
+Consumers can implement them via `PendingTransformer` when needed.
+
+## Cross-block Semantics Strategy
+
+Some Markdown constructs are inherently document-scoped:
+
+- footnote references/definitions
+- reference-style link definitions (`[id]: url`)
+
+`mdstream` supports two strategies:
+
+1. **SingleBlock**: if footnotes are detected, treat the whole document as a single block (Streamdown-like).
+2. **Invalidate**: keep blocks, but when a new definition arrives, emit `invalidated` IDs so adapters can selectively re-parse (Incremark-like).
+
+The default can prioritize streaming stability (SingleBlock for footnotes) while still allowing advanced consumers to opt into invalidation.
+
+Today, invalidation is implemented for reference-style link definitions. Footnote invalidation is planned post-MVP.
+
+### Footnote definition boundary rules
+
+When not in SingleBlock mode, `mdstream` tracks footnote definitions as their own block kind (`FootnoteDefinition`).
+For streaming stability (and to match Incremark-style incremental boundaries), the block ends when:
+
+- a blank line is followed by a non-indented line
+- a non-indented, non-empty line arrives (no blank line required)
+- a new footnote definition starts (`[^id]:`)
+
+## Reset semantics
+
+Some transitions cannot be expressed as "append-only committed blocks" without breaking Streamdown parity.
+In such cases, `mdstream` emits `Update { reset: true, .. }` so consumers can drop cached blocks and
+rebuild from the current state. The primary example is switching into SingleBlock footnote mode when
+`[^id]` / `[^id]:` is detected mid-stream.
+
+## Invariants
+
+- `committed` blocks are append-only, stable, and never re-emitted with changed text.
+- At most one `pending` block exists at a time.
+- `append()` does not allocate proportional to total history (no full re-parse).
+
+---
+
+# Compatibility & Edge Cases
+
+Source: https://github.com/latias94/mdstream/blob/main/docs/COMPATIBILITY.md
+
+# Compatibility & Edge Cases
+
+This document tracks compatibility goals with:
+
+- Streamdown (block splitting + termination behavior)
+- Incremark (stable boundary detection + streaming edge cases)
+- pulldown-cmark ecosystem (optional adapter)
+
+## Scope Rule
+
+`mdstream` follows a strict scope boundary:
+
+- If Streamdown's `parseMarkdownIntoBlocks` supports a streaming-stability behavior at the block
+  boundary level, `mdstream` must support it (with stable `committed + pending` semantics).
+- If Streamdown does not support it (e.g. provider-specific tool calls, message parts, citations as
+  business semantics), `mdstream` does not implement it in the core library.
+
+Any behavior outside Streamdown parity must be explicitly agreed as project scope before adding.
+
+## Streamdown parity checklist (block splitting)
+
+Baseline: `repo-ref/streamdown/packages/streamdown/lib/parse-blocks.tsx`.
+
+- Basic parsing: headings + paragraphs (covered: `tests/stream_streamdown_basic_parsing.rs`)
+- Code fences: ``` / ~~~ (covered: `tests/stream_streamdown_code_blocks.rs`)
+- Math blocks: `$$ ... $$` (covered: `tests/stream_block_splitting.rs`)
+- HTML blocks: conservative merge with tag stack (covered: `tests/stream_streamdown_html_blocks.rs`)
+- Footnotes: if any footnotes exist, return single block (covered: `tests/stream_block_splitting.rs`)
+- Tables: GFM delimiter row (covered: `tests/stream_streamdown_tables.rs`)
+- Streaming simulation (covered: `tests/stream_streamdown_simulation.rs`)
+- Streaming parity (incremental vs full re-parse): (covered: `tests/stream_streamdown_streaming_simulation_parity.rs`)
+- Mixed content scenario (covered: `tests/stream_streamdown_mixed_content.rs`)
+
+### Streamdown benchmark coverage
+
+The Streamdown benchmark suite `repo-ref/streamdown/packages/streamdown/__benchmarks__/parse-blocks.bench.ts`
+is tracked by the following tests:
+
+- `Basic Parsing` -> `tests/stream_streamdown_basic_parsing.rs`
+- `Code Blocks` -> `tests/stream_streamdown_code_blocks.rs`
+- `Math Blocks` -> `tests/stream_block_splitting.rs`
+- `HTML Blocks` -> `tests/stream_streamdown_html_blocks.rs`
+- `Footnotes` -> `tests/stream_block_splitting.rs`
+- `Tables` -> `tests/stream_streamdown_tables.rs`
+- `Streaming Simulation` -> `tests/stream_streamdown_simulation.rs` and `tests/stream_streamdown_streaming_simulation_parity.rs`
+- `Mixed Content` -> `tests/stream_streamdown_mixed_content.rs`
+
+## Known differences vs Streamdown (documented)
+
+Streamdown's block splitting uses `marked` tokenization plus a small post-merge step
+(`repo-ref/streamdown/packages/streamdown/lib/parse-blocks.tsx`). `mdstream` implements a
+streaming-first line scanner. As a result, there are some intentional differences:
+
+- HTML tag detection:
+  - Streamdown uses regexes like `/<(\\w+)[\\s>]/` and `/<\\/(\\w+)>/` (tag name = `\\w+`).
+  - `mdstream` recognizes ASCII tag names that start with a letter and continue with
+    alphanumerics/`_`. This is closer to CommonMark-style HTML blocks and avoids many false positives
+    in chat-like text, while still matching Streamdown's `\\w+` for most practical cases.
+- HTML stack handling:
+  - Streamdown only pops one closing tag per `html` token and does not attempt to parse multiple tags
+    within one token.
+  - `mdstream` scans each line and maintains a best-effort stack (multiple tags per line supported).
+- HTML comments:
+  - Streamdown behavior depends on `marked` tokenization (comments may or may not be merged depending
+    on how tokens are produced).
+  - `mdstream` treats multi-line `<!-- ... -->` as a single HTML block for stability.
+- Tables/lists/blockquote nuances:
+  - Streamdown relies on `marked`'s idea of tables/lists/quotes.
+  - `mdstream` uses lightweight heuristics designed to be chunking-invariant; some non-benchmark edge
+    cases may split differently.
+  - Streaming-only stability tweaks exist to preserve chunking invariance (e.g. avoiding premature
+    list commits when a list marker is split across chunks).
+
+These differences are acceptable as long as Streamdown benchmark parity tests and chunking invariance
+tests remain green (see `tests/chunking_invariance_suite.rs`).
+
+## Streaming edge cases (must handle)
+
+### Incomplete inline constructs
+
+- emphasis markers: `*`, `**`, `***`, `_`, `__`
+- inline code: backticks
+- strikethrough: `~~`
+- links/images:
+  - incomplete URL
+  - incomplete link text with nested brackets
+
+### Block constructs spanning chunks
+
+- fenced code blocks
+- blockquotes + lists (nested)
+- HTML blocks
+- tables
+- math blocks with `$$`
+- footnote definitions with continuation indentation
+
+## Footnotes and reference definitions
+
+These constructs are document-scoped and can force either:
+
+- stability-first behavior (single block)
+- invalidation behavior (selective re-parse in adapters)
+
+The chosen default should prioritize streaming stability.
+
+`mdstream` may emit `Update { reset: true, .. }` when entering SingleBlock footnote mode mid-stream so
+consumers can drop cached blocks and rebuild (Streamdown parity behavior).
+
+## Non-standard and ecosystem behaviors
+
+### Incomplete link placeholder
+
+Streamdown uses a special URL marker: `streamdown:incomplete-link`.
+
+`mdstream` should:
+
+- default to the same marker for compatibility
+- allow configuring it
+
+### Images
+
+Streamdown removes incomplete images (because partial images cannot display meaningfully).
+
+`mdstream` should support the same default behavior.
+
+---
+
+# Extensions
+
+Source: https://github.com/latias94/mdstream/blob/main/docs/EXTENSIONS.md
+
+# Extensions
+
+This document describes how consumers can extend `mdstream` to support custom streaming behaviors and non-standard Markdown constructs.
+
+## Extension Points
+
+### 1) BoundaryPlugin
+
+Purpose: participate in line-scoped context updates and stable boundary detection.
+
+Use cases:
+
+- custom containers (eg `:::warning`)
+- application-specific blocks (eg `<thinking>...</thinking>`)
+- language model tags
+
+Guidelines:
+
+- must be conservative: avoid committing too early
+- must not mutate committed text
+
+Status: implemented (MVP-level).
+
+`mdstream` provides:
+
+- `BoundaryPlugin` trait
+- `MdStream::push_boundary_plugin(...)` and `MdStream::with_boundary_plugin(...)`
+- `FenceBoundaryPlugin` as a small reference implementation (e.g. `:::warning ... :::`)
+- `TagBoundaryPlugin` as another built-in example (e.g. `<thinking> ... </thinking>`)
+- `ContainerBoundaryPlugin` for Incremark-compatible `::: name attr` containers (with nesting)
+- `FnBoundaryPlugin` for quick ad-hoc custom boundaries (closure-based)
+
+Notes on `:::` containers:
+
+- If you want **Incremark parity** (`::: name attr` with nesting depth), use `ContainerBoundaryPlugin`.
+  - It requires **whitespace after the marker** (so `:::warning` does not match).
+  - It supports longer markers (e.g. `:::::`) and nested containers (each end closes one level).
+- If you want a **fence-like block** that also matches `:::warning` (no whitespace), use
+  `FenceBoundaryPlugin` instead.
+
+Minimal example:
+
+```rust
+use mdstream::{
+    BoundaryUpdate, ContainerBoundaryPlugin, FenceBoundaryPlugin, FnBoundaryPlugin, MdStream,
+    Options, TagBoundaryPlugin,
+};
+
+let mut s = MdStream::new(Options::default());
+s.push_boundary_plugin(FenceBoundaryPlugin::triple_colon());
+s.push_boundary_plugin(TagBoundaryPlugin::thinking());
+s.push_boundary_plugin(ContainerBoundaryPlugin::default());
+
+// A tiny custom container:
+// - starts at a line that is exactly "@@@"
+// - ends at the next line that is exactly "@@@"
+let plugin = FnBoundaryPlugin::new(
+    |line| line.trim() == "@@@",
+    |line| {
+        if line.trim() == "@@@" {
+            BoundaryUpdate::Close
+        } else {
+            BoundaryUpdate::Continue
+        }
+    },
+);
+s.push_boundary_plugin(plugin);
+```
+
+### 2) PendingTransformer
+
+Purpose: transform the pending block into a safer `display` string for downstream parsers/renderers.
+
+Examples:
+
+- remend-like termination for incomplete Markdown
+- custom placeholder replacement
+
+Guidelines:
+
+- operate on a tail window to keep cost bounded
+- never change committed blocks
+
+Status: implemented (MVP-level).
+
+`mdstream` provides:
+
+- `PendingTransformer` trait
+- `MdStream::push_pending_transformer(...)` and `MdStream::with_pending_transformer(...)`
+- Built-in transformers for Streamdown-compatible behavior:
+  - `IncompleteLinkPlaceholderTransformer`
+  - `IncompleteImageDropTransformer`
+
+Minimal example:
+
+```rust
+use mdstream::{FnPendingTransformer, MdStream, Options};
+
+let mut s = MdStream::new(Options::default());
+// Append a marker so downstream parsers never see an empty string.
+s.push_pending_transformer(FnPendingTransformer(|input| {
+    if input.display.is_empty() { Some("<empty>".to_string()) } else { None }
+}));
+```
+
+### 3) BlockAnalyzer
+
+Purpose: extract metadata from blocks without changing text.
+
+Examples:
+
+- code fence info string extraction (`mermaid`, `json`, `python`, etc.)
+- heuristics for “this block is likely incomplete”
+
+Status: implemented (MVP-level).
+
+`mdstream` provides:
+
+- `BlockAnalyzer` trait
+- `AnalyzedStream<A>` wrapper to run an analyzer on each `append()`/`finalize()`
+- `CodeFenceAnalyzer` built-in analyzer that classifies code fences (e.g. `mermaid`, `json`)
+- `MathAnalyzer` built-in analyzer that reports whether a `$$` math block is balanced
+- `BlockHintAnalyzer` built-in analyzer that provides a small `likely_incomplete` hint for pending blocks
+- `TaggedBlockAnalyzer` built-in analyzer for custom tag blocks (e.g. `<thinking>...</thinking>`)
+
+Minimal example:
+
+```rust
+use mdstream::{AnalyzedStream, CodeFenceAnalyzer, Options};
+
+let mut s = AnalyzedStream::new(Options::default(), CodeFenceAnalyzer::default());
+let u = s.append("```mermaid\ngraph TD;\nA-->B;\n");
+assert!(u.pending_meta.is_some());
+```
+
+## Mermaid and Code Blocks
+
+`mdstream` does not render Mermaid, but it should support it by:
+
+- ensuring code fences are never split while unclosed (pending until closed)
+- exposing the fence info string so UIs can dispatch to Mermaid renderers
+- providing lightweight helpers:
+  - `Block::code_fence_header()`
+  - `Block::code_fence_language()`
+
+## Philosophy
+
+Extensions should not compromise the primary invariants:
+
+- immutable committed blocks
+- bounded per-chunk cost
+- render-agnostic output
+
+---
+
+# MVP
+
+Source: https://github.com/latias94/mdstream/blob/main/docs/MVP.md
+
+# MVP
+
+This document defines the MVP scope and acceptance criteria for `mdstream`.
+
+## MVP Goals
+
+1. Provide a stable block stream for streaming Markdown.
+2. Ensure per-chunk processing is bounded and avoids O(n²).
+3. Match practical streaming behavior of Streamdown + Incremark in edge cases.
+
+## MVP Feature Set
+
+### Block boundary detection (MUST)
+
+- Headings (ATX `#` and setext `===` / `---`)
+- Paragraph boundaries via blank lines
+- Thematic breaks (`---`, `***`, `___`)
+- Fenced code blocks (``` / ~~~)
+- Blockquotes (`>`)
+- Lists (ordered/unordered) with conservative nesting behavior
+- Tables (GFM-style delimiter row)
+- HTML blocks (conservative merge for multi-line blocks)
+- `$$ ... $$` math blocks (treat unmatched `$$` as pending)
+- Footnote definitions (`[^id]:`) with continuation indentation
+
+### Pending transformation (MUST)
+
+Remend-like termination for incomplete syntax near the tail (pending only):
+
+- emphasis markers (`*`, `**`, `***`, `_`, `__`)
+- inline code backticks
+- strikethrough (`~~`)
+- links/images:
+  - incomplete link URL becomes `](streamdown:incomplete-link)` (configurable)
+  - incomplete images are removed (configurable)
+- setext heading protection (avoid misclassifying partial list markers as heading underlines)
+- `$$` balancing for pending math blocks
+
+### Optional (SHOULD)
+
+- `pulldown-cmark` adapter (feature-gated) for Rust UI/TUI ecosystems
+- Boundary extension points (custom containers/directives) via `BoundaryPlugin`
+
+## Behavioral Contracts (Acceptance)
+
+### Incrementality
+
+- When appending `k` chunks with total length `n`, total processing time should scale ~O(n), not O(n²).
+- `append(chunk)` must not rescan or split the entire buffer when chunk does not contain newlines.
+
+### Stability
+
+- Once a block is emitted in `committed`, its `raw` text never changes.
+- Only the `pending` block may change between ticks.
+- Some scope-driven transitions require a rebuild (e.g. SingleBlock footnotes): `append()` may return `Update { reset: true, .. }`.
+
+### Edge-case tests to include (MVP test list)
+
+The following scenarios must be covered by unit tests (ported conceptually from Streamdown/Incremark):
+
+- Incomplete emphasis at chunk boundary: `**bold` then ` text**`
+- Incomplete inline code: `` `code`` then `` ` ``
+- Incomplete link: `[text](` then `url)`; and partial `[text` then `](`
+- Nested brackets in links: `[a [b] c](` split across chunks
+- Images: `![alt](` split across chunks should not produce partial artifacts
+- Fenced code blocks spanning multiple chunks; ensure no early commit inside fence
+- `$$` math blocks across chunks; ensure pending until balanced
+- Footnote definition continuation:
+  - `[^1]: line1\n    line2\n` split across chunks
+- HTML block spanning tokens: `<div>\n...` split; keep as one block until closed when possible
+- HTML block closure without blank line: `<div>...\n</div>\nAfter` should not merge `After` into the HTML block
+- Streamdown benchmark parity for HTML blocks:
+  - simple multi-line HTML
+  - nested HTML
+  - multiple HTML blocks with markdown between
+- Streamdown benchmark parity for tables:
+  - simple table
+  - large table (100 rows)
+- Streamdown benchmark parity for footnotes:
+  - document with footnotes
+  - document with many footnotes
+- Streamdown benchmark parity for streaming simulation:
+  - streaming text (50 steps)
+  - streaming code fence (9 steps)
+- Streamdown benchmark parity for mixed content:
+  - realistic AI response
+- Streamdown benchmark parity for basic parsing:
+  - single block
+  - multiple blocks (10)
+  - many blocks (100)
+- Streamdown benchmark parity for code blocks:
+  - single code block
+  - multiple code blocks
+  - large code block (1000 lines)
+- Chunking invariance for list/blockquote edge cases:
+  - list items separated by blank lines
+  - multiline list items and continuations
+  - task list items (`- [x]`)
+  - blockquote lazy continuation lines
+- List + emphasis interaction edge cases (avoid mis-termination)
+- Newline normalization:
+  - CRLF split across chunks (`"\r"` then `"\n"`) must become a single `\n`
+- Setext heading protection with indentation (`"  -"` / `"  ="`) should be protected consistently
+- Lists with multiline content starting at `- **...` should not be auto-closed across newlines (remend parity)
+
+## Out of Scope for MVP
+
+- Full CommonMark conformance test suite
+- Arbitrary plugin ecosystems beyond the initial extension points (see `docs/EXTENSIONS.md`)
+- Advanced cross-block semantics invalidation beyond reference-style link definitions (post-MVP)
+
+---
+
+# Roadmap
+
+Source: https://github.com/latias94/mdstream/blob/main/docs/ROADMAP.md
+
+# Roadmap
+
+This roadmap is intentionally practical: it prioritizes streaming stability and compatibility with Streamdown + Incremark behaviors.
+
+## v0.1 (MVP)
+
+- Block stream model: `committed + pending`
+- Stable boundary detection (core block-level constructs)
+- Pending termination (remend-like)
+- Minimal configuration options
+- MVP extension points:
+  - `BoundaryPlugin` (custom containers/directives)
+  - `PendingTransformer`
+  - `BlockAnalyzer`
+- Unit tests covering streaming edge cases
+- Regression tests ported from Streamdown benchmarks (incrementally)
+- Reference-style link definitions invalidation (opt-in mode)
+- Optional `pulldown-cmark` adapter (feature-gated)
+
+## v0.2 (Ergonomics + Robustness)
+
+- Add `snapshot_blocks()` and `snapshot_text()` convenience APIs
+- Improve HTML block handling and table/list heuristics
+- More remend parity tests (regression suite)
+- Streaming UX helpers (coalescing deltas; newline/time-window flush) (optional feature)
+- Concurrency compatibility:
+  - `sync` feature proposal for `Send + Sync` extension points
+  - optional “actor” wrapper for cross-thread consumers
+
+## v0.3 (Cross-block semantics)
+
+- Footnote mode improvements:
+  - default remains stability-first
+  - optional invalidation-based strategy for advanced consumers
+
+## v0.4+ (Performance)
+
+- Performance benchmarks and regression suite
+
+---
+
+# Document State (`DocumentState`)
+
+Source: https://github.com/latias94/mdstream/blob/main/docs/STATE.md
+
+# Document State (`DocumentState`)
+
+`DocumentState` is a small, UI-friendly container that holds the renderable state of a streaming
+Markdown document:
+
+- `committed`: stable blocks (append-only, never change)
+- `pending`: the only block that may change on each tick
+
+It exists to make `Update.reset` handling hard to get wrong, and to support partial refresh via
+`Update.invalidated` for adapters.
+
+## Why it is separate from `MdStream`
+
+`MdStream` is the parser. `DocumentState` is UI state.
+
+Keeping them separate allows:
+
+- render-agnostic integration (egui, gpui, TUI, etc.)
+- pipeline flexibility (`AnalyzedStream`, adapters, custom transformers)
+- predictable ownership and lifetimes
+
+## Usage
+
+```rust
+use mdstream::{DocumentState, MdStream, Options};
+
+let mut stream = MdStream::new(Options::default());
+let mut state = DocumentState::new();
+
+let update = stream.append("Hello **wor");
+let applied = state.apply(update);
+
+if applied.reset {
+    // Drop any external caches derived from old blocks.
+}
+```
+
+For `AnalyzedStream`, apply `u.update`:
+
+```rust
+use mdstream::{AnalyzedStream, BlockHintAnalyzer, CodeFenceAnalyzer, DocumentState, Options};
+
+let analyzer = (CodeFenceAnalyzer::default(), BlockHintAnalyzer::default());
+let mut stream = AnalyzedStream::new(Options::default(), analyzer);
+let mut state = DocumentState::new();
+
+let u = stream.append("```rust\nfn main() {}\n");
+state.apply(u.update);
+```
+
+
+---
+
+# Usage
+
+Source: https://github.com/latias94/mdstream/blob/main/docs/USAGE.md
+
+# Usage
+
+This document shows the recommended integration pattern for streaming UIs.
+
+## The Core Pattern
+
+Treat the incoming stream as:
+
+- `committed`: stable blocks (append-only, never change)
+- `pending`: the only block that can change per tick
+
+UIs should:
+
+1. Append new `committed` blocks to their view/model.
+2. Replace/update the last rendered `pending` block (if present).
+3. If `Update.reset` is true, drop cached blocks and rebuild from the new state.
+
+## Basic Example
+
+```rust
+use mdstream::{MdStream, Options};
+
+let mut s = MdStream::new(Options::default());
+
+// streaming tick
+let u = s.append("Hello **wor");
+if u.reset {
+    // Drop all previously cached blocks and restart rendering.
+}
+for b in u.committed {
+    // render once
+}
+if let Some(p) = u.pending {
+    // render/update pending (use p.display if you feed it into another Markdown parser)
+}
+```
+
+## Borrowed updates (`append_ref`)
+
+If your UI owns the stream (common for TUIs), `append_ref` avoids cloning the pending tail on every
+tick:
+
+```rust
+use mdstream::{MdStream, Options};
+
+let mut s = MdStream::new(Options::default());
+
+let u = s.append_ref("```rs\nfn main() {\n");
+assert!(u.pending.is_some());
+
+// Render only what changed:
+for b in u.committed {
+    let _ = b.id;
+}
+if let Some(p) = u.pending {
+    let text = p.display_or_raw();
+    let _ = text;
+}
+```
+
+Notes:
+
+- `UpdateRef` borrows from the stream. It is not suitable for sending across threads/tasks.
+- If needed, use `UpdateRef::to_owned()` (allocating) or `append()` (owned update).
+
+## `DocumentState` (UI State Helper)
+
+If you keep UI state as `(Vec<Block>, Option<Block>)`, you can use `Update::apply_to`. If you want a
+dedicated container, use `DocumentState`:
+
+```rust
+use mdstream::{DocumentState, MdStream, Options};
+
+let mut s = MdStream::new(Options::default());
+let mut state = DocumentState::new();
+
+let u = s.append("Hello **wor");
+let applied = state.apply(u);
+if applied.reset {
+    // Drop any external caches derived from old blocks.
+}
+```
+
+If your UI keeps state as `(Vec<Block>, Option<Block>)`, you can use `Update::apply_to` to avoid
+getting `reset` handling wrong:
+
+```rust
+use mdstream::{MdStream, Options};
+
+let mut s = MdStream::new(Options::default());
+let mut committed = Vec::new();
+let mut pending = None;
+
+let u = s.append("Hello **wor");
+u.apply_to(&mut committed, &mut pending);
+```
+
+## Analyzer Example (Metadata and Hints)
+
+If you want block metadata (e.g. code fence language) and streaming hints (e.g. likely incomplete),
+wrap the stream in `AnalyzedStream`.
+
+```rust
+use mdstream::{AnalyzedStream, BlockHintAnalyzer, CodeFenceAnalyzer, Options};
+
+let analyzer = (CodeFenceAnalyzer::default(), BlockHintAnalyzer::default());
+let mut s = AnalyzedStream::new(Options::default(), analyzer);
+
+let u = s.append("```mermaid\ngraph TD;\nA-->B;\n");
+
+for m in &u.committed_meta {
+    // m.id is a stable cache key; m.meta contains analyzer output
+}
+if let Some(pm) = &u.pending_meta {
+    // pending meta can change every tick, just like pending text
+}
+```
+
+## Demo
+
+Run the zero-dependency demo:
+
+```sh
+cargo run -p mdstream --example tui_like
+```
+
+## Streamdown Defaults
+
+If you want Streamdown-compatible behavior for incomplete links/images via pending transformers:
+
+```rust
+use mdstream::MdStream;
+
+let mut s = MdStream::streamdown_defaults();
+```
+
+---
+
+# Release Checklist
+
+Source: https://github.com/latias94/mdstream/blob/main/RELEASE_CHECKLIST.md
+
+# Release Checklist
+
+This checklist is optimized for `mdstream` releases where the `docs/` folder may be pruned (except internal ADP/ADR notes).
+
+## Before tagging
+
+- [ ] Update `Cargo.toml` `package.version`
+- [ ] Update `CHANGELOG.md` for the release version
+- [ ] Ensure `README.md` contains all user-facing guidance (installation, quick start, examples)
+- [ ] Run formatting and lint:
+  - [ ] `cargo fmt --all`
+  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
+- [ ] Run tests:
+  - [ ] `cargo test --tests`
+  - [ ] `cargo test --all-features --tests`
+- [ ] Verify optional feature builds:
+  - [ ] `cargo check --examples`
+  - [ ] `cargo check --features pulldown --examples`
+- [ ] Verify packaging does not include large/internal folders:
+  - [ ] `cargo package` (check the generated `.crate` contents)
+
+## Prune `docs/` (if desired)
+
+- [ ] Move any internal decisions you want to keep into an `adp/` (or similar) folder
+- [ ] Delete `docs/` before publishing (if that is the release policy)
+- [ ] Re-run `cargo package` to verify the crate is still self-explanatory
+
+## Tag and publish
+
+- [ ] Create tag `vX.Y.Z`
+- [ ] Push tag
+- [ ] Publish: `cargo publish`
+- [ ] Create a GitHub release for the tag (attach notes / changelog)
+
+---

@@ -1,0 +1,782 @@
+# PR generator
+
+Source: https://github.com/devops-ia/pr-generator/blob/main/README.md
+
+# PR generator
+
+
+Automated Pull Request creation daemon for **GitHub** and **Bitbucket Cloud**.
+
+`pr-generator` runs as a long-lived service that periodically scans your repository branches, matches them against configurable regex patterns, and automatically opens Pull Requests toward the configured destination branches — skipping any PR that already exists.
+
+---
+
+## Table of Contents
+
+- [How it works](#how-it-works)
+- [Quick start](#quick-start)
+- [Configuration](#configuration)
+  - [YAML file](#yaml-file)
+  - [Environment variables](#environment-variables)
+- [Providers](#providers)
+  - [GitHub — App authentication](#github--app-authentication)
+  - [GitHub — PAT authentication](#github--pat-authentication)
+  - [Bitbucket Cloud](#bitbucket-cloud)
+- [Rules](#rules)
+- [ArgoCD Image Updater integration](#argocd-image-updater-integration)
+- [Annotation-based discovery](#annotation-based-discovery)
+- [Health endpoints](#health-endpoints)
+- [Prometheus metrics](#prometheus-metrics)
+- [Docker](#docker)
+- [Development](#development)
+- [Troubleshooting](#troubleshooting)
+
+---
+
+## How it works
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                        Scan cycle                           │
+│                                                             │
+│  1. Fetch all branches   ──▶  GitHub  /  Bitbucket          │
+│  2. For every rule                                          │
+│       match branches against regex pattern                  │
+│       for each match                                        │
+│         skip  if open PR already exists                     │
+│         create PR  source ──▶ destination                   │
+│  3. Sleep scan_frequency seconds                            │
+│  4. Repeat                                                  │
+└─────────────────────────────────────────────────────────────┘
+```
+
+Key design points:
+
+- **Concurrent**: branches are fetched from all providers in parallel; rule×provider pairs are also processed concurrently (up to 10 workers).
+- **Idempotent**: an existing open PR for the same source→destination pair is detected and skipped.
+- **Dry-run mode**: log what would be created without actually calling the API.
+- **Graceful shutdown**: handles `SIGTERM` / `SIGINT` and drains in-progress work.
+
+---
+
+## Quick start
+
+```bash
+# Install
+pip install -e .
+
+# Point to your config file and run
+CONFIG_PATH=./config.yaml pr-generator
+```
+
+Or with Docker:
+
+```bash
+docker run --rm \
+  -v "$(pwd)/config.yaml:/etc/pr-generator/config.yaml:ro" \
+  ghcr.io/devops-ia/pr-generator:latest
+```
+
+---
+
+## Configuration
+
+### YAML file
+
+The default config path is `/etc/pr-generator/config.yaml`. Override with the `CONFIG_PATH` environment variable. The application exits with an error at startup if the file is not found.
+
+```yaml
+# config.yaml
+
+# How often (seconds) to scan for new branches.
+scan_frequency: 300        # default: 300
+
+# Logging level: DEBUG | INFO | WARNING | ERROR
+log_level: INFO            # default: INFO
+
+# Log format: "text" (human-readable) or "json" (structured, for log aggregators)
+log_format: text           # default: text
+
+# When true, PRs are logged but never actually created.
+dry_run: false             # default: false
+
+# Port for the built-in health server.
+health_port: 8080          # default: 8080
+
+providers:
+  github:
+    enabled: true
+    owner: my-org
+    repo: my-repo
+    app_id: "123456"
+    installation_id: "78901234"   # optional — auto-resolved if omitted
+    private_key_path: /secrets/github-app.pem   # path to PEM file
+    # Alternative: set GITHUB_APP_PRIVATE_KEY env var (plain PEM or base64-encoded)
+    timeout: 30            # HTTP timeout in seconds
+
+  bitbucket:
+    enabled: true
+    workspace: my-workspace
+    repo_slug: my-repo
+    token_env: BITBUCKET_TOKEN   # name of the env var that holds the token
+    close_source_branch: true    # delete source branch after merge (default: true)
+    timeout: 30
+
+rules:
+  - pattern: "feature/.*"          # Python regex matched against branch names
+    destinations:
+      github: main
+      bitbucket: develop
+
+  - pattern: "release/.*"
+    destinations:
+      github: main
+
+  - pattern: ".*-hotfix-.*"
+    destinations:
+      bitbucket: master
+```
+
+#### Multiple GitHub organisations
+
+Use any name as the provider key and set `type: github` (or `type: bitbucket`) to identify the implementation. Rules reference providers by their name.
+
+```yaml
+providers:
+  github-acme:
+    type: github          # required for non-standard key names
+    enabled: true
+    owner: acme-org
+    repo: backend
+    app_id: "111"
+    private_key_path: /secrets/acme-app.pem
+
+  github-skunkworks:
+    type: github
+    enabled: true
+    owner: skunkworks-org
+    repo: platform
+    auth_method: pat
+    token_env: SKUNKWORKS_GITHUB_TOKEN
+
+  bitbucket:              # "github" / "bitbucket" keys default type automatically
+    enabled: true
+    workspace: my-workspace
+    repo_slug: my-repo
+    token_env: BITBUCKET_TOKEN
+
+rules:
+  - pattern: "feature/.*"
+    destinations:
+      github-acme: main
+      github-skunkworks: develop
+      bitbucket: develop
+```
+
+**Config fields reference**
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `scan_frequency` | int | `300` | Seconds between scan cycles |
+| `log_level` | string | `"INFO"` | Python logging level |
+| `dry_run` | bool | `false` | Simulate PR creation without API calls |
+| `health_port` | int | `8080` | Port for health HTTP server |
+| `providers.<name>.type` | string | *(key name)* | Provider implementation: `github` or `bitbucket`. Required when the key name is not `github` or `bitbucket` |
+| `providers.<name>.enabled` | bool | `false` | Activate this provider instance. If no providers are enabled the application starts in **idle mode** — it logs a warning and keeps running without performing any scans |
+| `providers.<name>.owner` | string | — | GitHub organisation or user *(GitHub only)* |
+| `providers.<name>.repo` | string | — | Repository name *(GitHub only)* |
+| `providers.<name>.app_id` | string | — | GitHub App ID *(GitHub App auth)* |
+| `providers.<name>.installation_id` | string | *(auto)* | Installation ID; resolved automatically if omitted *(GitHub App auth)* |
+| `providers.<name>.private_key_path` | string | — | Path to GitHub App private key PEM file *(GitHub App auth)* |
+| `providers.<name>.auth_method` | string | `"app"` | `app` (GitHub App) or `pat` (Personal Access Token) *(GitHub only)* |
+| `providers.<name>.token_env` | string | `"GITHUB_TOKEN"` / `"BITBUCKET_TOKEN"` | Env var name containing the token *(PAT / Bitbucket)*. Must be **unique** across all enabled providers of the same type — duplicate values raise a `ValueError` at startup |
+| `providers.<name>.workspace` | string | — | Bitbucket workspace slug *(Bitbucket only)* |
+| `providers.<name>.repo_slug` | string | — | Bitbucket repository slug *(Bitbucket only)* |
+| `providers.<name>.close_source_branch` | bool | `true` | Delete source branch after PR merges *(Bitbucket only)* |
+| `providers.<name>.timeout` | float | `30` | HTTP timeout (seconds) |
+| `rules[].pattern` | string | — | Python regex applied to branch names |
+| `rules[].destinations` | map | — | `provider_name: destination_branch` pairs |
+
+---
+
+## Environment variables
+
+| Variable | Description |
+|----------|-------------|
+| `CONFIG_PATH` | Path to the YAML config file. Default: `/etc/pr-generator/config.yaml` |
+| `GITHUB_APP_PRIVATE_KEY` | GitHub App PEM key (plain text or base64-encoded). Used **only** when `private_key_path` is absent or empty in config — if `private_key_path` is set but the file does not exist, the application raises `FileNotFoundError` without falling back to this variable |
+| `GITHUB_TOKEN` | Default token env var for GitHub PAT providers (`token_env: GITHUB_TOKEN`) |
+| `BITBUCKET_TOKEN` | Default token env var for Bitbucket providers (`token_env: BITBUCKET_TOKEN`) |
+| *any name* | Custom env var referenced by `token_env` in provider config |
+
+---
+
+## Providers
+
+### GitHub App
+
+Authentication uses a [GitHub App](https://docs.github.com/en/apps/creating-github-apps/about-creating-github-apps/about-creating-github-apps). Two modes are available:
+
+**GitHub App (recommended)** — the provider:
+1. Signs a short-lived JWT with the App's RSA private key.
+2. Exchanges it for an installation access token (cached up to ~55 minutes).
+3. Uses the installation token for all API calls.
+4. Caches per-cycle PR-existence and branch-existence lookups to reduce API usage.
+
+**Personal Access Token (PAT)** — set `auth_method: pat` and point `token_env` at an env var holding the PAT.
+
+Required GitHub App permissions: **Contents** (read), **Pull requests** (read & write).
+
+### Bitbucket Cloud
+
+Authentication uses a project/repository **Bearer token** (HTTP access token).
+
+The provider fetches default reviewers at PR creation time and automatically includes them in the payload.
+
+Required Bitbucket permissions: **Repositories** (read), **Pull requests** (read & write).
+
+---
+
+## Rules
+
+Each rule has:
+
+- **`pattern`** — a Python regex (`re.compile`) matched against branch names using `re.match` (anchored at the start). The destination branch is excluded from matching.
+- **`destinations`** — a map of `provider_name → destination_branch`. Only providers that are both listed here **and** active in `providers` are processed.
+
+```yaml
+rules:
+  - pattern: "feature/.*"
+    destinations:
+      github: main          # create PRs toward "main" on GitHub
+      bitbucket: develop    # create PRs toward "develop" on Bitbucket
+```
+
+Multiple rules are supported.
+
+---
+
+## ArgoCD Image Updater integration
+
+`pr-generator` pairs naturally with [Argo CD Image Updater](https://argocd-image-updater.readthedocs.io/).
+Image Updater creates branches named `argocd-image-updater-set-<app>-<env>-<image>`.
+Configure rules to catch those branches and open PRs toward the appropriate target branch per environment.
+
+```yaml
+scan_frequency: 120
+
+providers:
+  github:
+    enabled: true
+    owner: my-org
+    repo: gitops-repo
+    auth_method: app
+    app_id: "123456"
+    private_key_path: /secrets/github-app.pem
+
+rules:
+  - pattern: "argocd-image-updater-.*-dev-.*"
+    destinations:
+      github: develop
+
+  - pattern: "argocd-image-updater-.*-staging-.*"
+    destinations:
+      github: staging
+
+  - pattern: "argocd-image-updater-.*-pro-.*"
+    destinations:
+      github: main
+```
+
+---
+
+## Annotation-based discovery
+
+Instead of a central `rules` list, each ArgoCD Application CR can carry annotations
+that define its own PR rules. `pr-generator` reads these annotations on every scan cycle
+— no restart or config change required.
+
+### Modes
+
+| Mode | Behaviour |
+|------|-----------|
+| `config_only` | Static rules from `config.yaml` only. No Kubernetes API access. **Default.** |
+| `annotations_only` | Rules come exclusively from annotated ArgoCD Applications. `rules:` is ignored at runtime. |
+| `hybrid` | Both sources active. Annotation destinations win on same pattern+provider collision. |
+
+### Annotation schema
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: my-app
+  annotations:
+    pr-generator.io/enabled: "true"
+    pr-generator.io/pattern: "^image-updater/.*"
+    pr-generator.io/destination.github: "main"       # provider key → base branch
+    pr-generator.io/destination.bitbucket: "develop"
+```
+
+### config.yaml
+
+```yaml
+annotation_discovery:
+  mode: hybrid                    # config_only | annotations_only | hybrid
+  annotation_prefix: pr-generator.io   # default
+
+# rules: required when mode is config_only or hybrid; optional for annotations_only
+rules:
+  - pattern: "^hotfix/.*"
+    destinations:
+      github: main
+```
+
+### RBAC requirement
+
+Annotation discovery reads `applications.argoproj.io` cluster-wide. The Helm chart
+creates a `ClusterRole` and `ClusterRoleBinding` automatically when
+`annotationDiscovery.enabled: true`. For bare Docker/pip deployments, the pod's
+ServiceAccount needs:
+
+```yaml
+rules:
+  - apiGroups: ["argoproj.io"]
+    resources: ["applications"]
+    verbs: ["get", "list"]
+```
+
+---
+
+## Health endpoints
+
+A lightweight HTTP server starts on `health_port` (default `8080`):
+
+| Endpoint | Behaviour |
+|----------|-----------|
+| `GET /livez` | `200 live` while running; `503 shutting down` during shutdown |
+| `GET /healthz` | Same as `/livez` (alias) |
+| `GET /readyz` | `200 ready` after the **first** scan cycle completes; `503 not ready` before that |
+| `GET /metrics` | Prometheus text exposition (see [Prometheus metrics](#prometheus-metrics)) |
+
+Suitable for Kubernetes liveness, readiness, and startup probes:
+
+```yaml
+livenessProbe:
+  httpGet:
+    path: /livez
+    port: 8080
+readinessProbe:
+  httpGet:
+    path: /readyz
+    port: 8080
+```
+
+---
+
+## Prometheus metrics
+
+`pr-generator` exposes Prometheus metrics at `GET /metrics` on the health port (default `8080`).
+
+### Metrics reference
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `pr_generator_scan_cycles_total` | Counter | — | Scan cycles completed |
+| `pr_generator_scan_duration_seconds` | Histogram | — | Duration per cycle (buckets: .1, .5, 1, 5, 10, 30, 60 s) |
+| `pr_generator_last_scan_timestamp_seconds` | Gauge | — | Unix timestamp of last completed cycle |
+| `pr_generator_prs_created_total` | Counter | `provider` | PRs opened |
+| `pr_generator_prs_skipped_total` | Counter | `provider` | PRs skipped (already open) |
+| `pr_generator_prs_simulated_total` | Counter | `provider` | PRs simulated (`dry_run: true`) |
+| `pr_generator_scan_errors_total` | Counter | `provider` | Errors during branch fetch or PR creation |
+| `pr_generator_rules_active` | Gauge | — | Rules active in the current cycle |
+| `pr_generator_annotation_rules_discovered` | Gauge | — | Rules discovered from ArgoCD annotations in last cycle |
+
+The `provider` label value is the key name from `config.providers` (e.g. `github`, `my-bitbucket`).
+
+### Scraping
+
+```bash
+curl http://localhost:8080/metrics
+```
+
+### Helm chart — Prometheus Operator
+
+```yaml
+metrics:
+  enabled: true
+  serviceMonitor:
+    enabled: true          # creates ServiceMonitor CRD
+    interval: 30s
+    labels:
+      release: kube-prometheus-stack   # match your Operator's serviceMonitorSelector
+```
+
+### Programmatic API
+
+```python
+from prometheus_client import CollectorRegistry
+from pr_generator.metrics import PrGeneratorMetrics
+
+# Isolated registry (useful in tests)
+m = PrGeneratorMetrics(registry=CollectorRegistry())
+m.record_annotation_rules(3)
+print(m.generate_latest().decode())
+```
+
+---
+
+## Docker
+
+The image is built from a two-stage Dockerfile:
+
+- **Stage 1** – installs Python dependencies into `/install`.
+- **Stage 2** – minimal `python:3.14-slim` runtime; runs as a non-root user (`prgen`).
+
+```bash
+# Build
+docker build -t pr-generator .
+
+# Run with YAML config
+docker run --rm \
+  -v "$(pwd)/config.yaml:/etc/pr-generator/config.yaml:ro" \
+  -v "$(pwd)/github-app.pem:/secrets/github-app.pem:ro" \
+  -e BITBUCKET_TOKEN=<token> \
+  -p 8080:8080 \
+  pr-generator
+```
+
+---
+
+## Development
+
+**Prerequisites**: Python ≥ 3.11
+
+```bash
+# Create and activate a virtual environment
+python -m venv .venv
+source .venv/bin/activate
+
+# Install the package in editable mode with dev extras
+pip install -e .
+pip install pytest
+
+# Run tests
+pytest
+
+# Run with a local config
+CONFIG_PATH=./config.yaml python -m pr_generator
+```
+
+**Project layout**
+
+```
+src/pr_generator/
+├── __main__.py          # Entry point: startup, provider init, scan loop
+├── config.py            # Config loading from YAML file
+├── models.py            # Dataclasses: AppConfig, ProviderConfig, ScanRule, …
+├── scanner.py           # Concurrent scan cycle orchestrator
+├── health.py            # HTTP health server (/livez, /readyz, /healthz)
+├── http_client.py       # Shared HTTP client with retry/backoff
+├── annotation_discovery.py  # Kubernetes annotation-based rule discovery
+├── config.py            # Config loader (YAML → AppConfig)
+├── health.py            # HTTP health + metrics server (/livez, /readyz, /metrics)
+├── logging_config.py    # Logging setup (plain text or structured JSON)
+├── metrics.py           # Prometheus metrics (PrGeneratorMetrics)
+└── providers/
+    ├── base.py          # ProviderInterface Protocol
+    ├── github.py        # GitHub App provider
+    └── bitbucket.py     # Bitbucket Cloud provider
+
+tests/
+├── conftest.py                  # Shared pytest fixtures
+├── test_annotation_discovery.py # Annotation discovery tests
+├── test_config.py               # Config loading tests
+├── test_health.py               # Health server tests
+├── test_metrics.py              # Prometheus metrics tests
+├── test_models.py               # Model tests
+└── test_scanner.py              # Scan cycle tests
+```
+
+---
+
+## Troubleshooting
+
+### Application exits with `FileNotFoundError`
+
+```
+FileNotFoundError: [Core] private_key_path '/secrets/github-app.pem' does not exist.
+```
+
+`private_key_path` is set in `config.yaml` but the file is not present at that path.
+Either mount the PEM file at the configured path, or remove `private_key_path` from
+the config and set the `GITHUB_APP_PRIVATE_KEY` environment variable instead.
+
+### `ValueError: duplicate tokenEnv`
+
+```
+ValueError: [Core] Providers 'bb-eu' and 'bb-us' both use tokenEnv 'BITBUCKET_TOKEN'.
+```
+
+Two enabled providers of the same type share the same `token_env` value. Assign a
+unique env var name to each provider and export the corresponding variable in your
+runtime environment.
+
+### `/readyz` returns `503`
+
+This is expected during startup. The endpoint returns `503 not ready` until the first
+full scan cycle completes. If it never flips to `200`, check the application logs for
+errors in the scan cycle (API auth failures, missing config fields, network issues).
+
+### No PRs are created (dry_run is false, branches exist)
+
+1. **Regex anchoring** — rules use `re.match`, which is anchored at the start of the
+   string. A pattern `feature/.*` will **not** match `hotfix/feature/x`. Enable
+   `log_level: DEBUG` to see per-branch matching decisions.
+2. **Provider name mismatch** — the name in `rules[].destinations` must exactly match
+   the provider key under `providers:`.
+3. **Destination branch excluded** — pr-generator skips branches whose name equals the
+   destination branch to avoid self-targeting PRs.
+
+### GitHub App: `RuntimeError: Could not resolve installation id`
+
+Set `installation_id` explicitly in the provider config (find it in your GitHub App
+settings under _Installations_), or ensure the GitHub App is installed on the target
+repository.
+
+
+---
+
+# Prometheus Metrics — Design Spec
+
+Source: https://github.com/devops-ia/pr-generator/blob/main/docs/superpowers/specs/2026-05-24-prometheus-metrics-design.md
+
+# Prometheus Metrics — Design Spec
+
+Date: 2026-05-24
+Status: approved
+
+## Summary
+
+Add a `/metrics` endpoint to the existing health HTTP server (port 8080) exposing
+Prometheus-compatible metrics. The Python app uses `prometheus-client` via a
+`PrGeneratorMetrics` class (dependency-injected, registry-isolated). The Helm chart
+adds pod annotations for plain Prometheus and an optional `ServiceMonitor` for
+Prometheus Operator.
+
+---
+
+## 1. Architecture
+
+### New files
+
+| File | Purpose |
+|------|---------|
+| `src/pr_generator/metrics.py` | `PrGeneratorMetrics` class owning all metric objects |
+| `tests/test_metrics.py` | Full test suite for metrics class and health `/metrics` endpoint |
+| `charts/pr-generator/templates/servicemonitor.yaml` | Optional ServiceMonitor CRD |
+
+### Modified files
+
+| File | Change |
+|------|--------|
+| `src/pr_generator/health.py` | Add `/metrics` path; inject `PrGeneratorMetrics` via closure subclass |
+| `src/pr_generator/__main__.py` | Instantiate `PrGeneratorMetrics` once at startup; pass to `start_health_server` and `scan_cycle` |
+| `src/pr_generator/scanner.py` | Accept `metrics: PrGeneratorMetrics \| None = None`; time cycle; call `record_cycle()` |
+| `requirements.txt` + `pyproject.toml` | Add `prometheus-client>=0.21.0` |
+| `charts/pr-generator/values.yaml` | Add `metrics` section |
+| `charts/pr-generator/templates/deployment.yaml` | Merge pod annotations when `metrics.enabled` |
+| `charts/pr-generator/values.schema.json` | Add `metrics` object schema |
+| `charts/pr-generator/Chart.yaml` | Bump `1.3.0 → 1.4.0` |
+
+### Data flow
+
+```
+__main__.py
+  ├── PrGeneratorMetrics(registry=REGISTRY)  ← instantiated once
+  ├── start_health_server(..., metrics=m)    → /metrics returns generate_latest()
+  └── loop:
+        rules = _resolve_rules(...)
+        m.record_annotation_rules(len(annotation_rules))
+        result = scan_cycle(..., metrics=m)  → record_cycle() at end of cycle
+```
+
+`PrGeneratorMetrics` has no imports from the provider or scanner layer.
+No circular dependencies.
+
+---
+
+## 2. Metrics Catalog
+
+All metric names are prefixed `pr_generator_`.
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `pr_generator_scan_cycles_total` | Counter | — | Scan cycles completed |
+| `pr_generator_scan_duration_seconds` | Histogram | — | Duration per cycle. Buckets: .1, .5, 1, 5, 10, 30, 60 |
+| `pr_generator_last_scan_timestamp_seconds` | Gauge | — | Unix timestamp of last completed cycle |
+| `pr_generator_prs_created_total` | Counter | `provider` | PRs opened |
+| `pr_generator_prs_skipped_total` | Counter | `provider` | PRs skipped (already open) |
+| `pr_generator_prs_simulated_total` | Counter | `provider` | PRs simulated (`dry_run: true`) |
+| `pr_generator_scan_errors_total` | Counter | `provider` | Errors during branch fetch or PR creation |
+| `pr_generator_rules_active` | Gauge | — | Rules active in the current cycle |
+| `pr_generator_annotation_rules_discovered` | Gauge | — | Rules discovered from ArgoCD annotations in last cycle |
+
+**Label cardinality:** `provider` takes the key name from `config.providers` (e.g. `github`,
+`my-bitbucket`). Fixed and low cardinality — safe.
+
+**Histogram choice over Summary:** Histograms allow cross-instance aggregation via
+`histogram_quantile()` in PromQL, consistent with Prometheus best practices.
+
+---
+
+## 3. `PrGeneratorMetrics` class interface
+
+```python
+class PrGeneratorMetrics:
+    def __init__(self, registry: CollectorRegistry = REGISTRY) -> None: ...
+
+    def record_cycle(self, result: CycleResult, duration: float) -> None:
+        """Increment counters and update gauges from a completed CycleResult."""
+
+    def record_annotation_rules(self, count: int) -> None:
+        """Update annotation_rules_discovered gauge."""
+
+    def generate_latest(self) -> bytes:
+        """Return Prometheus text exposition format."""
+```
+
+`record_cycle()` iterates `result.rule_results` and increments per-provider counters.
+`generate_latest()` delegates to `prometheus_client.generate_latest(self._registry)`.
+
+---
+
+## 4. `health.py` extension
+
+The existing `_HealthHandler` is extended with one new branch in `do_GET`:
+
+```python
+elif self.path == "/metrics":
+    if self.metrics is not None:
+        body = self.metrics.generate_latest()
+        self.send_response(200)
+        self.send_header("Content-Type", CONTENT_TYPE_LATEST)
+        self.end_headers()
+        self.wfile.write(body)
+    else:
+        self._write(404, "metrics not enabled")
+```
+
+`metrics` is injected into the handler class via the same closure-built subclass
+pattern used for `stop_event` and `ready_event`. `start_health_server` signature
+gains `metrics: PrGeneratorMetrics | None = None`.
+
+---
+
+## 5. `scanner.py` extension
+
+`scan_cycle()` gains `metrics: PrGeneratorMetrics | None = None`. Timing uses
+`time.monotonic()` bracketing the full cycle. At the end:
+
+```python
+if metrics is not None:
+    metrics.record_cycle(result, duration=time.monotonic() - t_start)
+```
+
+No metrics import at module level — `PrGeneratorMetrics` is imported inside
+`TYPE_CHECKING` guard for the type hint, avoiding a hard dependency in the scanner.
+
+---
+
+## 6. Helm chart
+
+### `values.yaml`
+
+```yaml
+metrics:
+  enabled: true
+  podAnnotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/path: "/metrics"
+    prometheus.io/port: "8080"
+  serviceMonitor:
+    enabled: false
+    interval: 30s
+    scrapeTimeout: 10s
+    labels: {}
+    namespace: ""
+```
+
+### `servicemonitor.yaml`
+
+Conditional on `metrics.enabled && metrics.serviceMonitor.enabled`.
+Points to the existing `http` port (8080) on the chart Service.
+Namespace defaults to `Release.Namespace`.
+
+### `deployment.yaml`
+
+When `metrics.enabled`, merge `metrics.podAnnotations` into pod annotations
+(in addition to the existing `checksum/config` annotation).
+
+### Schema
+
+`values.schema.json` adds `metrics` object with:
+- `enabled: boolean`
+- `podAnnotations: object` (additionalProperties: string)
+- `serviceMonitor: object` with `enabled`, `interval`, `scrapeTimeout`, `labels`, `namespace`
+
+---
+
+## 7. Tests
+
+### `tests/test_metrics.py`
+
+**`TestPrGeneratorMetrics`:**
+- Each test instantiates `PrGeneratorMetrics(registry=CollectorRegistry())` — no global state pollution
+- `record_cycle()` with multi-provider result increments all counters correctly
+- `record_cycle()` with empty result leaves counters at zero
+- `record_annotation_rules(5)` sets gauge to 5; calling again with 3 sets to 3
+- `generate_latest()` output contains expected metric names
+
+**`tests/test_health.py`** (new or extension):
+- `GET /metrics` returns 200 with `Content-Type: text/plain; version=0.0.4`
+- `GET /metrics` with `metrics=None` returns 404
+- Existing health endpoints unaffected
+
+### Isolation pattern
+
+```python
+def test_record_cycle_creates_pr():
+    registry = CollectorRegistry()
+    m = PrGeneratorMetrics(registry=registry)
+    result = CycleResult(cycle_id=1, rule_results=[
+        RuleResult(rule_pattern=".*", provider="github",
+                   destination="main", created=2, errors=0, ...)
+    ])
+    m.record_cycle(result, duration=1.5)
+    output = m.generate_latest().decode()
+    assert 'pr_generator_prs_created_total{provider="github"} 2.0' in output
+```
+
+---
+
+## 8. Dependency
+
+```
+prometheus-client>=0.21.0
+```
+
+Added to both `requirements.txt` and `pyproject.toml` `[project.dependencies]`.
+`prometheus-client` is a pure-Python package with no C extensions — no build
+requirements, compatible with the existing Alpine-based Docker image.
+
+---
+
+## Out of scope
+
+- Push gateway support
+- Custom histogram bucket configuration via values
+- Per-rule-pattern label (cardinality risk with dynamic annotation rules)
+- Alerting rules / PrometheusRule CRD
+
+---

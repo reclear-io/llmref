@@ -1,0 +1,267 @@
+# Register KCM on the broker before any other middleware (see DI note below)
+
+Source: https://github.com/modern-python/faststream-concurrent-aiokafka/blob/main/README.md
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)"  srcset="https://raw.githubusercontent.com/modern-python/.github/main/brand/projects/faststream-concurrent-aiokafka/lockup-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/modern-python/.github/main/brand/projects/faststream-concurrent-aiokafka/lockup-light.svg">
+    <img alt="faststream-concurrent-aiokafka" src="https://raw.githubusercontent.com/modern-python/.github/main/brand/projects/faststream-concurrent-aiokafka/lockup.png" width="420">
+  </picture>
+</p>
+
+
+Concurrent message processing middleware for [FastStream](https://faststream.airt.ai/) with aiokafka.
+
+By default FastStream processes Kafka messages sequentially — one message at a time per subscriber. This library turns each incoming message into an asyncio task so multiple messages are handled concurrently, while keeping offset commits correct and shutdown graceful.
+
+## Features
+
+- Concurrent message processing via asyncio tasks
+- Configurable concurrency limit (semaphore-based)
+- Batch offset committing per partition after each task completes
+- Rebalance-safe: pending offsets are flushed on partition revocation via `ConsumerRebalanceListener`
+- Fast shutdown: cancels in-flight tasks; uncommitted offsets are redelivered on restart (at-least-once)
+- Signal handling owned by your lifespan / process manager — this lib does not register SIGTERM/SIGINT handlers
+- Handler exceptions are logged but do not crash the consumer
+- Health check helper to probe handler status from a `ContextRepo`
+
+## Installation
+
+```bash
+pip install faststream-concurrent-aiokafka
+```
+
+## Quick Start
+
+`ack_policy=AckPolicy.MANUAL` is **required** on every concurrent subscriber — the middleware enforces this at runtime.
+Without it, FastStream would commit offsets before processing tasks complete, causing silent message loss on crash.
+Subscribers that use other ack policies are automatically passed through without concurrent processing.
+
+> **`AsgiFastStream` note**: its lifespan receives an app-level `ContextRepo` separate from `broker.context`. Pass `broker.context` explicitly instead of the injected argument.
+
+```python
+from contextlib import asynccontextmanager
+from faststream import ContextRepo
+from faststream.asgi import AsgiFastStream
+from faststream.kafka import KafkaBroker
+from faststream.middlewares import AckPolicy
+from faststream_concurrent_aiokafka import (
+    KafkaConcurrentProcessingMiddleware,
+    initialize_concurrent_processing,
+    stop_concurrent_processing,
+)
+
+broker = KafkaBroker(...)
+# Register KCM on the broker before any other middleware (see DI note below)
+broker.add_middleware(KafkaConcurrentProcessingMiddleware)
+
+@asynccontextmanager
+async def lifespan(_context: ContextRepo):
+    await initialize_concurrent_processing(
+        context=broker.context,
+        concurrency_limit=20,         # max concurrent tasks (minimum: 1)
+        commit_batch_size=100,        # commit after this many completed tasks
+        commit_batch_timeout_sec=5.0, # or after this many seconds
+    )
+    try:
+        yield
+    finally:
+        await stop_concurrent_processing(broker.context)
+
+app = AsgiFastStream(broker, lifespan=lifespan)
+
+@broker.subscriber("my-topic", group_id="my-group", ack_policy=AckPolicy.MANUAL)
+async def handle(msg: str) -> None:
+    ...
+
+# Subscribers without AckPolicy.MANUAL are passed through unchanged
+@broker.subscriber("other-topic", group_id="other-group")
+async def handle_other(msg: str) -> None:
+    ...
+```
+
+## Core Concepts
+
+### KafkaConcurrentProcessingMiddleware
+
+A FastStream `BaseMiddleware` subclass. Add it to your broker to enable concurrent processing. It wraps each incoming message in an asyncio task submitted to `KafkaConcurrentHandler`.
+
+### KafkaConcurrentHandler
+
+The processing engine. Manages:
+- An `asyncio.Semaphore` to enforce `concurrency_limit`
+- In-flight task tracking via a `set[asyncio.Task]`; each task's done-callback releases the semaphore, removes the task from the set, and logs any non-cancellation exception
+- A `KafkaBatchCommitter` for offset commits
+- An optional `ConsumerRebalanceListener` (via `handler.create_rebalance_listener()`) that flushes pending commits when partitions are revoked
+
+This library does **not** install signal handlers — shutdown is driven by your lifespan / process manager calling `stop_concurrent_processing`.
+
+### KafkaBatchCommitter
+
+Runs as a background asyncio task. A streaming loop absorbs `KafkaCommitTask` objects into per-partition pending state and commits each partition's contiguous-done prefix when total pending crosses `commit_batch_size`, when `commit_batch_timeout_sec` fires, or when `commit_all`/`close` sets the flush event. Cancelled tasks are treated as a hard boundary — the offset advance stops at the cancelled task so it gets redelivered on restart (at-least-once). If the committer's task dies, `CommitterIsDeadError` is raised to callers.
+
+## API Reference
+
+### `initialize_concurrent_processing(context, ...)`
+
+Create and start the concurrent processing handler; store it in FastStream's context.
+
+| Parameter | Default | Description |
+|---|---|---|
+| `context` | required | FastStream `ContextRepo` instance |
+| `concurrency_limit` | `10` | Max concurrent asyncio tasks (minimum: 1) |
+| `commit_batch_size` | `10` | Max messages per commit batch |
+| `commit_batch_timeout_sec` | `10.0` | Max seconds before flushing a batch |
+| `shutdown_timeout_sec` | `20.0` | Max seconds the batch committer waits for its background task to drain before forcing cancellation |
+| `max_uncommitted_tasks` | `10000` | Max tasks accepted but not yet committed before the consume path blocks (backpressure). `None` disables the bound. |
+
+Returns the `KafkaConcurrentHandler` instance.
+
+> **Tuning `max_uncommitted_tasks`:** each uncommitted entry holds only commit metadata — a task reference, its `TopicPartition`, offset, and consumer reference — not the message payload, so the default of `10000` is on the order of a few MB. Lower it to tighten the memory bound during a commit or broker outage, at the cost of stalling consumption sooner. Keep it `>= commit_batch_size` so size-based batching can still trigger (below that, commits fall back to the timeout/flush path); set it to `None` to disable the bound and restore unbounded buffering.
+
+### `stop_concurrent_processing(context)`
+
+Cancel all in-flight handler tasks, flush completed offsets via the committer, then stop the handler. Uncommitted offsets (from cancelled tasks or anything queued past a cancelled offset) are redelivered on restart — at-least-once.
+
+### `is_kafka_handler_healthy(context)`
+
+Returns `True` if the `KafkaConcurrentHandler` stored in `context` is running and healthy, `False` otherwise (not initialized, stopped, or committer task dead). Useful for readiness/liveness probes.
+
+### `KafkaConcurrentProcessingMiddleware`
+
+FastStream middleware class. Register it via `broker.add_middleware(...)`. See Quick Start for usage examples.
+
+> **Must be outermost.** `consume_scope` fires the handler as a background task and returns `None` immediately. Any middleware that wraps it on the outside will see that premature return and misfire — wrong timing, early cleanup, or missed exceptions. Middlewares added after it (i.e. inner in the chain) run correctly inside the background task.
+
+#### DI framework compatibility (`modern-di-faststream` and similar)
+
+DI frameworks like `modern-di-faststream` register a broker-level middleware that creates a REQUEST-scoped dependency container around each message. If that middleware is **outer** to `KafkaConcurrentProcessingMiddleware`, its scope closes as soon as `consume_scope` returns — before the background task runs — so any dependencies resolved inside the task (database sessions, repositories, …) are created from an already-closed container. Their finalizers never run, leaving connections unreturned to the pool.
+
+**Fix**: call `broker.add_middleware(KafkaConcurrentProcessingMiddleware)` **before** `setup_di(...)` (or any equivalent DI bootstrap call). FastStream stacks broker middlewares so the **first** registered is outermost; adding KCM first makes it wrap the DI middleware, so the DI middleware runs *inside* KCM's background task and can manage the scope lifetime correctly.
+
+```python
+broker = KafkaBroker(...)
+broker.add_middleware(KafkaConcurrentProcessingMiddleware)  # registered first → outermost
+modern_di_faststream.setup_di(app, container=container)    # registered after → inner to KCM
+```
+
+## How It Works
+
+1. **Message dispatch**: On each incoming message, `consume_scope` calls `handle_task()`, which acquires a semaphore slot then fires the handler coroutine as a background `asyncio.Task`.
+
+2. **Concurrency control**: The semaphore blocks new tasks when `concurrency_limit` is reached. The slot is released via a done-callback when the task finishes or fails.
+
+3. **Offset committing**: Each dispatched task is paired with its Kafka offset and consumer reference and enqueued in `KafkaBatchCommitter`. Once the task completes, the committer groups offsets by partition and calls `consumer.commit(partitions_to_offsets)` with `offset + 1` (Kafka's "next offset to fetch" convention).
+
+4. **Rebalance handling**: When Kafka revokes a partition, the `ConsumerRebalanceListener` (returned by `handler.create_rebalance_listener(flush_timeout_sec=...)`) calls `committer.commit_all()` to flush pending offsets before the partition is reassigned. The flush waits for in-flight handlers up to `flush_timeout_sec` (default 10 s) so a slow handler cannot stall the rebalance past `max.poll.interval.ms`; on timeout, the remaining in-flight messages are redelivered after reassignment (at-least-once). A future optimization may scope the wait to only the revoked partitions.
+
+5. **Shutdown**: `stop_concurrent_processing` cancels every in-flight asyncio task, then awaits `committer.close()`. The committer treats cancelled tasks as a hard offset boundary — cancelled-and-after offsets stay uncommitted and get redelivered on restart. Total wall-clock is sub-second in normal conditions and bounded by `shutdown_timeout_sec` only as a safety net for stuck network commits.
+
+## Migration from < 0.x
+
+Previously, `stop_concurrent_processing` waited up to `2 × shutdown_timeout_sec` for in-flight handlers to drain to completion. The new behavior cancels them immediately. The at-least-once contract is unchanged — uncommitted offsets are redelivered on restart, the same way they always were when the handler crashed mid-task.
+
+| What changed | Old | New |
+|---|---|---|
+| In-flight handler tasks on stop | drained to completion | **cancelled** |
+| `KafkaConcurrentHandler.wait_for_subtasks()` | public method | removed |
+| `shutdown_timeout_sec` | applied separately to handler and committer | applied to committer only |
+| Signal handler installation | installed automatically | removed — own them via your lifespan / process manager |
+
+If your handlers do non-idempotent work that's expensive to repeat, ensure your handlers are wrapped in `try/finally` so cleanup runs on `CancelledError`, or pin to the previous version of this library. To trigger shutdown on SIGTERM/SIGINT, your lifespan or main entry point must catch the signal and call `stop_concurrent_processing(broker.context)` — under uvicorn / AsgiFastStream this happens automatically through the lifespan `finally` block.
+
+## Requirements
+
+- Python >= 3.11
+- `faststream[kafka]`
+
+## 📦 [PyPI](https://pypi.org/project/faststream-concurrent-aiokafka)
+
+## 📝 [License](LICENSE)
+
+## Part of `modern-python`
+
+Browse the full list of templates and libraries in
+[`modern-python`](https://github.com/modern-python) — see the org profile for the categorized index.
+
+---
+
+# CLAUDE.md
+
+Source: https://github.com/modern-python/faststream-concurrent-aiokafka/blob/main/CLAUDE.md
+
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Commands
+
+`just --list` is the source of truth; run `just install` after pulling or
+changing `pyproject.toml`. Non-obvious notes:
+
+- `just test` / `just test-branch` run in Docker (start Redpanda, run pytest,
+  tear down) — they require Docker.
+- Run one test without Docker via the already-running stack:
+  `uv run --no-sync pytest tests/test_kafka_committer.py -k <name>`.
+- `just lint` auto-fixes; `just lint-ci` is the check-only CI variant (and runs
+  the planning validator).
+
+## Workflow
+
+Planning uses a portable two-axis convention: `architecture/` (repo root) is the
+living **truth home** and promotion target; `planning/changes/` holds the
+per-change bundles. **Start at the Quick path** in
+[`planning/README.md`](planning/README.md) to choose a lane (Full / Lightweight
+/ Tiny), create a bundle, and ship — that file is the authoritative spec. Run
+`just check-planning` to validate bundles and `just index` to print the listing.
+Release notes: copy `planning/releases/TEMPLATE.md` to
+`planning/releases/<version>.md` (bare version, no `v` prefix) when cutting a
+release.
+
+## Architecture
+
+The library provides concurrent Kafka message processing for FastStream. The
+authoritative, code-current account of each capability lives in
+[`architecture/`](architecture/). **When a change alters a capability's
+behavior, update the matching `architecture/<capability>.md` in the same PR** —
+that promotion is what keeps `architecture/` true.
+
+Invariants (what must not break):
+
+- **At-least-once offsets.** Offsets are committed only *after* the user task
+  finishes; a crash, cancellation, or rebalance before completion leaves the
+  offset uncommitted so the message is redelivered. A cancelled task is a hard
+  offset boundary — cancelled-and-after offsets on its partition stay
+  uncommitted.
+- **One handler per init, not a singleton.** A handler lives in `ContextRepo`
+  under `"concurrent_processing"`; `stop_concurrent_processing` clears it so a
+  fresh handler can be initialised. Lifecycle is owned by whoever calls
+  init/stop — no module-level state, no signal handlers.
+- **Middleware gates on manual acks.** It passes through FakeConsumer and
+  non-MANUAL-ack subscribers, refuses `_enable_auto_commit=True`, rejects batch
+  subscribers, and skips (logs, leaves offset uncommitted) once the handler is
+  stopped. The `_classify(...) -> _Route` branch *order* is load-bearing.
+- **Bounded shutdown / rebalance flush.** Shutdown is bounded by the committer's
+  `shutdown_timeout_sec` (default 20 s); the rebalance listener's `commit_all`
+  flush is bounded by `flush_timeout_sec` (default 10 s, well under aiokafka's
+  300 s `max.poll.interval.ms`).
+- **Real-broker tests.** Integration tests drive a real Redpanda container; the
+  FastStream/aiokafka harness invariants (start subscribers explicitly,
+  `auto_offset_reset="earliest"`, pre-create topics, etc.) are load-bearing.
+
+| Capability | File |
+|---|---|
+| `KafkaConcurrentHandler` (`processing.py`) — engine, dispatch, shutdown | [`architecture/concurrent-handler.md`](architecture/concurrent-handler.md) |
+| `KafkaBatchCommitter` (`batch_committer.py`) — offset-commit task | [`architecture/batch-committer.md`](architecture/batch-committer.md) |
+| Middleware, init/stop lifecycle, healthcheck (`middleware.py`, `healthcheck.py`) | [`architecture/middleware-lifecycle.md`](architecture/middleware-lifecycle.md) |
+| `ConsumerRebalanceListener` (`rebalance.py`) | [`architecture/rebalance.md`](architecture/rebalance.md) |
+| Real-broker integration-test harness (`tests/test_integration.py`) | [`architecture/integration-tests.md`](architecture/integration-tests.md) |
+
+## Conventions
+
+- **Type suppression**: use `# ty: ignore[rule-name]` (not `# type: ignore`).
+- **No `from __future__ import annotations`**: annotations are evaluated eagerly; `typing.Self`/`typing.Never` are used directly (requires Python ≥ 3.11).
+- **Imports at module level**: no local imports inside functions.
+
+---

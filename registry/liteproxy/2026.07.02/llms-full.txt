@@ -1,0 +1,669 @@
+# liteproxy
+
+Source: https://github.com/localrivet/liteproxy/blob/main/README.md
+
+# liteproxy
+
+A lightweight reverse proxy that reads Docker Compose files and routes traffic based on labels. No Docker socket required — just parse the compose file and proxy.
+
+## Features
+
+- **Zero config files** — all routing defined via compose labels
+- **Zero-downtime hot reload** — add/remove services without dropping connections
+- **Longest-prefix matching** — multiple services can share a host with different paths
+- **Wildcard subdomains** — `*.tenant.com` for multi-tenant SaaS routing
+- **TCP passthrough** — forward raw TCP for services that handle their own TLS
+- **Mixed mode** — combine passthrough and proxy routes on the same server
+- **Automatic HTTPS** — Let's Encrypt certificates via autocert (optional)
+- **Load balancer friendly** — HTTP-only mode for running behind LB/CDN
+- **High throughput** — lock-free hot path, parallel request handling
+- **Single binary** — easy to deploy
+
+## Quick Start
+
+**Important:** Liteproxy must run inside Docker Compose to resolve service names. Service names like `marketing` or `api` only resolve within Docker's network.
+
+```bash
+# Try the example
+docker compose -f example-compose.yaml up --build
+
+# Test routing
+curl -H "Host: example.com" http://localhost:9999/        # → nginx
+curl -H "Host: example.com" http://localhost:9999/api     # → api service
+curl -I -H "Host: www.example.com" http://localhost:9999/ # → 301 redirect
+```
+
+For local development without Docker:
+```bash
+go build -o liteproxy .
+LITEPROXY_HTTPS_ENABLED=false ./liteproxy
+# Note: upstream services won't resolve unless you add them to /etc/hosts
+```
+
+## How It Works
+
+1. Liteproxy reads your `compose.yaml` file
+2. Services with `liteproxy.*` labels become routing rules
+3. Incoming requests are matched by host + longest path prefix
+4. Requests are reverse-proxied to the matching service
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                      Liteproxy                          │
+│                                                         │
+│  ┌──────────────┐    ┌──────────────┐    ┌──────────┐  │
+│  │   Compose    │───▶│   Router     │───▶│  Proxy   │  │
+│  │   Parser     │    │   Table      │    │  Handler │  │
+│  └──────────────┘    └──────────────┘    └──────────┘  │
+│         │                                      │        │
+│         ▼                                      ▼        │
+│  ┌──────────────┐                     ┌──────────────┐ │
+│  │ compose.yaml │                     │  Upstream    │ │
+│  └──────────────┘                     │  Services    │ │
+└─────────────────────────────────────────────────────────┘
+```
+
+## Label Schema
+
+Add these labels to any service you want to proxy:
+
+| Label | Required | Default | Description |
+|-------|----------|---------|-------------|
+| `liteproxy.host` | yes | — | Domain to match (supports `*.example.com` wildcards) |
+| `liteproxy.port` | yes | — | Backend port to proxy to |
+| `liteproxy.port.http` | no | same as port | HTTP port override for passthrough (ACME challenges) |
+| `liteproxy.path` | no | `/` | Path prefix (longest match wins) |
+| `liteproxy.strip_prefix` | no | `false` | Strip path prefix before forwarding |
+| `liteproxy.redirect_from` | no | — | Comma-separated domains to 301 redirect |
+| `liteproxy.passhost` | no | `false` | Pass original Host header to upstream |
+| `liteproxy.passthrough` | no | `false` | Forward raw TCP without TLS termination |
+
+## Example Compose File
+
+```yaml
+services:
+  liteproxy:
+    image: liteproxy:latest
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./compose.yaml:/etc/liteproxy/compose.yaml:ro
+      - ./certs:/certs
+    environment:
+      LITEPROXY_COMPOSE_FILE: /etc/liteproxy/compose.yaml
+      LITEPROXY_HTTPS_ENABLED: "true"
+      LITEPROXY_ACME_EMAIL: you@example.com
+      LITEPROXY_WATCH: "true"
+
+  marketing:
+    image: nginx:alpine
+    labels:
+      liteproxy.host: "example.com"
+      liteproxy.port: "80"
+      liteproxy.redirect_from: "www.example.com,old.example.com"
+
+  api:
+    image: myapi:latest
+    labels:
+      liteproxy.host: "example.com"
+      liteproxy.port: "8080"
+      liteproxy.path: "/api"
+
+  redis:
+    image: redis:alpine
+    # no labels = not proxied
+```
+
+With this configuration:
+- `example.com/` → marketing:80
+- `example.com/api/*` → api:8080
+- `www.example.com/*` → 301 redirect to `example.com`
+
+## Routing Rules
+
+**Longest prefix wins:** When multiple services share a host, the most specific path matches first.
+
+```
+example.com/api/users  → matches /api  → api service
+example.com/about      → matches /     → marketing service
+```
+
+**Path preservation:** By default, the full path is preserved when forwarding to upstream.
+
+```
+Request: example.com/api/users
+Route:   /api → api:8080
+Upstream receives: /api/users
+```
+
+To strip the path prefix, set `liteproxy.strip_prefix: "true"`:
+
+```yaml
+labels:
+  liteproxy.host: "example.com"
+  liteproxy.port: "8080"
+  liteproxy.path: "/api"
+  liteproxy.strip_prefix: "true"  # upstream receives /users
+```
+
+**Redirects:** Requests to `redirect_from` domains return 301 to the primary host, preserving the path and query string.
+
+```
+www.example.com/pricing?plan=pro → 301 → example.com/pricing?plan=pro
+```
+
+## Wildcard Subdomain Routing
+
+For multi-tenant SaaS apps, use wildcard hosts (`*.tenant.com`):
+
+```yaml
+services:
+  marketing:
+    image: marketing:latest
+    labels:
+      liteproxy.host: "tenant.com"
+      liteproxy.port: "80"
+      liteproxy.redirect_from: "www.tenant.com"
+
+  tenant-app:
+    image: tenant-app:latest
+    labels:
+      liteproxy.host: "*.tenant.com"
+      liteproxy.port: "8080"
+```
+
+**Routing priority:**
+1. Redirects are checked first (`www.tenant.com` → 301 to `tenant.com`)
+2. Exact host matches (`tenant.com` → marketing)
+3. Wildcard matches (`acme.tenant.com` → tenant-app)
+
+**Note:** Wildcards match one subdomain level only:
+- ✅ `acme.tenant.com` matches `*.tenant.com`
+- ❌ `sub.acme.tenant.com` does NOT match `*.tenant.com`
+
+## TCP Passthrough
+
+For services that need to handle their own TLS (mail servers, custom protocols), use passthrough mode:
+
+```yaml
+services:
+  liteproxy:
+    image: liteproxy:latest
+    ports:
+      - "80:80"
+      - "443:443"
+
+  # Normal reverse proxy - liteproxy terminates TLS
+  webapp:
+    image: webapp:latest
+    labels:
+      liteproxy.host: "app.example.com"
+      liteproxy.port: "8080"
+
+  # Passthrough - mail server handles its own TLS
+  mailserver:
+    image: mailserver:latest
+    labels:
+      liteproxy.host: "mail.example.com"
+      liteproxy.port: "443"
+      liteproxy.port.http: "80"  # For ACME challenges
+      liteproxy.passthrough: "true"
+```
+
+**How passthrough works:**
+1. Liteproxy peeks at the TLS ClientHello (SNI) or HTTP Host header
+2. If the host matches a passthrough route, raw TCP is forwarded to the backend
+3. The backend handles TLS termination and all protocol details
+
+**Port routing for passthrough:**
+- HTTPS (port 443) → forwarded to `liteproxy.port` (e.g., backend:443)
+- HTTP (port 80) → forwarded to `liteproxy.port.http` (e.g., backend:80 for ACME)
+
+If `port.http` is not set, HTTP traffic also goes to `port`.
+
+**Use cases:**
+- Apps with their own autocert that need ACME challenges on port 80
+- Mail servers (Postfix, Dovecot) that need their own certificates
+- Services with mutual TLS (mTLS) requirements
+- Custom protocols over TLS
+- Services that must see the original client certificate
+
+**Performance:** Passthrough adds ~10-30 microseconds latency. Data transfer is network-bound, not CPU-bound.
+
+## Configuration
+
+Liteproxy is configured via environment variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `LITEPROXY_COMPOSE_FILE` | `./compose.yaml` | Path to compose file |
+| `LITEPROXY_HTTP_PORT` | `80` | HTTP listen port |
+| `LITEPROXY_HTTPS_PORT` | `443` | HTTPS listen port |
+| `LITEPROXY_HTTPS_ENABLED` | `false` | Enable HTTPS with autocert |
+| `LITEPROXY_ACME_EMAIL` | — | Let's Encrypt email (required if HTTPS enabled) |
+| `LITEPROXY_ACME_DIR` | `./certs` | Certificate storage directory |
+| `LITEPROXY_WATCH` | `false` | Auto-reload on compose file changes |
+
+## Multi-Project Networking
+
+Run multiple projects on one server with true hot reload — no liteproxy restart needed when adding new projects.
+
+### Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     liteproxy network                        │
+│                    (shared routing layer)                    │
+│                                                              │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐    │
+│  │liteproxy │  │  webapp  │  │   api    │  │   blog   │    │
+│  └──────────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘    │
+└─────────────────────┼─────────────┼─────────────┼──────────┘
+                      │             │             │
+              ┌───────┴───┐   ┌─────┴─────┐   ┌───┴───────┐
+              │project-a  │   │project-b  │   │project-c  │
+              │(private)  │   │(private)  │   │(private)  │
+              │           │   │           │   │           │
+              │  ┌─────┐  │   │  ┌─────┐  │   │  ┌─────┐  │
+              │  │ db  │  │   │  │redis│  │   │  │mysql│  │
+              │  └─────┘  │   │  └─────┘  │   │  └─────┘  │
+              └───────────┘   └───────────┘   └───────────┘
+```
+
+- **liteproxy network**: Shared network for routing. All routable services join this.
+- **project-* networks**: Private networks for internal services (databases, caches). Isolated from other projects.
+- **Routable services**: Join both networks (liteproxy + private)
+- **Internal services**: Join only private network (not accessible from outside)
+
+### Setup Instructions
+
+**Step 1: Create the liteproxy network**
+
+```bash
+docker network create liteproxy
+```
+
+**Step 2: Configure liteproxy**
+
+`liteproxy/compose.yaml`:
+
+```yaml
+services:
+  liteproxy:
+    image: liteproxy:latest
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./compose.yaml:/etc/liteproxy/compose.yaml:ro
+      - ./certs:/certs
+    environment:
+      LITEPROXY_COMPOSE_FILE: /etc/liteproxy/compose.yaml
+      LITEPROXY_HTTPS_ENABLED: "true"
+      LITEPROXY_ACME_EMAIL: you@example.com
+      LITEPROXY_WATCH: "true"
+    networks:
+      - liteproxy
+
+networks:
+  liteproxy:
+    external: true
+```
+
+**Step 3: Add routes to liteproxy's compose file**
+
+Liteproxy reads routes from its own compose file. Add service entries with labels for each routable service:
+
+`liteproxy/compose.yaml` (updated):
+
+```yaml
+services:
+  liteproxy:
+    image: liteproxy:latest
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./compose.yaml:/etc/liteproxy/compose.yaml:ro
+      - ./certs:/certs
+    environment:
+      LITEPROXY_COMPOSE_FILE: /etc/liteproxy/compose.yaml
+      LITEPROXY_HTTPS_ENABLED: "true"
+      LITEPROXY_ACME_EMAIL: you@example.com
+      LITEPROXY_WATCH: "true"
+    networks:
+      - liteproxy
+
+  # Routes — service names must match container names on liteproxy network
+  webapp:
+    labels:
+      liteproxy.host: "projecta.com"
+      liteproxy.port: "8080"
+      liteproxy.redirect_from: "www.projecta.com"
+
+  api:
+    labels:
+      liteproxy.host: "projectb.com"
+      liteproxy.port: "3000"
+      liteproxy.passthrough: "true"
+      liteproxy.port.http: "80"
+
+networks:
+  liteproxy:
+    external: true
+```
+
+**Step 4: Configure projects to join liteproxy network**
+
+Each project joins the shared `liteproxy` network for routable services, plus their own private network for internal services.
+
+Project A (`project-a/compose.yaml`):
+
+```yaml
+services:
+  webapp:
+    image: webapp:latest
+    container_name: webapp  # Must match service name in liteproxy's routes
+    networks:
+      - liteproxy    # Routable — liteproxy can reach this
+      - private      # Can talk to db
+
+  db:
+    image: postgres:alpine
+    networks:
+      - private      # Internal only — not routable
+
+networks:
+  liteproxy:
+    external: true   # Shared network, created in Step 1
+  private:
+    # Local to this project, auto-created
+```
+
+Project B (`project-b/compose.yaml`):
+
+```yaml
+services:
+  api:
+    image: api:latest
+    container_name: api  # Must match service name in liteproxy's routes
+    networks:
+      - liteproxy
+      - private
+
+  redis:
+    image: redis:alpine
+    networks:
+      - private
+
+networks:
+  liteproxy:
+    external: true
+  private:
+```
+
+**Step 5: Start services**
+
+```bash
+# 1. Create liteproxy network (once)
+docker network create liteproxy
+
+# 2. Start liteproxy
+cd liteproxy && docker compose up -d
+
+# 3. Start projects (any order, any time)
+cd project-a && docker compose up -d
+cd project-b && docker compose up -d
+```
+
+### Adding a New Project (Zero Downtime)
+
+1. Add service entry to liteproxy's `compose.yaml` (just the labels, no image needed)
+2. Create project compose file that joins the `liteproxy` network
+3. Start the project: `docker compose up -d`
+4. Liteproxy hot reloads and starts routing immediately
+
+**Liteproxy's compose.yaml** (add new services here):
+
+```yaml
+services:
+  liteproxy:
+    # ... liteproxy config ...
+
+  # Route definitions (no image needed, just labels)
+  webapp:
+    labels:
+      liteproxy.host: "projecta.com"
+      liteproxy.port: "8080"
+
+  api:
+    labels:
+      liteproxy.host: "projectb.com"
+      liteproxy.port: "3000"
+
+  # Add new projects here — hot reload picks them up
+  newproject:
+    labels:
+      liteproxy.host: "newproject.com"
+      liteproxy.port: "8080"
+```
+
+**Why this works**: Liteproxy parses the compose file for service names and labels. Docker resolves service names via DNS on the shared network. So `webapp` in the routes file resolves to the `webapp` container because they're on the same `liteproxy` network.
+
+```bash
+# Adding a new project:
+# 1. Edit liteproxy's compose.yaml, add service with labels
+# 2. Start the new project
+cd new-project && docker compose up -d
+# 3. Liteproxy auto-reloads (LITEPROXY_WATCH=true) — no restart needed
+```
+
+### AI Setup Instructions
+
+When configuring liteproxy for a new server or project, follow this exact pattern:
+
+1. **One shared network**: Create `liteproxy` network once (`docker network create liteproxy`)
+2. **Routes in liteproxy's compose**: Add `liteproxy.*` labels to liteproxy's compose file (not project files)
+3. **Service names = container names**: Route service names must match `container_name` in project compose
+4. **External network declaration**: Every project declares `liteproxy` network as `external: true`
+5. **Private networks**: Use a local `private` network for internal services (db, redis, etc.)
+6. **Dual network for routable services**: Routable containers join both `liteproxy` and `private`
+
+Common mistakes to avoid:
+- ❌ Putting labels in project compose files (liteproxy only reads its own compose file)
+- ❌ Mismatched names (route service name must match container_name on the network)
+- ❌ Creating separate networks per project that liteproxy must join (breaks hot reload)
+- ❌ Putting internal services (db, redis) on the liteproxy network (security risk)
+- ❌ Forgetting `external: true` on liteproxy network (creates duplicate networks)
+
+## Running Behind a Load Balancer
+
+When running behind a load balancer that handles TLS termination, use HTTP-only mode (the default):
+
+```yaml
+services:
+  liteproxy:
+    image: liteproxy:latest
+    ports:
+      - "80:80"
+    volumes:
+      - ./compose.yaml:/etc/liteproxy/compose.yaml:ro
+    environment:
+      LITEPROXY_COMPOSE_FILE: /etc/liteproxy/compose.yaml
+      # LITEPROXY_HTTPS_ENABLED defaults to false
+```
+
+For direct internet exposure with automatic certificates:
+
+```yaml
+environment:
+  LITEPROXY_HTTPS_ENABLED: "true"
+  LITEPROXY_ACME_EMAIL: you@example.com
+```
+
+## Hot Reload (Zero Downtime)
+
+Liteproxy supports zero-downtime configuration updates. Add new services, change routes, or remove hosts without restarting or dropping connections.
+
+### Automatic Reload (Recommended for Production)
+
+Enable file watching to automatically reload when `compose.yaml` changes:
+
+```yaml
+environment:
+  LITEPROXY_WATCH: "true"
+```
+
+When you edit the compose file:
+1. File watcher detects change (500ms debounce)
+2. New routes are parsed
+3. Router is swapped atomically (lock-free)
+4. Existing connections continue uninterrupted
+5. New requests use updated routes immediately
+
+### Manual Reload
+
+Send SIGHUP to reload configuration:
+
+```bash
+# Inside Docker
+docker compose exec liteproxy kill -HUP 1
+
+# Or from host
+docker compose kill -s HUP liteproxy
+```
+
+### Adding a New Service
+
+**Single-project setup** (all services in one compose file):
+```bash
+# 1. Add service to compose.yaml with liteproxy labels
+# 2. Start the new service
+docker compose up -d new-service
+# 3. Liteproxy auto-reloads — verify with:
+docker compose logs liteproxy | grep "reloaded"
+```
+
+**Multi-project setup** (separate compose files per project):
+```bash
+# 1. Add route to liteproxy's compose.yaml
+# 2. Start the new project (joins liteproxy network)
+cd new-project && docker compose up -d
+# 3. Liteproxy auto-reloads — no restart needed
+```
+
+See [Multi-Project Networking](#multi-project-networking) for full setup instructions.
+
+### Performance During Reload
+
+| Operation | Duration | Impact |
+|-----------|----------|--------|
+| Router swap | ~nanoseconds | None (atomic pointer) |
+| Cache clear | ~microseconds | First request to each service slightly slower |
+| Total reload | <1ms | No dropped connections |
+
+The hot path uses lock-free atomic operations and read-only locks that allow unlimited parallel requests.
+
+## Mixed Mode (Passthrough + Proxy)
+
+Liteproxy supports running passthrough and regular proxy routes simultaneously:
+
+```yaml
+services:
+  # Liteproxy terminates TLS, proxies HTTP to backend
+  webapp:
+    labels:
+      liteproxy.host: "app.example.com"
+      liteproxy.port: "8080"
+
+  # Backend handles its own TLS (passthrough)
+  legacy-app:
+    labels:
+      liteproxy.host: "legacy.example.com"
+      liteproxy.port: "443"
+      liteproxy.port.http: "80"
+      liteproxy.passthrough: "true"
+```
+
+For passthrough services with autocert:
+- `liteproxy.port` — HTTPS traffic forwarded here (usually 443)
+- `liteproxy.port.http` — HTTP traffic forwarded here (for ACME challenges, usually 80)
+
+## Performance
+
+Liteproxy is designed for high throughput with minimal overhead.
+
+### Unit Benchmarks
+
+Internal operations measured with `go test -bench`:
+
+| Operation | Time | Allocations | Notes |
+|-----------|------|-------------|-------|
+| Route match | 150 ns | 0 | Hot path, parallel |
+| Wildcard match | 153 ns | 0 | Hot path, parallel |
+| Redirect lookup | 141 ns | 0 | Hot path, parallel |
+| Passthrough check | 144 ns | 0 | Hot path, parallel |
+| SNI extraction | 19 ns | 1 | TLS passthrough |
+| HTTP host extraction | 1.6 µs | 11 | HTTP passthrough |
+
+### HTTP Benchmarks
+
+End-to-end benchmarks using [hey](https://github.com/rakyll/hey) with Docker resource constraints:
+
+**Minimal resources (0.5 CPU, 64MB RAM):**
+```
+Requests/sec:  11,676
+Latency p50:   5.5 ms
+Latency p99:   46 ms
+```
+
+**Standard resources (2 CPU, 256MB RAM):**
+```
+Requests/sec:  28,000
+Latency p50:   1.2 ms
+Latency p99:   7.4 ms
+```
+
+### Running Benchmarks
+
+**Unit benchmarks:**
+```bash
+go test -bench=. -benchmem ./...
+```
+
+**HTTP benchmarks (requires Docker and [hey](https://github.com/rakyll/hey)):**
+```bash
+# Start benchmark environment (0.5 CPU, 64MB per container)
+docker compose -f benchmark-compose.yaml up -d
+
+# Run benchmark: 100k requests, 100 concurrent connections
+hey -n 100000 -c 100 -host "example.com" http://localhost:50718/
+
+# Cleanup
+docker compose -f benchmark-compose.yaml down
+```
+
+### Design Characteristics
+
+- **Lock-free hot path**: Router access uses atomic pointer loads
+- **RWMutex for reads**: Route matching allows unlimited parallel readers
+- **Zero-allocation routing**: No heap allocations per request
+- **Connection pooling**: Shared HTTP transport with keep-alive
+- **Buffer pooling**: Reusable buffers for proxy and passthrough
+
+## Building
+
+```bash
+# Standard build
+go build -o liteproxy .
+
+# Smaller binary (strips debug info)
+go build -ldflags="-s -w" -o liteproxy .
+```
+
+## License
+
+MIT License - see [LICENSE](LICENSE) file.
+
+---

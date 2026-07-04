@@ -1,0 +1,1947 @@
+# strict-path
+
+Source: https://github.com/dk26/strict-path-rs/blob/main/README.md
+
+# strict-path
+
+
+**The moment a path string enters your program from outside your code — an HTTP request, a config file, an archive entry, a database row, an LLM tool call — reach for `strict-path`.** It pins that string to a directory you chose, so it can't escape via symlinks, encoding tricks, or platform quirks. [19+ real-world CVEs covered](https://dk26.github.io/strict-path-rs/security_methodology.html#12-coverage-what-we-protect-against).
+
+> Prepared statements prevent SQL injection. `strict-path` prevents path injection. Same rule: **data from outside never gets to act as structure.**
+
+## 🔍 Why String Checking Isn't Enough
+
+You strip `..` and check for `/`. But attackers have a dozen other vectors:
+
+| Attack vector | String filter | `strict-path` |
+|---|---|---|
+| `../../../etc/passwd` | ✅ Caught (if done right) | ✅ Blocked |
+| Symlink inside boundary → outside | ❌ Passes silently | ✅ Symlink resolved, escape blocked |
+| Windows 8.3: `PROGRA~1` bypasses filter | ❌ Passes silently | ✅ Short name resolved, escape blocked |
+| NTFS ADS: `file.txt:secret:$DATA` | ❌ Passes silently | ✅ Blocked ([CVE-2025-8088](https://dk26.github.io/strict-path-rs/security_methodology.html)) |
+| Unicode tricks: `..∕` (fraction slash U+2215) | ❌ Passes silently | ✅ Blocked |
+| Junction/mount point → outside boundary | ❌ Passes silently | ✅ Resolved & blocked |
+| TOCTOU race condition (CVE-2022-21658) | ❌ No defense | ⚡ Mitigated at validation |
+| Null byte injection | ❌ Truncation varies | ✅ Blocked |
+| Mixed separators: `..\../etc` | ❌ Often missed | ✅ Normalized & blocked |
+
+**How it works:** `strict-path` resolves the path on disk — follows symlinks, expands short names, normalizes encoding — then checks whether the resolved path is inside the boundary. If it isn't, you get an `Err`. The input string is irrelevant. Only where the path *actually leads* matters.
+
+<details>
+<summary><strong>Why canonicalization beats string blocklists</strong></summary>
+
+String-matching libraries maintain lists of dangerous patterns — `..`, `%2e%2e`, `%c0%ae` (overlong UTF-8), `&#46;` (HTML entities), full-width Unicode dots, zero-width characters, and dozens more. Every new encoding trick requires a new blocklist entry, and a single miss is a bypass.
+
+`strict-path` doesn't play that game. It asks the OS to resolve the path, then checks where it landed. URL-encoded `%2e%2e` isn't decoded — it's a literal directory name containing percent signs. Overlong UTF-8 sequences, HTML entities, code-page homoglyphs (¥→`\` in CP932, ₩→`\` in CP949) — none of these matter because the OS never interprets them as path separators or traversal sequences. The canonicalized result either falls inside the boundary or it doesn't.
+
+This is the same principle behind SQL prepared statements: instead of escaping every dangerous character (and inevitably missing one), you separate code from data structurally. `strict-path` separates *path resolution* from *path text*, making the entire class of encoding-bypass attacks irrelevant by design.
+
+</details>
+
+## ⚡ Get Secure in 30 Seconds
+
+```toml
+[dependencies]
+strict-path = "0.2"
+```
+
+```rust
+use strict_path::StrictPath;
+
+// Untrusted input: user upload, API param, config value, AI agent output, archive entry...
+let file = StrictPath::with_boundary("/var/app/downloads")?
+    .strict_join(&untrusted_user_input)?; // Every attack vector above → Err(PathEscapesBoundary)
+
+let contents = file.read()?; // Built-in safe I/O — stays within the secure API
+
+// Third-party crate needs AsRef<Path>?
+third_party::process(file.interop_path()); // &OsStr (implements AsRef<Path>)
+```
+
+If the input resolves outside the boundary — by *any* mechanism — `strict_join` returns `Err`.
+
+## 🎯 When to Use What
+
+**The trigger is the *origin of the path string*.** Is the string something your code produced, or did it come from outside?
+
+- **`Path` / `PathBuf`** (std) — the string is **yours**: a hardcoded constant, or assembled entirely from values your own code produced. There's no external input to validate.
+- **`StrictPath`** — the string came from **outside** (HTTP request, config file, archive entry, DB row, env var, LLM tool call, …) and an escape attempt is an **error** you want to know about. Log it, deny the request, abort the operation. Silently substituting a different file would hide the problem.
+- **`VirtualPath`** — the string came from **outside**, and an escape attempt should be **clamped**. The caller is navigating a sandbox you gave them (their own "/"), and `..` off the top just lands them back at their root.
+
+**Choose `StrictPath` (≈ 90% of cases):**
+- Archive extraction, config loading
+- File uploads to shared storage (admin panels, CMS assets, single-tenant apps)
+- LLM / AI agent file operations
+- Shared system resources (logs, cache, assets)
+- *Any case where escaping a path boundary is considered malicious.*
+
+**Choose `VirtualPath` (≈ 10% of cases):**
+- Multi-tenant file storage (SaaS per-user directories, isolated views)
+- Malware analysis sandboxes
+- Container-like plugins
+- *Any case where you want freedom of operation under complete isolation.*
+
+<details>
+<summary><strong>What <code>strict-path</code> is NOT</strong></summary>
+
+- Not a sandbox or chroot — your process still has whatever filesystem access the OS grants it.
+- Not a replacement for filesystem permissions, SELinux/AppArmor, or `openat2(RESOLVE_BENEATH)`. Compose with those where you have them.
+- Not a URL or shell-argument sanitizer — different injection class, different tool.
+- Not a performance-tuned lexical normalizer — canonicalization touches the disk. If every path is a hardcoded constant and you need nanoseconds, `std::path` is the right tool.
+
+</details>
+
+> 📖 **[Tutorial: Chapter 1 — The Basic Promise →](https://dk26.github.io/strict-path-rs/tutorial/chapter1_basic_promise.html)** · 📖 **[Complete Decision Matrix →](https://dk26.github.io/strict-path-rs/best_practices.html)** · 📚 **[More Examples →](https://dk26.github.io/strict-path-rs/examples/overview.html)**
+
+---
+
+## 🚀 Real-World Examples
+
+### Archive Extraction (Zip Slip Prevention)
+
+`PathBoundary` in the signature names the legal boundary for this operation — the directory that joined paths must stay inside.
+
+```rust
+use strict_path::PathBoundary;
+
+// Prevents CVE-2018-1000178 (Zip Slip) automatically (https://snyk.io/research/zip-slip-vulnerability)
+fn extract_archive(
+    extraction_dir: PathBoundary,
+    archive_entries: impl IntoIterator<Item = (String, Vec<u8>)>,
+) -> std::io::Result<()> {
+    for (entry_path, data) in archive_entries {
+        // Malicious paths like "../../../etc/passwd" → Err(PathEscapesBoundary)
+        let safe_file = extraction_dir.strict_join(&entry_path)?;
+        safe_file.create_parent_dir_all()?;
+        safe_file.write(&data)?;
+    }
+    Ok(())
+}
+```
+
+> The equivalent of `PathBoundary` for `VirtualPath` is the `VirtualRoot` type.
+
+### Multi-Tenant Isolation
+
+```rust
+use strict_path::VirtualRoot;
+
+// No path-traversal or symlinks can escape the tenant root.
+// Everything is clamped to the virtual root, including symlink resolutions.
+fn handle_file_request(tenant_id: &str, requested_path: &str) -> std::io::Result<Vec<u8>> {
+    let tenant_root = VirtualRoot::try_new_create(format!("./tenants/{tenant_id}"))?;
+
+    // "../../other_tenant/secrets.txt" → clamped to "/other_tenant/secrets.txt" in THIS tenant
+    let user_file = tenant_root.virtual_join(requested_path)?;
+    user_file.read()
+}
+```
+
+## 🧠 Compile-Time Safety with Markers
+
+Tag a `StrictPath` with a marker type so a function can only accept paths from the boundary you meant. Mixing them up is a compile error:
+
+```rust
+use strict_path::{PathBoundary, StrictPath};
+
+struct PublicAssets;
+struct UserUploads;
+
+fn serve_public_asset(file: &StrictPath<PublicAssets>) { /* safe to stream to any caller */ }
+
+let assets  = PathBoundary::<PublicAssets>::try_new_create("./assets")?;
+let uploads = PathBoundary::<UserUploads>::try_new_create("./uploads")?;
+
+let css:    StrictPath<PublicAssets> = assets.strict_join("style.css")?;
+let avatar: StrictPath<UserUploads>  = uploads.strict_join("avatar.jpg")?;
+
+serve_public_asset(&css);       // ✅ OK — PublicAssets matches
+// serve_public_asset(&avatar); // ❌ Compile error — UserUploads is not PublicAssets
+```
+
+> 📖 **[Complete Marker Tutorial →](https://dk26.github.io/strict-path-rs/tutorial/chapter3_markers.html)** — authorization patterns, permission matrices, `change_marker()` usage.
+
+## 🧰 What You Get Beyond Path Validation
+
+- 🛡️ **Built-in I/O** — `read()`, `write()`, `create_dir_all()`, `read_dir()` — no need to drop to `std::fs`
+- 📐 **Compile-time markers** — `StrictPath<UserUploads>` vs `StrictPath<SystemConfig>` can't be mixed up
+- 🔒 **Thread-safe** — all types are `Send + Sync`; share across threads and async tasks
+- 🤖 **LLM-ready** — doc comments and [context files](https://github.com/DK26/strict-path-rs/blob/main/LLM_CONTEXT_FULL.md) designed for AI agents with function calling
+
+<details>
+<summary><strong>Why the API looks the way it does (design notes for security reviewers and LLM integrators)</strong></summary>
+
+<br>
+
+This crate combines Rust's type system with Python's "one obvious way to do it" philosophy to build an API where **LLMs and humans naturally reach for the correct pattern** — wrong code either doesn't compile, or the compiler tells you exactly what to do instead.
+
+- **No `AsRef<Path>`, no `Deref`** — implementing either would let anything call `.join()` on a `StrictPath` and build a new path that skips boundary validation. Not implementing them closes that accidental path.
+- **`interop_path()` returns `&OsStr`, not `&Path`** — `&Path` carries `.join()` and `.parent()`, which would let callers build new unvalidated paths from a validated one. `&OsStr` doesn't; it's a one-way exit to third-party APIs with no accidental re-entry into path manipulation.
+- **One method per operation** — there is a single entry point for each operation (e.g. `strict_join` for joining). No aliases, no convenience wrappers, no "which one is the secure version?". The wrong-overload failure mode doesn't exist because there are no overloads.
+- **`#[must_use]` with instructions** — the `must_use` messages don't just say "unused Result", they say what to do (e.g. handle the result to detect traversal). When a caller — human or model — loops on compiler output, the message itself teaches the API.
+- **Doc comments explain *why*, not just *what*** — non-trivial functions document what attack the check prevents or what invariant it enforces, so a reader working from source alone has the reasoning on hand.
+
+</details>
+
+> 📖 **[Security Methodology →](https://dk26.github.io/strict-path-rs/security_methodology.html)** · 📚 **[Built-in I/O Methods →](https://dk26.github.io/strict-path-rs/best_practices/common_operations.html)** · 📚 **[Anti-Patterns →](https://dk26.github.io/strict-path-rs/anti_patterns.html)**
+
+## 🔒 Zero Idle Dependencies
+
+Every dependency in the default tree earns its place by closing a specific gap in cross-platform path resolution. Each is covered by `cargo audit` in CI, and the canonicalization engine has direct tests against the CVE payloads listed above.
+
+| Crate | Platforms | Security role |
+|---|---|---|
+| [`soft-canonicalize`](https://crates.io/crates/soft-canonicalize) | All | Canonicalization engine — symlink resolution, 8.3 short-name expansion, cycle detection, null-byte rejection. Maintained as part of this project. |
+| [`dunce`](https://crates.io/crates/dunce) | Windows | Strips `\\?\` / `\\.\` verbatim prefixes via `std::path::Prefix` pattern matching — no lossy UTF-8 round-trip, refuses to strip when unsafe (reserved names, >260 chars, trailing dots). Zero transitive deps. |
+| [`junction`](https://crates.io/crates/junction) | Windows (opt-in `junctions` feature) | NTFS junction creation and inspection for built-in junction helpers. |
+
+On Unix the total runtime tree is **2 crates** (`soft-canonicalize` + `proc-canonicalize`). On Windows it adds `dunce` (zero transitive deps). No idle dependencies — if a crate is in the tree, it has a security job.
+
+<details>
+<summary><strong>vs manual <code>soft-canonicalize</code></strong></summary>
+
+- `soft-canonicalize` = low-level path resolution engine (returns `PathBuf` — unchecked against a boundary)
+- `strict-path` = higher-level API on top of it: returns `StrictPath<Marker>`, which carries a checked boundary and a compile-time marker so paths from different trust zones can't be passed to the same function by mistake
+
+</details>
+
+## 🔌 Ecosystem Integration
+
+Compose with standard Rust crates for complete solutions:
+
+| Integration  | Purpose                 | Guide                                                                                       |
+| ------------ | ----------------------- | ------------------------------------------------------------------------------------------- |
+| **tempfile** | Secure temp directories | [Guide](https://dk26.github.io/strict-path-rs/ecosystem_integration.html#temporary-directories-tempfile) |
+| **dirs**     | OS standard directories | [Guide](https://dk26.github.io/strict-path-rs/os_directories.html)                          |
+| **app-path** | Application directories | [Guide](https://dk26.github.io/strict-path-rs/ecosystem_integration.html#portable-application-paths-app-path) |
+| **serde**    | Config bootstrap        | [Guide](https://dk26.github.io/strict-path-rs/ecosystem_integration.html#initializing-from-configuration) |
+| **Axum**     | Web server extractors   | [Tutorial](https://dk26.github.io/strict-path-rs/axum_tutorial/overview.html)               |
+| **Archives** | ZIP / TAR extraction    | [Guide](https://dk26.github.io/strict-path-rs/examples/archive_extraction.html)             |
+
+> 📚 **[Complete Integration Guide →](https://dk26.github.io/strict-path-rs/ecosystem_integration.html)**
+
+<details>
+<summary>🤖 <strong>LLM / AI Agent Integration</strong></summary>
+
+<br>
+
+Our doc comments and [LLM_CONTEXT_FULL.md](https://github.com/DK26/strict-path-rs/blob/main/LLM_CONTEXT_FULL.md) are designed for LLMs with function calling — enabling AI agents to use this crate safely for file operations.
+
+**LLM agent prompt (copy/paste):**
+```
+Fetch and follow this reference (single source of truth):
+https://github.com/DK26/strict-path-rs/blob/main/LLM_CONTEXT_FULL.md
+```
+
+**Context7 style:**
+```
+Fetch and follow this reference (single source of truth):
+https://github.com/DK26/strict-path-rs/blob/main/LLM_CONTEXT.md
+```
+
+</details>
+
+## 📚 Learn More
+
+📖 **[API Docs](https://docs.rs/strict-path)** · 📚 **[User Guide](https://dk26.github.io/strict-path-rs/)** · 📚 **[Anti-Patterns](https://dk26.github.io/strict-path-rs/anti_patterns.html)** · 📖 **[Security Methodology](https://dk26.github.io/strict-path-rs/security_methodology.html)** · 🧭 **[Canonicalized vs Lexical](https://dk26.github.io/strict-path-rs/ergonomics/choosing_canonicalized_vs_lexical_solution.html)** · 🛠️ **[`soft-canonicalize`](https://github.com/DK26/soft-canonicalize-rs)**
+
+**MSRV:** Rust 1.76 · **Releases:** [CHANGELOG.md](CHANGELOG.md)
+
+## 📄 License
+
+MIT OR Apache-2.0
+
+---
+
+# AGENTS.md
+
+Source: https://github.com/dk26/strict-path-rs/blob/main/AGENTS.md
+
+# AGENTS.md
+
+Operational hub for AI assistants working in this repository.
+Topic-specific depth lives in `.agents/*.md` satellites — read on demand.
+
+## Satellite Index
+
+| File | When to read |
+|---|---|
+| [`.agents/design-decisions.md`](.agents/design-decisions.md) | Adding/modifying APIs, questioning design choices |
+| [`.agents/coding-standards.md`](.agents/coding-standards.md) | Writing Rust code (must_use, indexing, comments, safety) |
+| [`.agents/api-usage.md`](.agents/api-usage.md) | Using strict-path types, naming, internals |
+| [`.agents/documentation.md`](.agents/documentation.md) | Writing docs, examples, demos, doctests |
+| [`.agents/ci-workflow.md`](.agents/ci-workflow.md) | CI, local scripts, debugging, benchmarks |
+| [`.agents/agent-behavior.md`](.agents/agent-behavior.md) | Git policy, issues, contributing, PR checklist |
+
+Also read: `LLM_CONTEXT_FULL.md` (usage-first API reference for LLMs).
+
+---
+
+## Maintaining This File
+
+AGENTS.md is read by stateless agents with no memory of prior sessions.
+Every rule must stand on its own.
+
+- **Only non-inferable content.** Don't duplicate what code reveals.
+- **General, not reactive.** No rules for single past mistakes.
+- **Context-free.** No references to specific conversations or commits.
+- **Principles over examples.** Prefer abstract guidance.
+
+## ⛔ Read Before Any Code Changes
+
+1. **Read the relevant source files.** Never modify code you haven't read.
+2. **Search before implementing.** Verify functionality doesn't already exist.
+3. **Canonicalization always resolves symlinks.** You can never get a
+   `StrictPath`/`VirtualPath` pointing to a symlink. Any API assuming
+   otherwise is fundamentally incompatible. See [`.agents/design-decisions.md`](.agents/design-decisions.md).
+
+## Build & Test
+
+```bash
+cargo build -p strict-path --all-features
+cargo test  -p strict-path --all-features
+cargo clippy -p strict-path --all-targets --all-features -- -D warnings
+cargo fmt   --all -- --check
+cargo doc   -p strict-path --no-deps --document-private-items --all-features
+```
+
+MSRV: Rust 1.76.0 — `rustup run 1.76 cargo build -p strict-path --all-features`
+
+Local CI: `./ci-local.ps1` (Windows) or `bash ./ci-local.sh` (Unix/WSL).
+
+## Project Overview
+
+- **Purpose**: Prevent directory traversal from external/unknown sources with safe path boundaries and safe symlinks.
+- **Core APIs**: `PathBoundary<Marker>`, `StrictPath<Marker>`, `VirtualRoot<Marker>`, `VirtualPath<Marker>`, `StrictPathError`.
+- **Security model**: "Restrict every external path." Untrusted inputs (user I/O, config, DB, LLMs, archives) must be validated into `StrictPath` or `VirtualPath` before I/O.
+- **Foundation**: Built on `soft-canonicalize`; canonicalization handles Windows 8.3 short names transparently.
+- **CRITICAL**: Canonicalization **always resolves symlinks** to targets — by design.
+- **TOCTOU scope**: Validates at join-time. Post-validation filesystem changes are outside scope (same limitation as SQL prepared statements).
+- **API philosophy**: Minimal, restrictive, explicit. Security over performance.
+
+### StrictPath vs VirtualPath: Detect vs Contain
+
+| | StrictPath (90%) | VirtualPath (10%) |
+|---|---|---|
+| **Philosophy** | Error on escape (detect attacks) | Silently clamp escapes (contain behavior) |
+| **Use cases** | Archives, config, uploads, shared resources | Multi-tenant SaaS, sandboxes, security research |
+| **On escape** | `Err(PathEscapesBoundary)` | Redirects within virtual boundary |
+| **Feature** | Always available | Requires `virtual-path` feature |
+
+**Common mistake**: VirtualPath for archive extraction — hides attacks. Use StrictPath.
+
+## Critical Design Principles (Non-Negotiable)
+
+These are stated once here. Satellites reference back.
+
+1. **No leaky traits**: Never `AsRef<Path>`, `Deref<Target=Path>`, implicit `From`/`Into` on crate types.
+2. **`interop_path()` → `&OsStr`**: The single gate for leaving the secure API. Pass directly to `AsRef<Path>` APIs. Never wrap in `Path::new()`/`PathBuf::from()`. Never expose to end-users (leaks real paths). Use `*_display()` for output.
+3. **One Way Principle**: Exactly one correct way per operation. No redundant convenience methods.
+4. **No new public APIs without maintainer approval.**
+
+## Repository Layout
+
+| Path | Purpose | Notes |
+|---|---|---|
+| `strict-path/` | Library crate | MSRV-bound (1.76.0) |
+| `benches/` | Performance benchmarks | Workspace member, latest stable |
+| `demos/` | Real-world demo binaries | Excluded from workspace, non-MSRV |
+| `.github/workflows/` | CI configs | Stable + MSRV split |
+| `.agents/` | AGENTS.md satellite files | Topic-specific agent guidance |
+| `.docs/` | mdBook worktree (branch `docs`) | `git worktree add .docs docs` |
+
+Docs: `README.md`, `LLM_CONTEXT_FULL.md`, `LLM_CONTEXT.md`.
+
+## Quick Do/Don't
+
+**Do:**
+- Validate untrusted segments via `strict_join`/`virtual_join`
+- Pass `&StrictPath`/`&VirtualPath` into helpers; or boundaries/roots + segment
+- Use `strictpath_display()`/`virtualpath_display()` for output
+- Use built-in I/O helpers, not `std::fs` on `interop_path()`
+
+**Don't:**
+- Wrap `interop_path()` in `Path::new()` or `PathBuf::from()`
+- Validate constants "just to use the API"
+- Add redundant ways to achieve the same thing
+- Use `pub(crate)` methods in tests as shortcuts around public API
+- Use generic variable names (`filename`, `path`) — name by domain/purpose
+- Add `#[allow(...)]` (except `clippy::type_complexity`)
+- Use `no_run`/`ignore` doctest fences
+
+---
+
+*For deeper guidance on any topic, read the relevant `.agents/*.md` satellite.*
+
+---
+
+# CLAUDE.md
+
+Source: https://github.com/dk26/strict-path-rs/blob/main/CLAUDE.md
+
+# CLAUDE.md
+
+Read [`AGENTS.md`](AGENTS.md) — it is the operational hub for all AI assistants in this repository.
+
+Topic-specific depth is in the [`.agents/`](.agents/) satellite files listed there.
+
+---
+
+# Contributing to strict-path
+
+Source: https://github.com/dk26/strict-path-rs/blob/main/CONTRIBUTING.md
+
+# Contributing to strict-path
+
+Thanks for your interest in contributing! 🦀
+
+## Quick Start
+
+1. Fork the repository
+2. Clone your fork: `git clone https://github.com/YOUR_USERNAME/strict-path-rs.git`
+3. Test locally:
+   - Linux/macOS/WSL: `bash ci-local.sh`
+   - Windows PowerShell: `.\ci-local.ps1`
+4. Submit a pull request
+
+## How to Contribute
+
+- 🐛 Bug reports: [Open an issue](https://github.com/DK26/strict-path-rs/issues) with reproduction steps
+- 💡 Features: Discuss in an issue before implementing (see [Feature Suggestions](#feature-suggestions) below)
+- 📝 Docs: Fix typos, add examples, improve clarity
+- 🔧 Code: Bug fixes and improvements welcome
+
+## Issue Template
+
+Copy, paste, and fill what you need. Delete unused lines:
+
+```markdown
+What: [Brief description]
+
+Why: [Problem or motivation]
+
+Idea: [Your proposed solution]
+
+Example: [Code or use case]
+
+Benefits: [Who gains, what improves]
+
+Links: [Related docs/issues]
+```
+
+## Feature Suggestions
+
+Before suggesting features, **have your LLM agent read our [`AGENTS.md`](./AGENTS.md) and [`LLM_CONTEXT_FULL.md`](./LLM_CONTEXT_FULL.md) files** and ask it:
+
+1. Does my suggested feature align with the project's design philosophy?
+2. Why might this feature not already be implemented?
+3. How does this fit within existing API patterns?
+
+**LLM Prompt:**
+```
+I want to suggest a feature for strict-path crate. Please read the AGENTS.md and LLM_CONTEXT_FULL.md files from this repository and tell me if my feature idea aligns with the design philosophy and why it might not already be implemented.
+```
+
+**Timeline expectations:**
+- **Within design philosophy:** May be added in minor releases
+- **Outside design philosophy:** Requires major version (potentially far future unless critical)
+
+We encourage **all** suggestions! The distinction just helps set implementation expectations. If you want to suggest design philosophy changes, create an issue for discussion.
+
+## Development
+
+**Project Philosophy:**
+- Type-safe security with compile-time guarantees
+- Never expose raw `std::path::Path` (zero attack surface)
+- Explicit method naming (`strictpath_*` vs `virtualpath_*`)
+- Cross-platform CVE protection
+
+
+## Testing
+
+Just run the CI script locally:
+
+```bash
+# Linux/macOS/WSL
+bash ci-local.sh
+
+# Windows PowerShell  
+.\ci-local.ps1
+```
+
+If it passes, your code is ready.
+
+### Local CI scripts (fast lanes)
+
+Use these from the repo root to get fast, targeted feedback:
+
+- Default pre-commit run: runs formatting + clippy auto-fixes for both core and demos, mirroring CI intent while staying fast.
+   - Windows: `./ci-local.ps1`
+   - Linux/macOS/WSL: `bash ./ci-local.sh`
+
+- Core-only quick check: validate the `strict-path/` crate without demos. Runs `cargo fmt --check`, `cargo clippy -D warnings`, and `cargo doc --no-deps` for the core.
+   - Windows: `./ci-check.ps1`
+   - Linux/macOS/WSL: `bash ./ci-check.sh`
+
+- Demos-only selective check: focuses solely on changed demo files. Auto-formats changed demos by default, validates style without compiling, and gates clippy to safe features to avoid heavy native deps.
+   - Windows: `./ci-check-demos.ps1`
+   - Linux/macOS/WSL: `bash ./ci-check-demos.sh`
+
+Notes
+- The demos checker looks at both `git diff` and `git diff --staged` and only checks files that actually changed.
+- Heavy demo feature sets (e.g., cloud SDKs) are opt-in; the default “safe features” keep runs lightweight.
+- See `AGENTS.md` for full details and rationale.
+
+## License
+
+By contributing, you agree that your contributions will be licensed under MIT OR Apache-2.0.
+
+## Getting Help
+
+- **Issues:** Bug reports and feature requests
+- **Email:** [dikaveman@gmail.com](mailto:dikaveman@gmail.com)
+
+Every contribution matters! 🚀
+
+---
+
+# strict-path — LLM Context
+
+Source: https://github.com/dk26/strict-path-rs/blob/main/LLM_CONTEXT.md
+
+# strict-path — LLM Context
+
+**Handle paths from external or unknown sources securely.** Uses Rust's type system to mathematically prove paths stay within defined boundaries—no escapes, symlinks included. API is minimal, restrictive, and explicit to prevent human and LLM API misuse.
+
+This document provides a "Context7" style explanation on how to use this crate (fewer tokens than LLM_CONTEXT_FULL.md).
+
+- Core types: `StrictPath<Marker>` is the safety-carrying path type — every value has been proven inside its boundary. `PathBoundary<Marker>` is the trust anchor / factory that produces `StrictPath` instances via `strict_join`. With feature `virtual-path`: `VirtualPath<Marker>` is the peer containment-semantics path type; `VirtualRoot<Marker>` is its anchor / factory.
+- Golden rule: "Restrict every external path." Validate user/LLM/config/archive input using `strict_join` or `virtual_join` before touching the filesystem.
+- Interop vs display: use `.interop_path()` only for third‑party APIs requiring `AsRef<Path>`; use `*_display()` for human‑readable output.
+- Trade‑off: Security > performance. Verifies paths on disk and follows symlinks. For symlink‑free + max performance, consider lexical solutions.
+- Built on `soft-canonicalize` + `proc-canonicalize` (Linux container realpath support). Full walkthrough: **[mdBook Guide](https://dk26.github.io/strict-path-rs/)**
+
+**🚨 CRITICAL for LLM code generation:**
+- NEVER validate hardcoded string literals — this defeats the entire purpose of the crate
+- ALWAYS use variable names that clearly show untrusted input: `user_input`, `requested_file`, `attack_input`
+- AVOID generic names like `filename`, `path`, `name` — they hide security intent
+- Include comments showing input source: `// User input from HTTP request, CLI args, etc.`
+
+## Install
+
+```toml
+[dependencies]
+strict-path = "*"
+# Virtual sandboxes (optional)
+# strict-path = { version = "*", features = ["virtual-path"] }
+```
+
+## Choose your mode
+
+- StrictPath (default, 90% cases): Detects escape attempts. Best for archive extraction, config loading, shared system areas, file uploads to shared storage (admin panels, CMS assets).
+- VirtualPath (opt‑in): Clamps escape attempts within a virtual root. Best for multi‑tenant file uploads (SaaS per‑user storage), per‑user sandboxes, malware analysis.
+
+## Quickstart
+
+Strict (detect & reject):
+```rust
+use strict_path::{PathBoundary, StrictPath};
+
+let uploads: PathBoundary = PathBoundary::try_new_create("./uploads")?;
+let username = "alice";
+let avatar: StrictPath = uploads.strict_join(format!("users/{username}/avatar.png"))?;
+avatar.create_parent_dir_all()?;
+avatar.write(b"<png>")?;
+println!("stored: {}", avatar.strictpath_display());
+```
+
+Virtual (contain & clamp) — requires feature `virtual-path`:
+```rust
+use strict_path::VirtualPath;
+
+let user_root: VirtualPath = VirtualPath::with_root_create("tenants/acme/alice")?;
+let doc: VirtualPath = user_root.virtual_join("../../etc/passwd")?; // "/etc/passwd"
+doc.create_parent_dir_all()?;
+doc.write(b"hello")?;
+println!("user sees: {}", doc.virtualpath_display());
+```
+
+## Critical mistakes that compile but are WRONG
+
+These patterns compile without errors but silently bypass security. A compiler warning will NOT save you here:
+
+```rust
+// ❌ WRONG: wrapping interop_path() in Path::new() defeats ALL safety
+let p = safe_path.interop_path();
+let parent = Path::new(p).parent();        // Compiles! But escapes the boundary.
+// ✅ RIGHT: use the crate's own method
+let parent = safe_path.strictpath_parent()?;
+
+// ❌ WRONG: bypassing validation with std::fs (won't compile — no AsRef<Path> on PathBoundary)
+// let data = std::fs::read_to_string(&boundary)?;  // Compiler prevents this!
+// ✅ RIGHT: always validate through strict_join first
+let validated = boundary.strict_join(user_input)?;
+let data = validated.read_to_string()?;
+
+// ❌ WRONG: printing with {:?} leaks real system paths to users
+println!("Path: {:?}", safe_path);         // Shows internal paths!
+// ✅ RIGHT: use explicit display helpers
+println!("Path: {}", safe_path.strictpath_display());    // system/admin
+println!("Path: {}", virtual_path.virtualpath_display()); // user-facing
+```
+
+**Rule of thumb:** If you're calling `std::fs::*`, `Path::new()`, `Path::join()`, or `PathBuf::from()` anywhere near untrusted input, you're doing it wrong. Use the crate's built-in I/O methods instead.
+
+## Contract (what this guarantees)
+
+- Inputs: Untrusted segments (user/LLM/CLI/config/archive).
+- Output: `StrictPath<T>`/`VirtualPath<T>` that cannot escape their boundary/root.
+- I/O: Use built‑ins (`read`, `write`, `create_dir_all`, `metadata`, etc.) safely on these types.
+- Errors (`StrictPathError`):
+  - `InvalidRestriction` — boundary/root cannot be created or is invalid
+  - `PathResolutionError` — resolution/canonicalization failure
+  - `PathEscapesBoundary` — attempted traversal or symlink/junction escape
+
+## Do / Don't
+
+- Do: `boundary.strict_join(user_input)` or `vroot.virtual_join(user_input)`.
+- Do: pass `&StrictPath<_>`/`&VirtualPath<_>` into helpers; or pass policy roots + segment.
+- Do: use `*_display()` for users; `.interop_path()` only for `AsRef<Path>` adapters.
+- Do: use variable names that clearly show untrusted input: `user_input`, `requested_file`, `attack_input`, `uploaded_data`.
+- Don't: wrap `.interop_path()` in `Path::new()` or `PathBuf::from()` — it's already `AsRef<Path>`.
+- Don't: use std path operations (`Path::join`, `Path::parent`) on untrusted input — use `.strict_join()` instead.
+- Don't: Construct boundaries/roots inside helpers; inject policy via parameters.
+- Don't: use generic variable names like `filename`, `path`, `name` that hide the fact you're validating untrusted input.
+
+## Quick recipes
+
+- File uploads to shared storage (Strict) — admin panels, CMS, single-tenant:
+```rust
+let uploads = PathBoundary::try_new_create("./uploads")?;
+let file = uploads.strict_join(filename)?; // traversal ⇒ error
+file.create_parent_dir_all()?;
+file.write(bytes)?;
+```
+
+- Multi-tenant file uploads (Virtual) — SaaS per-user storage:
+```rust
+let vroot = strict_path::VirtualPath::with_root_create(format!("users/{id}"))?;
+let vfile = vroot.virtual_join(user_path)?; // traversal ⇒ clamped
+vfile.write(data)?;
+println!("{}", vfile.virtualpath_display());
+```
+
+- Config loading (Strict):
+```rust
+struct ConfigFiles;
+let cfg_dir: PathBoundary<ConfigFiles> = PathBoundary::try_new_create("./config")?;
+let cfg = cfg_dir.strict_join(user_selected_name)?;
+let text = cfg.read_to_string()?;
+```
+
+## Markers in 60 seconds
+
+- Purpose: encode storage domains (and optionally permissions) at compile time.
+- Examples: `struct PublicAssets;`, `struct UserUploads;`, `StrictPath<(SystemFiles, ReadOnly)>`.
+- Rules:
+  - Name markers by what lives under the root (domain nouns). Avoid `Marker/Type/Root` suffixes.
+  - Accept `&StrictPath<Marker>`/`&VirtualPath<Marker>` in function signatures (for apps and library internals; library public APIs may accept standard types and validate internally — see note below).
+  - Use `change_marker()` only after authorization proof; conversions between types preserve markers automatically.
+  - Keep tuple markers FLAT with the resource first, then capabilities: `StrictPath<(SystemFiles, ReadOnly)>`. Avoid nested tuples and human-centric labels unless the directory literally stores those artifacts.
+
+> **Library authors**: All signature guidance applies to applications and internal library code. If you are writing a library, hide `strict-path` behind your own API boundary by default so downstream users don't need to depend on it directly. Expose `strict-path` types only when the library's purpose explicitly benefits from it.
+
+## Interop vs display
+
+- Interop: `path.interop_path()` only when a third‑party API requires `AsRef<Path>` (e.g., `WalkDir::new(path.interop_path())`).
+- Display: `strictpath_display()` (system) and `virtualpath_display()` (virtual). No implicit Display — you must opt in.
+
+## Feature notes
+
+- `virtual-path`: enables `VirtualRoot`/`VirtualPath` and virtual operations.
+- `junctions` (Windows): Built-in NTFS junction helpers for strict/virtual paths.
+
+## Ecosystem integration
+
+Use ecosystem crates directly with `PathBoundary` for maximum flexibility:
+- `tempfile` — RAII temporary directories: `tempfile::tempdir()` → `PathBoundary::try_new()`
+- `dirs` — OS standard directories: `dirs::config_dir()` → `PathBoundary::try_new_create()`
+- `app-path` — Portable app paths: `AppPath::with("subdir")` → `PathBoundary::try_new_create()`
+- `serde` — declare typed `PathBoundary<Marker>` / `VirtualRoot<Marker>` fields directly in your config struct. `FromStr` forwards to `try_new_create`; wire it to serde using serde's own mechanisms (`deserialize_with`, `serde_with`, user-defined wrappers). Serialize paths as display strings.
+
+## Decision guide (what to use when)
+
+| Scenario                                 | Use           | Why                                                                 |
+| ---------------------------------------- | ------------- | ------------------------------------------------------------------- |
+| Archive extraction                       | `StrictPath`  | Detect malicious names; fail fast on escape (`PathEscapesBoundary`) |
+| File uploads to shared storage           | `StrictPath`  | Admin panels, CMS assets — all users share one boundary             |
+| Config loading, system assets/logs/cache | `StrictPath`  | System‑facing, explicit boundaries                                  |
+| LLM/CLI/HTTP inputs for system I/O       | `StrictPath`  | Turn arbitrary segments into validated paths before I/O             |
+| Multi‑tenant file uploads                | `VirtualPath` | SaaS per‑user storage — each user/tenant isolated                   |
+| Multi‑tenant per‑user files              | `VirtualPath` | Rooted “/” UX, clamped containment                                  |
+| Malware/sandbox analysis                 | `VirtualPath` | Observe escapes safely (clamped)                                    |
+| UI display only                          | `VirtualPath` | User‑friendly rooted strings (`/a/b.txt`)                           |
+
+Notes:
+- For archives, prefer `StrictPath` so compromised archives are rejected instead of silently clamped. Use `VirtualPath` only for sandboxes where clamping is the objective.
+- Unified helpers: accept `&StrictPath<_>`; call with `vpath.as_unvirtual()` when you have `VirtualPath`.
+
+## Quick method reference
+
+Use these when writing or generating code. Names make the dimension explicit.
+
+- PathBoundary<T> (policy root; strict/system dimension)
+  - Constructors: `try_new(path)`, `try_new_create(path)`
+  - Validation: `strict_join(input) -> Result<StrictPath<T>>`
+  - Conversions: `into_strictpath()` (dir must exist)
+  - Display & interop: `strictpath_display()`, `interop_path()`
+  - I/O at root: `strict_read_dir()`, `read_dir()`, `remove_dir()`, `remove_dir_all()`, `metadata()`
+  - Links: `strict_symlink<P: AsRef<Path>>(link_path)`, `strict_hard_link<P: AsRef<Path>>(link_path)`
+
+- StrictPath<T> (validated system path)
+  - Sugar roots: `with_boundary(path)`, `with_boundary_create(path)`
+  - Join/mutate: `strict_join(..)`, `strictpath_parent()`, `strictpath_with_file_name(..)`, `strictpath_with_extension(..)`
+  - Display & interop: `strictpath_display()`, `interop_path()`
+  - Conversions: `try_into_boundary(_create)`, `virtualize()` [feature: virtual-path], `unstrict()` (escape hatch)
+- I/O: `exists()`, `try_exists()`, `is_file()`, `is_dir()`, `metadata()`, `read_dir()`, `strict_read_dir()`
+    - File ops: `read()`, `read_to_string()`, `write(..)`, `append(..)`, `create_file()`, `open_file()`, `open_with()`, `touch()`
+    - Dir ops: `create_dir()`, `create_dir_all()`, `create_parent_dir()`, `create_parent_dir_all()`, `remove_file()`, `remove_dir()`, `remove_dir_all()`
+    - Permissions: `set_permissions(perm)`
+    - Symlink-safe: `symlink_metadata()`, `strict_read_link()`
+  - Copy/move/links: `strict_copy(..)`, `strict_rename(..)`, `strict_symlink<P: AsRef<Path>>(link_path)`, `strict_hard_link<P: AsRef<Path>>(link_path)`
+
+- VirtualRoot<T> (policy root; virtual dimension) [feature: virtual-path]
+  - Constructors: `try_new(path)`, `try_new_create(path)`
+  - Validation: `virtual_join(input) -> Result<VirtualPath<T>>`
+  - Conversions: `into_virtualpath()` (dir must exist), `as_unvirtual() -> &PathBoundary<T>`, `unvirtual() -> PathBoundary<T>`
+  - Display & interop: `interop_path()`, root I/O: `virtual_read_dir()`, `read_dir()`, `remove_dir()`, `remove_dir_all()`, `metadata()`
+  - Links: `virtual_symlink<P: AsRef<Path>>(link_path)`, `virtual_hard_link<P: AsRef<Path>>(link_path)`
+
+- VirtualPath<T> (clamped virtual path; user-facing) [feature: virtual-path]
+  - I/O includes: `read_dir()`, `virtual_read_dir()` (auto-validated iterator), `virtual_read_link()`
+  - Sugar roots: `with_root(path)`, `with_root_create(path)`
+  - Join/mutate: `virtual_join(..)`, `virtualpath_parent()`, `virtualpath_with_file_name(..)`, `virtualpath_with_extension(..)`
+  - Display & interop: `virtualpath_display()`, `interop_path()`, `as_unvirtual() -> &StrictPath<T>`
+  - Conversions: `unvirtual() -> StrictPath<T>`, `change_marker()`
+  - I/O: same helpers as `StrictPath` (delegated to strict/system path)
+
+### Feature semantics
+
+- virtual-path: Enables all VirtualRoot/VirtualPath types and methods; `StrictPath` remains available without the feature.
+- junctions (Windows): Built-in NTFS junction helpers for directory links on Windows.
+
+### Ecosystem integration patterns
+
+**Temporary directories** (`tempfile` crate):
+```rust
+let temp = tempfile::tempdir()?;
+let boundary = PathBoundary::try_new(temp.path())?;
+// RAII cleanup from tempfile, security from strict-path
+```
+
+**OS standard directories** (`dirs` crate):
+```rust
+let config_base = dirs::config_dir().ok_or("No config")?;
+let boundary = PathBoundary::try_new_create(config_base.join("myapp"))?;
+```
+
+**Portable app paths** (`app-path` crate):
+```rust
+use app_path::AppPath;
+let app_path = AppPath::with("config");  // Relative to executable directory
+let boundary = PathBoundary::try_new_create(&app_path)?;
+```
+
+**Serialization** (`serde`):
+- Runtime `Cli`/`Config` structs hold typed `PathBoundary<Marker>` /
+  `VirtualRoot<Marker>` fields — **never** raw `PathBuf`. The typed field IS
+  the ingestion boundary.
+- `FromStr` forwards to `try_new_create`. clap `#[arg]` fields of the typed
+  form work directly via `FromStr`.
+- Boundary/root types do not implement `Deserialize`. Serde wiring is a
+  user-side integration choice (serde's own `deserialize_with`, `serde_with`,
+  user-defined wrappers).
+- In hand-written code, prefer named constructors (`try_new` / `try_new_create`)
+  over `.parse()` so policy is visible at the call site.
+- Serialize paths as display strings: `boundary.strictpath_display().to_string()`.
+- Untrusted per-request path strings (filenames, archive entries, HTTP body
+  fields) stay as `String` and are validated via `boundary.strict_join()` at
+  the use site.
+
+## Critical behaviors
+
+- Absolute joins are safe:
+  - `StrictPath::strict_join("/abs")` validates containment; errors if it would escape.
+  - `VirtualPath::virtual_join("/abs")` treats it as a virtual‑absolute; result is clamped under the same virtual root (e.g., `/etc/hosts` maps to `<vroot>/etc/hosts`).
+- Symlinks/junctions: Resolved during validation. Traversals that would leave the boundary/root return `PathEscapesBoundary` (strict) or are clamped (virtual).
+- Display is explicit: no `Display` impl on path types; use `strictpath_display()` / `virtualpath_display()`.
+- Interop is explicit: prefer crate I/O; use `interop_path()` only for third‑party APIs that insist on `AsRef<Path>`.
+
+## Golden rules (memorize these)
+
+1) Never wrap `.interop_path()` in `Path::new()` to use `Path::join`/`parent`; always use `strict_*` / `virtual_*` operations instead.
+2) Validate every external segment with `strict_join`/`virtual_join` at the boundary. Accept `&StrictPath<_>`/`&VirtualPath<_>` in downstream functions.
+3) Don’t convert secure types back to `Path`/`PathBuf` for I/O; prefer crate I/O. Use `interop_path()` only when a library insists on `AsRef<Path>`.
+4) Use explicit display methods. Do not format secure types directly.
+5) Don’t construct boundaries/roots inside helpers. Inject policy via parameters.
+6) Don’t call `strict_join("")` or `virtual_join("")` to get the root. Use `into_strictpath()` / `into_virtualpath()` instead.
+7) Use `change_marker()` only immediately after proving authorization; never as a convenience.
+
+## Naming rules (avoid confusion)
+
+- Name variables by domain/purpose, not by type:
+  - Good: `user_uploads_root`, `static_assets_root`, `config_dir`, `tenant_vroot`
+  - Avoid: `boundary`, `jail`, `root1`, one-letter names
+- For untrusted input, use names that make it obvious:
+  - Good: `user_input`, `requested_file`, `attack_input`, `uploaded_data`, `config_input`
+  - Avoid: `filename`, `path`, `name`, `config_name` (hides that it's untrusted)
+- Markers describe stored content (and optional capability), not people/teams.
+
+## Error-handling playbook
+
+```rust
+use strict_path::{PathBoundary, StrictPathError};
+
+let boundary = PathBoundary::try_new_create("./uploads")?;
+match boundary.strict_join(user_input) {
+  Ok(sp) => {
+    sp.create_parent_dir_all()?;
+    sp.write(bytes)?;
+  }
+  Err(StrictPathError::PathEscapesBoundary { attempted_path, restriction_boundary }) => {
+    // Security signal: traversal/symlink escape attempt
+    log::warn!("blocked traversal: {}", attempted_path.display());
+    // return 400/403 or skip entry (archives)
+  }
+  Err(StrictPathError::InvalidRestriction { source, .. }) => {
+    // Misconfiguration/permissions; surface to operator
+    return Err(source.into());
+  }
+  Err(StrictPathError::PathResolutionError { source, .. }) => {
+    // Malformed path or I/O error during canonicalization
+    return Err(source.into());
+  }
+}
+```
+
+## Discovery vs validation (directory iteration)
+
+Discover names, then validate each before use:
+```rust
+let root = PathBoundary::try_new_create("./public")?;
+for entry in root.read_dir()? {
+  let entry = entry?;
+  let name = entry.file_name();
+  // Do not trust `entry.path()` blindly; re-validate name
+  // OsStr/OsString implements AsRef<Path>, so pass directly
+  let sp = root.strict_join(&name)?; // safe path
+  println!("{}", sp.strictpath_display());
+}
+```
+
+## Root conversions (don’t use empty joins)
+
+```rust
+// Strict root as a path value
+let root_boundary = PathBoundary::try_new_create("./assets")?;
+let root_path = root_boundary.into_strictpath()?; // preferred
+
+// Virtual root as a path value (feature: virtual-path)
+let tenant_id = "acme";
+let vroot = strict_path::VirtualRoot::try_new_create(format!("tenants/{tenant_id}"))?;
+let vroot_path = vroot.into_virtualpath()?; // preferred
+```
+
+## Parent creation semantics
+
+- `create_parent_dir()` creates only the immediate parent, errors if grandparents are missing.
+- `create_parent_dir_all()` creates the full chain to the immediate parent (recursive).
+
+```rust
+let file = boundary.strict_join("a/b/c.txt")?;
+file.create_parent_dir_all()?; // ensures a/ and a/b/ exist
+file.write(b"ok")?;
+```
+
+## Edge cases handled (security surface)
+
+- Symlinks/junctions inside the boundary that point outside → rejected in strict (`PathEscapesBoundary`), clamped in virtual.
+- `..`, `.` components, mixed separators, redundant separators → normalized during resolution.
+- Windows specifics: 8.3 short names (e.g., `PROGRA~1`), UNC and `\\?\` extended paths, drive‑relative forms, junction points, NTFS ADS (e.g., `file.txt:stream`) are handled by the resolution pipeline.
+- TOCTOU concerns: canonicalization occurs as part of validation before producing safe types.
+
+## Practical patterns (copy/paste)
+
+### Archive extraction (Strict — detect & reject)
+```rust
+use strict_path::PathBoundary;
+
+fn extract_zip(entries: impl IntoIterator<Item=(String, Vec<u8>)>) -> std::io::Result<()> {
+  let extract_dir = PathBoundary::try_new_create("./extract")?;
+  for (name, data) in entries {
+    // Malicious: "../../etc/passwd" ⇒ Err(PathEscapesBoundary)
+    let sp = match extract_dir.strict_join(&name) {
+      Ok(p) => p,
+      Err(strict_path::StrictPathError::PathEscapesBoundary { .. }) => continue, // skip/flag
+      Err(e) => return Err(e.into()),
+    };
+    sp.create_parent_dir_all()?;
+    sp.write(&data)?;
+  }
+  Ok(())
+}
+```
+
+### Web/static server (Strict)
+```rust
+struct StaticFiles;
+use strict_path::{PathBoundary, StrictPath};
+
+async fn serve(static_root: &PathBoundary<StaticFiles>, req_path: &str) -> std::io::Result<Vec<u8>> {
+  let file: StrictPath<StaticFiles> = static_root.strict_join(req_path)?;
+  file.read()
+}
+```
+
+### LLM agent file ops (Strict)
+```rust
+use strict_path::PathBoundary;
+
+fn llm_write(workspace: &PathBoundary, filename: &str, bytes: &[u8]) -> std::io::Result<()> {
+  let path = workspace.strict_join(filename)?; // attack ⇒ error
+  path.create_parent_dir_all()?;
+  path.write(bytes)
+}
+```
+
+### Multi‑tenant per‑user storage (Virtual)
+```rust
+use strict_path::VirtualPath; // feature: virtual-path
+
+fn save_user_file(user_root_fs: &str, user_path: &str, data: &[u8]) -> std::io::Result<()> {
+  let vroot = VirtualPath::with_root_create(user_root_fs)?;
+  let vfile = vroot.virtual_join(user_path)?; // traversal ⇒ clamped
+  vfile.create_parent_dir_all()?;
+  vfile.write(data)
+}
+```
+
+## Serde and config
+
+- Runtime `Cli`/`Config` structs declare typed `PathBoundary<Marker>` /
+  `VirtualRoot<Marker>` fields. Raw `PathBuf` in these structs is the
+  anti-pattern — it erases the type-system guarantee.
+- `FromStr` forwards to `try_new_create`. Wire it to serde using serde's own
+  mechanisms; this crate neither ships nor prescribes a specific adapter.
+- clap `#[arg]` fields of the typed form work out of the box via `FromStr`.
+- Untrusted per-request path strings (filenames, archive entries, HTTP body
+  fields) are validated against a pre-constructed boundary via
+  `boundary.strict_join(…)` — they are not `FromStr` input.
+
+## OS/app/temp recipes (feature‑gated)
+
+```rust
+
+```
+
+## Interop cookbook
+
+Use `interop_path()` when a third‑party crate insists on `AsRef<Path>`.
+
+```rust
+use walkdir::WalkDir;
+let safe = boundary.strict_join("data")?;
+for entry in WalkDir::new(safe.interop_path()) { /* ... */ }
+```
+
+Prefer crate I/O when possible:
+```rust
+let bytes = safe.read()?;
+safe.write(b"new")?;
+```
+
+## Unified helper pattern (works for both Strict and Virtual)
+
+Write helpers against `&StrictPath<_>`; call with a `StrictPath` directly or borrow the strict view from a `VirtualPath`:
+
+```rust
+use strict_path::StrictPath;
+
+fn process_bytes<M>(p: &StrictPath<M>) -> std::io::Result<Vec<u8>> {
+  p.read()
+}
+
+// Call sites
+let strict = boundary.strict_join("a.txt")?;
+let _ = process_bytes(&strict)?;
+
+let user_id = "alice";
+let vroot = strict_path::VirtualPath::with_root_create(format!("users/{user_id}"))?; // feature: virtual-path
+let vfile = vroot.virtual_join("docs/a.txt")?;
+let _ = process_bytes(vfile.as_unvirtual())?; // borrow strict view
+```
+
+## Authorization markers with `change_marker()` (capability upgrade)
+
+Use tuple markers `(Resource, Capability)` and change the capability only after proving authorization.
+
+```rust
+use strict_path::StrictPath;
+
+struct UserUploads; struct ReadOnly; struct ReadWrite;
+
+fn grant_write(
+  file: StrictPath<(UserUploads, ReadOnly)>,
+  user_can_write: bool,
+) -> Result<StrictPath<(UserUploads, ReadWrite)>, &'static str> {
+  if user_can_write { Ok(file.change_marker()) } else { Err("denied") }
+}
+```
+
+Rules reminder:
+- Do not use `change_marker()` when converting between path types; conversions preserve markers automatically.
+- Only use `change_marker()` immediately after a successful authorization check.
+
+## I/O return values (matches std::fs)
+
+All I/O helpers return the same types as their `std::fs` counterparts to preserve OS signals and avoid extra probes.
+
+```rust
+// Copy returns number of bytes
+let n: u64 = src.strict_copy(dest.interop_path())?;
+
+// Rename/symlink/hard_link return ()
+dst.strict_rename("new_name.txt")?; // io::Result<()>
+
+// Metadata and existence checks
+let meta = file.metadata()?;
+let exists = file.exists();
+```
+
+## Hard links (platform behavior)
+
+Creating directory hard links is forbidden on many platforms (e.g., Linux, macOS). Expect `io::ErrorKind::PermissionDenied` in those cases. File hard links typically work within the same filesystem.
+
+```rust
+// Link a file to another safe location within the same restriction
+let src = boundary.strict_join("a.txt")?;
+let dst = boundary.strict_join("alias.txt")?;
+src.strict_hard_link(&dst)?; // io::Result<()>
+```
+
+## Equality/traits at a glance
+
+- `StrictPath<T>` and `VirtualPath<T>` compare/order/hash by their underlying strict/system path (same marker type).
+- Cross‑type equality: `VirtualPath<T> == StrictPath<T>` is true when the resolved system path is the same restriction‑validated path. Borrow the strict view with `as_unvirtual()` when needed by helpers.
+- No `AsRef<Path>` on secure path values; prefer `interop_path()` for third‑party adapters. Roots and boundaries provide their own interop methods.
+
+## Pitfalls (and fixes)
+
+- Anti‑pattern: validate constants only → Fix: validate actual untrusted segments.
+- Anti‑pattern: `std::fs::*` on `interop_path()` → Fix: prefer crate I/O (`read`, `write`, …).
+- Anti‑pattern: wrapping `.interop_path()` in `Path::new()` to use `Path::join` → Fix: use `strict_join`/`virtual_join` instead.
+- Anti‑pattern: convert `StrictPath`→`VirtualPath` just to print → Fix: use `strictpath_display()`; start with virtual if you need virtual UX.
+- Anti‑pattern: `strict_join("")` / `virtual_join("")` to get the root → Fix: use `into_strictpath()` / `into_virtualpath()`.
+- Anti‑pattern: `interop_path().as_ref()` or wrapping `interop_path()` in `Path::new`/`PathBuf::from` → Fix: pass `interop_path()` directly to APIs accepting `AsRef<Path>`.
+- Anti‑pattern: validate then immediately convert back to unsafe types and call `std::fs` → Fix: keep using crate I/O on the secure types; only use `interop_path()` for adapters.
+
+---
+
+# strict-path — LLM Context (Full)
+
+Source: https://github.com/dk26/strict-path-rs/blob/main/LLM_CONTEXT_FULL.md
+
+# strict-path — LLM Context (Full)
+
+**Handle paths from external or unknown sources securely.** Uses Rust's type system to mathematically prove paths stay within defined boundaries—no escapes in any shape or form, symlinks included.
+
+This document contains a full mapping and explanation of the API, compressed to be efficient with tokens.
+
+- `StrictPath` — the safety-carrying path type: every value has been proven inside its boundary
+- `PathBoundary` — trust anchor / factory that produces `StrictPath` instances via `strict_join`
+- `VirtualPath` — peer containment-semantics path type; user sees `/` as their root (feature: `virtual-path`)
+- `VirtualRoot` — trust anchor / factory that produces `VirtualPath` instances via `virtual_join` (feature: `virtual-path`)
+- Two invariants, two types: anchors prove the boundary directory is valid; paths prove a specific resolved location is inside that boundary.
+- Every operation is STRICTLY validated. No exceptions, no escapes.
+
+**API Philosophy:** Minimal, restrictive, explicit—designed to prevent human and LLM API misuse.
+**Trade‑off:** Security > performance. Verifies paths on disk, follows symlinks. For symlink‑free + max performance, use lexical solutions.
+**Foundation:** Built on `soft-canonicalize` + `proc-canonicalize` (Linux container realpath support). Full walkthrough: **[mdBook Guide](https://dk26.github.io/strict-path-rs/)**
+
+Audience and usage: This page is a minimal-context, copy/paste guide for tool-calling LLMs. Prefer the bullets and short recipes here; link to README and mdBook for longer explanations.
+
+**🚨 CRITICAL for LLM code generation:**
+- NEVER validate hardcoded string literals like `boundary.strict_join("file.txt")` — this is security theater
+- ALWAYS use variable names that show untrusted input: `user_input`, `requested_file`, `attack_input`, `uploaded_data`
+- AVOID generic names: `filename`, `path`, `name`, `config_name` — they hide that you're validating untrusted input
+- Include source comments: `// User input from HTTP request, CLI args, form data, etc.`
+
+## Essential Flow (Start Here)
+1. **Create boundary**: `PathBoundary::try_new_create(dir)` → secure foundation
+2. **Validate input**: `boundary.strict_join(user_input)` → `StrictPath<T>` 
+3. **Use safely**: All I/O methods available - `read()`, `write()`, `create_dir_all()`
+
+**Core Security Promise**: If you have `StrictPath<T>` or `VirtualPath<T>`, path traversal is impossible.
+
+## Features
+
+- Feature `virtual-path` (opt-in): Enables `VirtualRoot`/`VirtualPath` and all virtual-only APIs.
+
+  - Enable in Cargo.toml:
+    ```toml
+    [dependencies]
+    strict-path = { version = "...", features = ["virtual-path"] }
+    ```
+  - When not enabled: Only `PathBoundary` + `StrictPath` are available (all I/O included). All `VirtualRoot`/`VirtualPath` APIs are removed.
+
+- Feature `junctions` (Windows-only, opt-in): Enables built-in NTFS junction helpers
+
+	- What you get when enabled (Windows):
+		- `StrictPath::strict_junction<P: AsRef<Path>>(&self, link_path: P) -> io::Result<()>`
+		- `PathBoundary::strict_junction<P: AsRef<Path>>(&self, link_path: P) -> io::Result<()>`
+		- `VirtualPath::virtual_junction<P: AsRef<Path>>(&self, link_path: P) -> io::Result<()>`
+		- `VirtualRoot::virtual_junction<P: AsRef<Path>>(&self, link_path: P) -> io::Result<()>`
+	- Notes: Junctions are directory-only. Parents are not created automatically. Same-boundary rules apply.
+	- Enable in Cargo.toml (Windows):
+		```toml
+		[dependencies]
+		strict-path = { version = "...", features = ["junctions"] }
+		```
+
+## Core Security Foundation: `StrictPath`
+
+- `StrictPath<Marker>` is the core safe path type used for system-facing I/O.
+- If a function receives `&StrictPath<_>`, the path is already validated — no extra checks needed.
+- Create `StrictPath` via `PathBoundary::strict_join(..)` or borrow from `VirtualPath` via `.as_unvirtual()`.
+
+## When to Use Which Type? (Critical Decision)
+
+**The fundamental distinction is whether escapes are attacks or expected behavior:**
+
+### StrictPath — Detect & Reject (Default, 90% of use cases)
+
+**Philosophy**: "If something tries to escape, I want to know about it"
+
+Use `PathBoundary` → `StrictPath` when path escapes indicate **malicious intent**:
+
+- **Archive extraction** — Detect malicious paths; reject compromised archives
+- **File uploads to shared storage** — Admin panels, CMS assets, single-tenant apps where all users share one storage area
+- **Config loading** — Fail on untrusted config paths that try to escape
+- **Log files, cache, assets** — Shared system resources with strict boundaries
+- **Development tools** — Build systems, CLI utilities, single-user apps
+- **Any security boundary** — Where escapes are attacks that must be detected
+
+**Key behavior**: Returns `Err(PathEscapesBoundary)` when escape is attempted.
+
+**No feature required** — `PathBoundary` and `StrictPath` are always available.
+
+### VirtualPath — Contain & Redirect (Opt-in, 10% of use cases)
+
+**Philosophy**: "Let things try to escape, but silently contain them"
+
+Use `VirtualRoot` → `VirtualPath` when path escapes are **expected but must be controlled**:
+
+- **Multi-tenant file uploads** — SaaS per-user storage where each user/tenant gets isolated directories
+- **Multi-tenant systems** — Each user sees isolated `/` root without real paths
+- **Malware analysis sandboxes** — Observe malicious behavior while containing it
+- **Container-like plugins** — Modules get their own filesystem view
+- **Security research** — Simulate contained environments for testing
+- **User content isolation** — When users shouldn't see real system paths
+
+**Key behavior**: Silently clamps/redirects escape attempts within the virtual boundary.
+
+**Requires feature** — Enable in `Cargo.toml`:
+```toml
+[dependencies]
+strict-path = { version = "...", features = ["virtual-path"] }
+```
+
+### Decision Matrix
+
+| Scenario                      | Type          | Reason                                           |
+| ----------------------------- | ------------- | ------------------------------------------------ |
+| Archive extraction            | `StrictPath`  | Detect malicious paths                           |
+| File uploads (shared storage) | `StrictPath`  | Admin panels, CMS — all users share one boundary |
+| File uploads (multi-tenant)   | `VirtualPath` | SaaS per-user — each user/tenant isolated        |
+| Config loading                | `StrictPath`  | Fail on escape attempts                          |
+| Malware sandbox               | `VirtualPath` | Contain behavior safely                          |
+| Multi-tenant SaaS             | `VirtualPath` | Per-user isolation                               |
+| Single-user app               | `StrictPath`  | Simple boundary enforcement                      |
+
+### VirtualRoot Quick Checklist (LLMs should follow)
+- Construct per-user/tenant roots using an identifier segment: `let vroot = VirtualRoot::try_new_create(format!("users/{user_id}"))?;`.
+- Do not use a shared `VirtualRoot` for multiple users; create one per user/tenant.
+- Do not construct roots inside helpers; accept `&VirtualRoot`/`&VirtualPath` (or a root + raw segment) in function signatures.
+- Always validate raw segments with `virtual_join(untrusted)` before any I/O.
+- Use `virtualpath_display()` for UI and `.interop_path()` only for third‑party APIs that require `AsRef<Path>`.
+- If `user_id` comes from outside, treat it as an identifier (not a path). Sanitize to a slug; avoid path separators.
+
+### Marker playbook (LLM must follow)
+
+- **Domain markers**: Define markers that describe what lives under the boundary (e.g., `struct PublicAssets;`, `struct UserUploads;`). Create boundaries with those markers so helpers can accept `&StrictPath<PublicAssets>` vs `&StrictPath<UserUploads>` and the compiler blocks cross-domain mix-ups.
+- **Authorization markers**: Wrap a proof type in your marker when you need auth guarantees for shared system directories. Example: `struct UserHome { _proof: () }` with `fn authenticate_user_home(...) -> Result<UserHome, AuthError>`. After authentication, create a `PathBoundary<UserHome>` and call `.strict_join(...)` so every `StrictPath<UserHome>` proves both the boundary and the authorization.
+- **Permission tuples (convention)**: Combine resource + capability in a tuple marker with a FLAT tuple: `StrictPath<(SystemFiles, ReadOnly)>` and for multiple caps `StrictPath<(SystemFiles, ReadOnly, WriteOnly)>`. Avoid nesting tuples like `(SystemFiles, (ReadOnly, WriteOnly))` — keep it flat and always put the resource first.
+- **Naming rule (must follow)**: Use domain nouns that describe what lives under the boundary (`struct PublicAssets;`, `struct BrandEditorWorkspace;`). The marker must always communicate the filesystem contents protected by that restriction—any label that points at people, roles, or other metadata instead of the stored files is incorrect. Avoid meaningless suffixes like `Marker`, `Type`, or `Root`. Markers should never use human-centric labels unless the directory literally stores those artifacts; authorization state belongs in the capability witness. When combining with capabilities, keep the first tuple element as the storage domain and the remaining elements as capability proofs: `StrictPath<(BrandDirectorArchive, ReadOnly, WriteOnly)>`.
+- **Function signatures**: Accept either the validated path (`&StrictPath<Marker>`) or accept the policy root plus raw segment (`&PathBoundary<Marker>`, `&VirtualRoot<Marker>`). Never take raw `Path`/`String` parameters for untrusted input.
+- **Library public APIs**: All signature guidance above applies to **applications** and **library internals**. If you are writing a library, be mindful about exposing `strict-path` types in your public surface — by default, accept standard types (`&str`, `&Path`, `PathBuf`) in your public API and validate internally, so your users are not forced to depend on `strict-path`. Exception: when the library's purpose explicitly benefits from users working with these types (e.g., a security framework).
+- **Naming rule**: Use domain-based names (`public_assets_dir`, `user_uploads_dir`, `system_logs_dir`) for `PathBoundary`/`VirtualRoot` variables so the intent survives into code review.
+
+Marker transformation guidance
+- `.change_marker::<NewMarker>()` consumes the value and swaps only the marker. Use it right after you have proved a new authorization or capability (for example, after login or policy elevation).
+- Do not call `.change_marker::<()>()` for a no-op update. Prefer annotating the binding or function signature instead: `let boundary: PathBoundary<()> = PathBoundary::try_new_create(dir)?;`.
+
+## Quick Specs (LLM-friendly)
+
+- PathBoundary<T>
+	- Purpose: Policy root for safe strict paths (create → validate → use)
+	- `PathBoundary::try_new_create<P: AsRef<Path>>(path: P) -> Result<PathBoundary<T>>`
+		- Errors: `InvalidRestriction`
+		- Example: `let boundary = PathBoundary::try_new_create("./config")?;`
+	- `PathBoundary::strict_join<P: AsRef<Path>>(&self, candidate: P) -> Result<StrictPath<T>>`
+		- Errors: `PathEscapesBoundary`, `PathResolutionError`
+		- Security: Validates against boundary; prevents traversal/symlink escapes
+		- Example: `let file = boundary.strict_join(user_input)?; file.read()?;`
+
+- StrictPath<T>
+	- Purpose: Proven-safe system path (within its boundary)
+	- `StrictPath::strict_join<P: AsRef<Path>>(&self, path: P) -> Result<StrictPath<T>>`
+		- Errors: `PathEscapesBoundary`, `PathResolutionError`
+	- `StrictPath::interop_path(&self) -> &OsStr` (for unavoidable third-party `AsRef<Path>` APIs)
+	- `StrictPath::strictpath_display(&self) -> Display`
+		- `StrictPath::try_into_boundary(self) -> Result<PathBoundary<T>>` — promote the validated path to a boundary (directory must exist); call `.change_marker::<NewMarker>()` to propagate authorization markers
+		- `StrictPath::try_into_boundary_create(self) -> Result<PathBoundary<T>>` — same as above but ensures the directory exists first
+	- `StrictPath::create_file(&self) -> io::Result<File>` — open writable handle; call `.open_file()` for read-only access
+
+- VirtualRoot<T>
+	- Purpose: Policy root for user-facing sandbox with rooted virtual "/" semantics
+	- `VirtualRoot::try_new_create<P: AsRef<Path>>(dir: P) -> Result<VirtualRoot<T>>`
+		- Errors: `InvalidRestriction`
+	- `VirtualRoot::virtual_join<P: AsRef<Path>>(&self, candidate: P) -> Result<VirtualPath<T>>`
+		- Errors: `PathEscapesBoundary`, `PathResolutionError`
+
+- VirtualPath<T>
+	- Purpose: Virtual path with rooted "/" view; safe virtual operations mapped to a strict path
+	- `VirtualPath::with_root<P: AsRef<Path>>(root: P) -> Result<VirtualPath<T>>`
+	- `VirtualPath::with_root_create<P: AsRef<Path>>(root: P) -> Result<VirtualPath<T>>`
+	- `VirtualPath::virtual_join<P: AsRef<Path>>(&self, path: P) -> Result<VirtualPath<T>>`
+	- `VirtualPath::interop_path(&self) -> &OsStr` (for unavoidable third-party `AsRef<Path>` APIs)
+	- `VirtualPath::virtualpath_display(&self) -> Display` (e.g., "/file.txt")
+	- `VirtualPath::as_unvirtual(&self) -> &StrictPath<T>` (borrow strict/system view)
+	- `VirtualPath::create_file(&self) -> io::Result<File>` / `.open_file()` — safe I/O streaming within the virtual root
+
+## Architecture Overview
+
+All security flows through `StrictPath`:
+- `PathBoundary` → validates external input → produces `StrictPath`  
+- `VirtualPath` → extends `StrictPath` with user-friendly semantics
+- `VirtualRoot` → provides root context for creating `VirtualPath` instances
+
+Uses canonicalization + boundary checks to prevent directory traversal attacks.
+
+### PathBoundary — usage in one glance
+
+- Policy root for strict/system paths; construct once, pass around.
+- Validate untrusted input with `boundary.strict_join(input)` to get `StrictPath<T>`.
+- Do not build raw `Path` from user input; always validate via `strict_join()`.
+- For details, see the mdBook Best Practices; keep helpers accepting `&StrictPath<_>` or `&PathBoundary<_>`.
+
+## Quick Method Reference
+
+**PathBoundary<T>**: Secure boundary creation and validation
+Use when: validating untrusted segments into a system-facing path within a known root (policy).
+- `::try_new_create(path)` → Create boundary (mkdir if needed)  
+- `.strict_join(input)` → Validate untrusted input → `StrictPath<T>`
+- `.strict_read_dir()` → Iterator yielding validated `StrictPath` entries directly (no `into_strictpath()` needed)
+- `.read_dir()` → Raw `std::fs::ReadDir` for discovery (re-join via `strict_join` before I/O)
+
+**StrictPath<T>**: Proven-safe system paths
+Use when: passing proven-safe paths to I/O and helpers; no extra validation inside the function.
+- `.strict_join(path)` → Chain additional safe joins
+- `.interop_path()` → `&OsStr` for third-party `AsRef<Path>` APIs you cannot adapt
+- `.exists()` / `.try_exists()` → Check if path exists (fallible variant distinguishes permission errors)
+- `.read()/.write(data)/.append(data)` → I/O operations
+- `.touch()` → Create empty file or update mtime (preserves content)
+- `.create_file()` → Writable handle (pass to tar builders, etc.)
+- `.open_file()` → Read-only handle when you only need to stream bytes out
+- `.open_with()` → Builder: `.read(true).write(true).create(true).open()` for advanced modes
+- `.strict_read_dir()` → Iterator yielding validated `StrictPath` entries (no manual re-join needed)
+- `.strict_read_link()` → Read symlink target as validated `StrictPath` (errors if escapes boundary)
+- `.set_permissions(perm)` → Set file/directory permissions
+- `.strictpath_display()` → Display for logging
+
+**VirtualRoot<T>**: User-friendly sandbox policy root
+Use when: creating a per-user sandbox root that produces `VirtualPath` with rooted "/" UX.
+- `VirtualRoot::try_new_create(dir)` → Create user sandbox root
+- `.virtual_join(input)` → Validate/clamp user input → `VirtualPath<T>`
+- `.virtual_read_dir()` → Iterator yielding validated `VirtualPath` entries directly (no `into_virtualpath()` needed)
+- `.interop_path()` → `&OsStr` for third-party `AsRef<Path>` APIs at the root
+- `.read_dir()` → Raw `std::fs::ReadDir` for discovery (re-join via `virtual_join` before I/O)
+- `.remove_dir()` / `.remove_dir_all()` → Root-level cleanup
+
+**VirtualPath<T>**: User-facing clamped path
+Use when: handling user-facing paths; clamp via `.virtual_join()`; borrow strict view with `.as_unvirtual()` for shared helpers.
+- `.virtual_join(input)` → Chain additional safe virtual joins
+- `.virtualpath_display()` → Virtual display (e.g., "/file.txt")
+- `.as_unvirtual()` → Borrow underlying `StrictPath<T>` for shared helpers
+- `.interop_path()` → Pass into third-party APIs expecting `AsRef<Path>`
+- `.exists()` → Check if path exists (built-in)
+- I/O helpers available: `.read()`, `.write(..)`, `.append(..)`, `.create_file()`, `.open_file()`, `.open_with()`, `.touch()`, `.create_parent_dir_all()`
+- `.virtual_read_dir()` → Iterator yielding validated `VirtualPath` entries (no manual re-join needed)
+- `.virtual_read_link()` → Read symlink target as validated `VirtualPath` (clamps escapes)
+- `.symlink_metadata()` → Get metadata without following symlinks
+- `.set_permissions(perm)` / `.try_exists()` → Permission and fallible existence helpers
+
+## Built-in I/O Methods (Always Use These!)
+
+**CRITICAL**: `StrictPath` and `VirtualPath` provide built-in helpers for common filesystem operations. **Never** use `.interop_path()` to call `std::fs` methods directly — that's what these helpers are for!
+
+**File Operations**:
+- `.exists()` → Check if path exists (bool)
+- `.try_exists()` → Fallible existence check (distinguishes "not found" from permission errors)
+- `.read()` → Read file to Vec<u8>
+- `.read_to_string()` → Read file to String
+- `.write(contents)` → Write to file (creates or truncates)
+- `.append(data)` → Append to file (creates if missing)
+- `.touch()` → Create empty file or update modification time (preserves content)
+- `.create_file()` → Get writable File handle
+- `.open_file()` → Get read-only File handle
+- `.open_with()` → Builder for advanced file opening (read+write, append, exclusive create, truncate)
+- `.set_permissions(perm)` → Set file permissions
+- `.remove_file()` → Delete file
+
+**Directory Operations**:
+- `.create_dir()` → Create directory (must not exist)
+- `.create_dir_all()` → Create directory and all parents
+- `.create_parent_dir_all()` → Create all parent directories for a file path
+- `.read_dir()` → Iterate directory entries (returns raw `DirEntry`)
+- `.strict_read_dir()` / `.virtual_read_dir()` → Iterate with auto-validated `StrictPath`/`VirtualPath` entries
+- `.remove_dir()` → Delete empty directory
+- `.remove_dir_all()` → Delete directory and all contents
+ - `.symlink_metadata()` → Get metadata without following symlinks
+
+**Path Manipulation**:
+- `.strict_join(path)` / `.virtual_join(path)` → Safely append segment
+- `.strictpath_parent()` / `.virtualpath_parent()` → Get parent directory
+- `.strictpath_with_file_name()` / `.virtualpath_with_file_name()` → Replace filename
+- `.strictpath_with_extension()` / `.virtualpath_with_extension()` → Replace extension
+
+**File System Operations**:
+- `.strict_copy(dest)` → Copy file to destination (accepts `AsRef<Path>`)
+- `.strict_rename(dest)` → Move/rename file (accepts `AsRef<Path>`)
+- `.strict_symlink(link_path)` → Create symbolic link (accepts `AsRef<Path>`)
+- `.strict_hard_link(link_path)` → Create hard link (accepts `AsRef<Path>`)
+- `.strict_junction(link_path)` → Create NTFS directory junction (Windows, feature = "junctions", accepts `AsRef<Path>`)
+- `.strict_read_link()` → Read symlink target as validated `StrictPath` (errors if escapes boundary)
+- `.virtual_read_link()` → Read symlink target as validated `VirtualPath` (clamps escapes)
+
+**Why This Matters:**
+```rust
+// ❌ WRONG - Using interop_path with std::fs
+if Path::new(safe_path.interop_path()).exists() {  // DON'T DO THIS!
+    let content = std::fs::read_to_string(safe_path.interop_path())?;  // DON'T DO THIS!
+}
+
+// ✅ CORRECT - Using built-in methods
+if safe_path.exists() {  // ✅ Use the built-in method
+    let content = safe_path.read_to_string()?;  // ✅ Use the built-in method
+}
+```
+
+
+
+- ❌ **Never**: `std::path::Path::join(user_input)` - vulnerable to traversal  
+- ✅ **Always**: `boundary.strict_join(user_input)` or `vroot.virtual_join(user_input)`
+- ✅ **Only for third-party `AsRef<Path>` APIs**: use `.interop_path()` (never `.unstrict()`)
+- **⚠️ SECURITY CRITICAL: `interop_path()` Information Leakage**:
+  - `interop_path()` returns the **real host filesystem path** — use ONLY for passing to OS/library calls that need the real path to function.
+  - **NEVER** expose `interop_path()` to end-users: API responses, error messages, user-visible logs, serialized data sent to clients.
+  - In multi-tenant/cloud scenarios, exposing real paths leaks: internal directory structure, tenant IDs, usernames, infrastructure details (mount points, container paths).
+  - For user-facing output, use `virtualpath_display()` which shows the clean virtual view (e.g., `/docs/report.pdf`) instead of the real host path (e.g., `/var/app/cloud-storage/tenant-42/docs/report.pdf`).
+- Do not bypass: never call std fs ops on raw `Path`/`PathBuf` built from untrusted input.
+- Marker types prevent mixing distinct restrictions at compile time: use when you have multiple storage areas.
+- We do not implement `AsRef<Path>` on secure path values (`StrictPath`/`VirtualPath`). When an unavoidable third-party API expects `AsRef<Path>`, pass `.interop_path()`.
+	Note: `.interop_path()` returns `&OsStr`, which satisfies `AsRef<Path>` — you do not need to wrap it in `Path::new(..)` or `PathBuf::from(..)`.
+	For roots/policy types, use `PathBoundary::interop_path()` and `VirtualRoot::interop_path()` similarly. No type in this crate implements `AsRef<Path>` — always use `.interop_path()` for third-party APIs.
+- Interop doesn't require `.unstrict()`: prefer `.interop_path()` for those third-party adapters; call `.unstrict()` only when an owned `PathBuf` is strictly required.
+- `.interop_path()` returns `&OsStr` (which is `AsRef<Path>`), not `&Path` — use it directly for external APIs.
+- Never wrap `.interop_path()` in `Path::new()` to use `Path::join`/`parent` — they bypass security checks. Use `strict_join` / `virtualpath_parent` instead.
+- After `.unstrict()` (explicit escape hatch), you own a `PathBuf` and can do whatever you need.
+- Do not convert `StrictPath` -> `VirtualPath` just to print; for UI flows start with `VirtualPath::with_root(..).virtual_join(..)` and keep a `VirtualPath`.
+
+### Feature semantics (when enabled)
+- `app-path`: Environment override resolves to the final root path. When the env var is set, no subdirectory append occurs — the env value becomes the root.
+
+### Anti‑Patterns (Tell‑offs — do NOT do these!)
+
+**⚠️ SECURITY THEATER (THE ABSOLUTE WORST!) ⚠️**
+
+If you're only validating constants or immediately converting back to unsafe paths, **you're writing security theater, not security code.**
+
+- ❌ **Only validating constants**: `boundary.strict_join("hardcoded.txt")?` — no untrusted input ever flows through validation. This is completely pointless.
+- ❌ **Generic variable names that hide intent**: Use `user_input`, `requested_file`, `uploaded_data` not `filename`, `path`, `name`. Variables must clearly show they represent untrusted external input.
+- ❌ **Validating then converting back to unsafe types**: `let safe = boundary.strict_join(input)?; let path = PathBuf::from(safe.interop_path()); std::fs::read(&path)?` — you validated it, then threw away the safety!
+- ❌ **Accepting unsafe types in functions**: `fn process(path: &str) { boundary.strict_join(path)?; }` — validate at call site, accept `&StrictPath<_>` in signature.
+
+**Critical**: When writing code that uses this crate, always use variable names that make it obvious you're validating untrusted input:
+- ✅ Good: `user_input`, `requested_file`, `attack_input`, `uploaded_avatar`, `config_input`
+- ❌ Bad: `filename`, `path`, `name`, `config_name`, `user_doc_path`
+- Include comments showing source: `// User input from HTTP request, CLI args, form data, etc.`
+
+---
+
+**Path Construction & Interop** (most common mistakes):
+- ❌ `Path::new(path.interop_path()).join(untrusted)` — wrapping `.interop_path()` to use std path operations bypasses all security
+- ❌ `PathBuf::from(path.interop_path()).join(untrusted)` — same problem; defeats the entire purpose of validation
+- ❌ `Path::new(path.interop_path()).to_path_buf()` — `.interop_path()` is already `AsRef<Path>`; no wrapping needed
+- ❌ Performing filesystem I/O via `std::fs` on `.interop_path()` paths — use built-in helpers (`StrictPath::create_file`, `StrictPath::read_to_string`, etc.)
+
+**Key insight**: `.interop_path()` returns `&OsStr` which is `AsRef<Path>` — pass it directly to external APIs. Never wrap it in `Path::new()` or `PathBuf::from()` to perform path operations; that defeats all security. After `.unstrict()` (explicit escape hatch), you own a `PathBuf` and can do whatever you need.
+
+**Validation & Policy**:
+- ❌ Validating only constants (no untrusted segment ever flows through validation)
+- ❌ Construct `PathBoundary`/`VirtualRoot` inside helpers — treat them as policy and pass them in
+- ❌ Raw path parameters in safe helpers — use types/signatures that encode guarantees
+
+**Display & Interop**:
+- ❌ Convert `StrictPath` → `VirtualPath` just to print; use `strictpath_display()` or start with `VirtualPath` for UI
+- ❌ `interop_path().as_ref()` or `as_unvirtual().interop_path()` — when adapting third-party crates, call `.interop_path()` directly; no extra `.as_ref()` dance
+- ❌ Mixing interop and display (use `*_display()` for display)
+
+**Markers & Conversions**:
+- ❌ Using `change_marker()` without authorization checks or when converting between path types — conversions preserve markers automatically; only use `change_marker()` when you need a *different* marker after verification
+- ❌ Calling `strict_join("")` or `virtual_join("")` to grab the root — use dedicated conversions (`PathBoundary::into_strictpath()`, `VirtualRoot::into_virtualpath()`)
+
+**Multi-user Services**:
+- ❌ Single‑user demo flows for multi‑user services — use per‑user `VirtualRoot`
+
+**Remember**: `interop_path()` returns `&OsStr` which is already `AsRef<Path>`. You don't need to wrap it in anything!
+
+### Quick Reference: Anti-Pattern → Fix
+
+| ❌ Bad Pattern (DO NOT DO THIS!)                         | ✅ Correct Pattern                               | Why                                               |
+| ------------------------------------------------------- | ----------------------------------------------- | ------------------------------------------------- |
+| `Path::new(path.interop_path()).to_path_buf()`          | `path.interop_path()` directly                  | Already `AsRef<Path>`; wrapping adds nothing      |
+| `PathBuf::from(path.interop_path())`                    | `path.interop_path()` or `.unvirtual()`         | Unnecessary conversion; use direct access         |
+| `Path::new(path.interop_path()).exists()`               | `path.exists()`                                 | Built-in method; no leaking needed                |
+| `println!("{}", path.interop_path().to_string_lossy())` | `println!("{}", path.strictpath_display())`     | Use display methods for user output               |
+| `fn process(path: &str)` + validate inside              | `fn process(path: &StrictPath<_>)`              | Encode safety in signature; validate once at edge |
+| `let boundary = PathBoundary::try_new(...)?`            | `let uploads_dir = PathBoundary::try_new(...)?` | Name by purpose, not type                         |
+| `Path::new(path.interop_path()).join("child")`          | `path.strict_join("child")?`                    | Wrapping `.interop_path()` bypasses all security  |
+| `vroot.as_unvirtual().interop_path()`                   | `vroot.interop_path()`                          | VirtualRoot has `interop_path()` directly         |
+| `path.interop_path().as_ref()`                          | `path.interop_path()`                           | Already `AsRef<Path>`; redundant `.as_ref()`      |
+| `std::fs::copy(path.interop_path(), ...)`               | `path.strict_copy(...)`                         | Use built-in I/O helpers, not raw `std::fs`       |
+| `std::os::windows::fs::symlink_dir(..)` in app code     | `path.strict_symlink(&link_path)`               | Built-in link helpers apply boundary checks       |
+| Manual junction creation in app code                    | `path.strict_junction(&link_path)`              | Windows-only helper when feature is enabled       |
+
+### The Golden Rules (Memorize These!)
+
+1. **`.interop_path()` returns `&OsStr` (already `AsRef<Path>`)** — pass directly to external APIs, never wrap in `Path::new()`
+2. **Never wrap `.interop_path()` to use std path operations** — that defeats all security; use `strict_join`, `virtualpath_parent`, etc.
+3. **`.unstrict()` is the escape hatch** — after calling it, you own a `PathBuf` and leave the safety guarantees
+4. **Make functions accept safe types** - `&StrictPath<_>` in signatures, not `&str` with validation inside (applies to apps and library internals; library public APIs may accept standard types and validate internally)
+3. **Name variables by purpose, not type** - `uploads_dir`, `config_dir`, not `boundary`, `jail`
+4. **Use the right method for the job**:
+   - Display to users → `strictpath_display()` / `virtualpath_display()`
+   - Pass to third-party APIs → `interop_path()` (already `AsRef<Path>`)
+   - I/O operations → Use built-in helpers (`.read()`, `.write()`, `.append()`, `.create_file()`, etc.)
+5. **Let callers control security policy** - accept `&PathBoundary<_>` parameter, don't create inside helpers
+6. **Actually validate untrusted input** - don't just validate constants (security theater!)
+
+## Common Usage Patterns
+
+### Pattern 1: User File Uploads (VirtualPath)
+```rust
+struct UserFiles;
+let user_id = "alice";
+let user_root: VirtualRoot<UserFiles> =
+    VirtualRoot::try_new_create(format!("./users/{user_id}"))?;
+let user_file = user_root.virtual_join(untrusted_filename)?; // Always safe
+user_file.write(uploaded_data)?;
+println!("Saved: {}", user_file.virtualpath_display()); // Shows: "/document.pdf"
+```
+
+### Pattern 2: Config File Access (StrictPath) 
+```rust
+let config_boundary = PathBoundary::try_new_create("./config")?;
+// User input from CLI args, environment, or config loader
+let user_input = "app.toml";
+let config_file = config_boundary.strict_join(user_input)?;
+let content = config_file.read_to_string()?;
+println!("Config: {}", config_file.strictpath_display()); // Shows: "./config/app.toml"
+```
+
+### Pattern 3: Type Safety with Markers
+```rust
+struct UserFiles;
+struct ConfigFiles;
+fn process_user_file(f: &StrictPath<UserFiles>) -> Result<Vec<u8>> { f.read() }
+fn process_config_file(f: &StrictPath<ConfigFiles>) -> Result<String> { f.read_to_string() }
+
+// User input from request parameters, database, form data, etc.
+let user_input = "data.json";
+let config_input = "settings.toml";
+
+let user_file = user_boundary.strict_join(user_input)?;
+let config_file = config_boundary.strict_join(config_input)?;
+// process_user_file(&config_file); // ❌ Compile error - wrong marker type
+```
+
+### Pattern 4: External API Interop
+```rust
+use walkdir::WalkDir;
+
+// User input from request, form data, CLI args, etc.
+let user_input = "uploads";
+let safe_path = boundary.strict_join(user_input)?;
+// Only for third-party crates that insist on `AsRef<Path>`
+for entry in WalkDir::new(safe_path.interop_path()) {
+	let entry = entry?;
+	println!("{}", entry.path().display());
+}
+// ❌ Don't do: safe_path.unstrict() - prefer crate helpers; reach for `.interop_path()` only when adapting third-party APIs
+```
+
+## Error Handling
+
+**Common Error Types**:
+- `PathEscapesBoundary` - User attempted directory traversal (e.g., "../../../etc/passwd")
+- `InvalidRestriction` - Cannot create/access the boundary directory  
+- `PathResolutionError` - Invalid path format or I/O error during canonicalization
+
+**Error Pattern**:
+```rust
+match boundary.strict_join(user_input) {
+		Ok(safe_path) => { /* use safely */ },
+		Err(StrictPathError::PathEscapesBoundary { .. }) => { /* log security attempt */ },
+		Err(e) => { /* handle other errors */ }
+}
+```
+
+## Detailed API Reference
+
+### StrictPath API
+
+- with_boundary<P: AsRef<Path>>(dir_path: P) -> Result<Self>  // sugar; directory must exist
+- with_boundary_create<P: AsRef<Path>>(dir_path: P) -> Result<Self>  // sugar; creates directory if missing
+- change_marker<NewMarker>(self) -> StrictPath<NewMarker>  // transform marker after authorization
+- unstrict(self) -> PathBuf  // consumes — escape hatch (avoid)
+- virtualize(self) -> VirtualPath<Marker>  // upgrade to virtual view (UI ops) [feature: virtual-path]
+- interop_path(&self) -> &OsStr  // for unavoidable third-party `AsRef<Path>` adapters only
+- strictpath_display(&self) -> std::path::Display<'_>  // explicit display method
+- strict_join<P: AsRef<Path>>(&self, candidate_path: P) -> Result<Self>
+- strictpath_parent(&self) -> Result<Option<Self>
+- strictpath_with_file_name<S: AsRef<OsStr>>(&self, file_name: S) -> Result<Self>
+- strictpath_with_extension<S: AsRef<OsStr>>(&self, extension: S) -> Result<Self>
+- strict_rename<P: AsRef<Path>>(&self, dest: P) -> io::Result<()>
+- strict_copy<P: AsRef<Path>>(&self, dest: P) -> io::Result<u64>
+- strict_symlink<P: AsRef<Path>>(&self, link_path: P) -> io::Result<()>
+- strict_hard_link<P: AsRef<Path>>(&self, link_path: P) -> io::Result<()>
+- strict_junction<P: AsRef<Path>>(&self, link_path: P) -> io::Result<()>  // Windows-only, feature: junctions
+- symlink_metadata(&self) -> io::Result<std::fs::Metadata>  // metadata without following symlinks
+
+All operations prevent traversal and symlink/junction escapes. Do not use `std::path::Path::join` on untrusted input; use the explicit `strict_*/virtual_*` operations documented below.
+
+## Which Type Should I Use?
+
+Quick Decision Matrix:
+- **User Sandboxes** → `VirtualPath` (per-user isolated spaces)
+- **Shared Boundaries** → `StrictPath` (common protected areas)  
+- **Type Safety** → Both `StrictPath<T>` and `VirtualPath<T>` vs `Path/PathBuf`
+- **Unrestricted** → `std::path::Path` (no safety guarantees)
+
+Minimal decision checklist (LLM prompts)
+- Input: untrusted user path segment; expected UX: rooted "/" display → Use `VirtualRoot` + `.virtual_join(...)` → `VirtualPath<T>`.
+- Input: untrusted file/dir name for a known system directory → Use `PathBoundary` + `.strict_join(...)` → `StrictPath<T>`.
+- Need one helper usable from both → Write `fn f<M>(p: &StrictPath<M>) { ... }`; call with `StrictPath` or `VirtualPath::as_unvirtual()`.
+- Display: user-facing → `vpath.virtualpath_display()`; system logs → `spath.strictpath_display()`.
+- Interop: when an unavoidable third-party API expects `AsRef<Path>` → call `.interop_path()` on the secure type; do not use `.unstrict()` unless an owned `PathBuf` is required.
+
+**Common Use Cases:**
+```rust
+// ✅ Per-user storage - each user gets their own "/"
+let user_space: VirtualRoot<UserFiles> = VirtualRoot::try_new(format!("./users/{user_id}"))?;
+// User input from request path, form data, API payload, etc.
+let user_input = "docs/report.pdf";
+let doc = user_space.virtual_join(user_input)?; // User sees "/docs/report.pdf"
+
+// ✅ Shared config area - all users access same protected space
+let config_restriction: PathBoundary<ConfigFiles> = PathBoundary::try_new("./shared/config")?;
+let cfg = config_restriction.strict_join(user_requested_config)?; // Validates within shared boundary
+
+// ✅ Both can process user input safely
+let user_input = "../../../etc/passwd";
+let vp = user_space.virtual_join(user_input)?; // Clamped to user's space
+let sp = config_restriction.strict_join(user_input)?; // Rejected if escapes shared boundary
+
+// ❌ Don't use std::path for user input
+let bad = PathBuf::from(user_input).join("file.txt"); // 🚨 Vulnerable to traversal
+```
+
+**Conceptual Models:**
+- `StrictPath` = **Proven-safe, system-facing path**: validated path for system-facing I/O and interop
+- `VirtualPath` = **User-friendly wrapper**: user-facing virtual "/" view with virtual path operations; also supports I/O and interop
+
+**Unified Signatures (When Appropriate):**
+```rust
+// Generic across storage contexts — use only when required to have a function that works for multiple restrictions and contexts
+fn process_file<M>(path: &StrictPath<M>) -> std::io::Result<Vec<u8>> {
+	path.read()
+}
+
+// Callers pass either a borrowed StrictPath directly, or a borrowed StrictPath from VirtualPath::as_unvirtual()
+process_file(&strict_path);
+process_file(virtual_path.as_unvirtual());
+```
+```rust
+
+struct UserFiles;
+struct Logs;
+
+let bytes = read_user_file(vpath.as_unvirtual())?;
+
+// Compile-time separation of restrictions
+let logs: PathBoundary<Logs> = PathBoundary::try_new("./logs")?;
+// User input from monitoring system, request parameter, log viewer, etc.
+let user_input = "app.log";
+let log_path = logs.strict_join(user_input)?;
+// read_user_file(&log_path)?; // ❌ compile error: expected `StrictPath<UserFiles>`
+```
+
+## API Design Philosophy: Explicit Security
+
+**No Display Trait**: Both types require explicit display methods to prevent accidental path leakage:
+
+```rust
+// ❌ No automatic Display trait
+println!("{}", vpath);  // Compile error
+
+// ✅ Explicit display methods
+impl StrictPath {
+		pub fn strictpath_display(&self) -> impl Display { ... }
+}
+impl VirtualPath {
+	pub fn virtualpath_display(&self) -> impl Display { ... }   // Virtual view (rooted)
+	// System-facing strings are explicit:
+	// - Borrow the strict view and use Display: `self.as_unvirtual().strictpath_display()`
+}
+
+println!("User: {}", vpath.virtualpath_display());        // "/docs/file.txt"  
+let user_id = "alice";
+println!("Log: {}", vpath.as_unvirtual().strictpath_display());   // "/srv/users/{user_id}/docs/file.txt"
+```
+
+`VirtualPath` provides `virtualpath_display()` for user-facing display. System-facing strings are available but must be called explicitly:
+
+- Prefer virtual semantics in UI: `vpath.virtualpath_display()` or `vpath.virtualpath_display().to_string()`
+- When you need the real, system path string, either:
+	- Borrow the strict view and format it: `format!("{}", vpath.as_unvirtual().strictpath_display())`
+
+This keeps potentially sensitive operations visible in code review while offering ergonomic access when required.
+
+
+
+**Rationale:** Security-sensitive APIs should make potentially dangerous operations visible in code review. Automatic trait implementations like `Display` can hide semantic differences that could lead to unintentional information disclosure in user-facing contexts.
+
+Start here: [Quick Recipes](#quick-recipes) · [Pitfalls](#pitfalls-and-how-to-avoid)
+
+Top-level exports
+
+| Symbol                 |   Kind | Purpose                                                                                                      |
+| ---------------------- | -----: | ------------------------------------------------------------------------------------------------------------ |
+| `StrictPathError`      |   enum | Validation and resolution errors.                                                                            |
+| `Result<T>`            |  alias | `Result<T, StrictPathError>`                                                                                 |
+| `StrictPath<Marker>`   | struct | System-facing, restriction‑validated path that proves containment; supports I/O.                             |
+| `VirtualPath<Marker>`  | struct | User-facing path that extends `StrictPath` with a virtual‑root view and restriction‑aware ops; supports I/O. |
+| `PathBoundary<Marker>` | struct | Boundary policy that validates external input and produces `StrictPath`.                                     |
+| `VirtualRoot<Marker>`  | struct | Virtual policy root that produces `VirtualPath` values.                                                      |
+
+## Quick Recipes
+- **Sugar constructors (simple flows)**: `let sp = StrictPath::with_boundary_create("./safe")?.strict_join("a/b.txt")?;` or `let vp = VirtualPath::with_root_create("./safe")?.virtual_join("a/b.txt")?;`
+- **Policy types (reusable roots)**: `let restriction = PathBoundary::try_new_create("./safe")?; let sp = restriction.strict_join("a/b.txt")?;` or `let vroot = VirtualRoot::try_new("./safe")?; let vp = vroot.virtual_join("a/b.txt")?;`
+- Convert between types: `vpath.unvirtual()` → `StrictPath`, `spath.virtualize()` → `VirtualPath`
+- Unified functions: take `&StrictPath<_>` and call with `vpath.as_unvirtual()`
+
+Example — unified helper (copy/paste):
+```rust
+use strict_path::{PathBoundary, StrictPath, VirtualRoot, VirtualPath};
+
+fn process_common<M>(p: &StrictPath<M>) -> std::io::Result<Vec<u8>> { p.read() }
+
+let spath: StrictPath = PathBoundary::try_new("./assets")?
+	.strict_join("style.css")?;
+
+let user_id = "alice";
+let vroot: VirtualRoot = VirtualRoot::try_new(format!("./uploads/{user_id}"))?;
+let vpath: VirtualPath = vroot.virtual_join("avatar.jpg")?;
+
+let _ = process_common(&spath)?;                 // StrictPath
+let _ = process_common(vpath.as_unvirtual())?;   // Borrow strict view from VirtualPath
+```
+- Display paths: `spath.strictpath_display()`, `vpath.virtualpath_display()` (no automatic Display trait)
+- Type-safe function signatures: `fn serve_file<M>(p: &StrictPath<M>) -> io::Result<Vec<u8>> { p.read() }`
+- Type-safe virtual signatures: `fn serve_user_file(p: &VirtualPath) -> io::Result<Vec<u8>> { p.read() }`
+- Interop: when an unavoidable third-party API expects `AsRef<Path>`, pass `.interop_path()` (returns `&OsStr`, which implements `AsRef<Path>`). Example: `walkdir::WalkDir::new(src.interop_path())`.
+- Create parent dirs: `vp.create_parent_dir_all()?; vp.write("content")?;`
+
+Markers and type inference
+- All core types are generic over a `Marker` with a default of `()`.
+- In many cases, binding the value is enough for inference: `let vroot: VirtualRoot = VirtualRoot::try_new("./root")?; let vp = vroot.virtual_join("f.txt")?;`.
+- When inference needs help, add an explicit type or an empty turbofish:
+	- `let vroot: VirtualRoot<()> = VirtualRoot::try_new("./root")?;`
+	- `let vroot = VirtualRoot::<()>::try_new("./root")?;`
+- With a custom marker: `struct Docs; let vroot: VirtualRoot<Docs> = VirtualRoot::try_new("./docs")?;`
+- Prefer annotating the `let` binding or function signature for readability; use turbofish only when it clarifies intent or is required.
+
+StrictPathError (variants)
+- `InvalidRestriction { restriction: PathBuf, source: io::Error }`
+- `PathEscapesBoundary { attempted_path: PathBuf, restriction_boundary: PathBuf }`
+- `PathResolutionError { path: PathBuf, source: io::Error }`
+
+PathBoundary<Marker>
+- change_marker<NewMarker>(self) -> PathBoundary<NewMarker>
+- try_new<P: AsRef<Path>>(restriction_path: P) -> Result<Self>
+- try_new_create<P: AsRef<Path>>(root: P) -> Result<Self>
+- strict_join<P: AsRef<Path>>(&self, candidate_path: P) -> Result<StrictPath<Marker>>
+- into_strictpath(self) -> Result<StrictPath<Marker>>  // convert root into path (directory must exist)
+- exists(&self) -> bool
+- metadata(&self) -> io::Result<std::fs::Metadata>
+- interop_path(&self) -> &OsStr  // for unavoidable third-party `AsRef<Path>` adapters only
+- strictpath_display(&self) -> std::path::Display<'_>
+- virtualize(self) -> VirtualRoot<Marker>
+- strict_symlink<P: AsRef<Path>>(&self, link_path: P) -> io::Result<()>
+- strict_hard_link<P: AsRef<Path>>(&self, link_path: P) -> io::Result<()>
+- read_dir(&self) -> io::Result<std::fs::ReadDir>
+- remove_dir(&self) -> io::Result<()>
+- remove_dir_all(&self) -> io::Result<()>
+
+StrictPath<Marker>
+Note: `.unstrict()` is an explicit escape hatch. Interop doesn’t require it — prefer `.interop_path()`; use `.unstrict()` only when an owned `PathBuf` is strictly required.
+- with_boundary<P: AsRef<Path>>(dir_path: P) -> Result<Self>  // sugar; directory must exist
+- with_boundary_create<P: AsRef<Path>>(dir_path: P) -> Result<Self>  // sugar; creates directory if missing
+- unstrict(self) -> PathBuf  // consumes — escape hatch (avoid)
+- virtualize(self) -> VirtualPath<Marker>  // upgrade to virtual view (UI ops)
+- try_into_boundary(self) -> Result<PathBoundary<Marker>>
+- try_into_boundary_create(self) -> Result<PathBoundary<Marker>>
+- interop_path(&self) -> &OsStr  // third-party `AsRef<Path>` adapters only
+- strictpath_display(&self) -> std::path::Display<'_>
+- strict_join<P: AsRef<Path>>(&self, candidate_path: P) -> Result<Self>
+- strictpath_parent(&self) -> Result<Option<Self>>
+- strictpath_with_file_name<S: AsRef<OsStr>>(&self, file_name: S) -> Result<Self>
+- strictpath_with_extension<S: AsRef<OsStr>>(&self, extension: S) -> Result<Self>
+- strict_rename<P: AsRef<Path>>(&self, dest: P) -> io::Result<()>
+- strict_copy<P: AsRef<Path>>(&self, dest: P) -> io::Result<u64>
+- strict_symlink<P: AsRef<Path>>(&self, link_path: P) -> io::Result<()>
+- strict_hard_link<P: AsRef<Path>>(&self, link_path: P) -> io::Result<()>
+- strictpath_file_name(&self) -> Option<&OsStr>
+- strictpath_file_stem(&self) -> Option<&OsStr>
+- strictpath_extension(&self) -> Option<&OsStr>
+- strictpath_starts_with<P: AsRef<Path>>(&self, p: P) -> bool
+- strictpath_ends_with<P: AsRef<Path>>(&self, p: P) -> bool
+- exists(&self) -> bool
+- is_file(&self) -> bool
+- is_dir(&self) -> bool
+- metadata(&self) -> io::Result<std::fs::Metadata>
+- read_dir(&self) -> io::Result<std::fs::ReadDir>
+- read_to_string(&self) -> io::Result<String>
+- read(&self) -> io::Result<Vec<u8>>
+- write<C: AsRef<[u8]>>(&self, data: C) -> io::Result<()>
+- create_file(&self) -> io::Result<std::fs::File>
+- open_file(&self) -> io::Result<std::fs::File>
+- create_dir(&self) -> io::Result<()>
+- create_dir_all(&self) -> io::Result<()>
+- create_parent_dir(&self) -> io::Result<()>
+- create_parent_dir_all(&self) -> io::Result<()>
+- remove_file(&self) -> io::Result<()>
+- remove_dir(&self) -> io::Result<()>
+- remove_dir_all(&self) -> io::Result<()>
+
+VirtualRoot<Marker>
+- change_marker<NewMarker>(self) -> VirtualRoot<NewMarker>
+- try_new<P: AsRef<Path>>(root_path: P) -> Result<Self>
+- try_new_create<P: AsRef<Path>>(root_path: P) -> Result<Self>
+- virtual_join<P: AsRef<Path>>(&self, candidate_path: P) -> Result<VirtualPath<Marker>>
+- into_virtualpath(self) -> Result<VirtualPath<Marker>>  // convert root into virtual path (directory must exist)
+- metadata(&self) -> io::Result<std::fs::Metadata>
+- virtual_symlink<P: AsRef<Path>>(&self, link_path: P) -> io::Result<()>
+- virtual_hard_link<P: AsRef<Path>>(&self, link_path: P) -> io::Result<()>
+- interop_path(&self) -> &OsStr  // third-party `AsRef<Path>` adapters only
+- exists(&self) -> bool
+- as_unvirtual(&self) -> &PathBoundary<Marker>
+- unvirtual(self) -> PathBoundary<Marker>
+- read_dir(&self) -> io::Result<std::fs::ReadDir>
+- remove_dir(&self) -> io::Result<()>
+- remove_dir_all(&self) -> io::Result<()>
+
+VirtualPath<Marker>
+- with_root<P: AsRef<Path>>(root: P) -> Result<Self>  // sugar; root must exist
+- with_root_create<P: AsRef<Path>>(root: P) -> Result<Self>  // sugar; creates root if missing
+- change_marker<NewMarker>(self) -> VirtualPath<NewMarker>  // transform marker after authorization
+- unvirtual(self) -> StrictPath<Marker>  // downgrade to system-facing view when ownership is needed
+- as_unvirtual(&self) -> &StrictPath<Marker> // borrow the underlying strict path for system-facing related operations
+- interop_path(&self) -> &OsStr // for APIs that accept AsRef<Path>
+- virtual_join<P: AsRef<Path>>(&self, path: P) -> Result<Self>
+- virtualpath_parent(&self) -> Result<Option<Self>>
+- virtualpath_with_file_name<S: AsRef<OsStr>>(&self, file_name: S) -> Result<Self>
+- virtualpath_with_extension<S: AsRef<OsStr>>(&self, extension: S) -> Result<Self>
+- virtual_rename<P: AsRef<Path>>(&self, dest: P) -> io::Result<()>
+- virtual_copy<P: AsRef<Path>>(&self, dest: P) -> io::Result<u64>
+- create_file(&self) -> io::Result<std::fs::File>
+- open_file(&self) -> io::Result<std::fs::File>
+- virtual_symlink<P: AsRef<Path>>(&self, link_path: P) -> io::Result<()>
+- virtual_hard_link<P: AsRef<Path>>(&self, link_path: P) -> io::Result<()>
+- symlink_metadata(&self) -> io::Result<std::fs::Metadata>  // metadata without following symlinks
+- virtualpath_file_name(&self) -> Option<&OsStr>
+- virtualpath_file_stem(&self) -> Option<&OsStr>
+- virtualpath_extension(&self) -> Option<&OsStr>
+- virtualpath_starts_with<P: AsRef<Path>>(&self, p: P) -> bool
+- virtualpath_ends_with<P: AsRef<Path>>(&self, p: P) -> bool
+- virtualpath_display(&self) -> VirtualPathDisplay<'_, Marker>  // explicit display method
+- try_into_root(self) -> Result<VirtualRoot<Marker>>
+- try_into_root_create(self) -> Result<VirtualRoot<Marker>>
+- read_dir(&self) -> io::Result<std::fs::ReadDir>
+- exists / is_file / is_dir / metadata / read_to_string / read / write / create_file / open_file / create_dir / create_dir_all / create_parent_dir / create_parent_dir_all / remove_file / remove_dir / remove_dir_all (delegates to `StrictPath`; parents derived via virtual semantics)
+
+### Feature-gated APIs
+
+- Feature `virtual-path`
+	- Types: `VirtualRoot`, `VirtualPath`
+	- Methods: All `virtual_*` and `virtualpath_*` operations, conversions to/from `VirtualRoot`/`VirtualPath`, and `StrictPath::virtualize()`
+	- When not enabled: Only `PathBoundary`/`StrictPath` are available; all I/O remains available on `StrictPath`.
+
+### Ecosystem Integration (Composition Pattern)
+
+**Philosophy**: strict-path provides security primitives. You compose them with ecosystem tools.
+
+Instead of feature-gated wrappers, use ecosystem crates directly with `PathBoundary`:
+
+**Temporary Directories** (`tempfile` crate):
+```rust
+let temp = tempfile::tempdir()?;
+let boundary = PathBoundary::try_new(temp.path())?;
+// RAII cleanup from tempfile, security from strict-path
+```
+
+**OS Standard Directories** (`dirs` crate):
+```rust
+let config_base = dirs::config_dir().ok_or("No config")?;
+let boundary = PathBoundary::try_new_create(config_base.join("myapp"))?;
+```
+
+**Portable App Paths** (`app-path` crate):
+```rust
+use app_path::AppPath;
+let app_path = AppPath::with("config");  // Relative to executable directory
+let boundary = PathBoundary::try_new_create(&app_path)?;
+```
+
+**Serialization** (`serde`):
+- Runtime `Cli`/`Config` structs hold typed `PathBoundary<Marker>` /
+  `VirtualRoot<Marker>` fields. **Never raw `PathBuf`.** The typed field IS the
+  ingestion boundary.
+- `FromStr` forwards to `try_new_create` (creates if missing, then canonicalizes
+  and validates). clap `#[arg]` fields of the typed form work directly via
+  `FromStr`.
+- Boundary/root types do not implement `Deserialize`. Serde wiring is a
+  user-side integration choice (serde's own `deserialize_with`, `serde_with`,
+  or user-defined wrappers).
+- In hand-written code, prefer named constructors (`try_new` / `try_new_create`)
+  over `.parse()` so policy is visible at the call site.
+- Serialize paths as display strings: `boundary.strictpath_display().to_string()`.
+- Untrusted per-request path strings (filenames, archive entries, HTTP body
+  fields) stay as `String` and are validated via `boundary.strict_join()` at the
+  use site — those are not `FromStr` input.
+
+See the mdBook [Ecosystem Integration Guide](https://dk26.github.io/strict-path-rs/ecosystem_integration.html) for comprehensive patterns.
+
+Short usage rules (1-line each)
+- For user input: use `VirtualPath::virtual_join(...)` (construct a root via `VirtualPath::with_root(..)`) -> `VirtualPath`.
+- For I/O: use either `VirtualPath` or `StrictPath` (both support I/O). Call `.unvirtual()` only when you need a `StrictPath` explicitly.
+- Do not bypass: never call std fs ops on raw `Path`/`PathBuf` built from untrusted input.
+- Marker types prevent mixing distinct path boundaries at compile time: use when you have multiple storage areas.
+- No type in this crate implements `AsRef<Path>`. When an unavoidable third-party API expects `AsRef<Path>`, pass `.interop_path()` — it returns `&OsStr` which satisfies `AsRef<Path>`.
+- Interop doesn't require `.unstrict()`: prefer `.interop_path()` for those third-party adapters; call `.unstrict()` only when an owned `PathBuf` is strictly required.
+- `.interop_path()` returns `&OsStr` — never wrap it in `Path::new()` to use `Path::join`/`parent`; that bypasses all security. Use `strict_*` / `virtual_*` operations instead.
+	clamping or path boundary checks. Use `strict_join` / `virtualpath_parent` instead.
+ - Do not convert `StrictPath` -> `VirtualPath` just to print; for UI flows start with `VirtualPath::with_root(..).virtual_join(..)` and keep a `VirtualPath`.
+ - **ANTI-PATTERN**: Never use `.interop_path().to_string_lossy()` for display purposes. Use proper display methods instead:
+	 - `PathBoundary`/`StrictPath`: use `strictpath_display()`
+	 - `VirtualPath`: use `virtualpath_display()`
+	 - `VirtualRoot`: `Display` trait shows `"/"` (user-facing); for real system path use `vroot.as_unvirtual().strictpath_display()`
+	 - Reserve `interop_path()` only for external API interop that requires `AsRef<Path>`.
+
+Parent directory helpers (semantics)
+- create_parent_dir: non-recursive; creates only the immediate parent; errors if grandparents are missing; Ok(()) at restriction/virtual root.
+- create_parent_dir_all: recursive; creates the full chain up to the immediate parent; Ok(()) at restriction/virtual root.
+- VirtualPath parent helpers act in the virtual dimension (use `virtualpath_parent()`), then perform I/O on the underlying strict system path.
+ 
+Naming rationale (quick scan aid)
+- We name methods by their dimension so intent is obvious at a glance.
+- std `Path::join(..)` or `p.join(..)`: unsafe join (can escape); avoid on untrusted inputs.
+- `PathBoundary::strict_join(..)` / `StrictPath::strict_join(..)`: safe, validated strict path join.
+- `VirtualPath::virtual_join(..)`: safe, clamped virtual-path join (create a root via `VirtualPath::with_root(..)`).
+- This applies to other operations too: `*_parent`, `*_with_file_name`, `*_with_extension`, `*_starts_with`, `*_ends_with`, etc. Shortened names apply only to `*_join`.
+The explicit names make intent obvious even when types aren’t visible.
+ - For directory creation, `create_` = non-recursive, `*_all` = recursive (matches std `std::fs` semantics). Parent helpers mirror this.
+ - Switching views: typically stay within one dimension (virtual or system). For edge cases, upgrade with `.virtualize()` or downgrade with `.unvirtual()` to access the other dimension’s operations.
+
+**Critical: Absolute Path Join Behavior**
+- `std::path::Path::join("/absolute")`: DANGEROUS — replaces the base path entirely, enabling traversal.
+- `StrictPath::strict_join("/absolute")`: SECURE — validates the result stays within the restriction boundary; errors if it would escape.
+- `VirtualPath::virtual_join("/absolute")`: SECURE — interprets the path as absolute in the VIRTUAL namespace and replaces the current virtual path with that virtual-absolute. The resulting strict path is resolved under the same `VirtualRoot` (e.g., joining `/etc/passwd` yields a virtual `/etc/passwd` backed by `<virtual_root>/etc/passwd`). Any `..` that would go above the virtual root is clamped at the virtual root.
+
+This difference makes `std::path::Path::join` the #1 source of path traversal vulnerabilities, while our types make such attacks impossible.
+
+Display
+- Use `vpath.virtualpath_display()` for user-facing virtual paths (e.g., "/a/b.txt").
+- For system-facing logs and diagnostics, use `spath.strictpath_display()` or `vpath.as_unvirtual().strictpath_display()`.
+
+Separator normalization (platform specifics)
+- Windows: `virtualpath_display()` normalizes `\` to `/` and ensures a leading `/`.
+- Unix: backslashes are not path separators; they are preserved as literal characters. A leading `/` is ensured.
+
+Equality/Ordering/Hashing
+- `PathBoundary<Marker>` and `VirtualRoot<Marker>` compare/hash by canonicalized restriction root path and marker.
+- `VirtualPath` compares, orders, and hashes by its inner strict path, identical to `StrictPath`, including the marker type.
+- Cross-type equality is supported: `VirtualPath<Marker> == StrictPath<Marker>` compares underlying strict paths. Borrow via `.as_unvirtual()` when needed.
+
+## Traits at a glance
+- PathBoundary<Marker>
+	- Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash
+	- FromStr (when `Marker: Default`) → constructs from an existing directory (calls `try_new`; does not create)
+	- Cross-type equality: PartialEq<VirtualRoot<Marker>>, PartialEq<Path>, PartialEq<PathBuf>, PartialEq<&Path>
+	- No `AsRef<Path>` / `Deref`: pass `.interop_path()` (`&OsStr`) to third-party APIs that want `AsRef<Path>`.
+
+- VirtualRoot<Marker>
+	- Clone, Debug, Display, Eq, PartialEq, Ord, PartialOrd, Hash
+	- FromStr (when `Marker: Default`) → constructs from an existing directory (calls `try_new`; does not create)
+	- Cross-type equality: PartialEq<PathBoundary<Marker>>, PartialEq<Path>, PartialEq<PathBuf>, PartialEq<&Path>
+	- No `AsRef<Path>` / `Deref`: use `.interop_path()` for third-party APIs.
+
+- StrictPath<Marker>
+	- Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash
+	- Cross-type equality: PartialEq<VirtualPath<Marker>>, PartialEq<T: AsRef<Path>>
+	- No AsRef<Path>; use `interop_path()` when needed
+	- [feature serde] Serialize → system path string
+
+- VirtualPath<Marker>
+	- Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash
+	- Cross-type equality: PartialEq<StrictPath<Marker>>, PartialEq<T: AsRef<Path>> (compares virtual representation)
+	- No Display (use `virtualpath_display()` wrapper); No AsRef<Path>
+	- [feature serde] Serialize → rooted virtual string (e.g., "/a/b.txt")
+
+## Pitfalls (And How To Avoid)
+- Do not expose raw `Path`/`PathBuf` from `StrictPath`/`VirtualPath`. We do not implement `AsRef<Path>`. Prefer crate I/O or `.interop_path()` where `AsRef<Path>` is accepted, or explicit escape hatches when unavoidable.
+- Use restriction-aware joins/parents; never wrap `.interop_path()` in `Path::new()` to use std path operations.
+- Virtual strings are rooted. Use `virtualpath_display()` for UI/logging.
+- Use `PathBoundary::try_new_create(..)` when the restriction directory might not exist.
+- Symlinks/junctions to outside: paths that traverse a symlink or junction inside the restriction to a location outside the restriction are rejected at validation time with `StrictPathError::PathEscapesBoundary`.
+
+Common anti-patterns (LLM quick check)
+- Passing strings to `AsRef<Path>`-only APIs: avoid. Use crate I/O helpers or explicit escape hatches; for `AsRef<Path>`-accepting APIs, use `.interop_path()`.
+- Converting `StrictPath` -> `VirtualPath` only for display: **ANTI-PATTERN** `strict_path.clone().virtualize()` for virtual display - if you need virtual semantics, start with `VirtualRoot`/`VirtualPath` from the beginning.
+- Wrapping `.interop_path()` in `Path::new()` to use `Path::join`/`Path::parent`: use `strict_*` / `virtual_*` operations instead.
+- Forcing ownership: avoid `.into_owned()` on `Cow` unless an owned `String` is required.
+- Bare `{}` in format strings: prefer captured identifiers like `"{path}"` (bind a short local if needed).
+
+
+---

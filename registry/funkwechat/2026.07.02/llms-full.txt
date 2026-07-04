@@ -1,0 +1,303 @@
+# README.md
+
+Source: https://github.com/shinynito/funkwechat/blob/master/README.md
+
+FunkWechat v2
+=============
+
+强类型、链式、无兼容层的微信 SDK。
+
+> v2 是一次性重构版本，不兼容 v1 API。
+
+特性
+----
+- 强类型链式请求：`Request[T](client).Path(...).Post(ctx)`
+- 统一核心内核：请求执行、上传、微信错误解码、token 管理
+- Token 刷新去重：并发场景下单飞（singleflight-style）
+- 默认支持 query 脱敏日志
+
+AccessToken 并发刷新策略（防竞态 / 防 API 风暴）
+----
+FunkWechat `core.TokenManager` 已内置单机并发去重能力，核心点如下：
+
+- 缓存优先：`GetToken` 先读缓存，命中直接返回。
+- 双检缓存：进入刷新逻辑后再次读缓存，避免竞争窗口重复刷新。
+- 单飞去重：进程内通过 `mu + inflight` 合并并发刷新，多个 goroutine 只会触发一次上游 token 请求。
+- 提前过期：默认 `expireBufferSeconds = 300`，减少 token 临界过期造成的瞬时并发刷新。
+- 可取消等待：等待中的请求遵循 `context.Context`，避免无限阻塞。
+
+可参考：
+
+- `core/token_manager.go`
+- `core/token_manager_test.go`（`TestTokenManagerSingleflight` 验证 10 并发仅 1 次 fetch）
+
+多实例部署（K8s/多 Pod）建议
+----
+`TokenManager` 的单飞范围是“单进程”。如果有多个实例，建议在刷新入口增加分布式锁，避免跨实例 thundering herd：
+
+1. 先查共享缓存（Redis）。
+2. 未命中时尝试加锁（`SET lockKey val NX PX 5000`）。
+3. 获锁后再查一次缓存（double-check），仍未命中才 `RefreshToken`。
+4. 未获锁实例短暂退避后轮询缓存，不直接打微信刷新接口。
+5. 刷新失败做指数退避，避免失败风暴。
+
+示例（伪代码）：
+
+```go
+func GetTokenClusterSafe(
+	ctx context.Context,
+	tm core.AccessTokenProvider,
+	cache core.Cache,
+	lock DistLock,
+	cacheKey string,
+	lockKey string,
+) (string, error) {
+	if t, ok := cache.Get(ctx, cacheKey); ok {
+		return t, nil
+	}
+
+	locked, unlock, err := lock.TryLock(ctx, lockKey, 5*time.Second)
+	if err != nil {
+		return "", err
+	}
+	if locked {
+		defer unlock()
+		if t, ok := cache.Get(ctx, cacheKey); ok {
+			return t, nil
+		}
+		return tm.RefreshToken(ctx)
+	}
+
+	// 未拿到锁：等待持锁者刷新后从缓存读取，避免直接冲击上游接口。
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if t, ok := cache.Get(ctx, cacheKey); ok {
+			return t, nil
+		}
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(80 * time.Millisecond):
+		}
+	}
+	return "", fmt.Errorf("token refresh in progress, cache not ready")
+}
+```
+
+安装
+----
+```bash
+go get github.com/ShinyNito/FunkWechat/v2
+```
+
+小程序示例
+----
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/ShinyNito/FunkWechat/v2/miniprogram"
+)
+
+func main() {
+	client, err := miniprogram.New(miniprogram.Config{
+		AppID:     "your-appid",
+		AppSecret: "your-secret",
+	})
+	if err != nil {
+		panic(err)
+	}
+
+	session, err := client.Code2Session(context.Background(), miniprogram.Code2SessionRequest{
+		JSCode: "login-code",
+	})
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println(session.OpenID)
+
+	type SendResp struct {
+		MsgID int `json:"msgid"`
+	}
+	sendResp, err := miniprogram.Request[SendResp](client).
+		Path("/cgi-bin/message/send").
+		Body(map[string]any{"touser": "openid"}).
+		Post(context.Background())
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println(sendResp.MsgID)
+}
+```
+
+小程序解密用户敏感数据示例（encryptedData + iv）
+----
+对于历史流程或特定场景（前端传 `encryptedData` / `iv`），可以用 `core/utils.DecryptUserData` 解密。
+
+> 说明：如果你使用的是新版手机号能力，优先使用 `GetPhoneNumber`。下面示例是“拿到加密载荷后如何在服务端解密”。
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/ShinyNito/FunkWechat/v2/core/utils"
+	"github.com/ShinyNito/FunkWechat/v2/miniprogram"
+)
+
+type DecryptedPhone struct {
+	PhoneNumber     string `json:"phoneNumber"`
+	PurePhoneNumber string `json:"purePhoneNumber"`
+	CountryCode     string `json:"countryCode"`
+	Watermark       struct {
+		AppID     string `json:"appid"`
+		Timestamp int64  `json:"timestamp"`
+	} `json:"watermark"`
+}
+
+func DecryptPhoneNumber(
+	ctx context.Context,
+	client *miniprogram.Client,
+	jsCode string,
+	encryptedData string,
+	iv string,
+) (string, error) {
+	// 1) 先换取 session_key
+	session, err := client.Code2Session(ctx, miniprogram.Code2SessionRequest{JSCode: jsCode})
+	if err != nil {
+		return "", fmt.Errorf("code2session: %w", err)
+	}
+
+	// 2) 用 session_key + encryptedData + iv 解密
+	data, err := utils.DecryptUserData[DecryptedPhone](session.SessionKey, encryptedData, iv)
+	if err != nil {
+		return "", fmt.Errorf("decrypt user data: %w", err)
+	}
+
+	// 3) 建议校验 watermark.appid，防止跨应用数据误用
+	if data.Watermark.AppID != client.Config().AppID {
+		return "", fmt.Errorf("invalid watermark appid: %s", data.Watermark.AppID)
+	}
+
+	return data.PhoneNumber, nil
+}
+```
+
+公众号示例
+----
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/ShinyNito/FunkWechat/v2/officialaccount"
+)
+
+func main() {
+	client, err := officialaccount.New(officialaccount.Config{
+		AppID:     "your-appid",
+		AppSecret: "your-secret",
+	})
+	if err != nil {
+		panic(err)
+	}
+
+	ticket, err := client.GetTicket(context.Background(), officialaccount.GetTicketRequest{})
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println(ticket)
+
+	sign, err := client.GetJssdkSign(context.Background(), officialaccount.JssdkSignRequest{
+		URL: "https://example.com/page#hash",
+	})
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println(sign.Signature)
+}
+```
+
+公众号回调验签示例（VerifySignature / VerifyMsgSignature）
+----
+FunkWechat 在 `core/utils` 提供了微信签名校验工具，可用于验证回调来源真实性。
+
+1. URL 接入校验（GET）：使用 `VerifySignature(signature, timestamp, nonce, token)`。
+2. 安全模式消息回调（POST）：使用 `VerifyMsgSignature(msg_signature, timestamp, nonce, token, encryptedMsg)`。
+
+```go
+package main
+
+import (
+	"encoding/xml"
+	"io"
+	"net/http"
+
+	"github.com/ShinyNito/FunkWechat/v2/core/utils"
+)
+
+const verifyToken = "your-wechat-token"
+
+// 1) 微信服务器接入校验：GET /wechat/callback?signature=...&timestamp=...&nonce=...&echostr=...
+func HandleWechatVerify(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	signature := q.Get("signature")
+	timestamp := q.Get("timestamp")
+	nonce := q.Get("nonce")
+	echostr := q.Get("echostr")
+
+	if !utils.VerifySignature(signature, timestamp, nonce, verifyToken) {
+		http.Error(w, "invalid signature", http.StatusUnauthorized)
+		return
+	}
+
+	// 验签通过后按微信要求原样返回 echostr
+	_, _ = w.Write([]byte(echostr))
+}
+
+type callbackEnvelope struct {
+	XMLName xml.Name `xml:"xml"`
+	Encrypt string   `xml:"Encrypt"`
+}
+
+// 2) 安全模式消息回调验签：POST /wechat/callback?msg_signature=...&timestamp=...&nonce=...
+func HandleWechatMessage(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	msgSignature := q.Get("msg_signature")
+	timestamp := q.Get("timestamp")
+	nonce := q.Get("nonce")
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "read body failed", http.StatusBadRequest)
+		return
+	}
+
+	var env callbackEnvelope
+	if err := xml.Unmarshal(body, &env); err != nil {
+		http.Error(w, "invalid xml", http.StatusBadRequest)
+		return
+	}
+
+	if !utils.VerifyMsgSignature(msgSignature, timestamp, nonce, verifyToken, env.Encrypt) {
+		http.Error(w, "invalid msg signature", http.StatusUnauthorized)
+		return
+	}
+
+	// 这里再继续做解密和业务处理
+	w.WriteHeader(http.StatusOK)
+}
+```
+
+许可证
+------
+MIT
+
+---

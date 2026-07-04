@@ -1,0 +1,289 @@
+# embedded-build-tools
+
+Source: https://github.com/hxyulin/embedded-build-tools/blob/main/README.md
+
+# embedded-build-tools
+
+Reusable building blocks for **bare-metal Rust kernel build pipelines** —
+the parts Cargo and the wider ecosystem don't cover out of the box,
+packaged as a library you drive from a [`cargo xtask`][xtask] rather than
+from a bespoke build system.
+
+```toml
+[dependencies]
+embedded-build-tools = { version = "0.1", features = ["image", "qemu", "cargobuild"] }
+```
+
+## Philosophy
+
+Modern bare-metal Rust is well served by Cargo plus a few nightly
+features:
+
+- **Sysroots** → `-Z build-std`
+- **Two-triple bootloader/kernel handoff** → `-Z bindeps` (artifact
+  dependencies)
+- **Per-crate linker scripts / cfgs** → a crate's own `build.rs`
+- **Running in QEMU** → the `runner` key in `.cargo/config.toml`
+
+What's left over is glue: assembling a bootable disk image, launching
+QEMU with the right firmware, Kconfig-style options. That glue has to
+live *somewhere* — but it doesn't need a whole build system wrapped
+around it. `embedded-build-tools` is that glue as a plain library, so
+your build orchestration can stay an ordinary `cargo xtask`.
+
+Every tool is a **primitive**: given an explicit spec and an output path,
+do one well-defined thing and report what happened. There is no build
+graph, no cache, and no config-file format baked in — those belong to the
+caller.
+
+## Tools
+
+Each sits behind a cargo feature so you only compile what you use.
+
+| Feature | Status | What it does |
+|---|---|---|
+| `image` | ✅ available | Assemble bootable disk images: flat FAT32 and MBR-partitioned disks (ESP, raw boot-sector writes, auto-sizing). |
+| `qemu` | ✅ available | Build a QEMU command line, discover OVMF firmware, and launch the guest with a timeout and Ctrl-C teardown. |
+| `cargobuild` | ✅ available | Drive `cargo`, resolve the real artifact paths it produces from the JSON message stream, and convert ELF → flat binary with objcopy. |
+| `kconfig` | 🚧 planned | Kconfig-style typed configuration options (ranges, dependencies, presets). |
+
+## Example: assemble an ESP
+
+```rust
+use std::path::PathBuf;
+use embedded_build_tools::image::{
+    DiskImage, EntrySource, FileEntry, FsType, Layout,
+};
+
+let image = DiskImage {
+    name: "boot".into(),
+    size_mb: None, // auto-size, 64 MiB floor
+    layout: Layout::Flat {
+        fs_type: FsType::Fat32,
+        entries: vec![FileEntry {
+            dest_path: "/EFI/BOOT/BOOTX64.EFI".into(),
+            source: EntrySource::File { path: PathBuf::from("target/bootloader.efi") },
+        }],
+    },
+};
+
+let report = embedded_build_tools::image::build(&image, "disk.img".as_ref())?;
+print!("{}", report.log);
+# Ok::<(), embedded_build_tools::Error>(())
+```
+
+For a hybrid BIOS+UEFI disk, use `Layout::Partitioned` with an MBR table,
+an ESP partition, and a `RawWrite` supplying the boot sector at LBA 0.
+
+## Example: boot a kernel under QEMU
+
+```rust
+use std::path::PathBuf;
+use embedded_build_tools::qemu::{self, Boot, PathCheck, QemuConfig};
+
+// Pick a binary from the target triple, or set one explicitly.
+let binary = qemu::default_binary_for_target("x86_64-unknown-none")?;
+
+let mut config = QemuConfig::new(binary, Boot::Direct {
+    kernel: PathBuf::from("target/x86_64-unknown-none/debug/my-kernel"),
+});
+config.memory_mb = 512;
+config.timeout = Some(std::time::Duration::from_secs(30)); // for CI
+
+let command = qemu::build_command(&config, PathCheck::Skip)?; // Skip: dry-run
+println!("{}", command.to_shell());   // dry-run: print the argv
+// let status = command.spawn_and_wait()?;   // or actually launch it
+# Ok::<(), embedded_build_tools::Error>(())
+```
+
+For UEFI, discover firmware with `qemu::discover_ovmf(...)` and pass the
+resulting `Ovmf` into `Boot::Uefi { ovmf, drive }`.
+
+## Example: build a kernel and resolve its artifact
+
+Cargo builds bare-metal crates fine — what it won't tell you is *where*
+the output landed (the path has a content hash you can't predict). Ask
+it, by reading the JSON message stream:
+
+```rust
+use embedded_build_tools::cargobuild::{self, CargoBuild, Profile};
+
+let spec = CargoBuild {
+    package: Some("my-kernel".into()),
+    target: Some("x86_64-unknown-none".into()),
+    profile: Profile::Release,
+    ..CargoBuild::new()
+};
+
+let output = cargobuild::run(&spec)?;        // spawns cargo, parses artifacts
+let kernel = output.executable()?;           // the real, on-disk path
+
+// …which drops straight into the QEMU primitive:
+// QemuConfig::new(binary, Boot::Direct { kernel: kernel.to_path_buf() })
+# Ok::<(), embedded_build_tools::Error>(())
+```
+
+This is the seam the three features share: `cargobuild` resolves the
+path, `image` stages it onto a disk (or `qemu` boots it directly). For a
+bare-metal integration test, use `Subcommand::TestNoRun` — its
+`executable` is the test harness binary you boot under QEMU with an
+`isa-debug-exit` device. The sysroot itself still comes from `-Z
+build-std` in `.cargo/config.toml`; `cargobuild` runs the build, it
+doesn't replace Cargo.
+
+## Runnable example
+
+[`examples/hello-boot`](examples/hello-boot) is a complete `cargo xtask`
+project that boots a "hello world" two ways, wiring all three features
+together:
+
+```sh
+cd examples/hello-boot
+cargo xtask uefi              # cargobuild → image → qemu: a UEFI app on an ESP, booted by OVMF
+cargo xtask bios              # image → qemu: a NASM boot sector on an MBR disk, booted by SeaBIOS
+cargo xtask uefi --dry-run    # build + assemble, then print the QEMU argv instead of launching
+```
+
+It doubles as a template for adapting the primitives to a real kernel —
+see its [README](examples/hello-boot/README.md).
+
+## Provenance
+
+These tools were extracted from [Gluon][gluon], a from-scratch bare-metal
+build system, once `-Z build-std` and `-Z bindeps` matured enough that a
+full rustc-driving build system was no longer worth maintaining. The
+image, QEMU, artifact-resolution, and Kconfig subsystems were the parts
+that pulled their weight independently of the build graph — so they live
+on here as composable libraries. (`cargobuild` keeps only the half of
+Gluon's build-std work that Cargo still doesn't do for you: parsing the
+artifact stream to learn where outputs landed.)
+
+## License
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
+[MIT license](LICENSE-MIT) at your option. Unless you explicitly state
+otherwise, any contribution intentionally submitted for inclusion in this
+crate, as defined in the Apache-2.0 license, shall be dual licensed as
+above, without any additional terms or conditions.
+
+[xtask]: https://github.com/matklad/cargo-xtask
+[gluon]: https://github.com/hxyulin/gluon
+
+---
+
+# embedded-build-tools
+
+Source: https://github.com/hxyulin/embedded-build-tools/blob/main/CLAUDE.md
+
+# embedded-build-tools
+
+## Overview
+
+`embedded-build-tools` is a library of building blocks for bare-metal
+Rust kernel build pipelines: bootable disk-image assembly (FAT32/ESP/MBR),
+QEMU launching, Kconfig-style options, and `build-std`/metadata helpers.
+
+It is **not** a build system. The expected consumer is a `cargo xtask`
+(or a `build.rs`) that owns scheduling, incrementality, and configuration,
+and calls into these tools for the specific jobs Cargo doesn't do. Each
+tool is a primitive: given an explicit spec and an output path, do one
+well-defined thing and report what happened — no build graph, no cache,
+no config-file format baked in.
+
+It is a host-side userland library, so it has no `no_std` or
+zero-dependency constraints; mature crates (`hadris-fat`, `walkdir`,
+`thiserror`, `serde`) are used where they pull their weight.
+
+This crate was harvested from [Gluon](https://github.com/hxyulin/gluon),
+a from-scratch build system, after `-Z build-std` and `-Z bindeps`
+matured enough that the full build system was no longer worth
+maintaining.
+
+## Collaboration Instructions
+
+1. **Always ask for clarification rather than assuming intent.** If a
+   request is vague, ambiguous, or appears incorrect, stop and ask
+   before acting.
+2. **Consider multiple approaches.** Surface better options if they
+   exist — explain the trade-offs rather than silently picking one.
+3. **Be educational.** Offer brief explanations of *why* an approach is
+   preferred, especially around on-disk formats and toolchain quirks.
+4. **Plan before you build.** Discuss design, edge cases, and integration
+   points before writing code.
+
+## Engineering Guidelines
+
+1. **Stay a library of primitives.** Resist growing a build graph, a
+   cache, or a config format inside these tools — that belongs to the
+   consuming xtask. Each entry point takes an explicit spec and a path.
+2. **Stay kernel-agnostic.** No assumptions about a specific kernel,
+   bootloader, or boot protocol. The caller supplies concrete paths and
+   bytes.
+3. **Feature-gate every tool.** A consumer that only assembles images
+   must not compile the QEMU launcher. Shared pieces (the error type)
+   stay unconditional and small.
+4. **Determinism first.** Identical inputs must produce byte-identical
+   outputs: stable iteration order (sort directory walks), no reliance
+   on filesystem ordering or `HashMap` iteration.
+5. **Minimize `unsafe`.** This is a host tool; `unsafe` is forbidden at
+   the crate root (`#![forbid(unsafe_code)]`). Keep it that way.
+6. **Surface errors with context.** Every error names the offending
+   image, partition, entry, or path. Anonymous errors are bugs.
+7. **Document intent, not mechanics.** Comments explain *why* — on-disk
+   layout choices, the FAT label trick, the LBA-vs-byte boundary —
+   where the "what" is obvious but the "why" is not.
+
+## Testing
+
+- `cargo test --features image` — unit + end-to-end image tests (real
+  FAT32 formatting and MBR stamping against temp files).
+- `cargo clippy --all-features --all-targets` — must be clean.
+- Byte-level assertions for deterministic structures (MBR); structural
+  assertions (size, signature, progress log) for FAT contents.
+
+---
+
+# Contributing
+
+Source: https://github.com/hxyulin/embedded-build-tools/blob/main/CONTRIBUTING.md
+
+# Contributing
+
+Thanks for your interest in `embedded-build-tools`.
+
+## Ground rules
+
+- **It's a library of primitives, not a build system.** New code takes an
+  explicit spec and an output path, does one job, and reports what
+  happened. If a change wants a build graph, a cache, or a config-file
+  format, that logic belongs in the consuming `xtask`, not here.
+- **Feature-gate new tools.** A new subsystem (e.g. `gpt`, `ext4`) goes
+  behind its own cargo feature so consumers compile only what they use.
+- **Determinism is a hard requirement.** Identical inputs must produce
+  byte-identical outputs. Sort directory walks; never depend on
+  filesystem or `HashMap` iteration order.
+- **Errors must name the offender.** Every error points at a specific
+  image, partition, entry, or path.
+- **`unsafe` is forbidden** at the crate root. Keep it that way.
+
+## Before you open a PR
+
+```sh
+cargo test --all-features
+cargo clippy --all-features --all-targets   # must be clean
+cargo fmt --all
+```
+
+Add a `CHANGELOG.md` entry under `[Unreleased]` describing the change.
+
+## Commit messages
+
+Conventional-commit style (`feat:`, `fix:`, `docs:`, `test:`, `refactor:`)
+with a scope where it helps (`feat(image): GPT partition tables`).
+
+## License
+
+By contributing you agree your work is dual licensed under the MIT and
+Apache-2.0 licenses, without any additional terms or conditions.
+
+---

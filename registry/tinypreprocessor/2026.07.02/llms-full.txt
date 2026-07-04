@@ -1,0 +1,1583 @@
+# TinyPreprocessor
+
+Source: https://github.com/dsisco11/tinypreprocessor/blob/master/README.md
+
+# TinyPreprocessor
+
+A lightweight, extensible preprocessing library for .NET that resolves dependencies, merges resources, and generates source maps.
+
+## Features
+
+- **Dependency Resolution** – Recursively resolves resource dependencies with cycle detection
+- **Source Maps** – Generates mappings from output positions back to original sources
+- **Extensible** – Bring your own directive parser, resource resolver, and merge strategy
+- **Diagnostics** – Comprehensive error collection with "continue on error" support
+- **Thread-Safe** – Concurrent `ProcessAsync` calls with isolated state
+
+## Installation
+
+```bash
+dotnet add package TinyPreprocessor
+```
+
+## Requirements
+
+- .NET 8+ (TinyPreprocessor targets `net8.0`)
+
+## Quick Start
+
+TinyPreprocessor is a small pipeline that:
+
+1. Parses directives from each resource.
+2. Uses `IDirectiveModel<TDirective>` to decide which directives represent dependencies (and where they are).
+3. Resolves dependencies via `IResourceResolver<TContent>` (building a dependency graph).
+4. Topologically orders resources (dependencies first).
+5. Merges them via `IMergeStrategy<TContent, TDirective, TContext>` while building a source map and collecting diagnostics.
+
+TinyPreprocessor requires five components:
+
+1. **`IDirectiveParser<TContent, TDirective>`** – Parses directives from resource content
+2. **`IDirectiveModel<TDirective>`** – Interprets directive locations and dependency references
+3. **`IResourceResolver<TContent>`** – Resolves references to actual resources
+4. **`IMergeStrategy<TContent, TDirective, TContext>`** – Combines resources into final output
+5. **`IContentModel<TContent>`** – Defines how offsets and slicing work for your `TContent`
+
+### Example: Minimal In-Memory Includes
+
+```csharp
+using System;
+using System.Collections.Generic;
+using System.Threading;
+using System.Threading.Tasks;
+using TinyPreprocessor;
+using TinyPreprocessor.Core;
+using TinyPreprocessor.Diagnostics;
+using TinyPreprocessor.Text;
+
+// 1) Define your directive type.
+public sealed record IncludeDirective(string Reference, Range Location);
+
+// 2) Provide directive semantics to the pipeline.
+public sealed class IncludeDirectiveModel : IDirectiveModel<IncludeDirective>
+{
+    public Range GetLocation(IncludeDirective directive) => directive.Location;
+
+    public bool TryGetReference(IncludeDirective directive, out string reference)
+    {
+        reference = directive.Reference;
+        return true;
+    }
+}
+
+// 3) Implement a tiny directive parser for lines like: #include other.txt
+public sealed class IncludeParser : IDirectiveParser<ReadOnlyMemory<char>, IncludeDirective>
+{
+    public IEnumerable<IncludeDirective> Parse(ReadOnlyMemory<char> content, ResourceId resourceId)
+    {
+        var text = content.ToString();
+        var lines = text.Split('\n');
+        var offset = 0;
+
+        foreach (var line in lines)
+        {
+            if (line.StartsWith("#include "))
+            {
+                var path = line[9..].Trim().Trim('"');
+                yield return new IncludeDirective(path, offset..(offset + line.Length));
+            }
+            offset += line.Length + 1;
+        }
+    }
+}
+
+// 4) Implement an in-memory resolver.
+public sealed class InMemoryResolver : IResourceResolver<ReadOnlyMemory<char>>
+{
+    private readonly IReadOnlyDictionary<ResourceId, string> _files;
+
+    public InMemoryResolver(IReadOnlyDictionary<ResourceId, string> files) => _files = files;
+
+    public ValueTask<ResourceResolutionResult<ReadOnlyMemory<char>>> ResolveAsync(
+        string reference,
+        IResource<ReadOnlyMemory<char>>? context,
+        CancellationToken ct)
+    {
+        if (!_files.TryGetValue(new ResourceId(reference), out var content))
+        {
+            return ValueTask.FromResult(new ResourceResolutionResult<ReadOnlyMemory<char>>(
+                null,
+                new ResolutionFailedDiagnostic(reference, $"Not found: {reference}")));
+        }
+
+        var resource = new Resource<ReadOnlyMemory<char>>(reference, content.AsMemory());
+        return ValueTask.FromResult(new ResourceResolutionResult<ReadOnlyMemory<char>>(resource, null));
+    }
+}
+
+// 5) Wire everything together.
+var files = new Dictionary<ResourceId, string>
+{
+    ["main.txt"] = "#include a.txt\nMAIN\n",
+    ["a.txt"] = "A\n#include b.txt\n",
+    ["b.txt"] = "B\n"
+};
+
+var parser = new IncludeParser();
+var directiveModel = new IncludeDirectiveModel();
+var resolver = new InMemoryResolver(files);
+var merger = new ConcatenatingMergeStrategy<IncludeDirective, object>();
+var contentModel = new ReadOnlyMemoryCharContentModel();
+var context = new object();
+var config = new PreprocessorConfiguration<ReadOnlyMemory<char>, IncludeDirective, object>(
+    parser,
+    directiveModel,
+    resolver,
+    merger,
+    contentModel);
+var preprocessor = new Preprocessor<ReadOnlyMemory<char>, IncludeDirective, object>(config);
+var root = new Resource<ReadOnlyMemory<char>>("main.txt", files["main.txt"].AsMemory());
+
+var result = await preprocessor.ProcessAsync(root, context);
+
+if (!result.Diagnostics.HasErrors)
+{
+    Console.WriteLine(result.Content.ToString());
+}
+else
+{
+    foreach (var diagnostic in result.Diagnostics)
+    {
+        Console.WriteLine($"[{diagnostic.Code}] {diagnostic.Message}");
+    }
+}
+```
+
+## Configuration
+
+```csharp
+var options = new PreprocessorOptions(
+    DeduplicateIncludes: true,  // Currently informational (resources are processed once per call)
+    MaxIncludeDepth: 100,       // Safety limit for recursion
+    ContinueOnError: true       // Collect all diagnostics instead of stopping early
+);
+
+// Note: The current implementation processes each resource at most once per call,
+// so `DeduplicateIncludes` does not currently change output.
+var result = await preprocessor.ProcessAsync(root, context, options);
+```
+
+## Source Map Usage
+
+Query the source map to trace output positions back to original files:
+
+```csharp
+var result = await preprocessor.ProcessAsync(root, context);
+
+// Find where generated offset 0 in output came from
+var location = result.SourceMap.Query(generatedOffset: 0);
+
+if (location is not null)
+{
+    Console.WriteLine($"Originated from {location.Resource.Path} at original offset {location.OriginalOffset}");
+}
+
+// For precise diagnostic spans, query a range.
+// The range may map to multiple original resources (e.g., it crosses file boundaries).
+var ranges = result.SourceMap.QueryRangeByLength(generatedStartOffset: 0, length: 20);
+
+foreach (var range in ranges)
+{
+    Console.WriteLine(
+        $"Generated [{range.GeneratedStartOffset} - {range.GeneratedEndOffset}) -> {range.Resource.Path} [{range.OriginalStartOffset} - {range.OriginalEndOffset})");
+}
+
+// Boundary-based "line number" resolution (content-agnostic)
+//
+// If you want a line number for an offset, provide an IContentBoundaryResolver for a boundary kind
+// (e.g., TinyPreprocessor.Text.LineBoundary), and compose it with the source map.
+//
+// Example (LF-only): boundary offsets are start offsets of lines after the first line.
+public sealed class LfLineBoundaryResolver : IContentBoundaryResolver<ReadOnlyMemory<char>, LineBoundary>
+{
+    public IEnumerable<int> ResolveOffsets(ReadOnlyMemory<char> content, ResourceId resourceId, int startOffset, int endOffset)
+    {
+        var s = content.Span.Slice(startOffset, Math.Min(endOffset, content.Length) - startOffset);
+        for (var o = startOffset, i = s.IndexOf('\n'); i >= 0 && i + 1 < s.Length; s = s.Slice(i + 1), o += i + 1, i = s.IndexOf('\n'))
+            yield return o;
+    }
+}
+
+var boundaryLocation = result.SourceMap.ResolveOriginalBoundaryLocation(
+    generatedOffset: 0,
+    contentProvider: id => files[id].AsMemory(),
+    boundaryResolver: new LfLineBoundaryResolver());
+
+if (boundaryLocation is not null)
+{
+    Console.WriteLine($"Line index: {boundaryLocation.BoundaryIndex}");
+}
+```
+
+## Custom Merge Strategy
+
+### Merge identity
+
+If your merge strategy inlines/expands directives (e.g., `@import`, `#include`), use the authoritative dependency
+identity returned by your `IResourceResolver<TContent>`. TinyPreprocessor provides this mapping to merge via
+`MergeContext<TContent, TDirective>.ResolvedReferences`.
+
+Implement `IMergeStrategy<TContent, TDirective, TContext>` for custom output formatting:
+
+```csharp
+public sealed record JsonMergeOptions;
+
+public sealed class JsonMergeStrategy : IMergeStrategy<ReadOnlyMemory<char>, IncludeDirective, JsonMergeOptions>
+{
+    public ReadOnlyMemory<char> Merge(
+        IReadOnlyList<ResolvedResource<ReadOnlyMemory<char>, IncludeDirective>> orderedResources,
+        JsonMergeOptions userContext,
+        MergeContext<ReadOnlyMemory<char>, IncludeDirective> mergeContext)
+    {
+        // Custom merge logic here
+        // Use mergeContext.SourceMapBuilder to record mappings.
+        // Use offset-based segments for precise mappings:
+        //   mergeContext.SourceMapBuilder.AddOffsetSegment(resourceId, generatedStartOffset, originalStartOffset, length)
+        // Use mergeContext.Diagnostics to report issues
+
+        // If you need to inline/expand directives:
+        // - Use mergeContext.ResolvedReferences to map (requestingResourceId, directiveIndex) -> resolved dependency ResourceId
+        // - Then fetch the already-processed dependency content from mergeContext.ResolvedCache
+        // Do NOT re-derive ResourceIds from raw reference strings (resolvers may implement custom mapping).
+
+        return ReadOnlyMemory<char>.Empty;
+    }
+}
+```
+
+## Docs
+
+- [Core Abstractions](docs/01-core-abstractions.md)
+- [Diagnostics System](docs/02-diagnostics-system.md)
+- [Dependency Graph](docs/03-dependency-graph.md)
+- [Source Mapping](docs/04-source-mapping.md)
+- [Merge System](docs/05-merge-system.md)
+- [Preprocessor Orchestrator](docs/06-preprocessor-orchestrator.md)
+- [Content Boundaries](docs/07-content-boundaries.md)
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      Preprocessor                           │
+│  ┌──────────────┐  ┌────────────────────┐  ┌──────────────────┐  │
+│  │ Directive    │  │ IResourceResolver  │  │ IMergeStrategy   │  │
+│  │ Parser/Model │  │                   │  │                  │  │
+│  └──────────────┘  └────────────────────┘  └──────────────────┘  │
+│  ┌────────────────────┐                                         │
+│  │ IContentModel       │                                         │
+│  └────────────────────┘                                         │
+│          │                │                   │             │
+│          ▼                ▼                   ▼             │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │              ResourceDependencyGraph                │   │
+│  │         (cycle detection, topological sort)         │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                           │                                 │
+│                           ▼                                 │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │                  PreprocessResult                   │   │
+│  │    Content + SourceMap + Diagnostics + Graph        │   │
+│  └─────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## License
+
+MIT License - see [LICENSE.txt](LICENSE.txt)
+
+---
+
+# Core Abstractions Architecture
+
+Source: https://github.com/dsisco11/tinypreprocessor/blob/master/docs/01-core-abstractions.md
+
+# Core Abstractions Architecture
+
+This document describes the foundational types that form the backbone of TinyPreprocessor.
+
+## Overview
+
+The core abstractions define how resources are identified, represented, parsed, and resolved. These types are intentionally minimal and abstract to allow downstream users maximum flexibility.
+
+## Types
+
+### ResourceId
+
+A lightweight, immutable identifier for resources in the preprocessing system.
+
+```csharp
+public readonly struct ResourceId : IEquatable<ResourceId>
+{
+    public string Path { get; }
+}
+```
+
+- **Readonly struct**: Zero-allocation equality checks, value semantics
+- **String-based path**: Flexible enough for file paths, URIs, or abstract identifiers
+- **IEquatable<ResourceId>**: Enables efficient dictionary lookups and hash set operations
+- **Implicit conversion from string**: Convenient API for simple cases
+
+**Usage:**
+
+```csharp
+ResourceId id = "path/to/resource.txt";
+ResourceId id2 = new ResourceId("path/to/resource.txt");
+```
+
+### IResource
+
+Represents a single resource (file, module, or abstract content unit) in the preprocessing pipeline.
+
+```csharp
+public interface IResource
+{
+    ResourceId Id { get; }
+    ReadOnlyMemory<char> Content { get; }
+    IReadOnlyDictionary<string, object>? Metadata { get; }
+}
+```
+
+- **Interface**: Allows custom resource implementations (lazy-loaded, cached, virtual, etc.)
+- **TContent-generic**: The pipeline does not assume content is text or a sequence of symbols.
+- **Nullable Metadata**: Optional extensibility point for custom data (timestamps, checksums, etc.)
+
+**Default Implementation:**
+
+```csharp
+public sealed record Resource<TContent>(
+    ResourceId Id,
+    TContent Content,
+    IReadOnlyDictionary<string, object>? Metadata = null
+) : IResource<TContent>;
+```
+
+### Directives (TDirective) + IDirectiveModel
+
+Directives are modeled as an unconstrained `TDirective` type. Directive semantics needed by the pipeline
+(location + dependency reference extraction) are provided via `IDirectiveModel<TDirective>`.
+
+```csharp
+public interface IDirectiveModel<in TDirective>
+{
+    Range GetLocation(TDirective directive);
+    bool TryGetReference(TDirective directive, out string reference);
+}
+```
+
+**Example Directive Types:**
+
+```csharp
+public sealed record IncludeDirective(string Reference, Range Location);
+public sealed record ImportDirective(string Module, bool IsRelative, Range Location);
+```
+
+### IResourceResolver
+
+Resolves string references (from directives) into actual resources.
+
+```csharp
+public interface IResourceResolver<TContent>
+{
+    ValueTask<ResourceResolutionResult<TContent>> ResolveAsync(
+        string reference,
+
+        IResource<TContent>? relativeTo,
+        CancellationToken ct);
+}
+```
+
+- **Async-first (ValueTask)**: Resolution may involve I/O (file system, network, database)
+- **relativeTo parameter**: Enables relative path resolution from the including resource
+- **Returns result object**: Separates success/failure without exceptions for expected failures
+
+**ResourceResolutionResult:**
+
+```csharp
+public sealed record ResourceResolutionResult(
+    IResource? Resource,
+    IPreprocessorDiagnostic? Error)
+{
+    public bool IsSuccess => Resource is not null;
+
+    public static ResourceResolutionResult Success(IResource resource)
+        => new(resource, null);
+
+    public static ResourceResolutionResult Failure(IPreprocessorDiagnostic error)
+        => new(null, error);
+}
+```
+
+### IDirectiveParser<TContent, TDirective>
+
+Extracts directives from resource content.
+
+```csharp
+public interface IDirectiveParser<TContent, out TDirective>
+{
+    IEnumerable<TDirective> Parse(TContent content, ResourceId resourceId);
+}
+```
+
+- **Generic TDirective**: Type-safe parsing for specific directive types
+- **IEnumerable return**: Lazy evaluation, allows streaming large files
+- **ResourceId parameter**: Enables context-aware parsing and better error messages
+- **Sync API**: Parsing is CPU-bound; async would add overhead without benefit
+
+**Example Implementation:**
+
+```csharp
+public sealed class CStyleIncludeParser : IDirectiveParser<ReadOnlyMemory<char>, IncludeDirective>
+{
+    // Parses: #include "path" or #include <path>
+    public IEnumerable<IncludeDirective> Parse(ReadOnlyMemory<char> content, ResourceId resourceId)
+    {
+        // Implementation using Regex or manual parsing
+    }
+}
+```
+
+## Relationships
+
+```mermaid
+flowchart LR
+    subgraph Resolution
+        IResourceResolver -->|resolves to| IResource
+        IResource -->|has| ResourceId
+    end
+
+    subgraph Parsing
+        IDirectiveParserT["IDirectiveParser&lt;T&gt;"] -->|extracts| TDirective
+    end
+```
+
+## Thread Safety
+
+- **ResourceId**: Immutable, fully thread-safe
+- **IResource**: Implementations should be immutable or document thread-safety
+- **IResourceResolver**: Implementations should be thread-safe for concurrent resolution
+- **IDirectiveParser**: Stateless by design, inherently thread-safe
+
+## Extension Points
+
+1. **Custom Resource Types**: Implement `IResource` for lazy loading, caching, or virtual resources
+2. **Custom Directives**: Define any directive type + provide an `IDirectiveModel<TDirective>`
+3. **Custom Parsers**: Implement `IDirectiveParser<TContent, TDirective>` for different syntax styles
+4. **Custom Resolvers**: Implement `IResourceResolver<TContent>` for file systems, databases, or network resources
+
+### IContentModel<TContent>
+
+The pipeline measures and slices content using an `IContentModel<TContent>`. This defines what an "offset" means for your chosen `TContent`.
+
+```csharp
+public interface IContentModel<TContent>
+{
+    int GetLength(TContent content);
+    TContent Slice(TContent content, int start, int length);
+}
+```
+
+---
+
+# Diagnostics System Architecture
+
+Source: https://github.com/dsisco11/tinypreprocessor/blob/master/docs/02-diagnostics-system.md
+
+# Diagnostics System Architecture
+
+This document describes the diagnostic collection and reporting system for TinyPreprocessor.
+
+## Overview
+
+The diagnostics system provides a structured way to collect, categorize, and report issues encountered during preprocessing. It follows the "collect all, decide later" pattern—processing continues on errors, and the caller decides how to handle the collected diagnostics.
+
+## Types
+
+### DiagnosticSeverity
+
+Categorizes the importance of diagnostics.
+
+```csharp
+public enum DiagnosticSeverity
+{
+    Info = 0,
+    Warning = 1,
+    Error = 2
+}
+```
+
+**Severity Guidelines:**
+
+- **Info**: Informational messages (e.g., "Resource loaded from cache")
+- **Warning**: Non-fatal issues that may indicate problems (e.g., "Deprecated directive syntax")
+- **Error**: Fatal issues that prevent correct output (e.g., "Circular dependency detected")
+
+### IPreprocessorDiagnostic
+
+Interface for all diagnostic messages.
+
+```csharp
+public interface IPreprocessorDiagnostic
+{
+    DiagnosticSeverity Severity { get; }
+    string Code { get; }
+    string Message { get; }
+    ResourceId? Resource { get; }
+    Range? Location { get; }
+}
+```
+
+- **Code property**: Machine-readable identifier (e.g., "TPP0001") for filtering and documentation
+- **Nullable Resource**: Some diagnostics are global (e.g., configuration errors)
+- **Nullable Location**: Some diagnostics apply to entire resources, not specific ranges
+
+**Code Convention:**
+
+- Format: `TPP####` (TinyPreProcessor + 4-digit number)
+- Ranges:
+  - `TPP0001-TPP0099`: Dependency/graph errors
+  - `TPP0100-TPP0199`: Resolution errors
+  - `TPP0200-TPP0299`: Parse errors
+  - `TPP0300-TPP0399`: Merge errors
+  - `TPP0400-TPP0499`: Configuration/options errors
+
+### Built-in Diagnostic Types
+
+#### CircularDependencyDiagnostic
+
+Reported when a cycle is detected in the resource dependency graph.
+
+```
+record CircularDependencyDiagnostic : IPreprocessorDiagnostic
+    Severity = Error
+    Code     = "TPP0001"
+    Cycle    : IReadOnlyList<ResourceId>  // the cycle path
+    Message  = "Circular dependency detected: A → B → C → A"
+```
+
+#### ResolutionFailedDiagnostic
+
+Reported when a resource reference cannot be resolved.
+
+```
+record ResolutionFailedDiagnostic : IPreprocessorDiagnostic
+    Severity  = Error
+    Code      = "TPP0100"
+    Reference : string         // the unresolved reference
+    Reason    : string?        // optional failure reason
+    Message   = "Failed to resolve reference: '{Reference}'"
+```
+
+#### ParseErrorDiagnostic
+
+Reported when directive parsing fails.
+
+```
+record ParseErrorDiagnostic : IPreprocessorDiagnostic
+    Severity = Error (configurable)
+    Code     = "TPP0200"
+    Message  : string  // the parse error description
+```
+
+#### MaxDepthExceededDiagnostic
+
+Reported when include depth exceeds the configured maximum.
+
+```
+record MaxDepthExceededDiagnostic : IPreprocessorDiagnostic
+    Severity     = Error
+    Code         = "TPP0002"
+    MaxDepth     : int  // configured limit
+    CurrentDepth : int  // actual depth reached
+    Message      = "Maximum include depth ({MaxDepth}) exceeded at depth {CurrentDepth}"
+```
+
+### DiagnosticCollection
+
+Thread-safe collection for accumulating diagnostics during processing.
+
+```
+class DiagnosticCollection : IReadOnlyCollection<IPreprocessorDiagnostic>
+    // Thread-safe storage with lock-based synchronization
+
+    Properties:
+        Count          → number of diagnostics
+        HasErrors      → true if any Error severity exists
+        HasWarnings    → true if any Warning severity exists
+
+    Methods:
+        Add(diagnostic)              → append single diagnostic
+        AddRange(diagnostics)        → append multiple diagnostics
+        GetByResource(resourceId)    → filter by source resource
+        GetBySeverity(severity)      → filter by severity level
+        GetEnumerator()              → returns snapshot for thread-safe iteration
+```
+
+- **Lock-based**: Simple and correct; preprocessing is not typically lock-contention-heavy
+- **Snapshot on enumerate**: Prevents collection-modified exceptions
+- **Query methods**: Convenience for filtering by resource or severity
+
+## Usage Patterns
+
+### Adding Diagnostics During Processing
+
+```
+diagnostics = new DiagnosticCollection()
+
+// During resolution
+result = await resolver.ResolveAsync(reference, currentResource, ct)
+if not result.IsSuccess:
+    diagnostics.Add(result.Error)
+// During cycle detection
+for each cycle in graph.DetectCycles():
+    diagnostics.Add(new CircularDependencyDiagnostic(cycle))
+```
+
+### Resolution vs. Merge Responsibility
+
+TinyPreprocessor separates responsibilities between phases:
+
+- **Resolution diagnostics** (e.g., `TPP0100` `ResolutionFailedDiagnostic`) are emitted when
+  `IResourceResolver.ResolveAsync(reference, relativeTo)` cannot produce an `IResource`.
+- **Merge diagnostics** (e.g., `TPP0300` `NonWholeLineDirectiveDiagnostic`) are emitted when merge logic detects
+  issues while producing output.
+
+Merge strategies should only add diagnostics for merge-time concerns (e.g., directive placement rules, unsupported
+constructs, or missing data needed to build output), not for reference resolution.
+
+Merge strategies that inline/expand directives must use the authoritative resolved dependency identity provided via
+`MergeContext.ResolvedReferences`. They must not re-derive a `ResourceId` from the raw reference string using path
+heuristics, because resolvers may implement custom mapping.
+
+### Checking Results
+
+```
+result = await preprocessor.ProcessAsync(root, context, ct)
+
+if result.Diagnostics.HasErrors:
+    for each error in result.Diagnostics.GetBySeverity(Error):
+        print "[{error.Code}] {error.Resource}: {error.Message}"
+    return
+
+// Use result.Content
+```
+
+## Relationships
+
+```mermaid
+flowchart TB
+    DiagnosticCollection -->|contains| IPreprocessorDiagnostic
+    IPreprocessorDiagnostic <|-- CircularDependencyDiagnostic
+    IPreprocessorDiagnostic <|-- ResolutionFailedDiagnostic
+    IPreprocessorDiagnostic <|-- ParseErrorDiagnostic
+    IPreprocessorDiagnostic <|-- MaxDepthExceededDiagnostic
+```
+
+## Extension Points
+
+1. **Custom Diagnostics**: Implement `IPreprocessorDiagnostic` for domain-specific issues
+2. **Diagnostic Formatters**: Create formatters for different output styles (JSON, SARIF, etc.)
+3. **Diagnostic Filters**: Build filter chains for suppressing specific codes or severities
+
+---
+
+# Dependency Graph Architecture
+
+Source: https://github.com/dsisco11/tinypreprocessor/blob/master/docs/03-dependency-graph.md
+
+# Dependency Graph Architecture
+
+This document describes the dependency graph system that tracks resource relationships and enables cycle detection and topological ordering.
+
+## Overview
+
+The dependency graph layer wraps the **Graffs** library to manage resource dependencies. It provides cycle detection (to identify circular includes) and topological sorting (to determine correct processing order).
+
+## Graffs Integration
+
+TinyPreprocessor uses Graffs 0.1.0 for graph operations. Key Graffs types used:
+
+- `DependencyGraphBuilder<T>`: Fluent builder with `.DependsOn(dependent, dependency)` semantics
+- `AdjacencyListGraph<T>`: Sparse graph implementation (optimal for typical include graphs)
+- `CycleDetection`: Johnson's algorithm for finding all cycles
+- `TopologicalSort`: Kahn's algorithm for BFS-based topological ordering
+
+## Types
+
+### ResourceDependencyGraph
+
+Manages the dependency relationships between resources.
+
+```
+class ResourceDependencyGraph
+    // Wraps Graffs.DependencyGraphBuilder<ResourceId> internally
+
+    Methods:
+        AddResource(id)                    → register isolated node
+        AddDependency(dependent, dependency) → record "A depends on B"
+
+        DetectCycles()         → List<List<ResourceId>>  // all cycles found
+        HasCycles()            → bool                    // fast check
+        GetProcessingOrder()   → List<ResourceId>        // topological sort (deps first)
+
+        GetDependencies(id)    → Set<ResourceId>         // what does id depend on?
+        GetDependents(id)      → Set<ResourceId>         // what depends on id?
+        GetAllResources()      → Set<ResourceId>         // all registered nodes
+```
+
+- **Wraps Graffs**: Provides TinyPreprocessor-specific API while leveraging proven algorithms
+- **Lazy graph building**: `Build()` called on each query; efficient for typical use (build once, query few times)
+- **DependsOn semantics**: Matches natural "A includes B" → "A depends on B" mental model
+- **HashSet for nodes**: Ensures isolated nodes (no dependencies) are tracked
+
+## Dependency Direction
+
+Understanding the direction is crucial:
+
+```mermaid
+flowchart LR
+    main["main"] -->|includes| utils["utils"]
+    utils -->|includes| types["types"]
+```
+
+**Graph edges (DependsOn):**
+
+- `main → utils` (main depends on utils)
+- `utils → types` (utils depends on types)
+
+**Topological order (dependencies first):**
+
+- `[types, utils, main]`
+
+This order ensures that when processing `main`, both `utils` and `types` have already been processed.
+
+## Cycle Detection
+
+### What Constitutes a Cycle
+
+```mermaid
+flowchart LR
+    subgraph DirectCycle["Direct Cycle"]
+        A1["A"] --> B1["B"]
+        B1 --> A1
+    end
+
+    subgraph IndirectCycle["Indirect Cycle"]
+        A2["A"] --> B2["B"]
+        B2 --> C2["C"]
+        C2 --> A2
+    end
+
+    subgraph SelfReference["Self-Reference"]
+        A3["A"] --> A3
+    end
+```
+
+### Cycle Reporting
+
+When cycles are detected, they're converted to `CircularDependencyDiagnostic`:
+
+```
+function DetectCyclesAsDiagnostics() → IEnumerable<CircularDependencyDiagnostic>
+    for each cycle in DetectCycles():
+        displayCycle = cycle + [cycle[0]]  // append first to show closure
+        yield CircularDependencyDiagnostic(displayCycle)
+```
+
+**Output format:**
+
+```
+TPP0001: Circular dependency detected: A.txt → B.txt → C.txt → A.txt
+```
+
+## Topological Ordering
+
+### Kahn's Algorithm
+
+Graffs uses Kahn's algorithm (BFS-based) for topological sorting:
+
+1. Find all nodes with no incoming edges (no dependents)
+2. Add them to result, remove their outgoing edges
+3. Repeat until graph is empty
+4. If nodes remain, graph has cycles
+
+### Processing Order Example
+
+```
+// Given dependency structure:
+//   main includes header, utils
+//   utils includes types
+//   header includes types
+
+graph.AddDependency("main", "header")
+graph.AddDependency("main", "utils")
+graph.AddDependency("utils", "types")
+graph.AddDependency("header", "types")
+
+order = graph.GetProcessingOrder()
+// Result: [types, header, utils, main]
+// or:     [types, utils, header, main]
+// (header and utils are interchangeable since neither depends on the other)
+```
+
+## Usage in Preprocessor
+
+```
+// 1. Build graph during resolution phase
+graph = new ResourceDependencyGraph()
+
+function ResolveRecursive(resource, depth)
+    graph.AddResource(resource.Id)
+
+    directives = parser.Parse(resource.Content, resource.Id)
+    for each directive in directives:
+        result = await resolver.ResolveAsync(directive.Reference, resource, ct)
+        if result.IsSuccess:
+            graph.AddDependency(resource.Id, result.Resource.Id)
+            await ResolveRecursive(result.Resource, depth + 1)
+
+// 2. Detect cycles before processing
+for each cycle in graph.DetectCycles():
+    diagnostics.Add(CircularDependencyDiagnostic(cycle + [cycle[0]]))
+
+// 3. Get processing order (skip if cycles detected)
+if not diagnostics.HasErrors:
+    order = graph.GetProcessingOrder()
+    // Process resources in this order
+```
+
+## Relationships
+
+```mermaid
+flowchart TB
+    ResourceDependencyGraph -->|wraps| DependencyGraphBuilder["Graffs.DependencyGraphBuilder&lt;T&gt;"]
+    DependencyGraphBuilder -->|builds| AdjacencyListGraph["Graffs.AdjacencyListGraph&lt;T&gt;"]
+    AdjacencyListGraph -->|used by| CycleDetection
+    AdjacencyListGraph -->|used by| TopologicalSort
+```
+
+## Performance Characteristics
+
+| Operation          | Complexity    | Notes                                     |
+| ------------------ | ------------- | ----------------------------------------- |
+| AddResource        | O(1)          | HashSet insert                            |
+| AddDependency      | O(1)          | Builder accumulation                      |
+| DetectCycles       | O((V+E)(C+1)) | Johnson's algorithm, C = number of cycles |
+| HasCycles          | O(V+E)        | DFS-based, early exit                     |
+| GetProcessingOrder | O(V+E)        | Kahn's algorithm                          |
+
+For typical include graphs (tens to hundreds of files), all operations complete in milliseconds.
+
+## Thread Safety
+
+`ResourceDependencyGraph` is **not thread-safe**. It's designed for single-threaded use during a preprocessing operation. The calling `Preprocessor` manages concurrency at a higher level.
+
+---
+
+# Source Mapping Architecture
+
+Source: https://github.com/dsisco11/tinypreprocessor/blob/master/docs/04-source-mapping.md
+
+# Source Mapping Architecture
+
+This document describes the offset-based source mapping system that tracks the relationship between generated output offsets and original resource offsets.
+
+## Overview
+
+When multiple resources are merged into a single output, it's crucial to maintain a mapping back to the original sources. TinyPreprocessor uses **0-based offsets** throughout.
+
+This enables:
+
+- Precise diagnostics that can point back to an original resource + offset
+- Tooling that can translate slices of generated output to their origin
+
+**Important:** Offsets are measured in **content units**. For the default text pipeline (`TContent = ReadOnlyMemory<char>`), the unit is characters.
+
+## Types
+
+### OffsetSpan
+
+Represents a half-open range of offsets: `[Start, End)`.
+
+```csharp
+public readonly record struct OffsetSpan(int Start, int End)
+{
+    public int Length => End - Start;
+}
+```
+
+### OffsetMappingSegment
+
+An exact mapping segment between a generated offset span and an original resource offset span.
+
+```csharp
+public sealed record OffsetMappingSegment(
+    OffsetSpan Generated,
+    ResourceId OriginalResource,
+    OffsetSpan Original);
+```
+
+### SourceLocation
+
+Result of a point query: identifies an original resource and original offset.
+
+```csharp
+public sealed record SourceLocation(ResourceId Resource, int OriginalOffset);
+```
+
+### SourceRangeLocation
+
+Result of a range query: identifies original and generated spans for an overlapping region.
+
+```csharp
+public sealed record SourceRangeLocation(
+    ResourceId Resource,
+    int OriginalStartOffset,
+    int OriginalEndOffset,
+    int GeneratedStartOffset,
+    int GeneratedEndOffset);
+```
+
+### SourceMap
+
+Immutable collection of mapping segments with efficient lookup.
+
+```csharp
+public sealed class SourceMap
+{
+    public SourceLocation? Query(int generatedOffset);
+    public IReadOnlyList<SourceRangeLocation> QueryRangeByLength(int generatedStartOffset, int length);
+    public IReadOnlyList<SourceRangeLocation> QueryRangeByEnd(int generatedStartOffset, int generatedEndOffset);
+}
+```
+
+- **Offset-based**: Simpler and more general than line/column mapping.
+- **Exact segments**: Supports precise mapping across resource boundaries.
+
+### SourceMapBuilder
+
+Accumulates mapping segments during merge operations.
+
+```csharp
+public sealed class SourceMapBuilder
+{
+    public void AddOffsetSegment(ResourceId resource, int generatedStartOffset, int originalStartOffset, int length);
+    public SourceMap Build();
+    public void Clear();
+}
+```
+
+## Usage During Merge
+
+Merge strategies are responsible for adding mapping segments as they emit content:
+
+```
+generatedStart = outputOffset
+emit N content units from resource X starting at original offset O
+builder.AddOffsetSegment(X, generatedStart, O, length: N)
+```
+
+## Query Example
+
+```csharp
+var result = await preprocessor.ProcessAsync(root, context);
+
+// Map generated offset 0 back to its origin
+var location = result.SourceMap.Query(generatedOffset: 0);
+
+if (location is not null)
+{
+    Console.WriteLine($"Originated from {location.Resource.Path} at original offset {location.OriginalOffset}");
+}
+
+// Query a generated range and map it back to original ranges
+var ranges = result.SourceMap.QueryRangeByLength(generatedStartOffset: 0, length: 20);
+```
+
+## Relationships
+
+```mermaid
+flowchart TB
+    SourceMapBuilder -->|builds| SourceMap
+    SourceMap -->|query| SourceLocation
+    SourceMap -->|range query| SourceRangeLocation
+    SourceMap -->|contains| OffsetMappingSegment
+    OffsetMappingSegment -->|uses| OffsetSpan
+```
+
+## Thread Safety
+
+- **SourceMap**: Immutable after construction, thread-safe for queries
+- **SourceMapBuilder**: Not thread-safe; use one builder per merge operation
+
+---
+
+# Merge System Architecture
+
+Source: https://github.com/dsisco11/tinypreprocessor/blob/master/docs/05-merge-system.md
+
+# Merge System Architecture
+
+This document describes the extensible merge system that combines resolved resources into a single output.
+
+## Overview
+
+The merge system is the most customizable part of TinyPreprocessor. While the default behavior is simple concatenation with directive stripping, downstream users can implement sophisticated merge strategies for their specific use cases (e.g., CSS cascade resolution, module bundling, code generation).
+
+## Types
+
+### ResolvedResource
+
+A resource paired with its parsed directives, ready for merging.
+
+```
+record ResolvedResource(
+    Resource   : IResource<TContent>,
+    Directives : IReadOnlyList<TDirective>
+)
+    // Convenience properties: Id, Content (delegate to Resource)
+```
+
+- **Sealed record**: Immutable, clear ownership
+- **Directives included**: Merge strategies may need directive info (e.g., conditional includes)
+
+### MergeContext
+
+Shared context provided to merge strategies for source map building and diagnostics.
+
+```
+class MergeContext<TContent, TDirective>
+    Properties:
+        SourceMapBuilder : SourceMapBuilder   // for recording mappings
+        Diagnostics      : DiagnosticCollection // for reporting issues
+        ResolvedCache    : IReadOnlyDictionary<ResourceId, IResource<TContent>>  // for cross-referencing
+        ResolvedReferences : IReadOnlyDictionary<ResolvedReferenceKey, ResourceId> // directive occurrence -> resolved dependency id
+        DirectiveModel   : IDirectiveModel<TDirective>  // for interpreting directive locations
+        ContentModel     : IContentModel<TContent>  // for interpreting offsets + slicing content
+```
+
+- **SourceMapBuilder**: Merge strategies must record mappings for accurate source tracking
+- **Diagnostics**: Merge strategies can report issues (e.g., incompatible content types)
+- **ResolvedCache**: Enables strategies to look up related resources
+- **ResolvedReferences**: Provides the authoritative resolved dependency identity for each directive occurrence
+
+#### ResolvedReferences
+
+Some merge strategies need to inline/expand directives (e.g., `@import`, `#include`) by finding the already-processed
+dependency content. For these strategies, the **only** correct way to identify a dependency is to use the
+`ResourceId` returned by `IResourceResolver` during preprocessing.
+
+`ResolvedReferences` provides that identity as a lookup:
+
+- **Key**: `(requestingResourceId, directiveIndex)`
+  - `requestingResourceId` is the id of the resource that contained the directive
+  - `directiveIndex` is the zero-based index of the directive in that resource's parsed directive list
+- **Value**: the resolved target `ResourceId` returned by the resolver
+
+In code, the key type is `MergeContext<TContent, TDirective>.ResolvedReferenceKey`.
+
+If a directive failed to resolve, it has **no entry** in this map.
+
+### IMergeStrategy<TContent, TDirective, TContext>
+
+Interface for custom merge implementations.
+
+```csharp
+public interface IMergeStrategy<TContent, TDirective, in TContext>
+{
+    /// <summary>
+    /// Merges resolved resources into a single output.
+    /// Resources are provided in topological order (dependencies first).
+    /// </summary>
+    /// <param name="orderedResources">Resources sorted by dependency order.</param>
+    /// <param name="userContext">User-provided context for strategy customization.</param>
+    /// <param name="context">Merge context with source map builder and diagnostics.</param>
+    /// <returns>The merged content.</returns>
+    TContent Merge(
+        IReadOnlyList<ResolvedResource<TContent, TDirective>> orderedResources,
+        TContext userContext,
+        MergeContext<TContent, TDirective> context);
+}
+```
+
+- **Generic TContext**: User-defined context for passing strategy-specific options
+- **Topological order**: Resources arrive dependencies-first; strategies can rely on this
+- **Returns TContent**: Merge strategies own the output representation.
+
+### ConcatenatingMergeStrategy<TContext>
+
+Default implementation that concatenates resources and strips directives.
+
+```
+class ConcatenatingMergeStrategy<TContext> : IMergeStrategy<TContext>
+    Options:
+        Separator             = "\n"                    // between resources
+        IncludeResourceMarkers = false                   // debug markers
+        MarkerFormat          = "/* === {0} === */\n"  // marker template
+
+    function Merge(orderedResources, userContext, context) → content
+        for each resource in orderedResources:
+            if IncludeResourceMarkers:
+                output.Append(format(MarkerFormat, resource.Id))
+
+            strippedContent = StripDirectives(resource)
+            RecordSourceMappings(resource.Id, strippedContent, context.SourceMapBuilder)
+            output.Append(strippedContent)
+
+            if not lastResource:
+                output.Append(Separator)
+
+        return output
+
+    function StripDirectives(resource) → content
+        // Remove directive text ranges from content
+        // Preserve all non-directive content in order
+        for each directive in resource.Directives (sorted by location):
+            skip content in directive.Location range
+        return remaining content
+
+    function RecordSourceMappings(resourceId, content, builder)
+        // Map each output line back to original resource line
+        for each line in content:
+            builder.AddLine(resourceId, outputLine, originalLine)
+```
+
+- **Directive stripping**: By default, directives are removed from output
+- **Configurable separators**: Different use cases need different separators
+- **Optional markers**: Debug builds may want visible resource boundaries
+- **Line-by-line mapping**: Simple but accurate source mapping
+
+## Custom Merge Strategy Examples
+
+### CSS Cascade Strategy
+
+```
+class CssCascadeMergeStrategy : IMergeStrategy<CssContext>
+    function Merge(orderedResources, userContext, context) → content
+        // CSS cascade: later rules override earlier ones
+        // Topological order ensures base styles come first
+        for each resource in orderedResources:
+            output.AppendLine("/* Source: {resource.Id} */")
+            output.AppendLine(StripImports(resource))
+            RecordMappings(...)
+        return output
+```
+
+### Module Bundler Strategy
+
+```
+class ModuleBundleMergeStrategy : IMergeStrategy<BundleOptions>
+    function Merge(orderedResources, options, context) → content
+        // Wrap each module in IIFE for isolation
+        output.AppendLine("(function(modules) {")
+        output.AppendLine("  var cache = {};")
+        output.AppendLine("  function require(id) { /* loader */ }")
+
+        for each resource in orderedResources:
+            output.AppendLine("  modules['{resource.Id}'] = function(exports, require) {")
+            output.AppendLine(StripImports(resource))
+            output.AppendLine("  };")
+
+        output.AppendLine("})({});")
+        return output
+```
+
+### Conditional Include Strategy
+
+```
+class ConditionalMergeStrategy : IMergeStrategy<Dictionary<string, bool>>
+    function Merge(orderedResources, defines, context) → content
+        for each resource in orderedResources:
+            // Check #ifdef directives against defines map
+            shouldInclude = all IfDefDirectives satisfied by defines
+
+            if shouldInclude:
+                output.AppendLine(StripDirectives(resource))
+
+        return output
+```
+
+## Directive Stripping
+
+The default behavior strips directives from output. This is handled by examining directive locations via
+`IDirectiveModel<TDirective>.GetLocation(...)`:
+
+```mermaid
+flowchart LR
+    subgraph Original["Original Content"]
+        direction TB
+        L0["Line 0: Header comment"]
+        L1["Line 1: include directive"]:::directive
+        L2["Line 2: void main"]
+        L3["Line 3: doSomething"]
+        L4["Line 4: closing brace"]
+    end
+
+    subgraph Stripped["After Stripping"]
+        direction TB
+        S0["Line 0: Header comment"]
+        S1["Line 1: void main"]
+        S2["Line 2: doSomething"]
+        S3["Line 3: closing brace"]
+    end
+
+    Original --> Stripped
+
+    classDef directive fill:#f96,stroke:#333
+```
+
+**Example transformation:**
+
+- **Original Line 1**: `#include "utils.h"` → _Removed (directive)_
+- **Original Line 2**: `void main() {` → **New Line 1**
+- **Original Line 3**: `doSomething();` → **New Line 2**
+
+**Source mapping considerations:**
+
+- Line numbers shift after directive removal
+- The `ConcatenatingMergeStrategy` accounts for this in mapping generation
+
+## Relationships
+
+```mermaid
+flowchart TB
+    Preprocessor -->|uses| IMergeStrategy["IMergeStrategy&lt;T&gt;"]
+    MergeContext -->|provides| IMergeStrategy
+    ConcatenatingMergeStrategy -->|implements| IMergeStrategy
+
+    MergeContext -->|contains| SourceMapBuilder
+    MergeContext -->|contains| DiagnosticCollection
+    MergeContext -->|contains| ResolvedCache
+```
+
+## Extension Points
+
+1. **Custom TContext**: Pass strategy-specific options (defines, output format, etc.)
+2. **Custom IMergeStrategy**: Complete control over merge behavior
+3. **Directive-aware merging**: Access to parsed directives for conditional processing
+4. **Source map customization**: Full control over mapping granularity
+
+## Thread Safety
+
+- **ResolvedResource**: Immutable record, fully thread-safe
+- **MergeContext**: Contains mutable builders; not thread-safe
+- **IMergeStrategy implementations**: Should be stateless or document thread-safety
+- **ConcatenatingMergeStrategy**: Stateless (properties are init-only), thread-safe
+
+---
+
+# Preprocessor Orchestrator Architecture
+
+Source: https://github.com/dsisco11/tinypreprocessor/blob/master/docs/06-preprocessor-orchestrator.md
+
+# Preprocessor Orchestrator Architecture
+
+This document describes the main `Preprocessor` class that orchestrates the entire preprocessing pipeline.
+
+## Overview
+
+The `Preprocessor<TContent, TDirective, TContext>` class is the primary entry point for consumers. It coordinates:
+
+1. Recursive resource resolution
+2. Directive parsing
+3. Dependency graph construction
+4. Cycle detection
+5. Topological ordering
+6. Merge strategy execution
+7. Source map generation
+
+## Types
+
+### PreprocessorOptions
+
+Configuration options for preprocessing behavior.
+
+```
+record PreprocessorOptions
+    DeduplicateIncludes : bool = true   // include each resource only once
+    MaxIncludeDepth     : int  = 100    // safety limit against infinite recursion
+    ContinueOnError     : bool = true   // collect all diagnostics vs. stop at first
+
+    static Default : PreprocessorOptions  // default instance
+```
+
+- **Sealed record**: Immutable, with-expressions for modification
+- **Sensible defaults**: Works out-of-box for common cases
+- **DeduplicateIncludes**: Prevents duplicate content (like `#pragma once`)
+- **MaxIncludeDepth**: Safety limit against infinite recursion
+
+### PreprocessResult
+
+The result of preprocessing, containing merged output and metadata.
+
+```
+record PreprocessResult
+    Properties:
+        Content            : TContent                      // merged output
+        SourceMap          : SourceMap                     // position mappings
+        Diagnostics        : DiagnosticCollection          // all collected diagnostics
+        ProcessedResources : IReadOnlyList<ResourceId>     // in topological order
+        DependencyGraph    : ResourceDependencyGraph       // for downstream analysis
+```
+
+- Prefer checking `Diagnostics.HasErrors` for a quick "usable output" signal
+- **ProcessedResources**: Useful for cache invalidation, dependency tracking
+- **DependencyGraph exposed**: Enables downstream analysis (affected files, etc.)
+
+### Preprocessor<TContent, TDirective, TContext>
+
+The main orchestrator class.
+
+```
+class Preprocessor<TContent, TDirective, TContext>
+    Dependencies:
+        parser        : IDirectiveParser<TContent, TDirective>
+        directiveModel: IDirectiveModel<TDirective>
+        resolver      : IResourceResolver<TContent>
+        mergeStrategy : IMergeStrategy<TContent, TDirective, TContext>
+        contentModel  : IContentModel<TContent>
+
+    function ProcessAsync(root, context, options?, ct) → PreprocessResult
+        options ← options ?? PreprocessorOptions.Default
+
+        // Initialize per-call state
+        diagnostics ← new DiagnosticCollection()
+        graph ← new ResourceDependencyGraph()
+        cache ← new Dictionary<ResourceId, ResolvedResource>()
+        sourceMapBuilder ← new SourceMapBuilder()
+        resolvedReferences ← new Dictionary<MergeContext.ResolvedReferenceKey, ResourceId>()
+
+        // Phase 1: Recursive resolution
+        await ResolveRecursiveAsync(root, depth: 0, ...)
+
+        // Phase 2: Cycle detection
+        DetectAndReportCycles(graph, diagnostics)
+
+        // Phase 3: Topological ordering
+        processingOrder ← GetProcessingOrder(graph, diagnostics)
+
+        // Phase 4: Merge
+        mergeContext ← new MergeContext(sourceMapBuilder, diagnostics, cache, resolvedReferences, directiveModel, contentModel)
+        orderedResources ← processingOrder.Select(id → cache[id])
+        mergedContent ← mergeStrategy.Merge(orderedResources, context, mergeContext)
+
+        // Phase 5: Build result
+        return new PreprocessResult(mergedContent, sourceMapBuilder.Build(), ...)
+```
+
+## Processing Pipeline
+
+```mermaid
+flowchart TB
+    subgraph ProcessAsync["ProcessAsync()"]
+        direction TB
+
+        subgraph Phase1["Phase 1: Recursive Resolution"]
+            Parse["Parse Root Directives"] --> Resolve["Resolve References"]
+            Resolve --> AddToGraph["Add to Graph & Cache"]
+            AddToGraph -->|recurse for each dependency| Resolve
+        end
+
+        subgraph Phase2["Phase 2: Cycle Detection"]
+            DetectCycles["graph.DetectCycles()"] --> AddDiagnostics["Add CircularDependency Diagnostic for each cycle"]
+        end
+
+        subgraph Phase3["Phase 3: Topological Ordering"]
+            GetOrder["graph.GetProcessingOrder()"] --> OrderedList["Dependencies-first ordered list"]
+        end
+
+        subgraph Phase4["Phase 4: Merge"]
+            MergeStrategy["IMergeStrategy.Merge() with ordered resources"] --> MergedOutput["Merged content + Source mappings"]
+        end
+
+        subgraph Phase5["Phase 5: Build Result"]
+            Result["PreprocessResult { Content, SourceMap, Diagnostics }"]
+        end
+
+        Phase1 --> Phase2
+        Phase2 --> Phase3
+        Phase3 --> Phase4
+        Phase4 --> Phase5
+    end
+```
+
+## Per-Call Caching
+
+The preprocessor uses a per-call cache to:
+
+1. Prevent redundant resolution of the same resource
+2. Enable deduplication (when `DeduplicateIncludes = true`)
+3. Provide the resolved cache to merge strategies
+
+```
+// Cache structure
+cache : Dictionary<ResourceId, ResolvedResource>
+
+// On resolution
+if cache.ContainsKey(resource.Id):
+    return  // Skip - already resolved
+
+// After parsing
+cache[resource.Id] = ResolvedResource(resource, directives)
+```
+
+**Cache vs. DeduplicateIncludes:**
+
+- Cache is always populated (tracks what's been seen)
+- `DeduplicateIncludes` controls whether duplicate references cause re-processing
+- When `DeduplicateIncludes = false`, resources may appear multiple times in output
+
+## Include Convention (via IDirectiveModel)
+
+For the preprocessor to know which directives represent dependencies, provide an `IDirectiveModel<TDirective>`.
+This model extracts a `string` reference for directives that should trigger recursive resolution.
+
+### Resolved Identity for Merge
+
+Resolvers are allowed to implement arbitrary reference-to-identity mapping (e.g., domain-prefixed ids like
+`domain:shaderincludes/shared.glsl`). Merge strategies must not assume that a dependency id can be derived from the
+raw reference string.
+
+To support this, preprocessing records an authoritative mapping from each directive occurrence to its resolved
+dependency `ResourceId` and passes it into `MergeContext` as `ResolvedReferences`.
+
+## Error Handling Strategy
+
+The preprocessor follows the "collect all, decide later" pattern:
+
+```
+// Resolution error → add diagnostic, continue (if ContinueOnError)
+if resolution failed:
+    diagnostics.Add(error)
+    if not options.ContinueOnError: return
+
+// Cycle detected → add diagnostic, continue
+// (output may be incomplete but user sees all issues)
+
+// Max depth exceeded → add diagnostic, stop recursion for that branch
+```
+
+**Rationale:**
+
+- Users see ALL problems at once, not just the first
+- Enables IDE-style error lists
+- Partial results may still be useful (e.g., syntax highlighting)
+
+## Usage Example
+
+```
+// 1. Create components
+parser        = new IncludeParser()
+directiveModel= new IncludeDirectiveModel()
+resolver      = new FileSystemResolver("/project/src")
+merger        = new ConcatenatingMergeStrategy<IncludeDirective, object>()
+contentModel  = new ReadOnlyMemoryCharContentModel()
+
+// 2. Create configuration
+config = new PreprocessorConfiguration<ReadOnlyMemory<char>, IncludeDirective, object>(
+    parser,
+    directiveModel,
+    resolver,
+    merger,
+    contentModel)
+
+// 3. Create preprocessor
+preprocessor = new Preprocessor<ReadOnlyMemory<char>, IncludeDirective, object>(config)
+
+// 4. Load root resource
+root = new Resource("main.c", ReadFile("/project/src/main.c"))
+
+// 5. Process
+result = await preprocessor.ProcessAsync(root, context: null)
+
+// 6. Check results
+if result.Success:
+    WriteFile("/project/out/bundle.c", result.Content)
+else:
+    for each error in result.Diagnostics.GetBySeverity(Error):
+        print "[{error.Code}] {error.Resource}: {error.Message}"
+
+// 6. Use source map for error mapping
+runtimeError = SourcePosition(line: 150, column: 10)
+originalLocation = result.SourceMap.Query(runtimeError)
+if originalLocation exists:
+    print "Error originated in: {originalLocation}"
+```
+
+## Thread Safety
+
+- **Preprocessor**: Thread-safe for concurrent `ProcessAsync` calls (each call has isolated state)
+- **Per-call state**: Cache, graph, diagnostics are isolated per call
+- **Dependencies**: Parser, resolver, merger should be thread-safe or documented otherwise
+
+## Extension Points
+
+1. **Custom IDirectiveParser**: Parse any directive syntax
+2. **Custom IResourceResolver**: Load from any source (files, network, database)
+3. **Custom IMergeStrategy**: Control how resources combine
+4. **PreprocessorOptions**: Tune behavior for specific use cases
+5. **IDirectiveModel**: Define custom include semantics
+
+---
+
+# Content Boundaries
+
+Source: https://github.com/dsisco11/tinypreprocessor/blob/master/docs/07-content-boundaries.md
+
+# Content Boundaries
+
+TinyPreprocessor’s core pipeline is offset-based and content-agnostic.
+When downstream users want higher-level concepts like “line numbers”, they can supply boundary resolvers.
+
+## Core idea
+
+A boundary is a consumer-defined “split point” in content.
+A boundary resolver answers the question:
+
+- “Which boundary offsets exist within the offset range `[startOffset, endOffset)` of this content instance?”
+
+This is exposed via:
+
+- `IContentBoundaryResolver<TContent, TBoundary>`
+- `IContentBoundaryResolverProvider`
+
+`TBoundary` is a marker type so downstream users can define their own boundary kinds.
+
+## Line boundaries
+
+The built-in text merge strategy uses the boundary kind `TinyPreprocessor.Text.LineBoundary` when it is available.
+This allows users to define what a “line break” means for their content (LF, CRLF, custom tokens, etc.).
+
+### Expected `LineBoundary` convention
+
+For `LineBoundary`, a typical convention is:
+
+- Each boundary offset represents the start offset of a line after the first line.
+- In other words, boundary offsets are the offsets _immediately after_ a line break sequence.
+- Offsets are 0-based and must be returned in ascending order.
+
+Examples:
+
+- LF (`\n`) text: boundary offsets are `indexOf('\n') + 1` for each line break.
+- CRLF (`\r\n`) text: boundary offsets are `indexOf("\r\n") + 2` for each line break.
+- Custom line breaks: boundary offsets are whatever “start of next line” means to you.
+
+## Composing boundaries with SourceMap
+
+`SourceMap` stays offset-only. To compute a “line number” (boundary index):
+
+- Map generated offset → original `(ResourceId, OriginalOffset)` via `SourceMap.Query(...)`.
+- Count how many `LineBoundary` offsets occur before that original offset.
+
+See `SourceMapBoundaryExtensions.ResolveOriginalBoundaryLocation(...)` for a helper that performs this composition.
+
+---

@@ -33,7 +33,7 @@ Update React 19.0.0 - corrected docs root
 
 Use the [pull request template](.github/pull_request_template.md). Fill in technology ID, version, docs root, change type, and submission type. For contributions, run python3 scripts/verify_registry.py locally before requesting review — CI enforces the rest.
 
-Prefer opening a [request docs issue](https://github.com/reclear-io/fullcontext/issues/new?template=request-docs.yml) if you are not submitting artifacts yourself. Use [report registry issue](https://github.com/reclear-io/fullcontext/issues/new?template=report-registry-issue.yml) for incorrect or stale content.
+Prefer opening a [request docs issue](https://github.com/reclear-io/llmref/issues/new?template=request-docs.yml) if you are not submitting artifacts yourself. Use [report registry issue](https://github.com/reclear-io/llmref/issues/new?template=report-registry-issue.yml) for incorrect or stale content.
 
 See [SCHEMA.md](./SCHEMA.md) for the full `meta.json` specification.
 
@@ -45,9 +45,9 @@ Each snapshot lives at:
 registry/
   <technology-id>/
     <version>/
-      llms.txt
-      llms-full.txt
-      meta.json
+      llms.txt        # always
+      llms-full.txt   # only when the license permits redistribution
+      meta.json       # always (includes a license block)
 ```
 
 ### `meta.json` requirements
@@ -62,7 +62,9 @@ registry/
 
 - Use the official public documentation source only.
 - Do not include proprietary or non-public documentation.
-- Upstream license/terms must not restrict redistribution of docs content.
+- Licensing is detected automatically and recorded in `meta.json` `license`. Docs
+  whose license does not permit redistribution are still indexed for search, but
+  ship without `llms-full.txt` (see [SCHEMA.md](./SCHEMA.md#license)).
 - For updates, ensure `content_fingerprint` has changed from the prior snapshot.
 - Do not overwrite an existing version unless the PR is an intentional refresh.
 

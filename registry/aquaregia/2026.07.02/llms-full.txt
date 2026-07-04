@@ -1,0 +1,3064 @@
+# Aquaregia
+
+Source: https://github.com/minorcell/aquaregia/blob/main/README.md
+
+<div align="center">
+
+<img src="https://raw.githubusercontent.com/minorcell/aquaregia/dev/docs/public/brand/aquaregia-logo.svg" alt="Aquaregia logo" width="96" height="96">
+
+# Aquaregia
+
+**A lightweight Rust library for building LLM agents.**
+
+[API Docs](https://docs.rs/aquaregia) · [Examples](./examples/README.md) 
+
+</div>
+
+## Introduction
+
+### Why Aquaregia
+
+You want an agent: a model that calls your tools, loops until the job is done, and streams its progress as it goes. Writing that loop by hand — dispatching tool calls, feeding results back, tracking steps, handling the model that won't stop — is the part nobody enjoys.
+
+Aquaregia gives you that loop in a few lines. You describe the tools and the stopping rule; the `Agent` runs the think → call → observe → repeat cycle for you, with hooks at every boundary. And because the agent is built on one unified API across OpenAI, Anthropic, Google, and any OpenAI-compatible endpoint, the same agent runs on whichever provider you point it at — swap a constructor, keep the code.
+
+It's not a framework, not a gateway, not a microservice. It's a Rust library you `cargo add` and call directly.
+
+### At a glance
+
+| Capability                        | What you get                                                                            |
+| --------------------------------- | --------------------------------------------------------------------------------------- |
+| **Tool-using agents**             | Multi-step loop with `prepare_step` hooks, `max_steps`, `stop_when`, error policies      |
+| **Typed tools**                   | A tool is a typed `async fn` — `schemars` derives the schema, args marshal back to Rust  |
+| **Runs on any provider**          | One agent, same code, over OpenAI · Anthropic · Google · OpenAI-compatible gateways      |
+| **Streaming & non-streaming**     | Same builder feeds `generate` or `stream`, with consistent `StreamEvent`s                |
+| **Structured output**             | `generate_object::<T>()` and `stream_object::<T>()` with `schemars`-derived schemas      |
+| **Reasoning content**             | First-class reasoning extraction, streaming reasoning deltas, reasoning-token usage      |
+| **Multimodal input**              | Send images, PDFs, and other files by URL, base64, or raw bytes — one `FilePart` API     |
+| **Text embeddings**               | Generate vector embeddings with `embed()` — OpenAI, Google, OpenAI-compatible support    |
+| **Cancellation & retries**        | `CancellationToken` checked everywhere; exponential backoff with `Retry-After` honored   |
+
+## Quick Start
+
+### Install
+
+```bash
+cargo add aquaregia
+```
+
+You'll also need a Tokio runtime in your application — Aquaregia is async end-to-end.
+
+### Hello world
+
+The shortest path to a real model response:
+
+```rust
+use aquaregia::providers::openai;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let agent = openai::Client::from_env()?
+        .agent("gpt-5.5")
+        .build()?;
+
+    let response = agent
+        .prompt("Explain Rust ownership in 3 bullet points.")
+        .await?;
+
+    println!("{response}");
+    Ok(())
+}
+```
+
+Two moving parts: a **provider client** (auth + transport) and a **model-bound agent**. `.prompt()` is the common string-in/string-out path; reach for `.run()` or `.generate()` when you need richer metadata or explicit requests.
+
+### First streaming call
+
+For a single streaming model call, use the provider client directly:
+
+```rust
+use aquaregia::StreamEvent;
+use futures_util::StreamExt;
+
+let mut stream = client
+    .stream(ChatRequest::from_prompt(
+        "gpt-5.5",
+        "Write a haiku about the borrow checker.",
+    ))
+    .await?;
+
+while let Some(event) = stream.next().await {
+    match event? {
+        StreamEvent::TextDelta { text } => print!("{text}"),
+        StreamEvent::Done { .. }        => break,
+        _                               => {}
+    }
+}
+```
+
+Use `.prompt()` for ordinary text, and explicit `ChatRequest` values when you need lower-level control. The rest of this guide unpacks each piece.
+
+## Essentials
+
+### Provider clients
+
+Provider modules are the constructor entry-point for all LLM operations. Use `from_env()` for providers with a standard endpoint, or `.builder()` when you need explicit settings.
+
+```rust
+use aquaregia::providers::openai;
+use std::time::Duration;
+
+let client = openai::Client::builder()
+    .api_key(std::env::var("OPENAI_API_KEY")?)
+    .base_url("https://api.openai.com")          // optional: custom upstream
+    .timeout(Duration::from_secs(60))            // per-request HTTP timeout
+    .max_retries(3)                              // transient-failure retries
+    .default_max_steps(8)                        // default agent step cap
+    .user_agent("my-app/1.0")
+    .build()?;
+```
+
+Switching providers is just a different module — every method you'll see below works the same way on whichever provider client you end up with.
+
+| Provider          | Constructor                                                         |
+| ----------------- | ------------------------------------------------------------------- |
+| OpenAI            | `openai::Client::from_env()` or `openai::Client::builder().api_key(api_key)` |
+| Anthropic         | `anthropic::Client::from_env()` or `anthropic::Client::builder().api_key(api_key)` |
+| Google            | `google::Client::from_env()` or `google::Client::builder().api_key(api_key)` |
+| OpenAI-compatible | `openai_compatible::Client::from_env()` or `openai_compatible::Client::builder().base_url(url).api_key(token)` |
+
+#### Going deeper: OpenAI-compatible endpoints
+
+If your provider speaks the OpenAI chat-completions wire format but lives at a different URL — Together, Groq, your own gateway — `openai_compatible::Client::builder()` lets you bolt on custom headers, query params, and even a different chat path:
+
+```rust
+use aquaregia::providers::openai_compatible;
+
+let client = openai_compatible::Client::builder()
+    .base_url("https://api.example.com")
+    .api_key_from_env("OPENAI_COMPATIBLE_API_KEY")
+    .header("x-trace-source", "aquaregia")
+    .query_param("source", "library")
+    .chat_completions_path("/v1/chat/completions")
+    .build()?;
+```
+
+If the endpoint doesn't want any `Authorization` header at all, call `.no_api_key()` instead of `.api_key(...)`.
+
+### Generating text
+
+`agent.prompt(...)` is the common path when you only need visible text:
+
+```rust
+let response = client
+    .agent("gpt-5.5")
+    .build()?
+    .prompt("Summarize Rust's borrow checker for a Go developer.")
+    .await?;
+
+println!("{response}");
+```
+
+`generate` is the explicit request path: one request, one response, all content in `output_text`.
+
+```rust
+let response = client
+    .generate(ChatRequest::from_prompt(
+        "gpt-5.5",
+        "Summarize Rust's borrow checker for a Go developer.",
+    ))
+    .await?;
+
+println!("{}", response.output_text);
+println!("finish: {:?}", response.finish_reason);
+```
+
+`from_prompt(model, prompt)` is the one-line form. When you need more — system prompts, sampling controls, output limits, cancellation, or provider-specific options — reach for the builder:
+
+```rust
+use aquaregia::{ChatRequest, Message};
+
+let req = ChatRequest::builder("gpt-5.5")
+    .message(Message::system_text("You are concise."))
+    .message(Message::user_text("Write a release note."))
+    .temperature(0.2)
+    .max_output_tokens(300)
+    .build()?;
+```
+
+The model argument is just a string — Aquaregia doesn't try to enumerate model IDs because every provider ships new ones every few weeks. Pass whatever your provider's docs say is current; if the provider rejects it, you'll get a clean `InvalidRequest` error back.
+
+### Streaming responses
+
+When the consumer is a UI or a terminal, you want tokens as they arrive, not after the whole reply lands. Swap `generate` for `stream` and consume `StreamEvent`s:
+
+```rust
+use aquaregia::StreamEvent;
+use futures_util::StreamExt;
+
+let mut stream = client.stream(request).await?;
+
+while let Some(event) = stream.next().await {
+    match event? {
+        StreamEvent::TextDelta { text }          => print!("{text}"),
+        StreamEvent::ReasoningDelta { text, .. } => eprint!("{text}"),
+        StreamEvent::ToolCallReady { call }      => eprintln!("\n[tool] {}", call.tool_name),
+        StreamEvent::Usage { usage }             => eprintln!(
+            "\nin={} out={} total={}",
+            usage.input_tokens, usage.output_tokens, usage.total_tokens,
+        ),
+        StreamEvent::Done { .. }                 => break,
+        _ => {}
+    }
+}
+```
+
+The event stream is the union of everything a model might emit. You'll typically only match a few variants; the rest you can `_ => {}`. Here's the full menu:
+
+| Event                | Fields                                  | When it fires                                  |
+| -------------------- | --------------------------------------- | ---------------------------------------------- |
+| `ReasoningStarted`   | `block_id`, `provider_metadata`         | A reasoning block begins (Anthropic / Google)  |
+| `ReasoningDelta`     | `block_id`, `text`, `provider_metadata` | Each token of thought                          |
+| `ReasoningDone`      | `block_id`, `provider_metadata`         | A reasoning block closed                       |
+| `TextDelta`          | `text`                                  | Each token of the visible answer               |
+| `ToolCallReady`      | `call: ToolCall`                        | Model finished assembling a tool call          |
+| `Usage`              | `usage: Usage`                          | Provider reports token counts                  |
+| `Done`               | `finish_reason: FinishReason`          | Final event of every stream                    |
+
+Once `Done` fires the stream is finished — don't poll after. Use `finish_reason` to distinguish natural stops from token limits, tool calls, or provider-specific endings.
+
+### Reasoning
+
+Reasoning is the model's "thinking out loud" — separate from the visible answer, exposed as its own content block by Anthropic Extended Thinking, Google's `thoughts`, and OpenAI's reasoning-token accounting. Aquaregia surfaces it uniformly:
+
+```rust
+let out = client.generate(req).await?;
+
+println!("answer:     {}", out.output_text);
+println!("thinking:   {}", out.reasoning_text);
+println!("rsn-tokens: {}", out.usage.reasoning_tokens);
+
+for part in &out.reasoning_parts {
+    println!("[block] {}", part.text);
+    // part.provider_metadata carries signature blocks (Anthropic),
+    // thought signatures (Google), and any other provider extras.
+}
+```
+
+In streaming you'll see `ReasoningStarted` → `ReasoningDelta`(s) → `ReasoningDone` for each reasoning block before the visible text starts. The token-usage split comes from whichever fields the provider populates:
+
+| Provider                   | Reasoning-token mapping                                                                     |
+| -------------------------- | ------------------------------------------------------------------------------------------- |
+| OpenAI / OpenAI-compatible | `prompt_tokens_details.cached_tokens` + `completion_tokens_details.reasoning_tokens`        |
+| Anthropic                  | `cache_read_input_tokens` / `cache_creation_input_tokens`; reasoning-token split unavailable |
+| Google                     | `cachedContentTokenCount` + `thoughtsTokenCount`                                            |
+
+If a provider doesn't report a number, the field stays at `0` — Aquaregia never makes up data.
+
+### Structured output
+
+When you want a typed Rust value back instead of a blob of text, derive `JsonSchema` and call `generate_object::<T>()`. The schema is generated automatically and passed to the provider; the JSON response is parsed straight into `T`.
+
+```rust
+use aquaregia::{ChatRequest, Message};
+use schemars::JsonSchema;
+use serde::Deserialize;
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct WeatherResult {
+    city: String,
+    temp_c: f64,
+}
+
+let req = ChatRequest::builder("gpt-5.5")
+    .message(Message::user_text("What is the weather in Tokyo?"))
+    .temperature(0.2)
+    .build()?;
+
+let result = client.generate_object::<WeatherResult>(req).await?;
+
+println!("{} → {}°C", result.object.city, result.object.temp_c);
+```
+
+Providers without native structured-output mode (Anthropic, Google) fall back transparently to forced tool calls. From the caller's perspective there's no difference — you get a `T` either way.
+
+#### Streaming partial objects
+
+For UIs that should render fields as they arrive, `stream_object::<T>()` emits progressively-populated values. Each chunk is repaired and re-deserialised into a partial `T`. Fields not yet emitted by the model stay at their `Default`, so derive `Default` and add `#[serde(default)]`:
+
+```rust
+use aquaregia::types::StreamObjectEvent;
+use aquaregia::{ChatRequest, Message};
+use futures_util::StreamExt;
+use schemars::JsonSchema;
+use serde::Deserialize;
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(default)]
+struct WeatherResult {
+    city:   String,
+    temp_c: f64,
+}
+
+let mut stream = client.stream_object::<WeatherResult>(req).await?;
+while let Some(event) = stream.next().await {
+    match event? {
+        StreamObjectEvent::Partial { partial } => {
+            println!("partial: {} ({}°C)", partial.city, partial.temp_c);
+        }
+        StreamObjectEvent::Object { object } => {
+            println!("final:   {:?}", object);
+        }
+    }
+}
+```
+
+Under the hood is a stack-based JSON repairer that handles truncated strings, unclosed arrays and objects, and escape sequences mid-token. A chunk that splits a field name or value still produces a valid partial — you never have to handle invalid JSON in your code.
+
+### Tools
+
+A tool lets the model call your Rust code mid-conversation. Think of one as a **typed `async fn` the LLM can invoke by name** — Aquaregia builds the JSON Schema from your argument type, marshals the call args back into Rust, and runs your function.
+
+The typed style is the one you'll reach for most:
+
+```rust
+use aquaregia::{Tool, tool};
+use schemars::JsonSchema;
+use serde::Deserialize;
+use serde_json::json;
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct WeatherArgs { city: String }
+
+fn get_weather() -> Tool {
+    tool("get_weather")
+        .description("Get weather by city")
+        .execute(|args: WeatherArgs| async move {
+            json!({ "city": args.city, "temp_c": 23, "condition": "sunny" })
+        })
+}
+```
+
+`tool(name)` starts a builder; `.execute(closure)` consumes a `JsonSchema`-derived arg type and returns any `Serialize` value. Use `.try_execute(...)` when the tool can fail with `ToolExecError`.
+
+If you'd rather hand-write the schema (unusual constraints, no derive available), use `.raw_schema(...)` + `.execute_raw(...)`:
+
+```rust
+let fx_tool = tool("get_fx_rate")
+    .description("Get FX rate by currency pair, e.g. USD/CNY")
+    .raw_schema(json!({
+        "type": "object",
+        "properties": { "pair": { "type": "string" } },
+        "required": ["pair"]
+    }))
+    .execute_raw(|args| async move {
+        let pair = args.get("pair").and_then(|v| v.as_str()).unwrap_or("USD/CNY");
+        Ok(json!({ "pair": pair, "rate": 7.18 }))
+    });
+```
+
+Tool names must match `^[a-zA-Z0-9_-]{1,64}$` and be unique within an agent. That's validated at agent build time so an invalid registry never reaches the model.
+
+### Agents
+
+An `Agent` is a `generate`-plus-tools `while` loop with hooks: the model thinks → maybe calls tools → you run the tools → results go back to the model → repeat until it stops calling tools (or you cap it). You don't write the loop; you describe its inputs and outputs.
+
+The minimum agent is one tool and a step cap:
+
+```rust
+use aquaregia::providers::openai;
+
+let client = openai::Client::from_env()?;
+
+let agent = client
+    .agent("gpt-5.5")
+    .instructions("You can call tools before answering.")
+    .tool(get_weather())
+    .max_steps(4)
+    .build()?;
+
+let response = agent.prompt("Weather in Shanghai?").await?;
+println!("{response}");
+```
+
+`prompt` returns the final user-visible answer directly. Use `run` when you need the full `AgentOutput`: `steps` tells you how many round-trips it took, and `usage_total` aggregates token counts across every call.
+
+#### Streaming agent runs
+
+Use `agent.stream(...)` when the consumer needs the whole execution as it happens: model deltas, tool calls, tool results, step snapshots, and the final output.
+
+```rust
+use aquaregia::{AgentStreamEvent, StreamEvent};
+use futures_util::StreamExt;
+
+let mut stream = agent.stream("Weather in Shanghai?").await?;
+
+while let Some(event) = stream.next().await {
+    match event? {
+        AgentStreamEvent::Model {
+            event: StreamEvent::TextDelta { text },
+            ..
+        } => print!("{text}"),
+        AgentStreamEvent::ToolCallStart { event } => {
+            eprintln!("[tool] {}", event.tool_call.tool_name);
+        }
+        AgentStreamEvent::Done { output } => {
+            eprintln!("[done] steps={}", output.steps);
+            break;
+        }
+        _ => {}
+    }
+}
+```
+
+#### Event hooks
+
+Every interesting boundary in the loop emits an event. All hooks are `Fn + Send + Sync`, so you can attach closures directly — useful for logging, metrics, debug UIs:
+
+```rust
+let agent = client.agent("gpt-5.5")
+    .tool(get_weather())
+    .on_start(|e|            println!("[start] tools={} max_steps={}", e.tool_count, e.max_steps))
+    .on_step_start(|e|       println!("[step:{}] msgs={}", e.step, e.messages.len()))
+    .on_tool_call_start(|e|  println!("[tool:{}] {}", e.step, e.tool_call.tool_name))
+    .on_tool_call_finish(|e| println!("[tool:{}] {} in {}ms", e.step, e.tool_call.tool_name, e.duration_ms))
+    .on_step_finish(|s|      println!("[step:{}] finish={:?}", s.step, s.finish_reason))
+    .on_finish(|f|           println!("[done] {} steps, {} total tokens", f.step_count, f.usage_total.total_tokens))
+    .build()?;
+```
+
+#### Dynamic planning with `prepare_step`
+
+When you need to mutate the next step before it runs — narrow the tool list, swap models, inject a system prompt for that step only — give the agent a `prepare_step` closure:
+
+```rust
+use aquaregia::Message;
+
+let agent = client.agent("gpt-5.5")
+    .tools([get_weather(), get_fx_rate()])
+    .prepare_step(|event| {
+        let mut next = event.to_prepared();
+        next.messages.push(Message::system_text(format!(
+            "Step {}: be concise.", event.step,
+        )));
+        if event.step >= 2 {
+            next.tools.clear(); // disallow tools after step 2
+        }
+        next
+    })
+    .build()?;
+```
+
+The returned `AgentPreparedStep` is what the agent actually sends to the model for this step. Anything you don't change carries over from the previous state.
+
+#### Stopping policies
+
+Three knobs control how the loop ends:
+
+```rust
+use aquaregia::ToolErrorPolicy;
+
+let agent = client.agent("gpt-5.5")
+    .max_steps(8)
+    .stop_when(|step| step.tool_calls.is_empty() && !step.output_text.is_empty())
+    .tool_error_policy(ToolErrorPolicy::ContinueAsToolResult)
+    .build()?;
+```
+
+- **`max_steps`** — hard cap. Hitting it returns `ErrorCode::MaxStepsExceeded` instead of silently truncating.
+- **`stop_when`** — predicate checked after every step. Useful when you have a sharper definition of "done" than "no more tool calls".
+- **`tool_error_policy`** — what happens when a tool throws.
+  - `ContinueAsToolResult` (default) — schema-validation failures, timeouts, and panics become `{ "error": "..." }` results so the model can recover on the next step.
+  - `FailFast` — surface as `ErrorCode::ToolExecutionFailed` / `InvalidToolArgs` immediately.
+
+#### Multi-turn conversations
+
+`AgentOutput.transcript` is a complete `Vec<Message>` (system + user + assistant + tool results) you can feed straight back in for the next turn — no manual reconstruction:
+
+```rust
+let mut history = vec![Message::system_text("You are a careful assistant.")];
+
+loop {
+    let user_input = read_line()?;
+    history.push(Message::user_text(user_input));
+
+    let result = agent.run_messages(history.clone()).await?;
+    println!("{}", result.output_text);
+
+    history = result.transcript; // round-trip the full conversation
+}
+```
+
+See [`examples/claude_code`](./examples/claude_code) for a working terminal agent that uses this pattern with `bash` / `read` / `write` / `edit` tools.
+
+### Multimodal
+
+Images, PDFs, and other binary inputs all ride the same `FilePart` type, distinguished by an IANA `media_type`. The shortest path is `Message::user_file_url` / `Message::user_file_bytes`; for mixed content or multiple files per message, build a `Message` with explicit content parts:
+
+```rust
+use aquaregia::{
+    ChatRequest, ContentPart, FilePart, MediaData, Message, MessageRole, TextPart,
+};
+use aquaregia::providers::openai;
+
+let client = openai::Client::from_env()?;
+
+let out = client
+    .generate(
+        ChatRequest::builder("gpt-5.5")
+            .message(Message::new(
+                MessageRole::User,
+                vec![
+                    ContentPart::Text(TextPart::new("What's in this image?")),
+                    ContentPart::File(FilePart::new(
+                        MediaData::Url(
+                            "https://upload.wikimedia.org/wikipedia/commons/thumb/3/3a/Cat03.jpg/1200px-Cat03.jpg".into(),
+                        ),
+                        "image/jpeg",
+                    )),
+                ],
+            ))
+            .build()?,
+    )
+    .await?;
+```
+
+The convenience constructors:
+
+| Constructor                                                                                | Use case                                                |
+| ------------------------------------------------------------------------------------------ | ------------------------------------------------------- |
+| `Message::user_file_url(url, media_type)`                                                  | One file from a URL                                     |
+| `Message::user_file_bytes(bytes, media_type)`                                              | One file from raw bytes (auto base64)                   |
+| `Message::new(MessageRole::User, vec![Text, File, …])`                                     | Mixed content / multiple files                          |
+| `FilePart::new(data, media_type).with_filename(...).with_provider_options(...)`            | Full control: filename hint, per-block provider options |
+
+`media_type` is mandatory — IANA-style strings such as `image/jpeg`, `image/png`, `application/pdf`. Adapters dispatch on it:
+
+| `media_type`         | Anthropic                | OpenAI Responses                          | OpenAI-compatible | Google                       |
+| -------------------- | ------------------------ | ----------------------------------------- | ----------------- | ---------------------------- |
+| `image/*`            | `image` block            | `input_image` (`image_url` data URL)      | `image_url`       | `inlineData` / `fileData`    |
+| `application/pdf`    | `document` block         | `input_file` (with optional `filename`)   | ✗ rejected locally | `inlineData` / `fileData`    |
+| anything else        | ✗ rejected locally       | ✗ rejected locally                        | ✗ rejected locally | passed through (mimeType)    |
+
+Unsupported `media_type` surfaces as a local `ErrorCode::InvalidRequest` before any network round-trip — no silent fallback. Google receives the `media_type` verbatim and supports the broadest set (image / PDF / audio / video subtypes) at the API level; the others reject what they cannot represent.
+
+### Embeddings
+
+Generate vector embeddings for text using provider embedding models. Embeddings convert text into dense vector representations useful for semantic search, clustering, and similarity comparisons.
+
+```rust
+use aquaregia::embed::EmbedRequest;
+use aquaregia::providers::openai;
+
+let client = openai::Client::from_env()?;
+
+let response = client.embed(
+    EmbedRequest::new("text-embedding-3-small", vec!["Your text here"])
+).await?;
+
+println!("Dimension: {}", response.embeddings[0].len());
+println!("Tokens: {}", response.usage.tokens);
+```
+
+**Provider support:**
+
+| Provider          | Embedding API | Models                                    |
+| ----------------- | :-----------: | ----------------------------------------- |
+| OpenAI            | ✅            | `text-embedding-3-small`, `text-embedding-3-large` |
+| Anthropic         | ❌            | —                                         |
+| Google            | ✅            | `text-embedding-004`                      |
+| OpenAI-compatible | ✅            | Depends on provider                            |
+
+Anthropic does not provide an embedding API. For Anthropic-based applications, use a third-party embedding provider through the `openai_compatible` adapter (e.g., Voyage AI, Cohere).
+
+**Batch processing:**
+
+```rust
+let texts = vec![
+    "First document",
+    "Second document",
+    "Third document",
+];
+
+let response = client.embed(
+    EmbedRequest::new("text-embedding-3-small", texts)
+).await?;
+
+// response.embeddings[i] corresponds to texts[i]
+for (i, embedding) in response.embeddings.iter().enumerate() {
+    println!("Text {}: {} dimensions", i, embedding.len());
+}
+```
+
+**Provider-specific options:**
+
+Use `provider_options` to access provider-specific features like dimension reduction:
+
+```rust
+use serde_json::json;
+
+let response = client.embed(
+    EmbedRequest::builder("text-embedding-3-large")
+        .values(vec!["Some text"])
+        .provider_options(json!({
+            "openai": { "dimensions": 256 }  // Reduce from 3072 to 256
+        }))
+        .build()?
+).await?;
+```
+
+The core request type sticks to the lowest common denominator — model, messages, sampling, output limits, and cancellation. But every provider ships knobs that don't generalise: Anthropic's thinking budget, Google's safety thresholds, parameters that land on one provider and nowhere else. Rather than bloat the core type with fields that mean nothing to three out of four providers, Aquaregia gives you an escape hatch: `provider_options`.
+
+You pass a JSON object keyed by provider slug. The core never parses it — each adapter picks out its own key and merges those fields into the request body it sends. Anything the provider's API accepts, you can set:
+
+```rust
+use aquaregia::ChatRequest;
+use serde_json::json;
+
+let req = ChatRequest::builder("gpt-5.5")
+    .user("Prove the infinitude of primes.")
+    .provider_options(json!({
+        "openai": {
+            "reasoning": { "effort": "medium" }
+        }
+    }))
+    .build()?;
+```
+
+The slug (`"openai"`) is what routes the options, so a single request can carry settings for several providers — only the matching adapter reads its own block, the rest is ignored. That means you can keep one `provider_options` value and reuse it as you A/B across providers:
+
+```rust
+.provider_options(json!({
+    "anthropic": { "thinking": { "type": "enabled", "budget_tokens": 10000 } },
+    "google":    { "safetySettings": [
+        { "category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_ONLY_HIGH" }
+    ]}
+}))
+```
+
+| Provider slug       | Merged into                          |
+| ------------------- | ------------------------------------ |
+| `anthropic`         | Messages API request body (top level) |
+| `openai`            | Responses API request body (top level) |
+| `google`            | `generateContent` request body (top level) |
+| `openai-compatible` | Chat Completions request body (top level) |
+
+Because the merge is opaque, the responsibility is yours: keys you set override what the adapter computed, and a malformed value surfaces as a provider-side `InvalidRequest` rather than a compile error. This is the deliberate trade — full reach into provider features, no waiting on the core type to add a field.
+
+The same setter is on the agent builder returned by `client.agent(...)` — once configured, the options ride every step of the tool loop:
+
+```rust
+let agent = client.agent("gpt-5.5")
+    .tools([weather])
+    .provider_options(json!({
+        "openai": { "reasoning": { "effort": "medium" } }
+    }))
+    .build()?;
+```
+
+#### Per-message and per-content-block options
+
+Some provider features attach to a single message or even a single content block — Anthropic's `cache_control` breakpoint is the canonical example: it tells the API where to start a prompt cache, and *where* you put it is the whole point. The same `provider_options` shape works at message and block level:
+
+```rust
+use aquaregia::{ContentPart, Message, MessageRole, TextPart};
+
+let cached_system = TextPart::new(LONG_SYSTEM_PROMPT).with_provider_options(json!({
+    "anthropic": { "cache_control": { "type": "ephemeral" } }
+}));
+
+let system = Message::new(
+    MessageRole::System,
+    vec![ContentPart::Text(cached_system)],
+);
+```
+
+`Message::with_provider_options(...)` is the message-level analogue, merged into the message object itself rather than a block within it.
+
+The same opaqueness contract holds at every level — adapters read their slug, merge what they find, and never invent semantics. For OpenAI's Responses API and the openai-compatible Chat Completions adapter, attaching `provider_options` to a text block also forces the `content` field into the typed-array form (a bare string can't carry per-block fields).
+
+| Setter                          | Merged into                                                  |
+| ------------------------------- | ------------------------------------------------------------ |
+| `ChatRequest::builder().provider_options(…)` | Request body, top level                                      |
+| `client.agent(...).provider_options(…)`              | Every per-step request body, top level                       |
+| `Message::with_provider_options(…)`                  | The corresponding message object inside `messages` / `input` |
+| `TextPart::with_provider_options(…)`                 | The corresponding text content block                         |
+
+#### Provider-native capabilities
+
+Anthropic's `web_search_20250305`, OpenAI's `web_search` / `file_search` / `code_interpreter`, Google's `googleSearch` and friends are server-side provider capabilities. They go into the request body's provider-specific fields through `provider_options`:
+
+```rust
+let req = ChatRequest::builder("gpt-5.5")
+    .user("What did Rust 1.85 ship?")
+    .provider_options(json!({
+        "openai": {
+            "tools": [{
+                "type": "web_search"
+            }]
+        }
+    }))
+    .build()?;
+```
+
+One thing to know about the merge: top-level keys **overwrite** what the adapter computed for that key. If a provider uses a field named `tools` for server-side capabilities, put the complete provider-native array in `provider_options.<slug>.tools`.
+
+## Production
+
+Code that calls an LLM in production has to deal with three boring-but-essential concerns: stopping work that's no longer wanted, surviving transient failures, and reporting errors usefully.
+
+### Cancellation
+
+Every request and agent run accepts a `CancellationToken`. Cancel the token and the operation stops at the next safe boundary — Aquaregia checks before every HTTP send (via `tokio::select!`, zero overhead on the happy path), after every SSE chunk in streaming responses, and at the top of every agent step.
+
+```rust
+use aquaregia::{ChatRequest, ErrorCode};
+use std::time::Duration;
+use tokio_util::sync::CancellationToken;
+
+let token = CancellationToken::new();
+let bg = token.clone();
+tokio::spawn(async move {
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    bg.cancel();
+});
+
+let req = ChatRequest::builder("gpt-5.5")
+    .user("Write a 10,000-word essay.")
+    .cancellation_token(token)
+    .build()?;
+
+match client.generate(req).await {
+    Err(e) if e.code == ErrorCode::Cancelled => println!("cancelled"),
+    other                                    => println!("{other:?}"),
+}
+```
+
+Agents can take the token at builder time so every `agent.run(...)` call uses the same one:
+
+```rust
+let agent = client.agent("gpt-5.5")
+    .cancellation_token(token.clone())
+    .build()?;
+```
+
+### Retries & timeouts
+
+Two knobs, set on the client:
+
+```rust
+let client = aquaregia::providers::openai::Client::builder()
+    .api_key(api_key)
+    .max_retries(3)                          // default: 3
+    .timeout(Duration::from_secs(45))
+    .build()?;
+```
+
+Aquaregia retries on the classes that are actually transient: `RateLimited`, `ProviderServerError`, `Transport`, `Timeout`. Backoff is exponential with jitter. If the provider returns a `Retry-After` header, Aquaregia honours it instead of using its own delay.
+
+Every `Error` also carries `retryable: bool` flagging the same classification, so if you need a custom retry / circuit-breaker layer, you don't have to redo the taxonomy.
+
+### Error handling
+
+`Error` is a structured payload, not just a string. Match on `code: ErrorCode` for control flow; read the rest for diagnostics:
+
+```rust
+use aquaregia::ErrorCode;
+
+match client.generate(req).await {
+    Ok(out) => println!("{}", out.output_text),
+    Err(e) => match e.code {
+        ErrorCode::RateLimited        => eprintln!("retry after {:?}s", e.retry_after_secs),
+        ErrorCode::AuthFailed         => eprintln!("bad API key"),
+        ErrorCode::Cancelled          => eprintln!("cancelled"),
+        ErrorCode::MaxStepsExceeded   => eprintln!("agent loop too long"),
+        ErrorCode::InvalidToolArgs    => eprintln!("schema mismatch: {}", e.message),
+        ErrorCode::Timeout            => eprintln!("upstream timed out"),
+        _                              => eprintln!("error: {e}"),
+    },
+}
+```
+
+Every `Error` carries:
+
+- `code: ErrorCode` — a normalised variant (the discriminator you actually want to switch on)
+- `provider`, `status`, `request_id`, `raw_body`, `retry_after_secs` — diagnostic fields for logs and support tickets
+- `retryable: bool` — `true` iff Aquaregia's built-in retry would engage
+
+## Integration
+
+Aquaregia keeps web framework adapters out of the crate on purpose — `TextStream` is a `Stream` of `StreamEvent` and adapts cleanly to whatever transport your app already uses.
+
+Here's the Axum SSE pattern. Every `StreamEvent` becomes a named SSE event your frontend can switch on:
+
+```rust
+use aquaregia::{providers::openai, ChatRequest, StreamEvent, TextStream};
+use axum::{
+    extract::State,
+    response::{
+        IntoResponse,
+        sse::{Event, Sse},
+    },
+    routing::get,
+    Router,
+};
+use futures_util::StreamExt;
+use std::{convert::Infallible, sync::Arc};
+
+fn to_axum_sse(stream: TextStream) -> impl IntoResponse {
+    Sse::new(stream.map(|item| {
+        let event = match item {
+            Ok(StreamEvent::ReasoningStarted { .. })       => Event::default().event("reasoning_start").data("{}"),
+            Ok(StreamEvent::ReasoningDelta { text, .. })   => Event::default().event("reasoning_token").data(text),
+            Ok(StreamEvent::ReasoningDone { .. })          => Event::default().event("reasoning_end").data("{}"),
+            Ok(StreamEvent::TextDelta { text })            => Event::default().event("token").data(text),
+            Ok(StreamEvent::ToolCallReady { .. })          => Event::default().event("tool_call").data("{}"),
+            Ok(StreamEvent::Usage { .. })                  => Event::default().event("usage").data("{}"),
+            Ok(StreamEvent::Done { finish_reason })        => Event::default()
+                .event("done")
+                .data(format!("{finish_reason:?}")),
+            Err(err)                                       => Event::default().event("error").data(err.message),
+        };
+        Ok::<Event, Infallible>(event)
+    }))
+}
+
+async fn chat(State(client): State<Arc<openai::Client>>) -> impl IntoResponse {
+    let stream = client
+        .stream(ChatRequest::from_prompt("gpt-5.5", "Hello."))
+        .await
+        .unwrap();
+    to_axum_sse(stream)
+}
+
+let app: Router = Router::new()
+    .route("/chat", get(chat))
+    .with_state(Arc::new(client));
+```
+
+For Actix, Warp, or your own gRPC layer the recipe is identical — map each `StreamEvent` variant to your wire format. The example keeps non-text payloads minimal; in a real app you'd serialise tool calls, usage, and reasoning metadata into whatever shape your frontend already speaks.
+
+## Reference
+
+Lookup tables for when you know roughly what you want and need the exact name.
+
+### Capability matrix
+
+| Capability                       | OpenAI | Anthropic | Google | OpenAI-Compatible |
+| -------------------------------- | :----: | :-------: | :----: | :---------------: |
+| Custom `base_url`                |   ✓    |     ✓     |   ✓    |         ✓         |
+| Custom headers / query / path    |        |           |        |         ✓         |
+| `api_version` (header)           |        |     ✓     |        |                   |
+| Structured output                |   ✓    |     ✓     |   ✓    |         ✓         |
+| Tool-call streaming              |   ✓    |     ✓     |   ✓    |         ✓         |
+| Cache-token split in `Usage`     |   ✓    |     ✓     |   ✓    |   if reported     |
+| `provider_options` passthrough   |   ✓    |     ✓     |   ✓    |         ✓         |
+| Embeddings                       |   ✓    |           |   ✓    |         ✓         |
+
+### `Usage` fields
+
+```rust
+pub struct Usage {
+    pub input_tokens:             u32, // total
+    pub input_no_cache_tokens:    u32,
+    pub input_cache_read_tokens:  u32,
+    pub input_cache_write_tokens: u32,
+    pub output_tokens:            u32, // total
+    pub output_text_tokens:       u32,
+    pub reasoning_tokens:         u32,
+    pub total_tokens:             u32,
+    pub raw_usage:                Option<serde_json::Value>,
+}
+```
+
+`Usage` implements `Add` and `AddAssign`, so totalling tokens across agent steps is a one-liner. `AgentOutput.usage_total` is already aggregated for you.
+
+### Examples
+
+```bash
+DEEPSEEK_API_KEY=... cargo run --manifest-path examples/chatgpt/Cargo.toml
+```
+
+| Example | Focus |
+| [`chatgpt`](./examples/chatgpt) | ChatGPT-style web app with a plain HTML frontend and Rust streaming backend |
+| [`claude_code`](./examples/claude_code) | Terminal code-agent app with `ratatui` and local file/shell tools |
+
+Examples are independent Cargo packages so app-only dependencies stay out of the root crate manifest. See [`examples/README.md`](./examples/README.md) for the directory rules.
+
+### API reference
+
+Full type signatures, every public item, every variant — on [docs.rs/aquaregia](https://docs.rs/aquaregia).
+
+## Development
+
+```bash
+cargo fmt
+cargo test
+cargo check --manifest-path examples/chatgpt/Cargo.toml
+cargo check --manifest-path examples/claude_code/Cargo.toml
+cargo clippy -- -D warnings
+```
+
+## AI-Assisted Development
+
+AI-assisted development is welcome in this project, but the contributor remains responsible for the final result. If code, tests, docs, or API changes are proposed with AI help, the person submitting them is still expected to understand, review, and validate them.
+
+This repository also keeps agent-facing guidance principle-based on purpose. Files such as `AGENTS.md` and `CLAUDE.md` should describe durable constraints and decision rules, not long checklists of internal APIs that drift away from the code.
+
+## Contributing & License
+
+Contributions are welcome. For behaviour changes, include integration tests (happy path + error mapping + tool/stream flows where relevant).
+
+- [Contributing Guide](./CONTRIBUTING.md)
+- [Code of Conduct](./CODE_OF_CONDUCT.md)
+- [Security Policy](./SECURITY.md)
+- Licensed under the [MIT License](./LICENSE)
+
+---
+
+# CLAUDE.md
+
+Source: https://github.com/minorcell/aquaregia/blob/main/AGENTS.md
+
+# CLAUDE.md
+
+Behavioral guidelines to reduce common LLM coding mistakes. Merge with project-specific instructions as needed.
+
+**Tradeoff:** These guidelines bias toward caution over speed. For trivial tasks, use judgment.
+
+## 1. Think Before Coding
+
+**Don't assume. Don't hide confusion. Surface tradeoffs.**
+
+Before implementing:
+
+- State your assumptions explicitly. If uncertain, ask.
+- If multiple interpretations exist, present them - don't pick silently.
+- If a simpler approach exists, or the user's framing seems wrong, say so before implementing. Silent compliance is the failure mode, not delay.
+- If something is unclear, stop. Name what's confusing. Ask.
+
+## 2. Simplicity First
+
+**Minimum code that solves the problem. Nothing speculative.**
+
+- No features beyond what was asked.
+- No abstractions for single-use code.
+- No "flexibility" or "configurability" that wasn't requested.
+- No error handling for impossible scenarios.
+- If you write 200 lines and it could be 50, rewrite it.
+- Public exposure is part of complexity. A `pub` type, re-export, or trait method joins the API contract — every name there is a future breaking-change target. Default to `pub(crate)`; promote to `pub` only when an external caller genuinely needs it. Mirror data structures, `#[doc(hidden)] pub` trait surfaces, and dead re-exports all qualify as complexity that wasn't asked for.
+
+Ask yourself: "Would a senior engineer say this is overcomplicated?" If yes, simplify.
+
+## 3. Surgical Changes
+
+**Touch only what you must. Clean up only your own mess.**
+
+When editing existing code:
+
+- Don't "improve" adjacent code, comments, or formatting.
+- Don't refactor things that aren't broken.
+- Match existing style, even if you'd do it differently.
+- If you notice unrelated dead code, mention it - don't delete it.
+
+When your changes create orphans:
+
+- Remove imports/variables/functions that YOUR changes made unused.
+- Don't remove pre-existing dead code unless asked.
+
+The test: Every changed line traces directly to the user's request — file count and fan-out don't matter, traceability does.
+
+## 4. Goal-Driven Execution
+
+**Define success criteria. Loop until verified.**
+
+Transform tasks into verifiable goals:
+
+- "Add validation" → "Write tests for invalid inputs, then make them pass"
+- "Fix the bug" → "Write a test that reproduces it, then make it pass"
+- "Refactor X" → "Ensure tests pass before and after"
+
+For multi-step tasks where each step depends on the previous one, state a brief plan:
+
+```
+1. [Step] → verify: [check]
+2. [Step] → verify: [check]
+3. [Step] → verify: [check]
+```
+
+Strong success criteria let you loop independently. Weak criteria ("make it work") require constant clarification.
+
+"Tests pass" usually means more than `cargo test`. If CI gates on `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings`, those are part of the success criterion — a green local test run that ships a clippy warning still fails the gate. Treat the full CI check set as the verification step, not the subset you happen to run locally.
+
+## 5. Honest Reporting
+
+**The user can't verify every step. Your reports must be honest enough that they could.**
+
+- Don't claim a check you didn't run. If you verified A but skipped B, name B — don't let "all checks pass" paper over the gap.
+- Surface uncertainty you didn't resolve. If a number was estimated, mark it estimated; if a search may have missed cases, say where.
+- Flag scope you expanded without asking. If the request was "fix X" and you also touched Y, name Y in the report — don't bury it in the diff.
+- Name judgment calls the user delegated to you. "You decide" is not a license to decide silently — surface the call you made so the user can override.
+
+The test: if the user audits your work an hour later, will they find anything you didn't already mention?
+
+## 6. Write Durable Guidance, Not Checklists
+
+**Agent-facing documentation should age slowly.**
+
+- Files such as `AGENTS.md` and `CLAUDE.md` should capture stable principles. Prefer revising an existing principle over adding a new one — readers run out of working memory before reaching the bottom.
+- Avoid long inventories of internal APIs, file lists, or implementation-specific checklists that will drift from the code.
+- Prefer guidance that explains how to reason about the system over guidance that attempts to mirror the system exhaustively.
+- If examples are needed, keep them short and illustrative rather than comprehensive.
+
+## 7. Lean API Design
+
+**Every abstraction — public or internal — must earn its complexity.**
+
+Every generic parameter, marker trait, phantom type, or feature flag that ends up in user-facing code costs the user cognitive overhead every time they write a type annotation or read an error message. Add that cost only when there is a concrete, demonstrable benefit.
+
+Before adding type-level structure, ask:
+
+- Does this prevent a real class of mistakes that a clear runtime error would not catch?
+- Does this enable real code reuse — not just the appearance of a unified interface?
+- Can a user realistically misuse the API without this constraint, and would the failure be silent?
+
+If the answers are "no", the abstraction is decorative. Remove it.
+
+Concrete rules for this codebase:
+
+- No phantom type parameters on public structs unless they enforce a boundary that the construction site cannot enforce.
+- No feature flags that gate no code (`openai = []` is noise, not a feature).
+- No trait hierarchies where each implementor does something entirely different — four `impl`s with no shared runtime behaviour is not polymorphism, it is a dispatch table in disguise.
+- No extra wrapper types when a plain value type (`String`, a struct with named fields) communicates the same contract.
+- A trait with few methods is not under-designed when the per-implementation work is supposed to be encapsulated. Don't expand a trait's surface to "advertise" the diversity its implementations hide — that diversity belongs inside the implementors. A multi-provider adapter trait with two methods is correct precisely because provider differences are not part of the shared contract.
+
+The test: if removing the abstraction requires no user-side code changes beyond dropping a type annotation, it was not carrying its weight.
+
+Corollary: when an abstraction has to stay because it appears in a public bound, pick the access modifier that matches your intent. `#[doc(hidden)] pub trait` hides from rustdoc but does not prevent external impls — that is documentation theater. Use the sealed-trait pattern (`pub trait T: private::Sealed`) when you need a public bound without a public extension point.
+
+**These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.
+
+---
+
+# CLAUDE.md
+
+Source: https://github.com/minorcell/aquaregia/blob/main/CLAUDE.md
+
+AGENTS.md
+
+---
+
+# Contributing to Aquaregia
+
+Source: https://github.com/minorcell/aquaregia/blob/main/CONTRIBUTING.md
+
+# Contributing to Aquaregia
+
+Thanks for your interest in contributing.
+
+## Before You Start
+
+- Search existing issues and pull requests before opening a new one.
+- For bugs, include reproducible steps and expected vs actual behavior.
+- For feature requests, explain the use case and API impact.
+
+## Development Setup
+
+```bash
+cargo fmt
+cargo test
+cargo check --manifest-path examples/chatgpt/Cargo.toml
+cargo check --manifest-path examples/claude_code/Cargo.toml
+cargo check --no-default-features
+cargo check --no-default-features --features openai
+cargo check --no-default-features --features anthropic
+```
+
+## AI-Assisted Contributions
+
+AI assistance is welcome in this project. It can speed up exploration, implementation, refactoring, and documentation work.
+
+That does not reduce contributor responsibility:
+
+- Understand the code and behavior you are changing.
+- Review AI-assisted output critically before submitting it.
+- Validate the final result locally when the change affects behavior, API shape, tests, or docs.
+- Do not submit changes you cannot explain or debug.
+
+## Pull Request Guidelines
+
+- Keep PRs focused and small when possible.
+- Include or update tests for behavior changes.
+- Update docs/examples when public APIs or behavior changes.
+- Write clear commit messages and PR descriptions.
+
+## Documentation Guidance
+
+- Keep human-facing and agent-facing documentation principle-based.
+- Prefer durable constraints, review standards, and decision rules over exhaustive lists of internal APIs or file-by-file checklists.
+- If a document starts mirroring the codebase too closely, reduce and generalize it before it drifts out of date.
+
+## Code Style
+
+- Follow Rust formatting via `cargo fmt`.
+- Prefer explicit, readable code over clever shortcuts.
+- Keep public APIs provider-agnostic and consistent across adapters.
+
+## Review Process
+
+- Maintainers review for correctness, API consistency, and test coverage.
+- Feedback may request changes before merge.
+- By submitting a contribution, you agree it can be distributed under the MIT license in this repository.
+
+---
+
+# agents.mdx
+
+Source: https://github.com/minorcell/aquaregia/blob/main/docs/content/docs/agents.mdx
+
+title: Agents
+description: Build assistants that can call tools and keep working until the task is done.
+
+An agent is the right abstraction when the model may need multiple steps: answer, call a tool, observe the result, call another tool, and then produce a final response.
+
+This guide builds a small weather assistant.
+
+## 1. Start with instructions
+
+Instructions define the agent's default behavior. They are added as a system message unless the run already provides one.
+
+```rust
+use aquaregia::providers::openai;
+
+let client = openai::Client::from_env()?;
+
+let agent = client
+    .agent("gpt-5.5")
+    .instructions("You are concise. Call tools when they help.")
+    .max_steps(4)
+    .build()?;
+
+let response = agent.prompt("Should I bring an umbrella in Shanghai?").await?;
+println!("{response}");
+```
+
+Use `prompt(...)` when the caller only needs text.
+
+## 2. Add a tool
+
+Agents become useful when they can call your Rust code.
+
+```rust
+use aquaregia::{Tool, tool};
+use schemars::JsonSchema;
+use serde::Deserialize;
+use serde_json::json;
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct WeatherArgs {
+    city: String,
+}
+
+fn get_weather() -> Tool {
+    tool("get_weather")
+        .description("Get current weather by city")
+        .execute(|args: WeatherArgs| async move {
+            json!({
+                "city": args.city,
+                "temp_c": 23,
+                "condition": "light rain"
+            })
+        })
+}
+```
+
+Attach the tool to the agent:
+
+```rust
+let agent = client
+    .agent("gpt-5.5")
+    .instructions("Call the weather tool before making weather recommendations.")
+    .tool(get_weather())
+    .max_steps(4)
+    .build()?;
+
+let response = agent.prompt("Should I bring an umbrella in Shanghai?").await?;
+println!("{response}");
+```
+
+The model sees the tool schema, decides whether to call it, and receives the tool result before answering.
+
+## 3. Inspect what happened
+
+For application logs, billing, or debugging, use `run(...)`.
+
+```rust
+let output = agent
+    .run("Should I bring an umbrella in Shanghai?")
+    .await?;
+
+println!("{}", output.output_text);
+println!("steps={}", output.steps);
+println!("tokens={}", output.usage_total.total_tokens);
+
+for step in &output.step_results {
+    println!(
+        "step={} tool_calls={}",
+        step.step,
+        step.tool_calls.len()
+    );
+}
+```
+
+`output.transcript` contains the complete conversation, including assistant tool calls and tool result messages.
+
+## 4. Continue a conversation
+
+Store the transcript and feed it into the next run.
+
+```rust
+use aquaregia::Message;
+
+let mut history = vec![Message::system_text("You are a careful assistant.")];
+
+history.push(Message::user_text("Should I bring an umbrella in Shanghai?"));
+let first = agent.run_messages(history.clone()).await?;
+history = first.transcript;
+
+history.push(Message::user_text("What about tomorrow morning?"));
+let second = agent.run_messages(history).await?;
+
+println!("{}", second.output_text);
+```
+
+This keeps tool results and assistant messages intact without manually rebuilding the conversation.
+
+## 5. Stream the run
+
+Use `stream(...)` for CLIs, chat UIs, and debug panels.
+
+```rust
+use aquaregia::{AgentStreamEvent, StreamEvent};
+use futures_util::StreamExt;
+
+let mut stream = agent
+    .stream("Should I bring an umbrella in Shanghai?")
+    .await?;
+
+while let Some(event) = stream.next().await {
+    match event? {
+        AgentStreamEvent::Model {
+            event: StreamEvent::TextDelta { text },
+            ..
+        } => print!("{text}"),
+        AgentStreamEvent::ToolCallStart { event } => {
+            eprintln!("[tool] {}", event.tool_call.tool_name);
+        }
+        AgentStreamEvent::Done { output } => {
+            eprintln!("[done] steps={}", output.steps);
+            break;
+        }
+        _ => {}
+    }
+}
+```
+
+Model deltas, tool execution, step snapshots, and final output all travel through the same stream.
+
+## 6. Tune the model request
+
+Sampling and output limits belong on the agent when they should apply to every step.
+
+```rust
+let agent = client
+    .agent("gpt-5.5")
+    .instructions("Answer with short, factual recommendations.")
+    .temperature(0.2)
+    .top_p(0.9)
+    .max_output_tokens(800)
+    .stop_sequences(["\nObservation:"])
+    .build()?;
+```
+
+Use provider options when a feature exists in one provider but not in the common request shape.
+
+```rust
+use serde_json::json;
+
+let agent = client
+    .agent("gpt-5.5")
+    .provider_options(json!({
+        "openai": {
+            "reasoning": { "effort": "medium" }
+        }
+    }))
+    .build()?;
+```
+
+Agent-level `provider_options(...)` is copied into every model request in the run. Use request or message-level provider options for one-off direct calls.
+
+## 7. Change a step before it runs
+
+Use `prepare_step(...)` when later steps need a different budget, tool set, or model. Keep this callback small; it runs inside the agent loop.
+
+```rust
+let agent = client
+    .agent("gpt-5.5")
+    .tool(get_weather())
+    .prepare_step(|step| {
+        let mut next = step.to_prepared();
+
+        if step.step > 1 {
+            next.max_output_tokens = Some(500);
+        }
+
+        next
+    })
+    .build()?;
+```
+
+`prepare_step` receives the messages, selected model, tools, sampling settings, and previous step snapshots for the step that is about to run.
+
+## 8. Add hooks for side effects
+
+Use hooks for logging and metrics. Use `stream(...)` for user-facing output.
+
+```rust
+let agent = client
+    .agent("gpt-5.5")
+    .tool(get_weather())
+    .on_step_start(|e| eprintln!("[step:{}]", e.step))
+    .on_tool_call_start(|e| eprintln!("[tool] {}", e.tool_call.tool_name))
+    .on_finish(|e| eprintln!("[done] steps={}", e.step_count))
+    .build()?;
+```
+
+Hooks observe the run; they should not be used to build the UI stream. For user-facing progress, use `agent.stream(...)`.
+
+## Choosing stopping behavior
+
+`max_steps` is the primary safety control. If the model keeps asking for tools, the run fails with `ErrorCode::MaxStepsExceeded` instead of looping forever.
+
+```rust
+let agent = client
+    .agent("gpt-5.5")
+    .tool(get_weather())
+    .max_steps(4)
+    .build()?;
+```
+
+Use `stop_when(...)` only when your application has a clearer definition of completion than "the model stopped calling tools".
+
+```rust
+let agent = client
+    .agent("gpt-5.5")
+    .tool(get_weather())
+    .stop_when(|step| step.output_text.contains("FINAL:"))
+    .build()?;
+```
+
+## Cancel an agent run
+
+Bind a `CancellationToken` when the caller may leave, close a request, or start a newer run.
+
+```rust
+use tokio_util::sync::CancellationToken;
+
+let token = CancellationToken::new();
+
+let agent = client
+    .agent("gpt-5.5")
+    .cancellation_token(token.clone())
+    .build()?;
+
+token.cancel();
+```
+
+Cancellation is checked before model calls, during streaming, and between agent steps.
+
+## Agent builder reference
+
+The builder is organized around the parts of an agent run.
+
+| Need | Method |
+| Set system behavior | `instructions(...)` |
+| Register one tool | `tool(tool)` |
+| Register many tools | `tools(tools)` |
+| Cap the loop | `max_steps(u32)` |
+| Sampling | `temperature(f32)`, `top_p(f32)` |
+| Output limits | `max_output_tokens(u32)`, `stop_sequences(...)` |
+| Cancellation | `cancellation_token(token)` |
+| Per-step mutation | `prepare_step(...)` |
+| Lifecycle hooks | `on_start(...)`, `on_step_start(...)`, `on_step_finish(...)`, `on_tool_call_start(...)`, `on_tool_call_finish(...)`, `on_finish(...)` |
+| Custom completion rule | `stop_when(...)` |
+| Tool failure behavior | `tool_error_policy(ToolErrorPolicy::...)` |
+| Provider-specific fields | `provider_options(json!(...))` |
+
+Run methods:
+
+| Method | Returns |
+| `prompt(text)` | final assistant text |
+| `run(text)` | `AgentOutput` with transcript, usage, and steps |
+| `stream(text)` | `AgentStreamEvent` stream for the full run |
+| `run_messages(messages)` | `AgentOutput` from an existing conversation |
+| `stream_messages(messages)` | full agent stream from an existing conversation |
+
+---
+
+# direct-requests.mdx
+
+Source: https://github.com/minorcell/aquaregia/blob/main/docs/content/docs/direct-requests.mdx
+
+title: Direct Requests
+description: Send one model request when you do not need an agent loop.
+
+Use a direct request when your application already knows the exact message list and only needs one provider call.
+
+Good fits:
+
+- single-turn generation
+- application-managed chat history
+- structured extraction
+- multimodal prompts
+
+Use an agent instead when Aquaregia should execute tools and keep looping until the task is done.
+
+## Generate from one prompt
+
+```rust
+use aquaregia::{ChatRequest, providers::openai};
+
+let client = openai::Client::from_env()?;
+
+let response = client
+    .generate(ChatRequest::from_prompt(
+        "gpt-5.5",
+        "Write a concise release note for this library change.",
+    ))
+    .await?;
+
+println!("{}", response.output_text);
+```
+
+`from_prompt(...)` creates one user message. It is the shortest path for simple calls.
+
+## Build a request from messages
+
+Use the builder when you need system instructions, multiple turns, sampling, cancellation, or provider-specific options.
+
+```rust
+use aquaregia::{ChatRequest, Message, providers::openai};
+
+let client = openai::Client::from_env()?;
+
+let req = ChatRequest::builder("gpt-5.5")
+    .message(Message::system_text("You are concise and factual."))
+    .message(Message::user_text("What changed in Rust 1.85?"))
+    .temperature(0.2)
+    .max_output_tokens(800)
+    .build()?;
+
+let response = client.generate(req).await?;
+println!("{}", response.output_text);
+```
+
+`user(...)` and `system(...)` append messages. Use `messages(...)` when you want to replace the message list explicitly.
+
+## Read the response
+
+`ChatResponse` normalizes the provider response:
+
+| Field | Use |
+| `output_text` | visible assistant text |
+| `reasoning_text` | flattened reasoning text when the provider exposes it |
+| `reasoning_parts` | structured reasoning blocks with provider metadata |
+| `finish_reason` | normalized finish reason such as `Stop`, `Length`, or `ToolCalls` |
+| `usage` | token counters, including cache and reasoning counters when available |
+| `tool_calls` | model-requested tool calls returned by the provider |
+| `raw_provider_response` | best-effort raw provider payload for debugging |
+
+## Control generation
+
+The request builder supports the common generation controls:
+
+| Method | Use |
+| `temperature(f32)` | randomness, validated as `0.0..=2.0` |
+| `top_p(f32)` | nucleus sampling, validated as `0.0..=1.0` |
+| `max_output_tokens(u32)` | output budget |
+| `stop_sequences(...)` | provider stop strings |
+| `cancellation_token(token)` | cancel HTTP work or streams |
+| `provider_options(json!(...))` | pass provider-specific request fields |
+
+Use lower temperature for extraction and classification. Use higher temperature for creative drafting.
+
+## Builder reference
+
+| Method | Effect |
+| `ChatRequest::from_prompt(model, prompt)` | create one user-message request |
+| `ChatRequest::builder(model)` | start a full request builder |
+| `message(message)` | append one `Message` |
+| `user(prompt)` | append one user message |
+| `system(instruction)` | append one system message |
+| `messages(messages)` | replace messages explicitly |
+| `temperature(...)`, `top_p(...)` | set sampling |
+| `max_output_tokens(...)`, `stop_sequences(...)` | set output limits |
+| `output_schema(...)` | request JSON matching a manual schema |
+| `provider_options(...)` | pass provider-specific fields |
+| `cancellation_token(...)` | attach cancellation |
+| `build()` | validate model, messages, and sampling |
+
+---
+
+# embeddings.mdx
+
+Source: https://github.com/minorcell/aquaregia/blob/main/docs/content/docs/embeddings.mdx
+
+title: Embeddings
+description: Generate vectors for search, clustering, and retrieval.
+
+Use embeddings when text should become vectors for similarity search, clustering, recommendations, or retrieval.
+
+Embedding is a provider-client API, not an agent API. The model does not produce prose; it returns one vector per input string.
+
+## Generate one embedding
+
+```rust
+use aquaregia::embed::EmbedRequest;
+use aquaregia::providers::openai;
+
+let client = openai::Client::from_env()?;
+
+let response = client
+    .embed(EmbedRequest::new(
+        "text-embedding-3-small",
+        vec!["Aquaregia builds Rust agents."],
+    ))
+    .await?;
+
+println!("dimension={}", response.embeddings[0].len());
+println!("tokens={}", response.usage.tokens);
+```
+
+The `embeddings` vector has the same order as the input `values`.
+
+## Batch inputs
+
+Batch related texts in one request when your provider quota and payload size allow it.
+
+```rust
+let req = EmbedRequest::new(
+    "text-embedding-3-large",
+    vec![
+        "Rust agent library",
+        "tool calling",
+        "structured output",
+    ],
+);
+
+let response = client.embed(req).await?;
+
+for vector in response.embeddings {
+    println!("dimension={}", vector.len());
+}
+```
+
+Store the returned vectors next to the source text or document chunk ids in your vector database.
+
+## Use provider-specific embedding options
+
+Provider-specific fields go through `provider_options(...)`.
+
+```rust
+use aquaregia::embed::EmbedRequest;
+use serde_json::json;
+
+let req = EmbedRequest::builder("text-embedding-3-small")
+    .values(vec!["Aquaregia simplifies Rust agents."])
+    .provider_options(json!({
+        "openai": {
+            "dimensions": 256
+        }
+    }))
+    .build()?;
+
+let response = client.embed(req).await?;
+```
+
+Use this for fields such as OpenAI embedding dimensions or gateway-specific request options.
+
+## Compare vectors
+
+Aquaregia returns raw vectors. Your application decides how to index and compare them.
+
+```rust
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+    let mag_a = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let mag_b = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    dot / (mag_a * mag_b)
+}
+```
+
+For production retrieval, use a vector database or an approximate nearest-neighbor index instead of scanning every vector.
+
+## Response fields
+
+| Field | Use |
+| `embeddings` | vectors, in input order |
+| `model` | provider-reported model id |
+| `usage.tokens` | input token count |
+| `provider_metadata` | provider-specific response metadata when available |
+
+## Provider support
+
+`embed(...)` is implemented for OpenAI and OpenAI-compatible clients. Anthropic and Google clients currently return `ErrorCode::UnsupportedOperation` for embeddings.
+
+---
+
+# errors-production.mdx
+
+Source: https://github.com/minorcell/aquaregia/blob/main/docs/content/docs/errors-production.mdx
+
+title: Errors and Production
+description: Handle failures, retries, cancellation, and operational metadata.
+
+Production LLM calls need clear boundaries around time, retries, cancellation, and error reporting.
+
+Aquaregia returns one error type from provider calls, agent runs, streams, structured output, and embeddings: `aquaregia::Error`.
+
+## Handle errors by code
+
+```rust
+use aquaregia::{ChatRequest, ErrorCode, providers::openai};
+
+let client = openai::Client::from_env()?;
+
+match client
+    .generate(ChatRequest::from_prompt("gpt-5.5", "hello"))
+    .await
+{
+    Ok(response) => println!("{}", response.output_text),
+    Err(err) => match err.code {
+        ErrorCode::AuthFailed => eprintln!("check API credentials"),
+        ErrorCode::RateLimited => eprintln!("retry later"),
+        ErrorCode::Cancelled => eprintln!("request was cancelled"),
+        ErrorCode::UnsupportedOperation => eprintln!("provider does not support this operation"),
+        _ => eprintln!("request failed: {err}"),
+    },
+}
+```
+
+`Error` also carries provider metadata when available:
+
+| Field | Meaning |
+| `code` | stable Aquaregia error category |
+| `message` | human-readable diagnostic |
+| `provider` | provider slug such as `openai` or `anthropic` |
+| `status` | HTTP status when the error came from a provider response |
+| `retryable` | whether retrying may succeed |
+| `request_id` | provider request id when exposed in headers |
+| `raw_body` | best-effort provider error body |
+| `retry_after_secs` | `Retry-After` value when present |
+
+## Retry and timeout policy
+
+Configure retries and request timeout on the provider client.
+
+```rust
+use aquaregia::providers::openai;
+use std::time::Duration;
+
+let client = openai::Client::builder()
+    .api_key_from_env("OPENAI_API_KEY")
+    .timeout(Duration::from_secs(45))
+    .max_retries(2)
+    .build()?;
+```
+
+Retryable error codes are:
+
+| Error code | Typical cause |
+| `RateLimited` | provider returned HTTP 429 |
+| `ProviderServerError` | provider returned HTTP 5xx |
+| `Transport` | network or DNS failure |
+| `Timeout` | configured timeout elapsed |
+
+Authentication, validation, unsupported operation, invalid tool arguments, and cancellation errors are not retryable by default.
+
+## Cancel work the caller no longer needs
+
+Attach a `CancellationToken` to a direct request:
+
+```rust
+use aquaregia::{ChatRequest, providers::openai};
+use tokio_util::sync::CancellationToken;
+
+let token = CancellationToken::new();
+
+let req = ChatRequest::builder("gpt-5.5")
+    .user("Write a long report.")
+    .cancellation_token(token.clone())
+    .build()?;
+
+token.cancel();
+
+let result = openai::Client::from_env()?.generate(req).await;
+```
+
+Attach the same kind of token to an agent when a whole tool loop should stop.
+
+```rust
+let agent = client
+    .agent("gpt-5.5")
+    .cancellation_token(token.clone())
+    .build()?;
+```
+
+Cancellation is checked before HTTP sends, while reading streams, and between agent steps.
+
+## Bound agent loops
+
+Always set a step cap for tool-using agents unless you have a specific reason not to.
+
+```rust
+let agent = client
+    .agent("gpt-5.5")
+    .tool(search_docs())
+    .max_steps(6)
+    .build()?;
+```
+
+If the model keeps requesting tools after the cap, the run fails with `ErrorCode::MaxStepsExceeded`.
+
+## Tool failure policy
+
+By default, a failing tool becomes an error-shaped tool result and the agent can recover.
+
+```rust
+use aquaregia::ToolErrorPolicy;
+
+let agent = client
+    .agent("gpt-5.5")
+    .tool(read_file())
+    .tool_error_policy(ToolErrorPolicy::FailFast)
+    .build()?;
+```
+
+Use `FailFast` when a tool failure means the whole application operation should stop.
+
+## Error code reference
+
+| Code | Meaning |
+| `InvalidRequest` | invalid model, messages, sampling values, schema, or request shape |
+| `AuthFailed` | missing, empty, invalid, or unauthorized credentials |
+| `RateLimited` | provider rate limit |
+| `ProviderServerError` | provider 5xx response |
+| `Transport` | network or transport failure |
+| `Timeout` | request timeout |
+| `StreamProtocol` | malformed or incomplete streaming payload |
+| `UnknownTool` | model requested a tool that was not registered |
+| `InvalidToolArgs` | model produced tool arguments that did not match the schema |
+| `ToolExecutionFailed` | a Rust tool returned an execution error |
+| `MaxStepsExceeded` | agent exceeded its tool-loop step cap |
+| `InvalidResponse` | provider response could not be parsed or normalized |
+| `Cancelled` | caller cancelled with a token |
+| `UnsupportedOperation` | provider adapter does not support the requested operation |
+
+---
+
+# index.mdx
+
+Source: https://github.com/minorcell/aquaregia/blob/main/docs/content/docs/index.mdx
+
+title: Overview
+description: Build provider-backed LLM agents in Rust.
+
+Aquaregia is a lightweight Rust library for building LLM agents.
+
+The common shape is:
+
+1. choose a provider client
+2. bind it to a model with `client.agent(model)`
+3. add instructions and tools
+4. run the agent, stream it, or inspect the full transcript
+
+```rust
+use aquaregia::providers::openai;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let agent = openai::Client::from_env()?
+        .agent("gpt-5.5")
+        .instructions("You are concise.")
+        .build()?;
+
+    let response = agent
+        .prompt("Explain Rust ownership in 3 bullet points.")
+        .await?;
+
+    println!("{response}");
+    Ok(())
+}
+```
+
+## When to use Aquaregia
+
+Use Aquaregia when your application needs one of these workflows:
+
+- a model-bound assistant with stable instructions
+- a tool-using loop where the model can call your Rust code
+- streaming output for a CLI, chat UI, or debug panel
+- structured data returned as Rust types
+- direct model requests for application-managed conversations
+- multimodal prompts and embeddings for retrieval
+- the same high-level code running across multiple providers
+
+For one-off lower-level calls, provider clients also expose `generate(...)`, `stream(...)`, `generate_object::<T>(...)`, `stream_object::<T>(...)`, and `embed(...)`.
+
+## The mental model
+
+An agent is a loop:
+
+1. send the current messages and tool schemas to the model
+2. receive text and optional tool calls
+3. execute requested tools
+4. send tool results back to the model
+5. stop when the model returns a final answer or your stopping rule fires
+
+Aquaregia owns that loop. Your code owns the tools, model choice, stopping policy, and how to display the result.
+
+## Choose a path
+
+Start with the guide that matches what you are building:
+
+| Goal | Read |
+| Run the smallest working example | [Quickstart](./quickstart) |
+| Configure OpenAI, Anthropic, Google, or a gateway | [Providers](./providers) |
+| Send one explicit model request | [Direct requests](./direct-requests) |
+| Build an assistant that can call tools | [Agents](./agents) |
+| Turn Rust functions into model-callable tools | [Tools](./tools) |
+| Stream model or agent output to a UI | [Streaming](./streaming) |
+| Ask the model for typed data | [Structured output](./structured-output) |
+| Send images, PDFs, or bytes | [Multimodal input](./multimodal) |
+| Generate vectors for search or RAG | [Embeddings](./embeddings) |
+| Pass provider-native fields | [Provider options](./provider-options) |
+| Handle retries, cancellation, and errors | [Errors and production](./errors-production) |
+
+---
+
+# multimodal.mdx
+
+Source: https://github.com/minorcell/aquaregia/blob/main/docs/content/docs/multimodal.mdx
+
+title: Multimodal Input
+description: Send images, PDFs, and other file parts with chat requests.
+
+Multimodal input is represented as normal message content. A user message can contain text plus one or more `FilePart` values.
+
+Aquaregia does not guess media types. Always pass the IANA media type, such as `image/png`, `image/jpeg`, or `application/pdf`.
+
+## Ask about an image URL
+
+```rust
+use aquaregia::{
+    ChatRequest, ContentPart, FilePart, MediaData, Message, MessageRole, TextPart,
+    providers::openai,
+};
+
+let client = openai::Client::from_env()?;
+
+let message = Message::new(
+    MessageRole::User,
+    vec![
+        ContentPart::Text(TextPart::new("What's in this image?")),
+        ContentPart::File(FilePart::new(
+            MediaData::Url("https://example.com/diagram.png".to_string()),
+            "image/png",
+        )),
+    ],
+);
+
+let response = client
+    .generate(
+        ChatRequest::builder("gpt-5.5")
+            .message(message)
+            .build()?,
+    )
+    .await?;
+
+println!("{}", response.output_text);
+```
+
+Use `Message::user_file_url(...)` for the one-file shorthand:
+
+```rust
+let message = Message::user_file_url(
+    "https://example.com/diagram.png",
+    "image/png",
+);
+```
+
+## Send local bytes
+
+For local files, read bytes and let the adapter encode them for the provider.
+
+```rust
+use std::fs;
+use aquaregia::{FilePart, MediaData};
+
+let bytes = fs::read("invoice.pdf")?;
+
+let file = FilePart::new(
+    MediaData::Bytes(bytes),
+    "application/pdf",
+).with_filename("invoice.pdf");
+```
+
+Then include the file part in a message:
+
+```rust
+use aquaregia::{ContentPart, Message, MessageRole, TextPart};
+
+let message = Message::new(
+    MessageRole::User,
+    vec![
+        ContentPart::Text(TextPart::new("Summarize this document in 5 bullets.")),
+        ContentPart::File(file),
+    ],
+);
+```
+
+Use `MediaData::Base64(...)` when another system already gave you base64 without a data URL prefix.
+
+## Attach provider-specific block fields
+
+Some provider features attach to a single file or text block. Use block-level `provider_options(...)`.
+
+```rust
+use aquaregia::{FilePart, MediaData};
+use serde_json::json;
+
+let file = FilePart::new(
+    MediaData::Url("https://example.com/report.pdf".to_string()),
+    "application/pdf",
+)
+.with_filename("report.pdf")
+.with_provider_options(json!({
+    "anthropic": {
+        "cache_control": { "type": "ephemeral" }
+    }
+}));
+```
+
+The adapter reads only its provider slug and merges that object into the provider block it sends.
+
+## Provider support
+
+Aquaregia exposes one file shape, but each adapter can only send media types that the provider wire format supports.
+
+| Provider | File parts currently mapped by the adapter |
+| OpenAI | images and PDFs |
+| Anthropic | images and PDFs |
+| Google | URLs and inline bytes/base64 using the given MIME type |
+| OpenAI-compatible | images only, because the Chat Completions-compatible shape has no portable PDF block |
+
+The upstream model may still reject a file type, file size, URL, or modality. In that case the provider error is returned as an Aquaregia `Error`.
+
+## Constructors reference
+
+| API | Use |
+| `Message::user_file_url(url, media_type)` | one user message containing one URL file |
+| `Message::user_file_bytes(bytes, media_type)` | one user message containing one bytes file |
+| `FilePart::new(MediaData::Url(...), media_type)` | explicit URL file part |
+| `FilePart::new(MediaData::Base64(...), media_type)` | explicit base64 file part |
+| `FilePart::new(MediaData::Bytes(...), media_type)` | explicit bytes file part |
+| `with_filename(...)` | provider filename hint |
+| `with_provider_options(...)` | provider-specific block fields |
+
+---
+
+# provider-options.mdx
+
+Source: https://github.com/minorcell/aquaregia/blob/main/docs/content/docs/provider-options.mdx
+
+title: Provider Options
+description: Pass provider-specific request fields without changing the common API.
+
+The common Aquaregia types cover the portable surface: messages, tools, streaming, structured output, usage, and embeddings.
+
+Use `provider_options(...)` for provider-native fields that should pass through without Aquaregia trying to model them.
+
+## Shape
+
+Provider options are a JSON object keyed by provider slug:
+
+```rust
+use serde_json::json;
+
+json!({
+    "openai": {
+        "reasoning": { "effort": "medium" }
+    },
+    "anthropic": {
+        "thinking": { "type": "enabled", "budget_tokens": 4096 }
+    },
+    "google": {
+        "generationConfig": { "thinkingConfig": { "thinkingBudget": 1024 } }
+    },
+    "openai-compatible": {
+        "extra_body_field": true
+    }
+})
+```
+
+The active adapter reads only its own slug and merges those fields into the outgoing provider payload. Unknown slugs and non-object values are ignored.
+
+## Request-level options
+
+Use request-level options for one direct generation request.
+
+```rust
+use aquaregia::{ChatRequest, providers::openai};
+use serde_json::json;
+
+let client = openai::Client::from_env()?;
+
+let req = ChatRequest::builder("gpt-5.5")
+    .user("Explain why this migration failed.")
+    .provider_options(json!({
+        "openai": {
+            "reasoning": { "effort": "medium" }
+        }
+    }))
+    .build()?;
+
+let response = client.generate(req).await?;
+```
+
+Use agent-level options when the same provider field should apply to every step in a tool loop.
+
+```rust
+let agent = client
+    .agent("gpt-5.5")
+    .provider_options(json!({
+        "openai": {
+            "reasoning": { "effort": "low" }
+        }
+    }))
+    .build()?;
+```
+
+## Message and content-block options
+
+Some provider features attach to a specific message or content block. Anthropic prompt caching is the common case.
+
+```rust
+use aquaregia::{ContentPart, Message, MessageRole, TextPart};
+use serde_json::json;
+
+let cached_context = TextPart::new(LONG_CONTEXT).with_provider_options(json!({
+    "anthropic": {
+        "cache_control": { "type": "ephemeral" }
+    }
+}));
+
+let system = Message::new(
+    MessageRole::System,
+    vec![ContentPart::Text(cached_context)],
+);
+```
+
+`Message::with_provider_options(...)` merges into the provider message object. `TextPart::with_provider_options(...)` and `FilePart::with_provider_options(...)` merge into the individual content block.
+
+## Provider-native capabilities
+
+Some providers expose server-side capabilities such as web search or file search. Pass those fields through `provider_options` when the provider, not Aquaregia, runs the capability.
+
+```rust
+use aquaregia::{ChatRequest, providers::openai};
+use serde_json::json;
+
+let req = ChatRequest::builder("gpt-5.5")
+    .user("Find recent information about Rust releases.")
+    .provider_options(json!({
+        "openai": {
+            "tools": [{
+                "type": "web_search"
+            }]
+        }
+    }))
+    .build()?;
+
+let response = openai::Client::from_env()?.generate(req).await?;
+```
+
+Top-level provider option keys overwrite the payload keys Aquaregia already computed. If a provider uses a field named `tools` for server-side capabilities, put the complete provider-native array in `provider_options.<slug>.tools`.
+
+## Embedding options
+
+Embedding requests also accept provider options.
+
+```rust
+use aquaregia::embed::EmbedRequest;
+use serde_json::json;
+
+let req = EmbedRequest::builder("text-embedding-3-small")
+    .values(vec!["Aquaregia simplifies Rust agents."])
+    .provider_options(json!({
+        "openai": {
+            "dimensions": 256
+        }
+    }))
+    .build()?;
+```
+
+## Merge locations
+
+| Setter | Merged into |
+| `ChatRequest::builder(...).provider_options(...)` | top-level provider request body |
+| `client.agent(...).provider_options(...)` | every top-level provider request body in the agent run |
+| `Message::with_provider_options(...)` | the serialized message object |
+| `TextPart::with_provider_options(...)` | the serialized text content block |
+| `FilePart::with_provider_options(...)` | the serialized file content block |
+| `EmbedRequest::builder(...).provider_options(...)` | top-level embedding request body |
+
+## Boundary
+
+Aquaregia treats provider options as an escape hatch:
+
+- it does not validate provider option names or values
+- it does not guarantee that a provider or model supports the field
+- it does not reconcile conflicts when an option overwrites a field Aquaregia generated
+- it preserves the common API by keeping provider-specific concepts out of core types
+
+When a feature becomes portable across providers, it can move into the common request shape. Until then, prefer `provider_options` over adding provider-specific library types.
+
+---
+
+# providers.mdx
+
+Source: https://github.com/minorcell/aquaregia/blob/main/docs/content/docs/providers.mdx
+
+title: Providers
+description: Choose and configure the model provider your application talks to.
+
+A provider client owns authentication, endpoint configuration, retries, timeout, and HTTP transport.
+
+Create one provider client near the edge of your application, then pass it to the code that builds agents or sends direct requests.
+
+## Use OpenAI
+
+For the default OpenAI setup:
+
+```rust
+use aquaregia::providers::openai;
+
+let client = openai::Client::from_env()?;
+
+let agent = client
+    .agent("gpt-5.5")
+    .build()?;
+```
+
+`from_env()` expects:
+
+```bash
+export OPENAI_API_KEY=...
+```
+
+## Configure the endpoint
+
+Use the builder when credentials, endpoint, or HTTP behavior should be explicit.
+
+```rust
+use aquaregia::providers::openai;
+use std::time::Duration;
+
+let client = openai::Client::builder()
+    .api_key_from_env("OPENAI_API_KEY")
+    .base_url("https://api.openai.com")
+    .timeout(Duration::from_secs(60))
+    .max_retries(3)
+    .default_max_steps(8)
+    .user_agent("my-app/1.0")
+    .build()?;
+```
+
+`default_max_steps(...)` is the fallback cap used by agents built from this client. Individual agents can still override it with `.max_steps(...)`.
+
+Hosted providers also allow `base_url(...)`. Use it for enterprise gateways, test doubles, private proxies, or provider-compatible deployments that still use the hosted provider's wire format.
+
+```rust
+use aquaregia::providers::{anthropic, google};
+
+let anthropic_client = anthropic::Client::builder()
+    .api_key_from_env("ANTHROPIC_API_KEY")
+    .base_url("https://anthropic-gateway.example.com")
+    .api_version("2023-06-01")
+    .build()?;
+
+let google_client = google::Client::builder()
+    .api_key_from_env("GOOGLE_API_KEY")
+    .base_url("https://generativelanguage.googleapis.com/v1beta")
+    .build()?;
+```
+
+## Switch hosted providers
+
+Hosted providers follow the same pattern.
+
+```rust
+use aquaregia::providers::{anthropic, google, openai};
+
+let openai_client = openai::Client::from_env()?;
+let anthropic_client = anthropic::Client::from_env()?;
+let google_client = google::Client::from_env()?;
+```
+
+| Provider | Environment variable |
+| OpenAI | `OPENAI_API_KEY` |
+| Anthropic | `ANTHROPIC_API_KEY` |
+| Google | `GOOGLE_API_KEY` |
+
+The agent API stays the same:
+
+```rust
+let agent = anthropic_client
+    .agent("claude-sonnet-4-6")
+    .instructions("Answer in short paragraphs.")
+    .build()?;
+```
+
+Provider-specific builder options:
+
+| Provider | Builder options |
+| OpenAI | `api_key(...)`, `api_key_from_env(...)`, `base_url(...)` |
+| Anthropic | `api_key(...)`, `api_key_from_env(...)`, `base_url(...)`, `api_version(...)` |
+| Google | `api_key(...)`, `api_key_from_env(...)`, `base_url(...)` |
+
+All hosted provider builders also support:
+
+| Option | Use it when |
+| `timeout(Duration)` | a request should fail after a bounded time |
+| `max_retries(u8)` | retryable provider, transport, and timeout failures should be retried by the client |
+| `default_max_steps(u32)` | agents built from the client should inherit a tool-loop cap |
+| `user_agent(...)` | your application needs a custom Aquaregia `User-Agent` suffix/value |
+
+## Use an OpenAI-compatible gateway
+
+Use `openai_compatible` when your upstream speaks the OpenAI Chat Completions wire format.
+
+For the common environment-based setup:
+
+```bash
+export OPENAI_COMPATIBLE_BASE_URL=https://api.example.com
+export OPENAI_COMPATIBLE_API_KEY=...
+```
+
+```rust
+use aquaregia::providers::openai_compatible;
+
+let client = openai_compatible::Client::from_env()?;
+```
+
+`OPENAI_COMPATIBLE_API_KEY` is optional; if it is not set, requests are sent without an `Authorization` header.
+
+```rust
+use aquaregia::providers::openai_compatible;
+
+let client = openai_compatible::Client::builder()
+    .base_url("https://api.example.com")
+    .api_key_from_env("OPENAI_COMPATIBLE_API_KEY")
+    .chat_completions_path("/v1/chat/completions")
+    .build()?;
+
+let agent = client
+    .agent("gpt-5.5")
+    .build()?;
+```
+
+Gateways sometimes need custom headers or query parameters:
+
+```rust
+let client = openai_compatible::Client::builder()
+    .base_url("https://api.example.com")
+    .api_key_from_env("OPENAI_COMPATIBLE_API_KEY")
+    .header("x-trace-source", "aquaregia")
+    .query_param("source", "library")
+    .build()?;
+```
+
+If the upstream does not require an `Authorization` header, call `.no_api_key()`.
+
+OpenAI-compatible builders support:
+
+| Option | Use it when |
+| `base_url(...)` | required endpoint root for the gateway |
+| `api_key(...)` / `api_key_from_env(...)` | send an `Authorization: Bearer ...` token |
+| `no_api_key()` | the gateway uses local auth, mTLS, or no auth |
+| `header(name, value)` | the gateway requires extra static headers |
+| `query_param(name, value)` | the gateway requires static query parameters |
+| `chat_completions_path(path)` | the chat endpoint is not `/v1/chat/completions` |
+| `timeout(...)`, `max_retries(...)`, `default_max_steps(...)`, `user_agent(...)` | same runtime controls as hosted providers |
+
+## Pick the right layer
+
+Provider clients expose the same high-level methods. If a provider cannot perform an operation, the call returns `ErrorCode::UnsupportedOperation`.
+
+| Need | Use |
+| Final text from an assistant | `client.agent(model).build()?.prompt(...)` |
+| Full tool-loop metadata | `agent.run(...)` |
+| Full tool-loop stream | `agent.stream(...)` |
+| One model request | `client.generate(request)` |
+| One model stream | `client.stream(request)` |
+| Typed data | `client.generate_object::<T>(request)` |
+| Progressive typed data | `client.stream_object::<T>(request)` |
+| Text embeddings | `client.embed(request)` |
+
+Provider-specific capabilities belong in `provider_options`, not in separate client types.
+
+Current operation coverage:
+
+| Operation | OpenAI | Anthropic | Google | OpenAI-compatible |
+| --- | --- | --- | --- | --- |
+| `generate` / `stream` | yes | yes | yes | yes |
+| `agent` | yes | yes | yes | yes |
+| `generate_object` / `stream_object` | native structured output | tool-call fallback | tool-call fallback | tool-call fallback |
+| `embed` | yes | unsupported | unsupported | yes, if the gateway implements embeddings |
+
+---
+
+# quickstart.mdx
+
+Source: https://github.com/minorcell/aquaregia/blob/main/docs/content/docs/quickstart.mdx
+
+title: Quickstart
+description: Build and run your first OpenAI agent.
+
+This page gets a minimal OpenAI-backed agent running in a Rust binary.
+
+## 1. Create a project
+
+```bash
+cargo new aquaregia-hello
+cd aquaregia-hello
+```
+
+Add Aquaregia and Tokio:
+
+```bash
+cargo add aquaregia
+cargo add tokio --features full
+```
+
+## 2. Set the API key
+
+```bash
+export OPENAI_API_KEY=...
+```
+
+`openai::Client::from_env()` reads `OPENAI_API_KEY` and builds a provider client with default HTTP settings.
+
+## 3. Write the agent
+
+Replace `src/main.rs` with:
+
+```rust
+use aquaregia::providers::openai;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let agent = openai::Client::from_env()?
+        .agent("gpt-5.5")
+        .instructions("You explain technical topics clearly and briefly.")
+        .build()?;
+
+    let response = agent
+        .prompt("Explain Rust ownership in 3 bullet points.")
+        .await?;
+
+    println!("{response}");
+    Ok(())
+}
+```
+
+Run it:
+
+```bash
+cargo run
+```
+
+## 4. Inspect the run
+
+`prompt(...)` is the shortest path when you only need the final text. Use `run(...)` when you need metadata for logs, billing, or debugging.
+
+```rust
+let output = agent
+    .run("Explain Rust ownership in 3 bullet points.")
+    .await?;
+
+println!("{}", output.output_text);
+println!("steps={}", output.steps);
+println!("tokens={}", output.usage_total.total_tokens);
+```
+
+`AgentOutput` includes:
+
+- final visible text
+- number of executed steps
+- full transcript, including tool results
+- accumulated token usage
+- per-step snapshots
+
+## 5. Add a lower-level call when needed
+
+Agents are the default path for assistant-style applications. If you need one explicit model request, call the provider client directly.
+
+```rust
+use aquaregia::{ChatRequest, providers::openai};
+
+let client = openai::Client::from_env()?;
+
+let response = client
+    .generate(ChatRequest::from_prompt(
+        "gpt-5.5",
+        "Write a short release note for a Rust library.",
+    ))
+    .await?;
+
+println!("{}", response.output_text);
+```
+
+Use direct requests for simple calls, structured output, multimodal input, embeddings, or integration points where you already manage conversation state yourself.
+
+## Next step
+
+Add a tool to the agent in [Agents](./agents), learn provider configuration in [Providers](./providers), or send one explicit request in [Direct requests](./direct-requests).
+
+---
+
+# streaming.mdx
+
+Source: https://github.com/minorcell/aquaregia/blob/main/docs/content/docs/streaming.mdx
+
+title: Streaming
+description: Stream model output and full agent execution.
+
+Streaming is useful when the user should see progress before the whole run finishes.
+
+Aquaregia has two streaming layers:
+
+| Need | Use |
+| One model request | `client.stream(request)` |
+| Full agent execution with tools | `agent.stream(prompt)` |
+
+## Stream one model call
+
+Use provider-client streaming when you already know the exact request.
+
+```rust
+use aquaregia::{ChatRequest, StreamEvent, providers::openai};
+use futures_util::StreamExt;
+
+let client = openai::Client::from_env()?;
+
+let mut stream = client
+    .stream(ChatRequest::from_prompt(
+        "gpt-5.5",
+        "Write a haiku about Rust.",
+    ))
+    .await?;
+
+while let Some(event) = stream.next().await {
+    match event? {
+        StreamEvent::TextDelta { text } => print!("{text}"),
+        StreamEvent::ReasoningDelta { text, .. } => eprint!("{text}"),
+        StreamEvent::Usage { usage } => {
+            eprintln!("tokens={}", usage.total_tokens);
+        }
+        StreamEvent::Done { finish_reason } => {
+            eprintln!("finish={finish_reason:?}");
+            break;
+        }
+        _ => {}
+    }
+}
+```
+
+`StreamEvent` is provider-agnostic. Providers can emit different subsets of events depending on their wire format and model support.
+
+## Stream an agent run
+
+Use agent streaming when tools may run during the response.
+
+```rust
+use aquaregia::{AgentStreamEvent, StreamEvent};
+use futures_util::StreamExt;
+
+let mut stream = agent
+    .stream("Should I bring an umbrella in Shanghai?")
+    .await?;
+
+while let Some(event) = stream.next().await {
+    match event? {
+        AgentStreamEvent::Model {
+            event: StreamEvent::TextDelta { text },
+            ..
+        } => print!("{text}"),
+        AgentStreamEvent::ToolCallStart { event } => {
+            eprintln!("[tool:start] {}", event.tool_call.tool_name);
+        }
+        AgentStreamEvent::ToolCallFinish { event } => {
+            eprintln!("[tool:done] error={}", event.tool_result.is_error);
+        }
+        AgentStreamEvent::StepFinish { event } => {
+            eprintln!("[step:{}] calls={}", event.step, event.tool_calls.len());
+        }
+        AgentStreamEvent::Done { output } => {
+            eprintln!("[done] steps={}", output.steps);
+            break;
+        }
+        _ => {}
+    }
+}
+```
+
+Agent streaming is the right data path for chat UIs, terminal agents, and debug panels because it shows both model output and tool execution.
+
+## Stream from stored messages
+
+If you already own the conversation history, use `stream_messages(...)`.
+
+```rust
+use aquaregia::Message;
+
+let messages = vec![
+    Message::system_text("You are concise."),
+    Message::user_text("Summarize the previous report."),
+];
+
+let mut stream = agent.stream_messages(messages).await?;
+```
+
+The final `Done` event contains the updated transcript. Persist that transcript for the next turn.
+
+## Map events to a UI
+
+A typical UI needs only a few event types:
+
+| UI need | Event |
+| Append assistant text | `AgentStreamEvent::Model { event: StreamEvent::TextDelta { .. } }` |
+| Show tool is running | `AgentStreamEvent::ToolCallStart` |
+| Show tool result | `AgentStreamEvent::ToolCallFinish` |
+| Update debug timeline | `AgentStreamEvent::StepFinish` |
+| Persist transcript | `AgentStreamEvent::Done { output }` |
+
+The final `AgentOutput` contains the complete transcript. Persist that instead of reconstructing messages from streamed tokens.
+
+## Model stream events
+
+`client.stream(...)` emits provider-agnostic `StreamEvent` values:
+
+| Event | Meaning |
+| `ReasoningStarted { block_id, provider_metadata }` | a reasoning block started |
+| `ReasoningDelta { block_id, text, provider_metadata }` | reasoning text arrived |
+| `ReasoningDone { block_id, provider_metadata }` | a reasoning block finished |
+| `TextDelta { text }` | visible assistant text arrived |
+| `ToolCallReady { call }` | the model produced a complete tool call |
+| `Usage { usage }` | usage counters arrived before the stream ended |
+| `Done { finish_reason }` | the model stream ended cleanly with the provider finish reason |
+
+Reasoning events appear only when the provider and model expose reasoning content. Treat them as optional debug or audit data unless your product explicitly displays reasoning.
+
+## Agent stream events
+
+`agent.stream(...)` wraps model events with the lifecycle of the tool loop:
+
+| Event | Meaning |
+| `Start { event }` | run metadata: model, initial messages, tool count, max steps |
+| `StepStart { event }` | one model/tool-loop step is about to run |
+| `Model { step, event }` | a `StreamEvent` from the provider during that step |
+| `ToolCallStart { event }` | a registered Rust tool is about to execute |
+| `ToolCallFinish { event }` | a registered Rust tool finished and produced a tool result |
+| `StepFinish { event }` | one step completed, including text, tool calls, usage, and finish reason |
+| `Done { output }` | the full agent run completed successfully |
+
+Errors are delivered as `Err(Error)` items from the stream. When that happens, stop reading and handle the error the same way you would handle a failed non-streaming call.
+
+## Send streaming over SSE
+
+Aquaregia does not force a web transport. For a server-sent events endpoint, map events into your application's wire format.
+
+```rust
+match event? {
+    AgentStreamEvent::Model {
+        event: StreamEvent::TextDelta { text },
+        ..
+    } => send_sse("text_delta", text).await?,
+    AgentStreamEvent::ToolCallStart { event } => {
+        send_sse("tool_start", event.tool_call.tool_name).await?;
+    }
+    AgentStreamEvent::Done { output } => {
+        send_sse("done", output.output_text).await?;
+    }
+    _ => {}
+}
+```
+
+Keep the final `Done` payload authoritative. Intermediate text deltas are for display; the final output and transcript are what you should store.
+
+## When not to stream
+
+Use `prompt(...)` or `run(...)` when:
+
+- the caller is a background job
+- you only need a final value
+- the response is small
+- your application already has its own progress model
+
+Streaming adds event handling. Use it when that extra surface improves the user experience.
+
+---
+
+# structured-output.mdx
+
+Source: https://github.com/minorcell/aquaregia/blob/main/docs/content/docs/structured-output.mdx
+
+title: Structured Output
+description: Ask the model for typed Rust data instead of prose.
+
+Use structured output when your application needs data it can validate and store.
+
+Examples:
+
+- classify a support ticket
+- extract fields from a document
+- produce a product brief object
+- return a list of search filters
+
+## Define the output type
+
+Derive `Deserialize` and `JsonSchema` for the type you want back.
+
+```rust
+use schemars::JsonSchema;
+use serde::Deserialize;
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct TicketClassification {
+    category: String,
+    priority: String,
+    needs_human: bool,
+}
+```
+
+## Generate the object
+
+```rust
+use aquaregia::{ChatRequest, Message, providers::openai};
+
+let client = openai::Client::from_env()?;
+
+let req = ChatRequest::builder("gpt-5.5")
+    .message(Message::system_text(
+        "Classify support tickets. Return only the requested structure.",
+    ))
+    .message(Message::user_text(
+        "My invoice says I was charged twice this month.",
+    ))
+    .temperature(0.2)
+    .build()?;
+
+let result = client
+    .generate_object::<TicketClassification>(req)
+    .await?;
+
+println!("{:?}", result.object);
+```
+
+Aquaregia derives JSON Schema from the Rust type and asks the provider for JSON matching that schema. The response is deserialized before it reaches your application code.
+
+The result also carries metadata you can log:
+
+```rust
+println!("finish={:?}", result.finish_reason);
+println!("tokens={}", result.usage.total_tokens);
+```
+
+## Stream a structured object
+
+Use `stream_object::<T>()` when a UI should update as fields arrive.
+
+```rust
+use aquaregia::types::StreamObjectEvent;
+use futures_util::StreamExt;
+use schemars::JsonSchema;
+use serde::Deserialize;
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(default)]
+struct ProductBrief {
+    name: String,
+    tagline: String,
+    audience: Vec<String>,
+}
+
+let mut stream = client.stream_object::<ProductBrief>(req).await?;
+
+while let Some(event) = stream.next().await {
+    match event? {
+        StreamObjectEvent::Partial { partial } => {
+            println!("draft name: {}", partial.name);
+        }
+        StreamObjectEvent::Object { object } => {
+            println!("final: {:?}", object);
+        }
+    }
+}
+```
+
+Partial objects are best effort. Fields that have not arrived yet use their default values, so streaming output types should derive `Default` and use `#[serde(default)]`.
+
+## Provide your own schema
+
+Most applications should prefer `generate_object::<T>()`. Use `OutputSchema` directly when the schema comes from a file, a database, or another language runtime.
+
+```rust
+use aquaregia::{ChatRequest, OutputSchema, providers::openai};
+use serde_json::json;
+
+let client = openai::Client::from_env()?;
+
+let schema = OutputSchema {
+    name: "invoice_fields".to_string(),
+    description: Some("Fields extracted from an invoice".to_string()),
+    json_schema: json!({
+        "type": "object",
+        "properties": {
+            "vendor": { "type": "string" },
+            "total": { "type": "number" },
+            "currency": { "type": "string" }
+        },
+        "required": ["vendor", "total", "currency"]
+    }),
+};
+
+let response = client
+    .generate(
+        ChatRequest::builder("gpt-5.5")
+            .user("Invoice from Example Inc. Total USD 42.50.")
+            .output_schema(schema)
+            .build()?,
+    )
+    .await?;
+
+println!("{}", response.output_text);
+```
+
+Manual schemas return a normal `ChatResponse`. Use `generate_object::<T>()` when you want Aquaregia to deserialize into a Rust type before returning.
+
+## Use normal request controls
+
+Structured output still starts from a `ChatRequest`, so the same controls apply:
+
+```rust
+use aquaregia::Message;
+
+let req = ChatRequest::builder("gpt-5.5")
+    .message(Message::system_text("Extract only facts present in the input."))
+    .message(Message::user_text(
+        "Customer wants a refund because the package arrived damaged.",
+    ))
+    .temperature(0.0)
+    .max_output_tokens(600)
+    .provider_options(serde_json::json!({
+        "openai": {
+            "reasoning": { "effort": "low" }
+        }
+    }))
+    .build()?;
+```
+
+Use lower temperature for extraction and classification. Use more room in `max_output_tokens(...)` when the schema can produce long arrays.
+
+## Choose structured output or agents
+
+Structured output is a client-level API. Use it when the model should return one typed value.
+
+Use an agent when the model needs to work through tools and intermediate observations before answering.
+
+| Need | Use |
+| one typed object | `client.generate_object::<T>(request)` |
+| progressive typed object | `client.stream_object::<T>(request)` |
+| tool loop with final text | `agent.run(...)` |
+| streamed tool loop | `agent.stream(...)` |
+
+## Provider behavior
+
+OpenAI uses native structured output. Providers without native structured-output support use an internal tool-call fallback. The caller still receives the same typed Rust value.
+
+If a provider does not support the needed underlying operation, the call fails with `ErrorCode::UnsupportedOperation`. Provider-specific structured-output options can be passed through `provider_options`, but Aquaregia does not validate those fields.
+
+---
+
+# tools.mdx
+
+Source: https://github.com/minorcell/aquaregia/blob/main/docs/content/docs/tools.mdx
+
+title: Tools
+description: Turn Rust functions into model-callable capabilities.
+
+A tool is a contract between the model and your application:
+
+- the model sees a name, description, and JSON Schema
+- Aquaregia validates and deserializes the model's JSON arguments
+- your Rust function runs
+- the result is serialized and sent back to the model
+
+This page shows how to design that contract.
+
+## Start with the task boundary
+
+Give each tool one clear job. The model should know when to use it from the name and description.
+
+```rust
+use aquaregia::{Tool, tool};
+use schemars::JsonSchema;
+use serde::Deserialize;
+use serde_json::json;
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct WeatherArgs {
+    city: String,
+}
+
+fn get_weather() -> Tool {
+    tool("get_weather")
+        .description("Get current weather by city")
+        .execute(|args: WeatherArgs| async move {
+            json!({
+                "city": args.city,
+                "temp_c": 23,
+                "condition": "light rain"
+            })
+        })
+}
+```
+
+Attach it to the agent:
+
+```rust
+let agent = client
+    .agent("gpt-5.5")
+    .instructions("Use tools when they provide fresher information.")
+    .tool(get_weather())
+    .max_steps(4)
+    .build()?;
+```
+
+## Return data, not prose
+
+Tools should return structured facts the model can use in the next step.
+
+Prefer:
+
+```rust
+json!({
+    "city": "Shanghai",
+    "temp_c": 23,
+    "condition": "light rain"
+})
+```
+
+Avoid returning a sentence like `"Shanghai is rainy and 23C"` unless the upstream system only gives you text. Structured results make the next model step easier to reason about.
+
+## Fallible tools
+
+Use `.try_execute(...)` when the tool can fail.
+
+```rust
+use aquaregia::tool::ToolExecError;
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ReadFileArgs {
+    path: String,
+}
+
+fn read_file() -> Tool {
+    tool("read_file")
+        .description("Read a UTF-8 file from the workspace")
+        .try_execute(|args: ReadFileArgs| async move {
+            let text = std::fs::read_to_string(&args.path)
+                .map_err(|e| ToolExecError::Execution(e.to_string()))?;
+
+            Ok(json!({
+                "path": args.path,
+                "content": text
+            }))
+        })
+}
+```
+
+By default, tool failures become error-shaped tool results so the model can recover:
+
+```json
+{ "error": "file not found" }
+```
+
+Use `FailFast` when the application should stop immediately.
+
+```rust
+use aquaregia::ToolErrorPolicy;
+
+let agent = client
+    .agent("gpt-5.5")
+    .tool(read_file())
+    .tool_error_policy(ToolErrorPolicy::FailFast)
+    .build()?;
+```
+
+## Multiple tools
+
+Register one tool with `.tool(...)`, or a batch with `.tools(...)`.
+
+```rust
+let agent = client
+    .agent("gpt-5.5")
+    .tools([get_weather(), get_fx_rate()])
+    .max_steps(6)
+    .build()?;
+```
+
+If tool order matters to your application, express that in the instructions or split the workflow outside the agent. The model chooses which registered tool to call at each step.
+
+## Raw JSON tools
+
+Typed tools should be the default. Use `.raw_schema(...)` only when the JSON contract is easier to write directly than to derive from Rust types.
+
+```rust
+let fx_tool = tool("get_fx_rate")
+    .description("Get FX rate by currency pair, e.g. USD/CNY")
+    .raw_schema(json!({
+        "type": "object",
+        "properties": {
+            "pair": { "type": "string" }
+        },
+        "required": ["pair"]
+    }))
+    .execute_raw(|args| async move {
+        let pair = args
+            .get("pair")
+            .and_then(|v| v.as_str())
+            .unwrap_or("USD/CNY");
+
+        Ok(json!({
+            "pair": pair,
+            "rate": 7.18
+        }))
+    });
+```
+
+## Naming rules
+
+Tool names must match `^[a-zA-Z0-9_-]{1,64}$` and must be unique within an agent.
+
+Good names:
+
+- `get_weather`
+- `read_file`
+- `search_docs`
+
+Avoid names that describe implementation details rather than capability.
+
+## Tool builder reference
+
+| API | Use |
+| `tool(name)` | start a tool definition |
+| `description(text)` | tell the model when and why to call the tool |
+| `execute(typed closure)` | typed, infallible tool; return any serializable value |
+| `try_execute(typed closure)` | typed, fallible tool; return `Result<Out, ToolExecError>` |
+| `raw_schema(json!(...))` | replace the derived argument schema |
+| `execute_raw(raw JSON closure)` | raw JSON tool with manual argument handling |
+
+`execute(...)` and `try_execute(...)` derive the input JSON Schema from the `Args` type. Use raw tools only when deriving the schema from Rust would make the contract less clear.
+
+## Tool errors
+
+Fallible tools return `ToolExecError`.
+
+| Error | Meaning |
+| `ToolExecError::Execution(message)` | the application operation failed |
+| `ToolExecError::Timeout` | the tool timed out |
+
+The agent converts tool failures according to `ToolErrorPolicy`. `ContinueAsToolResult` lets the model recover from the failed observation; `FailFast` returns the error to your application immediately.
+
+---
+
+# Aquaregia Docs
+
+Source: https://github.com/minorcell/aquaregia/blob/main/docs/README.md
+
+# Aquaregia Docs
+
+This directory contains the Aquaregia documentation site.
+
+## Development
+
+```bash
+pnpm install
+pnpm dev
+```
+
+Open http://localhost:3000.
+
+## Content
+
+- Landing page: `src/app/(home)/page.tsx`
+- Documentation pages: `content/docs/*.mdx`
+- Navigation order: `content/docs/meta.json`
+- Shared docs layout: `src/lib/layout.shared.tsx`
+
+Write docs as current API documentation. Avoid migration notes in the guide pages; put release history in the root `CHANGELOG.md`.
+
+## Checks
+
+```bash
+pnpm types:check
+pnpm build
+```
+
+---
+
+# Security Policy
+
+Source: https://github.com/minorcell/aquaregia/blob/main/SECURITY.md
+
+# Security Policy
+
+## Supported Versions
+
+Security fixes are applied to the latest code on the default branch.
+
+## Reporting a Vulnerability
+
+Please do not disclose vulnerabilities publicly before a fix is available.
+
+To report a vulnerability:
+
+- Prefer GitHub private vulnerability reporting (Security Advisory) if enabled.
+- Otherwise, contact the maintainer directly on GitHub: `@minorcell`.
+
+When reporting, include:
+
+- A clear description of the issue.
+- Steps to reproduce or a proof of concept.
+- Potential impact and affected components.
+- Suggested mitigation if available.
+
+## Response Process
+
+- We will acknowledge reports as soon as possible.
+- We will validate, triage severity, and work on a fix.
+- We will coordinate disclosure timing with the reporter when possible.
+
+---

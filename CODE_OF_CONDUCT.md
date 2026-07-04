@@ -45,8 +45,8 @@ If you experience or witness unacceptable behavior, please report it privately.
 
 Instead:
 
-1. Email [fullcontext@reclear.io](mailto:fullcontext@reclear.io), or
-2. Open a [private security advisory](https://github.com/reclear-io/fullcontext/security/advisories/new) on GitHub.
+1. Email [wale@team.reclear.io](mailto:wale@team.reclear.io), or
+2. Open a [private security advisory](https://github.com/reclear-io/llmref/security/advisories/new) on GitHub.
 
 Include any relevant context, such as links, screenshots, or a description of what happened. Reports will be reviewed as promptly as we can and handled as confidentially as possible.
 

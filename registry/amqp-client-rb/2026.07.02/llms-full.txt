@@ -1,0 +1,869 @@
+# AMQP::Client
+
+Source: https://github.com/cloudamqp/amqp-client.rb/blob/main/README.md
+
+# AMQP::Client
+
+A modern AMQP 0-9-1 Ruby client. Very fast (just as fast as the Java client, and >2x than other Ruby clients), fully thread-safe, blocking operations and straight-forward error handling.
+
+It's small, and without any dependencies. Other Ruby clients are about several times bigger. But without trading functionality.
+
+It's safe by default, messages are published as persistent, and is waiting for confirmation from the broker. That can of course be disabled if performance is a priority.
+
+## Support
+
+The library is fully supported by [CloudAMQP](https://www.cloudamqp.com), the largest LavinMQ and RabbitMQ hosting provider in the world. Open [an issue](https://github.com/cloudamqp/amqp-client.rb/issues) or [email our support](mailto:support@cloudamqp.com) if you have problems or questions.
+
+## Documentation
+
+[API reference](https://cloudamqp.github.io/amqp-client.rb/)
+
+## Usage
+
+The client has two APIs.
+
+### High level API
+
+The library provides a high-level API that manages channels, content-types, encodings, reconnection automatically.
+
+```ruby
+require "amqp-client"
+
+# Configure built-in codecs for automatic JSON, gzip, and deflate handling
+AMQP::Client.configure do |config|
+  config.enable_builtin_codecs
+end
+
+# Start the client, it will connect and once connected it will reconnect if that connection is lost
+# Operation pending when the connection is lost will raise an exception (not timeout)
+amqp = AMQP::Client.new("amqp://localhost").start
+
+# Declares a durable queue
+myqueue = amqp.queue("myqueue")
+
+# Declares a topic exchange
+ex = amqp.topic_exchange("myexchange")
+
+# Bind the queue to any exchange, with any binding key
+myqueue.bind(ex, binding_key: "my.events.*")
+
+# The message will be reprocessed if the client loses connection to the broker
+# between message arrival and when the message was supposed to be ack'ed.
+myqueue.subscribe(prefetch: 20) do |msg|
+  puts msg.parse # Parses msg.body based on content_type and content_encoding
+rescue => e
+  puts e.full_message
+end
+# The message is automatically ack'd by Queue#subscribe if the block returns successfully
+# If the block raises the message is rejected and requeued.
+# You still can control the acking and rejecting in the block if you want to, e.g:
+myqueue.subscribe do |msg|
+  msg.ack
+rescue => e
+  msg.reject
+end
+
+# Publish directly to the queue, message will be serialized to json automatically
+myqueue.publish({ foo: "bar" }, content_type: "application/json")
+
+# Publish to any exchange
+ex.publish("my message", routing_key: "topic.foo", headers: { foo: "bar" })
+# Message will be gzip encoded automatically
+amqp.publish("an event", exchange: "amq.topic", routing_key: "my.event", content_encoding: "gzip")
+```
+
+#### Configuration
+
+Configure class-level defaults and enable built-in codecs using the `configure` method:
+
+```ruby
+AMQP::Client.configure do |config|
+  config.enable_builtin_codecs  # Enable automatic JSON, gzip, and deflate handling
+  config.default_content_type = "application/json"
+  config.default_content_encoding = "gzip"
+  config.strict_coding = true  # Raise errors on unknown codecs
+end
+```
+
+You can also register custom parsers and coders:
+
+```ruby
+AMQP::Client.configure do |config|
+  config.register_parser(content_type: "application/msgpack", parser: MsgPackParser)
+  config.register_coder(content_encoding: "lz4", coder: LZ4Coder)
+end
+```
+
+**Built-in codecs** support these formats:
+- `application/json` - JSON encoding/decoding
+- `gzip` - Gzip compression
+- `deflate` - Deflate compression (RFC 1950, zlib-wrapped)
+
+The `AMQP::Client::Coders::DeflateRaw` coder is shipped but not registered by default. It produces raw DEFLATE (RFC 1951, no zlib header or Adler-32 checksum), matching what Node's `zlib.deflateRaw` emits. Opt in by registering it under whichever content_encoding you want, e.g.:
+
+```ruby
+AMQP::Client.configure do |config|
+  config.register_coder(content_encoding: "deflate", coder: AMQP::Client::Coders::DeflateRaw)
+end
+```
+
+These settings will be used as defaults for all client instances, but can be overridden per-instance:
+
+```ruby
+client = AMQP::Client.new("amqp://localhost")
+client.default_content_type = "text/plain"  # Override for this instance
+```
+
+#### Lifecycle logging and thread names
+
+Pass `?name=` in the connection URL to identify a client instance. The same identifier appears in both lifecycle log lines and `Thread#name` for every thread the library spawns:
+
+```ruby
+require "logger"
+
+client = AMQP::Client.new("amqp://broker?name=worker-1", logger: Logger.new($stdout))
+client.start
+# => INFO -- : AMQP::Client[worker-1]: connected
+# Thread.list now includes:
+#   "amqp.supervisor[worker-1]"
+#   "amqp.read_loop[worker-1] broker:5672"
+#   "amqp.heartbeat[worker-1] broker:5672"  (when heartbeat > 0)
+```
+
+Without `?name=`, threads use the shorter form (`amqp.read_loop broker:5672`) and the log prefix is plain `AMQP::Client:`. The `amqp` segment is kept short so `amqp.read_loop` (14 chars) still fits the 15-char `comm` field used by `ps -L` and `top -H`.
+
+When `logger:` is not set, reconnect errors still go to stderr via `Kernel#warn` so existing behavior is preserved.
+
+#### Publishing and consuming on the same connection
+
+Each connection is driven by a single read loop, but consumer callbacks run on their own worker threads, so a busy or slow consumer never blocks deliveries, and publishing (a socket write) is independent of the read loop. Sharing one connection for both is therefore fine in most cases.
+
+The exception is AMQP flow control. If you publish faster than the broker accepts — or the broker raises a `connection.blocked` alarm (low memory or disk) — the socket write buffer fills and publishes block. Because acknowledgements are writes too, a consumer's acks then block behind the stalled publisher, its prefetch window fills, and deliveries stop. This affects every AMQP client, but it's most visible with high-prefetch manual-ack consumers such as LavinMQ and RabbitMQ streams.
+
+To stay decoupled, use a separate `AMQP::Client` (its own connection) for heavy publishing and another for consuming, and watch for back-pressure with `Connection#on_blocked`/`#on_unblocked`.
+
+### Low level API
+
+This API matches the AMQP protocol very well, it can do everything the protocol allows, but requires some knowledge about the protocol, and doesn't handle reconnects.
+
+```ruby
+require "amqp-client"
+
+# Opens and establishes a connection
+conn = AMQP::Client.new("amqp://guest:guest@localhost").connect
+
+# Open a channel
+ch = conn.channel
+
+# Create a temporary queue
+q = ch.queue_declare
+
+# Publish a message to said queue
+ch.basic_publish_confirm "Hello World!", exchange: "", routing_key: q.queue_name, persistent: true
+
+# Poll the queue for a message
+msg = ch.basic_get(q.queue_name)
+
+# Print the message's body to STDOUT
+puts msg.body
+```
+
+## Supported Ruby versions
+
+All maintained Ruby versions are supported.
+
+See the [CI workflow](https://github.com/cloudamqp/amqp-client.rb/blob/main/.github/workflows/ci.yml) for the exact versions.
+
+## Installation
+
+Add this line to your application's Gemfile:
+
+```ruby
+gem 'amqp-client'
+```
+
+And then execute:
+
+```bash
+    bundle install
+```
+
+Or install it yourself as:
+
+```bash
+    gem install amqp-client
+```
+
+## Development
+
+After checking out the repo, run `bin/setup` to install dependencies. Then, run `rake test` to run the tests. You can also run `bin/console` for an interactive prompt that will allow you to experiment.
+
+To install this gem onto your local machine, run `bundle exec rake install`.
+
+### RabbitMQ Connection.Blocked tests
+
+The RabbitMQ `Connection.Blocked` tests change the broker memory watermark with `sudo rabbitmqctl`. They are skipped unless `RUN_RABBITMQ_CONNECTION_BLOCKED_TESTS` is set to `1` or `true`:
+
+```bash
+RUN_RABBITMQ_CONNECTION_BLOCKED_TESTS=1 bundle exec rake test
+```
+
+### LavinMQ flow-control tests
+
+The LavinMQ flow-control test starts a private LavinMQ instance configured to reject publishes due to low disk space. It is skipped unless `RUN_LAVINMQ_FLOW_CONTROL_TESTS` is set to `1` or `true`:
+
+```bash
+RUN_LAVINMQ_FLOW_CONTROL_TESTS=1 bundle exec rake test
+```
+
+CI opts in for the Linux LavinMQ test jobs.
+
+### TLS tests
+
+`rake test` excludes the TLS tests because they need a broker with TLS enabled. `bin/test-tls` runs them against a throwaway broker without disturbing anything you already have set up: it generates a self-signed certificate, starts the broker as your user from a temporary directory on non-default ports (21672/21671), runs the `_tls` tests, then shuts it down. With no argument it tests both brokers in turn:
+
+```bash
+bin/test-tls            # both brokers
+bin/test-tls lavinmq    # or a single broker: lavinmq or rabbitmq
+```
+
+It never uses the system service, writes under `/etc`, stops a broker you are already running, or touches the default LavinMQ control socket. The broker is installed if missing (LavinMQ from CloudAMQP's packagecloud repo, which is removed again if the script added it); that install is the only step needing `sudo`. An installed broker package is left in place afterwards — only the apt repo is cleaned up. The certificate directory is `CERT_DIR` (default `/tmp/amqp-tls`) and the ports are `TEST_AMQP_PORT`/`TEST_AMQPS_PORT`. Requires a Linux host. The TLS jobs in the CI workflow call this same script, so CI exercises it too.
+
+### Release Process
+
+The gem uses rake tasks to automate the release preparation process. The actual gem building and publishing is handled automatically by GitHub Actions when a tag is pushed.
+
+#### Quick Release (Patch Version)
+
+```bash
+rake release:prepare
+```
+
+This will:
+
+1. Run tests and RuboCop to ensure code quality
+2. Bump the patch version (e.g., 1.2.0 → 1.2.1)
+3. Update the CHANGELOG.md with the new version and current date
+4. Create a git commit and tag for the release
+5. Push commits and tags to the remote repository
+6. GitHub Actions will automatically build and publish the gem to RubyGems
+
+#### Custom Version Bump
+
+For minor or major version bumps:
+
+```bash
+# Minor version bump (e.g., 1.2.0 → 1.3.0)
+rake release:prepare[minor]
+
+# Major version bump (e.g., 1.2.0 → 2.0.0)
+rake release:prepare[major]
+```
+
+#### Individual Release Steps
+
+You can also run individual steps if needed:
+
+```bash
+# Bump version only
+rake release:bump[patch]  # or [minor] or [major]
+
+# Update changelog with current version
+rake release:changelog
+
+# Create git tag with changelog entries
+rake release:tag
+
+# Push tag to remote (handles conflicts)
+rake release:push_tag
+```
+
+#### Manual Release Steps
+
+If you prefer manual control:
+
+1. Update the version number in `lib/amqp/client/version.rb`
+2. Update the CHANGELOG.md with the new version and release notes
+3. Commit your changes: `git add . && git commit -m "Release X.Y.Z"`
+4. Create and push a tag: `git tag vX.Y.Z && git push origin vX.Y.Z`
+5. GitHub Actions will automatically build and publish the gem when the tag is pushed
+
+## Contributing
+
+Bug reports and pull requests are welcome on GitHub at [https://github.com/cloudamqp/amqp-client.rb](https://github.com/cloudamqp/amqp-client.rb/)
+
+## License
+
+The gem is available as open source under the terms of the [MIT License](https://opensource.org/licenses/MIT).
+
+---
+
+# Migration Guide: v1.x to v2.0
+
+Source: https://github.com/cloudamqp/amqp-client.rb/blob/main/MIGRATION_GUIDE_v2.md
+
+# Migration Guide: v1.x to v2.0
+
+This guide will help you migrate your code from amqp-client v1.x to v2.0. Version 2.0 introduces several breaking changes that improve API consistency, clarity, and functionality.
+
+## Table of Contents
+
+- [Breaking Changes](#breaking-changes)
+  - [1. Keyword Arguments](#1-keyword-arguments)
+  - [2. Exchange Convenience Methods Renamed](#2-exchange-convenience-methods-renamed)
+  - [3. Direct Exchange Default Name](#3-direct-exchange-default-name)
+  - [4. Subscribe Methods Return Consumer](#4-subscribe-methods-return-consumer)
+  - [5. Channel#basic_subscribe Return Value](#5-channelbasic_subscribe-return-value)
+  - [6. QueueOk Changed to Data Class](#6-queueok-changed-to-data-class)
+- [New Features](#new-features)
+  - [Automatic Message Encoding/Serialization](#automatic-message-encodingserialization)
+  - [Default Content Type and Encoding](#default-content-type-and-encoding)
+  - [Automatic Ack/Reject in Queue#subscribe](#automatic-ackreject-in-queuesubscribe)
+  - [RPC API](#rpc-api)
+  - [Queue Polling](#queue-polling)
+
+## Breaking Changes
+
+### 1. Keyword Arguments
+
+**Impact: ALL public API methods**
+
+All public methods now use keyword arguments instead of positional arguments for improved clarity and to prevent argument order mistakes.
+
+#### High-Level API Changes
+
+**Publishing:**
+
+```ruby
+# v1.x
+amqp.publish("my message", "amq.topic", "routing.key", headers: { foo: "bar" })
+queue.publish("body", content_type: "application/json")
+exchange.publish("body", "routing.key")
+
+# v2.0
+amqp.publish("my message", exchange: "amq.topic", routing_key: "routing.key", headers: { foo: "bar" })
+queue.publish("body", content_type: "application/json")
+exchange.publish("body", routing_key: "routing.key")
+```
+
+**Exchange Declaration:**
+
+```ruby
+# v1.x
+amqp.exchange("my.exchange", "x-consistent-hash", durable: true)
+
+# v2.0
+amqp.exchange("my.exchange", type: "x-consistent-hash", durable: true)
+```
+
+**Queue Binding:**
+
+```ruby
+# v1.x
+queue.bind("amq.topic", "routing.key")
+
+# v2.0
+queue.bind("amq.topic", binding_key: "routing.key")
+# Or better, use the exchange object:
+exchange = amqp.topic_exchange("amq.topic")
+queue.bind(exchange, binding_key: "routing.key")
+```
+
+#### Low-Level API Changes
+
+**Publishing:**
+
+```ruby
+# v1.x
+channel.basic_publish("body", "exchange", "routing.key", persistent: true)
+channel.basic_publish_confirm("body", "exchange", "routing.key", persistent: true)
+
+# v2.0
+channel.basic_publish("body", exchange: "exchange", routing_key: "routing.key", persistent: true)
+channel.basic_publish_confirm("body", exchange: "exchange", routing_key: "routing.key", persistent: true)
+```
+
+**Exchange Declaration:**
+
+```ruby
+# v1.x
+channel.exchange_declare("my.exchange", "topic", durable: true)
+
+# v2.0
+channel.exchange_declare("my.exchange", type: "topic", durable: true)
+```
+
+### 2. Exchange Convenience Methods Renamed
+
+**Impact: Code using convenience methods for exchange types**
+
+Exchange convenience methods have been renamed to include `_exchange` suffix for improved clarity:
+
+```ruby
+# v1.x
+amqp.direct("my.exchange")
+amqp.fanout("my.exchange")
+amqp.topic("my.exchange")
+amqp.headers("my.exchange")
+
+# v2.0
+amqp.direct_exchange("my.exchange")
+amqp.fanout_exchange("my.exchange")
+amqp.topic_exchange("my.exchange")
+amqp.headers_exchange("my.exchange")
+```
+
+### 3. Direct Exchange Default Name
+
+**Impact: Code relying on the direct exchange method to get the default exchange**
+
+The default name for the direct exchange has changed from an empty string (the default exchange) to `"amq.direct"` for API consistency:
+
+```ruby
+# v1.x
+amqp.direct()         # Returns the default exchange
+amqp.direct("")       # Returns the default exchange
+
+# v2.0
+amqp.direct_exchange()        # Returns exchange with name "amq.direct"
+amqp.direct_exchange("")      # Returns the default exchange
+```
+
+**Migration:**
+
+- If you were relying on `direct()` to return the default exchange (empty string), use `direct_exchange("")` explicitly
+- You should probably use `default_exchange` rather than `direct_exchange("")`.*
+
+### 4. Subscribe Methods Return Consumer
+
+**Impact: Code using Client#subscribe or Queue#subscribe**
+
+The `subscribe` methods now return a `Consumer` object which can be used to cancel the subscription:
+
+```ruby
+# v1.x
+queue.subscribe(prefetch: 10) do |msg|
+  puts msg.body
+end
+# No way to cancel the subscription
+
+# v2.0
+consumer = queue.subscribe(prefetch: 10) do |msg|
+  puts msg.body
+end
+
+# Can now cancel:
+consumer.cancel
+```
+
+**Migration:**
+
+- If you don't need to cancel subscriptions, you can ignore the return value
+- To cancel a subscription, store the returned `Consumer` object and call `cancel` on it
+
+### 5. Channel#basic_subscribe Return Value
+
+**Impact: Low-level API code using basic_subscribe**
+
+The `Channel#basic_subscribe` method now returns `Connection::Channel::ConsumeOk` for better consumer response handling:
+
+```ruby
+# v1.x
+channel.basic_consume(queue_name, no_ack: false) do |msg|
+  # ...
+end
+# Returned some internal value
+
+# v2.0
+consume_ok = channel.basic_consume(queue_name, no_ack: false) do |msg|
+  # ...
+end
+# consume_ok has: consumer_tag
+```
+
+**Migration:**
+
+- If you weren't using the return value, no changes needed
+- If you were using it, update to use the `ConsumeOk` structure
+
+### 6. QueueOk Changed to Data Class
+
+**Impact: Code inspecting QueueOk structure internals**
+
+`Connection::Channel::QueueOk` has been converted from a `Struct` to a `Data` class (immutable):
+
+```ruby
+# v1.x
+queue_ok = channel.queue_declare("my.queue")
+queue_ok.queue_name = "something else"  # Mutable
+
+# v2.0
+queue_ok = channel.queue_declare(name: "my.queue")
+queue_ok.queue_name = "something else"  # Error: Data objects are immutable
+```
+
+**Migration:**
+
+- If you were only reading fields, no changes needed
+- If you were modifying the structure, you'll need to create new instances instead
+
+## New Features
+
+While not breaking changes, these new features may allow you to simplify your code:
+
+### Configure Block Pattern
+
+A new unified configuration API has been introduced:
+
+```ruby
+AMQP::Client.configure do |config|
+  config.enable_builtin_codecs
+  config.default_content_type = "application/json"
+  config.default_content_encoding = "gzip"
+  config.strict_coding = true
+
+  # Can also register custom parsers/coders
+  config.register_parser(content_type: "application/msgpack", parser: MsgPackParser)
+end
+```
+
+### Automatic Message Encoding/Serialization
+
+The high-level API now supports automatic message encoding and serialization:
+
+```ruby
+# Enable built-in codecs via configure block
+AMQP::Client.configure do |config|
+  config.enable_builtin_codecs
+end
+
+# Automatically serializes to JSON
+queue.publish({ foo: "bar" }, content_type: "application/json")
+
+# Automatically deserializes based on content_type
+queue.subscribe do |msg|
+  data = msg.parse  # Returns the parsed Ruby hash
+end
+```
+
+**Supported formats:**
+
+- `application/json` - JSON encoding/decoding
+- `gzip` - Gzip compression
+- `deflate` - Deflate compression
+
+### Default Content Type and Encoding
+
+You can set default `content_type` and `content_encoding` in the configure block:
+
+```ruby
+# Class-level defaults via configure block
+AMQP::Client.configure do |config|
+  config.default_content_type = "application/json"
+  config.default_content_encoding = "gzip"
+end
+
+# Instance-level override
+amqp = AMQP::Client.new("amqp://localhost")
+amqp.default_content_type = "text/plain"
+
+# These will be applied automatically unless explicitly overridden
+queue.publish({ foo: "bar" })  # Automatically uses application/json
+```
+
+### Automatic Ack/Reject in Queue#subscribe
+
+`Queue#subscribe` now handles acknowledgments and rejections automatically:
+
+```ruby
+# Automatic handling
+queue.subscribe(prefetch: 20) do |msg|
+  process(msg)
+  # Message is automatically ack'd if block returns successfully
+  # Message is automatically rejected (with requeue) if block raises an exception
+end
+
+# Manual handling still works if you prefer
+queue.subscribe do |msg|
+  msg.ack
+rescue => e
+  msg.reject(requeue: false)
+end
+```
+
+### RPC API
+
+A new RPC API has been added for request-response patterns:
+
+```ruby
+# Server
+amqp.rpc_server("rpc_queue") do |request|
+  { result: request[:value] * 2 }
+end
+
+# Client
+rpc = amqp.rpc_client
+response = rpc.call({ value: 21 }, routing_key: "rpc_queue")
+# => { result: 42 }
+```
+
+### Queue Polling
+
+You can now poll messages from queues as an alternative to subscribing:
+
+```ruby
+# Get a single message (returns nil if queue is empty)
+msg = queue.get
+
+# Or using the client
+msg = amqp.get(queue: "my.queue")
+
+if msg
+  process(msg)
+  msg.ack
+end
+```
+
+**New parameters:**
+
+- `passive` - Check if queue exists without creating it
+- `exclusive` - Queue will be deleted when connection closes
+
+## Migration Checklist
+
+1. [ ] Update all `publish` calls to use keyword arguments
+2. [ ] Update all `exchange_declare` calls to use `type:` keyword
+3. [ ] Update all `queue_declare` calls to use keyword arguments
+4. [ ] Rename `direct()`, `fanout()`, `topic()`, `headers()` to `*_exchange()` variants
+5. [ ] Review uses of `direct()` with no arguments - may need to explicitly pass `""`
+6. [ ] If cancelling subscriptions, store the returned `Consumer` object
+7. [ ] Update any code that was mutating `QueueOk` structures
+8. [ ] Replace `require "amqp-client/enable_builtin_codecs"` with configure block
+9. [ ] Consider using automatic message encoding for JSON/gzip/deflate
+10. [ ] Consider using automatic ack/reject in `Queue#subscribe`
+11. [ ] Review and test all queue bindings to use the new syntax
+
+## Getting Help
+
+If you encounter issues during migration:
+
+1. Check the [API documentation](https://cloudamqp.github.io/amqp-client.rb/)
+2. Review the [examples in the README](https://github.com/cloudamqp/amqp-client.rb#readme)
+3. [Open an issue](https://github.com/cloudamqp/amqp-client.rb/issues) on GitHub
+4. [Contact CloudAMQP support](mailto:support@cloudamqp.com)
+
+---
+
+# AMQP Client 2.0.0
+
+Source: https://github.com/cloudamqp/amqp-client.rb/blob/main/RELEASE_NOTES_v2.0.0.md
+
+# AMQP Client 2.0.0
+
+We're excited to announce the release of AMQP Client 2.0! This major version brings significant improvements to API clarity, consistency, and functionality while introducing powerful new features for automatic message encoding and configuration management.
+
+## 🎯 Highlights
+
+- **Keyword Arguments Throughout** - All public methods now use keyword arguments for improved clarity and safety
+- **Unified Configuration API** - New `AMQP::Client.configure` block for centralized configuration
+- **Automatic Message Encoding** - Built-in support for JSON, gzip, and deflate with extensible codec registry
+- **RPC Support** - Native RPC client/server implementation
+- **Enhanced Consumer Control** - Subscribe methods now return cancelable `Consumer` objects
+- **Automatic Ack/Reject** - `Queue#subscribe` handles acknowledgments automatically
+
+## 💔 Breaking Changes
+
+### 1. Keyword Arguments (All APIs)
+
+All public methods now require keyword arguments instead of positional arguments:
+
+```ruby
+# v1.x
+amqp.publish("message", "amq.topic", "routing.key")
+
+# v2.0
+amqp.publish("message", exchange: "amq.topic", routing_key: "routing.key")
+```
+
+**Migration:** Update all method calls to use keyword arguments. See the [Migration Guide](MIGRATION_GUIDE_v2.md#1-keyword-arguments) for complete examples.
+
+### 2. Exchange Convenience Methods Renamed
+
+Exchange type methods now have an `_exchange` suffix for clarity:
+
+```ruby
+# v1.x
+amqp.direct()
+amqp.topic()
+amqp.fanout()
+
+# v2.0
+amqp.direct_exchange()
+amqp.topic_exchange()
+amqp.fanout_exchange()
+```
+
+### 3. Direct Exchange Default Name
+
+The default direct exchange name changed from `""` to `"amq.direct"` for consistency:
+
+```ruby
+# v1.x
+amqp.direct()  # Returns exchange with name ""
+
+# v2.0
+amqp.direct_exchange()     # Returns "amq.direct"
+amqp.direct_exchange("")   # Explicitly use empty string if needed
+```
+
+### 4. Subscribe Returns Consumer
+
+`Client#subscribe` and `Queue#subscribe` now return a `Consumer` object that can be cancelled:
+
+```ruby
+consumer = queue.subscribe(prefetch: 10) do |msg|
+  # Process message
+end
+
+# Later...
+consumer.cancel
+```
+
+### 5. Other Breaking Changes
+
+- `Channel#basic_subscribe` now returns `Connection::Channel::ConsumeOk`
+- `Connection::Channel::QueueOk` is now an immutable `Data` class instead of `Struct`
+
+## ✨ New Features
+
+### Unified Configuration
+
+Configure all settings in one place with the new configure block:
+
+```ruby
+AMQP::Client.configure do |config|
+  config.enable_builtin_codecs  # JSON, gzip, deflate
+  config.default_content_type = "application/json"
+  config.default_content_encoding = "gzip"
+  config.strict_coding = true
+
+  # Register custom codecs
+  config.register_parser(content_type: "application/msgpack", parser: MsgPackParser)
+end
+```
+
+**Note:** The old `require "amqp-client/enable_builtin_codecs"` approach has been removed.
+
+### Automatic Message Encoding
+
+Built-in support for JSON serialization and compression:
+
+```ruby
+# Enable built-in codecs
+AMQP::Client.configure do |config|
+  config.enable_builtin_codecs
+end
+
+# Automatically serializes to JSON
+queue.publish({ user: "john", action: "login" }, content_type: "application/json")
+
+# Automatically deserializes
+queue.subscribe do |msg|
+  data = msg.parse  # Returns Ruby hash
+end
+```
+
+**Supported formats:**
+- `application/json` - JSON encoding/decoding
+- `gzip` - Gzip compression
+- `deflate` - Deflate compression
+
+### Automatic Ack/Reject
+
+`Queue#subscribe` now handles message acknowledgments automatically:
+
+```ruby
+queue.subscribe(prefetch: 20) do |msg|
+  process(msg)
+  # Automatically ack'd on success
+  # Automatically rejected (with requeue) on exception
+end
+```
+
+Manual control is still available if needed.
+
+### RPC Support
+
+Native RPC implementation for request-response patterns:
+
+```ruby
+# Server
+amqp.rpc_server("rpc_queue") do |request|
+  { result: request[:value] * 2 }
+end
+
+# Client
+rpc = amqp.rpc_client
+response = rpc.call({ value: 21 }, routing_key: "rpc_queue")
+# => { result: 42 }
+```
+
+### Queue Polling
+
+Poll messages without subscribing:
+
+```ruby
+msg = queue.get
+if msg
+  process(msg)
+  msg.ack
+end
+```
+
+### Enhanced Queue Options
+
+- `passive` - Check queue existence without creating
+- `exclusive` - Delete queue when connection closes
+
+### Improved Consumer Management
+
+- `Client#started?` - Check if client is started
+- `Message#delivery_info` - Structured access to delivery metadata
+- Consumer objects can be cancelled
+
+## 🔧 Additional Improvements
+
+- **Thread Safety** - `Client#start` is now thread-safe
+- **Confirm Handling** - `wait_for_confirms` properly handles NACKs and returns boolean
+- **Network Optimization** - Nagle's algorithm disabled for lower latency
+- **Bug Fixes** - Various fixes including minitest compatibility
+
+## 📚 Migration
+
+Please review the complete [Migration Guide](MIGRATION_GUIDE_v2.md) for detailed migration instructions, code examples, and a step-by-step checklist.
+
+### Quick Migration Checklist
+
+1. ✅ Update all method calls to use keyword arguments
+2. ✅ Rename `direct()`, `fanout()`, `topic()`, `headers()` to `*_exchange()`
+3. ✅ Replace `require "amqp-client/enable_builtin_codecs"` with configure block
+4. ✅ Store returned `Consumer` objects if you need to cancel subscriptions
+5. ✅ Review direct exchange usage if relying on empty string default
+6. ✅ Update any code mutating `QueueOk` structures
+
+### Migration Support
+
+- 📖 [Full Migration Guide](MIGRATION_GUIDE_v2.md)
+- 📚 [API Documentation](https://cloudamqp.github.io/amqp-client.rb/)
+- 💬 [Open an Issue](https://github.com/cloudamqp/amqp-client.rb/issues)
+- 📧 [Contact Support](mailto:support@cloudamqp.com)
+
+## 🙏 Acknowledgments
+
+Thank you to everyone who contributed feedback, bug reports, and suggestions that shaped this release!
+
+---
+
+**Full Changelog**: https://github.com/cloudamqp/amqp-client.rb/compare/v1.2.1...v2.0.0
+
+---

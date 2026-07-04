@@ -1,0 +1,4920 @@
+# Client Plugin Internals
+
+Source: https://github.com/doridian/openbambuapi/blob/main/client-plugin-internals.md
+
+# Client Plugin Internals
+
+> Notes on a few compile-time constants observed inside the network plugin
+> that ships with BambuStudio (the slicer's network agent process).
+>
+> These are baked into the plugin binary and appear to be identical for
+> every installation — they are not derived from anything user-specific
+> and anyone can re-extract them from their own slicer install. They are
+> only useful for inspecting your own slicer's behaviour (e.g. decrypting
+> your own network log files for debugging).
+
+## Debug log encryption
+
+The network plugin writes its internal log stream to files of the form:
+
+```
+~/.config/BambuStudio/log/debug_network_<timestamp>.log.enc
+```
+
+(equivalent paths on macOS / Windows under the per-user BambuStudio data
+directory)
+
+These files are an spdlog stream encrypted with **AES-128-ECB** using a
+16-byte ASCII key embedded in the plugin:
+
+```
+yyuBcftO2jkZeucy
+```
+
+A one-liner to decrypt your own log file:
+
+```sh
+openssl enc -d -aes-128-ecb -nopad \
+  -K "$(printf yyuBcftO2jkZeucy | xxd -p)" \
+  -in ~/.config/BambuStudio/log/debug_network_*.log.enc | strings
+```
+
+The decrypted stream contains spdlog binary format-ID prefixes interleaved
+with the formatted message text, so piping through `strings` (or a small
+spdlog-aware parser) gives the most readable output. Each record begins
+with a timestamp like `[2025-…] [I] [T <tid>]:` followed by the message.
+
+This is handy for debugging your own slicer's MQTT / HTTPS behaviour
+without having to attach a debugger.
+
+## Analytics upload encryption
+
+The plugin periodically uploads `*_track_*.zip.enc` and `*_cache_*.zip.enc`
+bundles for analytics / crash reporting. The encryption is **AES-256-CBC**
+and three baked-in ASCII constants are visible adjacent to the relevant
+code:
+
+```
+IXdE2DUTsO7b6k58rwZn1b0bWHZysj8d   (32 bytes)
+p6nTAFdtBS4G4PiE                   (16 bytes)
+hCUSRUX6huMKP7I9                   (16 bytes)
+```
+
+The 32-byte string is the AES-256 key; the two 16-byte strings appear to
+be IVs for the two upload categories (`_track_` vs `_cache_`), but the
+exact pairing is best confirmed against a captured bundle.
+
+These are noted here mostly for completeness — if you care about what your
+slicer is sending home, you can decrypt the bundles you find on disk
+before they're uploaded.
+
+## Plugin self-version string
+
+The plugin reports its own version internally as e.g.:
+
+```
+bambu_network_agent/02.07.00.50
+```
+
+This version is **independent** of the slicer it ships alongside — for
+example a slicer build labelled `02.07.00.55` may carry a plugin whose
+internal version is `02.07.00.50`. If you're correlating bug reports or
+log files across installs, the agent version string is what matters for
+the network layer, not the slicer's user-facing version.
+
+## Studio binary verification (the "signed studio" gate)
+
+Before the plugin will **sign** outbound `print.*` control commands, it
+verifies that its host process is a genuine, Bambu-signed BambuStudio
+install. This gate is what makes *control* commands require a signed
+client even though *status/reads* flow regardless: an unsigned control
+publish is silently dropped by post-2025 firmware, which the slicer sees
+as `BAMBU_NETWORK_SIGNED_ERROR` (`-26`) — see
+[cloud-x509-auth.md](cloud-x509-auth.md) for the signing/cert flow itself.
+
+Observed on Windows, plugin `02.07.00.x`. The plugin Authenticode-verifies
+**two** modules with `WinVerifyTrust`:
+
+1. the host executable — resolved via `GetModuleFileName(NULL)`
+   (`bambu-studio.exe`)
+2. `BambuStudio.dll` — the slicer's network-agent code that `LoadLibrary`s
+   the plugin (resolved via `GetModuleFileName(hDllBase)`)
+
+For each module it extracts the signer certificate and compares the
+publisher to a pinned identity:
+
+| Field | Value |
+|-------|-------|
+| Subject | `Shanghai Lunkuo Technology Co., Ltd` (older builds pinned `Shenzhen Tuozhu Technology Co., Ltd.`, that cert expired 2026-02-10) |
+| Issuer | `GlobalSign GCC R45 EV CodeSigning CA 2020` |
+
+The comparison is on the certificate's **full identity (public key / SPKI)**,
+not just the subject string — a self-signed certificate that merely copies
+the subject, serial and issuer name does *not* pass. If either module is
+unsigned or from another publisher, the plugin logs
+`process_network_msg, unsigned_studio` (and `add sign info failed`); the
+command then ships unsigned and the printer rejects it.
+
+The open-source slicer does an *additional*, independent same-publisher
+check before it will even load the plugin: `SummarizeSelf()` /
+`IsSamePublisher()` (in `src/slic3r/Utils/CertificateVerify.cpp` /
+`NetworkAgent.cpp`) compare the host's signer SPKI to the plugin DLL's. A
+host signed by a different publisher than the plugin is refused with
+`module is from another publisher`, and the slicer falls into its
+plugin-redownload loop.
+
+### Note for custom / forked builds (interoperability)
+
+A locally-built (unsigned) BambuStudio fork therefore can read status from
+your own printers but cannot get its *control* commands signed. Because the
+gate checks the genuine signed binaries — not anything secret — you can
+interoperate using the official binaries you already have installed,
+without any private key:
+
+- Launch with a **genuine, version-matched** official `bambu-studio.exe`.
+  It is a thin launcher that `LoadLibrary`s `BambuStudio.dll` and calls the
+  exported `bambustu_main(int argc, char** argv)`; a fork's DLL exports the
+  same entry, so the genuine launcher will happily run your DLL. This
+  satisfies check #1. **Version match matters** — e.g. a `02.06` launcher
+  against a `02.07` plugin faults inside the (now-activated) signing path;
+  align the exe, `BambuStudio.dll` and plugin to the same `02.07.00.x`.
+- Satisfy check #2 by pointing the plugin's verification of your
+  `BambuStudio.dll` at the genuine official `BambuStudio.dll` — e.g. an
+  in-process inline hook on `GetModuleFileNameW/A` (and `CryptQueryObject`)
+  installed *before* the plugin loads, returning the official DLL's path
+  when the plugin resolves your fork's DLL.
+
+With both module checks satisfied the plugin self-decrypts its embedded app
+key and signs `print.*` normally, so commands are accepted by the printer.
+
+---
+
+Corrections and additions welcome — these are observations from a single
+slicer build, and behaviour may differ across platforms or versions.
+
+---
+
+# Basics
+
+Source: https://github.com/doridian/openbambuapi/blob/main/cloud-http.md
+
+# Basics
+
+## URL
+
+The API is available at a base path of `https://api.bambulab.com`. All URLs below are relative to this.
+
+## Authentication
+
+All requests (except to the token refresh endpoint) must be made by presenting an `Authorization` header in the form of `Bearer {ACCESS_TOKEN}`.
+
+## Login and get a token
+
+## POST https://api.bambulab.com/v1/user-service/user/login
+
+**Request**
+
+Either login with password OR verification code, not both
+```json
+{
+    "account": "<EMAIL>",
+    "password":"<PASSWORD>",
+    "code": "<VERIFICATION-CODE>",
+}
+```
+
+**Response**
+
+Here you grab the `accessToken` and `refreshToken` from the body of the response. They're usually valid for about 3 months.
+```json
+{
+	"accessToken": "[REMOVED]",
+	"refreshToken": "[REMOVED]", // same as token
+	"loginType": "", // if empty there should be token, if 'verifyCode' you'll need to use verification code to login
+	"expiresIn": 7776000, // ~ 3 Months in seconds
+	... // and a few other unimportant stuff
+}
+```
+
+## Requests
+
+Request bodies must be empty for GET requests, and otherwise valid JSON
+
+## Responses
+
+Error responses tend to follow the following format. As do success messages for **/v1/iot-service/...**
+```json
+{
+	"message": "success", // "success" on success, otherwise error message, may be missing
+	"code": null, // Error code, integer on error
+	"error": null, // Error name/type
+
+	// If success, other map entries may be present here
+}
+
+```
+
+# URLs
+
+## GET /v1/user-service/my/messages
+
+Returns list of messages, looks like a pretty bare Elasticsearch response.
+
+Can take the optional query parameters `type`, `after` and `limit`.
+
+**Response**
+```json
+{
+	"hits": [
+		{
+			"id": 0, // [REMOVED]
+			"type": 6,
+			"design": null,
+			"comment": null,
+			"taskMessage": {
+				"id": 1, // [REMOVED]
+				"title": "Untitled",
+				"cover": "https://bbl-us-public.oss-us-west-1.aliyuncs.com/[REMOVED]",
+				"status": 2,
+				"deviceId": "[REMOVED]"
+			},
+			"from": {
+				"uid": 2, // [REMOVED]
+				"name": "Doridian",
+				"avatar": "https://bbl-us-public.oss-us-west-1.aliyuncs.com/avatar/[REMOVED]",
+				"fanCount": 0,
+				"followCount": 0,
+				"likeCount": 0,
+				"isFollowed": false
+			},
+			"createTime": "2022-11-22T02:54:12Z"
+		},
+        ...
+    ]
+}
+```
+
+## GET /v1/user-service/my/tasks
+
+Returns list of tasks, looks like a pretty bare Elasticsearch response.
+
+Can take the optional query parameters `deviceId`, `after` and `limit`.
+
+**Response**
+```json
+{
+	"total": 5,
+	"hits": [
+		{
+			"id": 0, // [REMOVED]
+			"designId": 0,
+			"modelId": "[REMOVED]",
+			"title": "Untitled",
+			"cover": "https://bbl-us-public.oss-us-west-1.aliyuncs.com/[REMOVED]",
+			"status": 2,
+			"feedbackStatus": 0,
+			"startTime": "2022-11-22T01:58:10Z",
+			"endTime": "2022-11-22T02:54:12Z", // if endTime is within a minute of startTime, that means the file is currently printing
+			"weight": 12.6,
+			"costTime": 3348, // how long the print will take in seconds
+			"profileId": 0, // [REMOVED]
+			"plateIndex": 1,
+			"deviceId": "[REMOVED]",
+			"amsDetailMapping": [],
+			"mode": "cloud_file"
+		},
+        ...
+    ]
+}
+```
+
+## POST /v1/user-service/my/task
+
+Creates a task, expects a task object (see above) to be passed via the body.
+
+## GET /v1/user-service/my/ticket/{TICKET_ID}
+
+Returns a ticket, probably means support tickets. Don't have any to test.
+
+## POST /v1/user-service/user/refreshtoken
+
+> [!CAUTION]
+> This endpoint will only return 401 responses now. The refresh tokens are also equal to the access tokens in all known cases, and have the same validity as well. That makes this endpoint **practically useless**
+
+Send a valid `refreshToken` and get new tokens with new expiration times.
+
+**Request**
+```json
+{
+	"refreshToken": "{REFRESH_TOKEN}"
+}
+```
+
+**Response**
+```json
+{
+	"accessToken": "[REMOVED]",
+	"refreshToken": "[REMOVED]",
+	"expiresIn": 29501294,
+	"refreshExpiresIn": 29501294
+}
+```
+
+## GET /v1/design-user-service/my/preference
+
+Fetches your user account preferences and information. Also is a mirror for `https://makerworld.com/api/v1/design-user-service/my/preference`
+
+Useful for numeric `uid`, which when prefixed with `u_` acts as your cloud mqtt username, as this is no longer provided within access tokens.
+
+**Response**
+```json
+{
+    "uid": 0000000000, // [REMOVED]
+    "name": "name", // [REMOVED]
+    "handle": "handle", // [REMOVED]
+    "avatar": "url", // [REMOVED]
+    "bio": "",
+    "links": [
+        "url1", // [REMOVED]
+        "url2" // [REMOVED]
+    ],
+    "backgroundUrl": "url", // [REMOVED]
+    ... // various unimportant account settings and values, all 0 or 1 for values
+}
+```
+
+## GET /v1/iot-service/api/slicer/resource
+
+Returns a bunch of resources, downloadable things for the slicer.
+
+Takes optional query arguments in the form of `type=version` to check for a type at that version. This is used for downloading the networking and camera plugins.
+
+Known types (with example version) are: 
+- `slicer/plugins/cloud=01.01.00.00`
+
+**Response**
+```json
+{
+	"message": "success",
+	"code": null,
+	"error": null,
+	"software": {
+		"type": null,
+		"version": "01.03.00.25",
+		"description": "[Improvements]\n1. Show the print sequence in label when printing in by-object sequence\n\n[Bugs Fixed]\n1. Fixed a possible collision issue when printing in by-object sequence\n2. Fixed an empty layer issue after adding modifier\n3. Fixed an issue where \"Can't find my device\" link does not work on macOS\n4. Fixed a crash issue after entering Assembly View\n5. Fixed an issue where there may be some unexpected color lines generated in multi-color model\n6. Fixed a crash issue when performing a mandatory firmware updating\n7. Fixed a slicing performance issue when there are more than 10 colors in the same layer",
+		"url": "https://upgrade-file.bambulab.com/studio/software/01.03.00.25/Bambu_Studio_win-v01.03.00.25.exe",
+		"force_update": false
+	},
+	"guide": null,
+	"resources": [
+		{
+			"type": "slicer/plugins/cloud",
+			"version": "01.01.00.11",
+			"description": "",
+			"url": "https://upgrade-file.bambulab.com/studio/plugins/01.01.00.11/win_01.01.00.11.zip",
+			"force_update": false
+		}
+	]
+}
+```
+
+## GET /v1/iot-service/api/slicer/setting?version={SLICER_VERSION}
+
+Returns a list of possible slicer profiles (`print`, `printer` and `material`) to query.
+
+**Response**
+```json
+{
+	"message": "success",
+	"code": null,
+	"error": null,
+	"print": {
+		"public": [
+			{
+				"setting_id": "GP001",
+				"version": "01.03.00.13",
+				"name": "0.08mm Extra Fine @BBL X1C",
+				"nickname": null,
+				"filament_id": null
+			},
+			{
+				"setting_id": "GP002",
+				"version": "01.03.00.13",
+				"name": "0.12mm Fine @BBL X1C",
+				"nickname": null,
+				"filament_id": null
+			},
+            ...
+		],
+		"private": []
+	},
+	"printer": {
+		"public": [
+			{
+				"setting_id": "GM001",
+				"version": "01.03.00.13",
+				"name": "Bambu Lab X1 Carbon 0.4 nozzle",
+				"nickname": null,
+				"filament_id": null
+			},
+			{
+				"setting_id": "GM003",
+				"version": "01.03.00.13",
+				"name": "Bambu Lab X1 0.4 nozzle",
+				"nickname": null,
+				"filament_id": null
+			},
+            ...
+		],
+		"private": []
+	},
+	"filament": {
+		"public": [
+			{
+				"setting_id": "GFSB98",
+				"version": "01.03.00.13",
+				"name": "Generic ASA",
+				"nickname": null,
+				"filament_id": "GFB98"
+			},
+			{
+				"setting_id": "GFSC99_00",
+				"version": "01.03.00.13",
+				"name": "Generic PC @0.2 nozzle",
+				"nickname": null,
+				"filament_id": "GFC99"
+			},
+			{
+				"setting_id": "GFSC99",
+				"version": "01.03.00.13",
+				"name": "Generic PC",
+				"nickname": null,
+				"filament_id": "GFC99"
+			},
+            ...
+		],
+		"private": [
+			{
+				"setting_id": "[REMOVED]",
+				"version": "1.3.0.13",
+				"name": "PolyLite ASA",
+				"nickname": null,
+				"filament_id": null
+			},
+            ...
+		]
+	}
+}
+```
+
+## GET /v1/iot-service/api/slicer/setting/{SETTING_ID}
+
+Gets the full data of a slicer setting by its id.
+
+**Response**
+```json
+{
+	"message": "success",
+	"code": null,
+	"error": null,
+	"public": true,
+	"version": "01.00.03.08",
+	"type": "print",
+	"name": "0.12mm Fine @BBL X1C",
+	"nickname": null,
+	"base_id": null,
+	"setting": {
+		"from": "system",
+		"name": "0.12mm Fine @BBL X1C",
+		"type": "process",
+		"version": "01.00.03.08",
+		"inherits": "fdm_process_bbl_0.12",
+		"model_id": [
+			"BL-P001",
+			"BL-P002"
+		],
+		...
+		"wipe_tower_no_sparse_layers": "0",
+		"support_base_pattern_spacing": "2.5",
+		"support_interface_top_layers": "2",
+		"compatible_printers_condition": "",
+		"support_interface_loop_pattern": "0",
+		"support_interface_bottom_layers": "2",
+		"internal_solid_infill_line_width": "0.45"
+	},
+	"filament_id": null
+}
+```
+
+## GET /v1/iot-service/api/user/bind
+
+This lists devices "bound" to the current user. As in, all your devices.
+
+**Response**
+```json
+{
+	"message": "success",
+	"code": null,
+	"error": null,
+	"devices": [
+		{
+			"dev_id": "[REMOVED]",
+			"name": "3DP-00M-000",
+			"online": true,
+			"print_status": "SUCCESS",
+			"dev_model_name": "BL-P001",
+			"dev_product_name": "X1 Carbon",
+			"dev_access_code": "[REMOVED]\n"
+		}
+	]
+}
+```
+
+## PATCH /v1/iot-service/api/user/device/info
+
+This is to update device info. Likely only the name.
+
+**Request**
+```json
+{
+	"dev_id": "{DEVICE_ID}",
+	...
+}
+```
+
+**Response**
+```json
+{
+	"message": "success",
+	"code": null,
+	"error": null
+}
+```
+
+## GET /v1/iot-service/api/user/device/version?dev_id={DEVICE_ID}
+
+Queries information about firmware version and updates for a device.
+
+**Response**
+```json
+{
+	"message": "success",
+	"code": null,
+	"error": null,
+	"devices": [
+		{
+			"dev_id": "00M00A280102436",
+			"version": "01.01.01.00",
+			"firmware": [
+				{
+					"version": "01.01.01.00",
+					"force_update": false,
+					"url": "https://upgrade-file.bambulab.com/device/BL-P001/01.01.01.00/product/ota-v01.01.01.00-20221012091123.json.sig",
+					"description": "## version ota01.01.01.00：\n### 【Improvements】\n1. [System] Differentiated between SD card not inserted prompts and SD card not formatted prompts.\n2. [System] Added support for Bambu Handy to browse more than 20 timelapse videos.\n3. [System] Updated some HMS contents.\n4. [Algorithm] Added support for automatic micro lidar calibration when micro lidar parameter drift is detected.\n5. [AMS] Added support for pausing printing and providing a popup message when filament or spools are stuck when printing with an AMS. After solving the issue manually, printing can be resumed by clicking the \"Retry\" button.\n### 【Bugs fixed】\n1. [System] Fixed the issue where the screen flashes a pop-up without content when logs are being uploaded through Bambu Handy.\n2. [Algorithm] Fixed the ota01.01.00.00 issue where the maximum acceleration was set to 5000mm/s² after the first layer inspection function, which caused the estimated print time to be inaccurate. This version returns the original print quality and acceleration values as ota01.00.00.00.\n3. [Algorithm] Fixed the issue where timelapse exposure may be abnormal and the first several frames may be dropped on some printers.\n4. [AMS] Reduced the probability of reading RFID again when AMS is idle."
+				}
+			],
+			"ams": []
+		}
+	]
+}
+```
+
+## GET /v1/iot-service/api/user/notification?action={ACTION}&ticket={TICKET_ID}
+
+`ACTION` must be either `upload` or `import_mesh`
+
+## GET /v1/iot-service/api/user/print
+
+This accepts the optional query parameter `force`, which the slicer always sets to `true`.
+
+The response is the current status of the printer.
+
+**Response**
+```json
+{
+	"message": "success",
+	"code": null,
+	"error": null,
+	"devices": [
+		{
+			"dev_id": "[REMOVED]",
+			"dev_name": "3DP-00M-000",
+			"dev_model_name": "BL-P001",
+			"dev_product_name": "X1 Carbon",
+			"dev_online": true,
+			"dev_access_code": "[REMOVED]\n",
+			"task_id": null,
+			"task_name": null,
+			"task_status": null,
+			"model_id": null,
+			"project_id": null,
+			"profile_id": null,
+			"start_time": null,
+			"prediction": null,
+			"progress": null,
+			"thumbnail": null
+		}
+	]
+}
+```
+
+## GET /v1/iot-service/api/user/profile/{PROFILE_ID}?model_id={MODEL_ID}
+
+Queries the details of a profile for a certain model, likely for profile deviations?
+
+```json
+{
+	"message": "success",
+	"code": null,
+	"error": null,
+	"profile_id": "[REMOVED]",
+	"model_id": "[REMOVED]",
+	"status": "ACTIVE",
+	"name": "Untitled",
+	"content": null,
+	"create_time": "2022-11-22 09:58:04",
+	"update_time": "2022-11-22 09:58:09",
+	"context": {
+		"compatibility": {
+			"dev_model_name": "BL-P001",
+			"dev_product_name": "X1 Carbon",
+			"nozzle_diameter": 0.4
+		},
+		"pictures": null,
+		"configs": [
+			{
+				"name": "project_settings.config",
+				"dir": "Metadata",
+				"url": "https://model-file.bambulab.com/[REMOVED]"
+			},
+			{
+				"name": "model_settings.config",
+				"dir": "Metadata",
+				"url": "https://model-file.bambulab.com/[REMOVED]"
+			},
+			{
+				"name": "slice_info.config",
+				"dir": "Metadata",
+				"url": "https://model-file.bambulab.com/[REMOVED]"
+			}
+		],
+		"plates": [
+			{
+				"index": 1,
+				"thumbnail": {
+					"name": "plate_1.png",
+					"dir": "Metadata",
+					"url": "https://model-file.bambulab.com/[REMOVED]"
+				},
+				"prediction": 3348,
+				"weight": 12.6,
+				"gcode": {
+					"name": null,
+					"dir": null,
+					"url": null
+				},
+				"filaments": [
+					{
+						"id": "1",
+						"type": "PLA",
+						"color": "#00AE42",
+						"used_m": "4.16",
+						"used_g": "12.60"
+					}
+				]
+			}
+		],
+		"materials": [
+			{
+				"color": "00AE42",
+				"material": "PLA"
+			}
+		],
+		"auxiliary_pictures": [],
+		"auxiliary_bom": [],
+		"auxiliary_guide": [],
+		"auxiliary_other": []
+	},
+	"filename": "[REMOVED]",
+	"url": "https://model-file.bambulab.com/[REMOVED]",
+	"md5": "[REMOVED]",
+	"keystore_xml": null
+}
+```
+
+## GET /v1/iot-service/api/user/project
+
+Queries a list of projects for the current user.
+
+**Response**
+```json
+{
+	"message": "success",
+	"code": null,
+	"error": null,
+	"projects": [
+		{
+			"project_id": "[REMOVED]",
+			"user_id": "[REMOVED]",
+			"model_id": "[REMOVED]",
+			"status": "ACTIVE",
+			"name": "Untitled",
+			"content": "null",
+			"create_time": "2022-11-22 09:58:04",
+			"update_time": "2022-11-22 09:58:10"
+		},
+		...
+	]
+}
+```
+
+## GET /v1/iot-service/api/user/project/{PROJECT_ID}
+
+Gets full details about a single project.
+
+**Response**
+```json
+{
+	"message": "success",
+	"code": null,
+	"error": null,
+	"project_id": "[REMOVED]",
+	"user_id": "[REMOVED]",
+	"model_id": "[REMOVED]",
+	"status": "ACTIVE",
+	"name": "Untitled",
+	"content": null,
+	"create_time": "2022-11-22 09:58:04",
+	"update_time": "2022-11-22 09:58:10",
+	"profiles": [
+		{
+			"profile_id": "[REMOVED]",
+			"model_id": "[REMOVED]",
+			"status": "ACTIVE",
+			"name": "Untitled",
+			"content": "{}",
+			"create_time": "2022-11-22 09:58:04",
+			"update_time": "2022-11-22 09:58:09",
+			"context": {
+				"compatibility": {
+					"dev_model_name": "BL-P001",
+					"dev_product_name": "X1 Carbon",
+					"nozzle_diameter": 0.4
+				},
+				"pictures": null,
+				"configs": [
+					{
+						"name": "project_settings.config",
+						"dir": "Metadata",
+						"url": "https://model-file.bambulab.com/[REMOVED]"
+					},
+					{
+						"name": "model_settings.config",
+						"dir": "Metadata",
+						"url": "https://model-file.bambulab.com/[REMOVED]"
+					},
+					{
+						"name": "slice_info.config",
+						"dir": "Metadata",
+						"url": "https://model-file.bambulab.com/[REMOVED]"
+					}
+				],
+				"plates": [
+					{
+						"index": 1,
+						"thumbnail": {
+							"name": "plate_1.png",
+							"dir": "Metadata",
+							"url": "https://model-file.bambulab.com/[REMOVED]"
+						},
+						"prediction": 3348,
+						"weight": 12.6,
+						"gcode": {
+							"name": null,
+							"dir": null,
+							"url": null
+						},
+						"filaments": [
+							{
+								"id": "1",
+								"type": "PLA",
+								"color": "#00AE42",
+								"used_m": "4.16",
+								"used_g": "12.60"
+							}
+						]
+					}
+				],
+				"materials": [
+					{
+						"color": "00AE42",
+						"material": "PLA"
+					}
+				],
+				"auxiliary_pictures": [],
+				"auxiliary_bom": [],
+				"auxiliary_guide": [],
+				"auxiliary_other": []
+			}
+		}
+	],
+	"download_url": null,
+	"download_md5": null,
+	"keystore_xml": null,
+	"upload_url": null,
+	"upload_ticket": null
+}
+```
+
+## GET /v1/iot-service/api/user/task/{TASK_ID}
+
+Gets information about a task. So far this has always yielded a 403 even on my own tasks.
+
+**Response**
+```json
+{
+	"message": "permission denied",
+	"code": 8,
+	"error": "Resource forbidden",
+	"parent": null,
+	"model_id": null,
+	"project_id": null,
+	"profile_id": null,
+	"status": null,
+	"name": null,
+	"content": null,
+	"context": null,
+	"create_time": null,
+	"update_time": null,
+	"sub_task": null,
+	"subtask": null,
+	"est": null,
+	"url": null,
+	"md5": null
+}
+```
+
+## POST /v1/iot-service/api/user/ttcode
+
+Gets the TTCode for the printer. This is used for authentication to the webcam stream.
+
+**Request**
+```json
+{
+	"dev_id": "{DEVICE_ID}"
+}
+```
+
+**Response**
+```json
+{
+	"message": "success",
+	"code": null,
+	"error": null,
+	"ttcode": "[REMOVED]",
+	"passwd": "[REMOVED]",
+	"authkey": "[REMOVED]"
+}
+```
+
+---
+
+# Undocumented Endpoints (Discovered via Bambu Handy APK Reverse Engineering)
+
+> **Methodology:** These endpoints were extracted via a runtime memory dump of the Bambu Handy Android APK (Dart AOT, Dart SDK 3.8.1). String constants and URL path fragments were recovered from the Dart isolate heap in process memory. HTTP methods are inferred from path semantics (e.g., `GET` for reads, `POST` for mutations) — actual methods may differ. No request or response body schemas are available.
+
+---
+
+## User Service
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/v1/user-service/general/config` | General app configuration |
+| GET | `/v1/user-service/latest/app` | Latest app version check |
+| GET | `/v1/user-service/latest/app2` | Latest app version check (v2) |
+| GET | `/v1/user-service/my/firmwarebeta` | Beta firmware program enrollment status |
+| POST | `/v1/user-service/my/identity/verify` | Identity verification |
+| POST | `/v1/user-service/my/logout` | Logout current session |
+| GET | `/v1/user-service/my/message/{id}` | Get specific message by ID |
+| GET | `/v1/user-service/my/message/count` | Unread message count |
+| GET | `/v1/user-service/my/message/device/taskstatus` | Device task status messages |
+| GET | `/v1/user-service/my/message/latest` | Latest messages |
+| POST | `/v1/user-service/my/message/read` | Mark messages as read |
+| GET | `/v1/user-service/my/model/profile` | User model/printer profile |
+| GET | `/v1/user-service/my/password/verifiedstatus` | Password verification status |
+| POST | `/v1/user-service/my/password/verify` | Verify current password |
+| GET | `/v1/user-service/my/profile` | User profile |
+| GET | `/v1/user-service/my/rating` | User rating |
+| GET | `/v1/user-service/my/rating/popup` | Rating popup trigger |
+| GET | `/v1/user-service/my/task/{id}` | Get specific task by ID |
+| GET | `/v1/user-service/my/task/printedplates` | Printed plates history |
+| GET | `/v1/user-service/my/tfa` | Two-factor authentication settings |
+| GET | `/v1/user-service/my/tfa/name` | TFA device name |
+| GET | `/v1/user-service/my/tfas` | List all TFA devices |
+| GET | `/v1/user-service/my/totp/secret` | TOTP secret for authenticator app setup |
+| POST | `/v1/user-service/my/upload` | Upload file |
+| POST | `/v1/user-service/user/consent` | User consent / GDPR acknowledgement |
+| POST | `/v1/user-service/user/devicetoken` | Register device push notification token |
+| POST | `/v1/user-service/user/resetpassword` | Initiate password reset |
+| POST | `/v1/user-service/user/sendsmscode` | Send SMS verification code |
+| POST | `/v1/user-service/user/signup` | User registration |
+| POST | `/v1/user-service/user/signuporlogin` | Combined signup or login |
+| POST | `/v1/user-service/user/tfa/login` | Login with two-factor authentication |
+
+---
+
+## IoT Service
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/v1/iot-service/api/slicer2d/settings/bbl_material/{id}` | 2D slicer material settings by ID |
+| GET | `/v1/iot-service/api/user/applications/{id}` | User applications by ID |
+| GET | `/v1/iot-service2/api/user/device/file_download` | Device file download (note: iot-service**2**) |
+
+---
+
+## Design Service
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/v1/design-service/contest/list` | Design contests list |
+| GET | `/v1/design-service/design/{id}` | Get design details by ID |
+| GET | `/v1/design-service/design/awarded` | Awarded designs |
+| GET | `/v1/design-service/design/category` | Design categories |
+| GET | `/v1/design-service/design/ids` | Get designs by IDs (batch) |
+| POST | `/v1/design-service/draft/sliceerror` | Report slice error for a draft |
+| GET | `/v1/design-service/favorites-collections/tab` | Favorites collection tabs |
+| GET | `/v1/design-service/favorites-pinned` | Pinned favorites |
+| GET | `/v1/design-service/favorites/{id}` | Get favorites collection by ID |
+| GET | `/v1/design-service/favorites/designs/{id}` | Designs within a favorites collection |
+| GET | `/v1/design-service/favorites/v2/list/{id}` | Favorites list v2 by ID |
+| POST | `/v1/design-service/hiddendesigns/like` | Like hidden designs |
+| GET | `/v1/design-service/instance/{id}` | Get design instance by ID |
+| GET | `/v1/design-service/my/design/favoriteslist` | My favorited designs list |
+| GET | `/v1/design-service/my/design/follow` | Designs from followed designers |
+| GET | `/v1/design-service/my/design/history` | Design view history |
+| GET | `/v1/design-service/my/design/like` | My liked designs |
+| GET | `/v1/design-service/my/favorites` | My favorites collections |
+| GET | `/v1/design-service/my/favorites/{id}` | Get specific favorites collection |
+| GET | `/v1/design-service/my/favorites/crowdfunding/designs` | Crowdfunding favorited designs |
+| GET | `/v1/design-service/my/favorites/like/invalid` | Invalid liked favorites |
+| GET | `/v1/design-service/my/favorites/listlite` | Favorites list (lightweight) |
+| POST | `/v1/design-service/my/favorites/v2/like` | Like favorites v2 |
+| GET | `/v1/design-service/my/instance/{id}` | My design instance by ID |
+| GET | `/v1/design-service/my/instance/published` | My published instances |
+| GET | `/v1/design-service/my/instance2d/published` | My published 2D instances |
+| GET | `/v1/design-service/my/preset/published` | My published presets |
+| GET | `/v1/design-service/my/publisheddesigns` | My published designs |
+| POST | `/v1/design-service/my/quick-boost-design` | Quick boost design |
+| GET | `/v1/design-service/published/{id}` | Get published design by ID |
+| GET | `/v1/design-service/publisheddesigns/{params}` | Published designs listing |
+
+---
+
+## Design User Service
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/v1/design-user-service/countries` | Country list |
+| GET | `/v1/design-user-service/device/names` | Device names mapping |
+| GET | `/v1/design-user-service/filament/config` | Filament configuration |
+| DELETE | `/v1/design-user-service/my/blacklist/{id}` | Remove from blacklist |
+| GET | `/v1/design-user-service/my/blacklist` | Get blacklist |
+| DELETE | `/v1/design-user-service/my/blocklist/{id}` | Remove from blocklist |
+| GET | `/v1/design-user-service/my/blocklist` | Get blocklist |
+| GET | `/v1/design-user-service/my/filament/v2` | My filaments v2 |
+| POST | `/v1/design-user-service/my/filament/v2/ams/sync` | Sync AMS filaments |
+| POST | `/v1/design-user-service/my/filament/v2/batch` | Batch filament operations |
+| POST | `/v1/design-user-service/my/follow/{id}` | Follow or unfollow a user |
+| GET | `/v1/design-user-service/my/follow/mutual` | Mutual follows |
+| GET | `/v1/design-user-service/my/im/token` | Instant messaging token |
+| POST | `/v1/design-user-service/my/makerworld/init` | Initialize MakerWorld profile |
+| GET | `/v1/design-user-service/my/permission` | User permissions |
+| GET | `/v1/design-user-service/my/printingexperience` | Printing experience data |
+| GET | `/v1/design-user-service/my/process-files` | Process files |
+| GET | `/v1/design-user-service/my/profile` | User profile (MakerWorld) |
+| POST | `/v1/design-user-service/my/upload` | Upload file |
+| GET | `/v1/design-user-service/user/{id}` | Get user profile by ID |
+| GET | `/v1/design-user-service/user/profile/{id}` | Get user profile details |
+| POST | `/v1/design-user-service/user/upload/picsearch` | Image search upload |
+
+---
+
+## Design Recommend Service
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/v1/design-recommend-service/my/for-you` | Personalized design recommendations |
+
+---
+
+## Community Service
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/v1/community-service/exclusive-designs` | Exclusive community designs |
+| GET | `/v1/community-service/my/post` | My posts |
+| GET | `/v1/community-service/my/post/comment` | Comments on my posts |
+| GET | `/v1/community-service/my/post/following` | Posts from followed users |
+| GET | `/v1/community-service/my/post/like` | My liked posts |
+| POST | `/v1/community-service/post` | Create a post |
+| GET | `/v1/community-service/post/{id}` | Get post by ID |
+| GET | `/v1/community-service/post/for-you` | For-you post feed |
+| GET | `/v1/community-service/post/search` | Search posts |
+| GET | `/v1/community-service/tag/{id}` | Get tag by ID |
+| GET | `/v1/community-service/tag/hot` | Hot / trending tags |
+| GET | `/v1/community-service/tag/suggest` | Suggested tags |
+| GET | `/v1/community-service/user/{id}` | Community user profile |
+| POST | `/v1/community-service/vote/cast/{id}` | Cast vote on item |
+| GET | `/v1/community-service/who-to-follow` | Suggested users to follow |
+
+---
+
+## Comment Service
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/v1/comment-service/comment` | Create a comment |
+| GET | `/v1/comment-service/comment/{id}` | Get or delete comment by ID |
+| POST | `/v1/comment-service/commentandrating` | Submit comment and rating combined |
+| POST | `/v1/comment-service/community/comment` | Create a community comment |
+| GET | `/v1/comment-service/community/comment/{id}` | Get community comment by ID |
+| POST | `/v1/comment-service/community/commentreply` | Reply to a community comment |
+| GET | `/v1/comment-service/community/commentreply/{id}` | Get community comment reply |
+| GET | `/v1/comment-service/community/rootcomment/{id}` | Get root community comment |
+| GET | `/v1/comment-service/community/{id}` | Community item comments |
+| POST | `/v1/comment-service/message` | Send direct message |
+| GET | `/v1/comment-service/message/{id}` | Get message by ID |
+| GET | `/v1/comment-service/messagesession/list` | Message sessions list |
+| POST | `/v1/comment-service/messagesession/read` | Mark message session as read |
+| GET | `/v1/comment-service/pinned/comment` | Pinned comments |
+| GET | `/v1/comment-service/rating/{id}` | Get rating by ID |
+| POST | `/v1/comment-service/rating/customize` | Submit custom rating |
+| GET | `/v1/comment-service/rating/inst/{id}` | Rating for design instance |
+| GET | `/v1/comment-service/rating/my` | My ratings |
+| GET | `/v1/comment-service/rating/reply/{id}` | Rating reply by ID |
+| GET | `/v1/comment-service/rating/reply/reply/{id}` | Reply to rating reply |
+| GET | `/v1/comment-service/ratingreply/{id}` | Rating reply (alternate path) |
+
+---
+
+## IM Service
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/v1/im-service/msg` | Send instant message |
+
+---
+
+## Search Service
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/v1/search-service/cfg2` | Search configuration v2 |
+| GET | `/v1/search-service/design/{id}` | Search design by ID |
+| GET | `/v1/search-service/homepage/nav` | Homepage navigation config |
+| GET | `/v1/search-service/recommand/youlike` | Recommended designs for you |
+| GET | `/v1/search-service/search/user` | Search users |
+| GET | `/v1/search-service/searchlist` | Search listing |
+| GET | `/v1/search-service/select/all` | Select all search results |
+| GET | `/v1/search-service/select/design/nav` | Design navigation search |
+| GET | `/v1/search-service/select/design2` | Design search v2 |
+| GET | `/v1/search-service/select/favorites` | Search favorites |
+| GET | `/v1/search-service/select/user/top` | Top users |
+| GET | `/v1/search-service/suggest` | Search suggestions |
+| GET | `/v1/search-service/suggest2` | Search suggestions v2 |
+
+---
+
+## Hub Service
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/v1/hub-service/academy/client/course/categories/tree/app` | Academy course category tree |
+
+---
+
+## Task Service
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/v1/task-service/task/{id}` | Get task by ID |
+| GET | `/v1/task-service/user/taskv2` | User tasks v2 |
+| GET | `/v1/task-service/user/taskv2/displayPopup/{id}` | Task popup display |
+| GET | `/v1/task-service/usertask/display/beginnerGuide/{id}` | Beginner guide display |
+
+---
+
+## Operation Service
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/v1/operation-service/apphomepage` | App homepage content |
+| GET | `/v1/operation-service/bbl/activity` | BBL activities and events |
+| GET | `/v1/operation-service/configuration` | App configuration |
+| GET | `/v1/operation-service/contest/{id}` | Contest details by ID |
+| GET | `/v1/operation-service/contest/awardlist` | Contest award list |
+| GET | `/v1/operation-service/contest/preview` | Contest preview |
+| GET | `/v1/operation-service/favorites-collections/cfg` | Favorites collections config |
+| GET | `/v1/operation-service/official/guide/{id}` | Official guide by ID |
+| GET | `/v1/operation-service/official/guides` | Official guides list |
+| GET | `/v1/operation-service/popularcreators` | Popular creators |
+| GET | `/v1/operation-service/support/list` | Support resources list |
+| POST | `/v1/operation-service/userContestDesign` | User contest design submission |
+
+---
+
+## Point Service
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/v1/point-service/boost/boostdesign` | Boost a design |
+| GET | `/v1/point-service/boost/boostingright` | Check boosting rights |
+| POST | `/v1/point-service/boost/quickboostdesign` | Quick boost a design |
+| GET | `/v1/point-service/giftcard/selfBuiltStatus` | Gift card self-built status |
+| GET | `/v1/point-service/point-bill/my` | My points bill / transaction history |
+| GET | `/v1/point-service/product/listTaskOptionsV2` | Task options for earning points v2 |
+| GET | `/v1/point-service/product/pointShops` | Points shops listing |
+| GET | `/v1/point-service/product/products` | Products listing |
+| POST | `/v1/point-service/redeem` | Redeem points |
+| GET | `/v1/point-service/redeem/detail` | Redemption details |
+| GET | `/v1/point-service/redeem/history` | Redemption history |
+| POST | `/v1/point-service/redeem/task/multi` | Multi-task redemption |
+| POST | `/v1/point-service/redeemPointByTask` | Redeem points by completing a task |
+| POST | `/v1/point-service/redeemProductByTask` | Redeem product by completing a task |
+| GET | `/v1/point-service/summary` | Points balance summary |
+
+---
+
+## Report Service
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/v1/report-service/community/report` | Report community content |
+| GET | `/v1/report-service/my/appeal` | My appeals |
+| GET | `/v1/report-service/my/appealed` | Appealed reports |
+| GET | `/v1/report-service/my/claim` | My IP claims |
+| GET | `/v1/report-service/my/defense` | My defenses |
+| POST | `/v1/report-service/my/ip-infringement-report` | Submit IP infringement report |
+| GET | `/v1/report-service/my/report` | My report |
+| GET | `/v1/report-service/my/reports` | My reports list |
+| GET | `/v1/report-service/report/classification` | Report classifications |
+
+---
+
+## Aftersale Service
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/v1/aftersale-service/makerworld/classification` | MakerWorld support ticket classifications |
+| POST | `/v1/aftersale-service/makerworld/create` | Create MakerWorld support ticket |
+| GET | `/v1/aftersale-service/makerworld/list` | MakerWorld support tickets list |
+| GET | `/v1/aftersale-service/makerworld/rateurl/{id}` | Rate MakerWorld support URL |
+| GET | `/v1/aftersale-service/makerworld/replylanguage` | Reply language preference |
+| GET | `/v1/aftersale-service/makerworld/totalunreadcount` | Total unread MakerWorld ticket count |
+| GET | `/v1/aftersale-service/makerworld/trouble/{id}` | Get MakerWorld support ticket by ID |
+| GET | `/v1/aftersale-service/robot/ai/key/list` | AI support key list |
+| GET | `/v1/aftersale-service/trouble/check/snvalid` | Validate printer serial number |
+| POST | `/v1/aftersale-service/trouble/classification/ai` | AI-assisted trouble classification |
+| GET | `/v1/aftersale-service/trouble/classificationv2` | Trouble classification v2 |
+| POST | `/v1/aftersale-service/trouble/create` | Create trouble ticket |
+| DELETE | `/v1/aftersale-service/trouble/draft/delete` | Delete draft ticket |
+| POST | `/v1/aftersale-service/trouble/draft/save` | Save draft ticket |
+| GET | `/v1/aftersale-service/trouble/hmscode` | HMS error code lookup |
+| GET | `/v1/aftersale-service/trouble/list` | Trouble tickets list |
+| GET | `/v1/aftersale-service/trouble/material` | Material-related trouble info |
+| GET | `/v1/aftersale-service/trouble/model` | Model-related trouble info |
+| GET | `/v1/aftersale-service/trouble/rateurl/{id}` | Rate trouble ticket URL |
+| GET | `/v1/aftersale-service/trouble/recentlycommoninfo` | Recently common trouble info |
+| GET | `/v1/aftersale-service/trouble/region` | Region selection |
+| GET | `/v1/aftersale-service/trouble/totalunreadcount` | Total unread trouble ticket count |
+| GET | `/v1/aftersale-service/trouble/trouble/{id}` | Get trouble ticket details by ID |
+
+---
+
+# Infrastructure
+
+> Discovered via Bambu Handy APK runtime memory dump.
+
+## API Environments
+
+| Environment | Base URL |
+|-------------|----------|
+| Production | `https://api.bambulab.com/v1/` |
+| Pre-production (US) | `https://api-pre-us.bambulab.net/v1/` |
+| Pre-production | `https://api-pre.bambulab.net/v1/` |
+| QA | `https://api-qa.bambulab.net/v1/` |
+| Dev | `https://api-dev.bambulab.net/v1/` |
+| Stress testing | `https://api-stress.bambulab.net/v1/` |
+
+## MQTT Brokers
+
+| Broker | Notes |
+|--------|-------|
+| `cn.mqtt.bambulab.com` | China region |
+| `us.mqtt.bambulab.com` | US region |
+| `mqtt.bambu-lab.com` | Legacy / global |
+| `stress-us.mqtt.bambu-lab.com` | Stress testing |
+
+### MQTT Log Topics
+
+```
+/logs/mqtt/{deviceId}
+/logs/mqtt/device_ids
+/logs/mqtt/status/{deviceId}
+```
+
+## Internal Portals
+
+| Host | Purpose |
+|------|---------|
+| `portal-dev.bambulab.net` | Developer portal |
+| `portal-pre.bambulab.net` | Pre-production portal |
+| `portal-qa.bambulab.net` | QA portal |
+| `makerhub-dev.bambulab.net` | MakerWorld hub dev |
+| `makerhub-pre.bambulab.net` | MakerWorld hub pre-production |
+| `makerhub-pre-us.bambulab.net` | MakerWorld hub pre-production (US) |
+| `makerhub-qa.bambulab.net` | MakerWorld hub QA |
+
+## Support Domains
+
+| Domain | Notes |
+|--------|-------|
+| `support.bambulab.com` | Production (global) |
+| `support.bambulab.cn` | Production (China) |
+| `pre-support.bambulab.net` | Pre-production |
+| `pre-support-us.bambulab.net` | Pre-production (US) |
+| `test-support.bambulab.net` | Test environment |
+
+## Store Domains
+
+| Domain | Region |
+|--------|--------|
+| `us.store.bambulab.com` | United States |
+| `eu.store.bambulab.com` | Europe |
+| `uk.store.bambulab.com` | United Kingdom |
+| `ca.store.bambulab.com` | Canada |
+| `au.store.bambulab.com` | Australia |
+| `jp.store.bambulab.com` | Japan |
+| `asia.store.bambulab.com` | Asia |
+| `test2.store.bambulab.com` | Test / staging |
+
+## Feature Flags and Telemetry
+
+| Path | Description |
+|------|-------------|
+| `/api/client-sdk/toggles` | Feature flag toggles (Unleash-compatible) |
+| `/api/events` | Client event tracking |
+
+## TUTK Camera Protocol
+
+The Bambu Handy app uses ThroughTek Kalay (TUTK) for P2P camera streaming to printers. Key details:
+
+| Component | Notes |
+|-----------|-------|
+| SDK Libraries | `libIOTCAPIs`, `libAVAPIs`, `libTUTKGlobalAPIs` |
+| Connection | `IOTC_Connect_ByUID_Parallel`, `IOTC_Connect_ByUIDEx` |
+| Auth Modes | `AV_AUTH_PASSWORD`, `AV_AUTH_TOKEN`, `AV_SECURITY_DTLS` |
+| Data Modes | `IOTC_DATA_TRANSMIT_INTEGRITY_MODE`, `IOTC_DATA_TRANSMIT_COMPATIBILITY_MODE`, `IOTC_DATA_TRANSMIT_ADAPTATION_MODE` |
+| Region Config | `TUTK_SDK_Set_Region` |
+
+---
+
+# MakerWorld / Design Services API
+
+Source: https://github.com/doridian/openbambuapi/blob/main/cloud-makerworld.md
+
+# MakerWorld / Design Services API
+
+> Reverse-engineered from Bambu Handy app (v3.x) via live traffic capture  
+> These endpoints are **not documented** in the original OpenBambuAPI  
+> Base URL: `https://api.bambulab.com/v1`  
+> Also accessible via: `https://makerworld.com/api/v1` (Cloudflare-protected)
+
+## Overview
+
+MakerWorld is Bambu Lab's 3D model sharing platform. The app communicates with **8 microservices** for content discovery, social features, and model management. All endpoints require Bearer JWT authentication.
+
+---
+
+## Design Service (`/design-service/`)
+
+3D model management — designs (models), instances (print profiles), favorites, downloads.
+
+### GET /v1/design-service/design/{designId}
+
+Get full design details including title, creator, instances, tags, images.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `designId` | path | yes | Numeric design ID |
+| `trafficSource` | query | no | Analytics source: `browse`, `recommend`, `search` |
+| `visitHistory` | query | no | `true` to log page visit |
+
+**Response includes:**
+- `id` — design ID
+- `title` — design title
+- `designCreator` — `{ name, uid, avatar }`
+- `instances[]` — array of print instances
+  - `id` — instance ID (needed for download)
+  - `isDefault` — boolean
+  - `title` — instance name
+  - `plates[]` — plate configurations
+- `tags[]` — category tags
+- `likeCount`, `downloadCount`, `commentCount`
+- `images[]` — gallery image URLs
+
+```bash
+curl -s "https://api.bambulab.com/v1/design-service/design/2416782?trafficSource=browse&visitHistory=true" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+### GET /v1/design-service/design/{designId}/remixed
+
+Get designs that are remixes of a given design.
+
+### POST /v1/design-service/design/{designId}/like
+
+Like/unlike a design (toggle). No request body needed.
+
+### GET /v1/design-service/instance/{instanceId}/f3mf
+
+Download a 3MF file for a design instance.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `instanceId` | path | Instance ID from design details |
+| `type` | query | `preview` (metadata only) or `download` (full 3MF binary) |
+
+**Download workflow:**
+1. Fetch design details → get default instance ID
+2. Call with `type=download` → receive 3MF binary
+
+```bash
+# Preview (metadata)
+curl -s "https://api.bambulab.com/v1/design-service/instance/2650240/f3mf?type=preview" \
+  -H "Authorization: Bearer $TOKEN"
+
+# Download (full 3MF file)
+curl -sOJ "https://api.bambulab.com/v1/design-service/instance/2650240/f3mf?type=download" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+### GET /v1/design-service/favorites/designs/{userId}
+
+Get a user's favorited designs.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `userId` | path | Numeric user ID |
+| `offset` | query | Pagination offset |
+| `limit` | query | Page size (default 20) |
+
+### GET /v1/design-service/my/design/favoriteslist
+
+Check if specific designs are in the current user's favorites.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `designId` | query | Design ID to check |
+
+### GET /v1/design-service/my/design/like
+
+Get designs the current user has liked. Supports `offset` and `limit` query params.
+
+### GET /v1/design-service/my/favorites/listlite
+
+Lightweight endpoint returning only IDs of all favorited designs.
+
+### GET /v1/design-service/draft/sliceerror
+
+Get draft designs that had slicing errors.
+
+---
+
+## Design User Service (`/design-user-service/`)
+
+Extends the existing `/design-user-service/my/preference` endpoint (already documented in [cloud-http.md](cloud-http.md)).
+
+### GET /v1/design-user-service/my/profile
+
+Get the current user's MakerWorld profile (distinct from `/my/preference`).
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `immediacy` | query | `true` for non-cached response |
+
+### GET /v1/design-user-service/my/follow/mutual
+
+Get mutual follows (users who follow you and you follow back).
+
+### GET /v1/design-user-service/my/permission
+
+Check user permissions.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `permType` | query | `0` = general permissions, `6` = upload permission |
+
+---
+
+## Design Recommend Service (`/design-recommend-service/`)
+
+### GET /v1/design-recommend-service/my/for-you
+
+Personalized design recommendations ("For You" feed).
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `limit` | query | Number of results (default 20) |
+| `offset` | query | Pagination offset |
+| `seed` | query | Randomization seed (`0` for fresh results) |
+| `acceptTypes` | query | Comma-separated content type IDs |
+
+**Content type IDs:**
+| ID | Type |
+|----|------|
+| `0` | 3D Model |
+| `2` | Remix |
+| `3` | Article |
+| `5` | Collection |
+| `6` | Tutorial |
+
+```bash
+curl -s "https://api.bambulab.com/v1/design-recommend-service/my/for-you?limit=20&offset=0&seed=0&acceptTypes=0,2,5,6,3" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+---
+
+## Comment Service (`/comment-service/`)
+
+Comments, ratings, and direct messaging for designs.
+
+### GET /v1/comment-service/commentandrating
+
+Get comments and ratings for a design.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `designId` | query | Design ID |
+| `offset` | query | Pagination offset |
+| `limit` | query | Page size (default 20) |
+| `type` | query | `0` = all |
+| `sort` | query | `0` = newest first |
+
+```bash
+curl -s "https://api.bambulab.com/v1/comment-service/commentandrating?designId=2416782&offset=0&limit=20&type=0&sort=0" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+### GET /v1/comment-service/comment/{commentId}/detail
+
+Get a single comment with full details.
+
+### GET /v1/comment-service/comment/{commentId}/reply
+
+Get replies to a comment.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `commentId` | path | Parent comment ID |
+| `limit` | query | Max replies (default 10) |
+| `after` | query | Reply ID cursor for forward pagination |
+| `msgCommentReplyId` | query | Load context around a specific reply |
+
+### POST /v1/comment-service/comment/{commentId}/like
+
+Like a comment (toggle).
+
+### POST /v1/comment-service/comment/{commentId}/reply
+
+Post a reply to a comment.
+
+### GET /v1/comment-service/rating/inst/{instanceId}
+
+Get rating data for a specific design instance.
+
+### GET /v1/comment-service/messagesession/list
+
+Get message sessions (direct messages inbox).
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `userSelect` | query | `all` or specific filter |
+| `typeSelect` | query | `all` or specific filter |
+| `projectScope` | query | `0` = general, `2` = MakerWorld |
+| `offset` | query | Pagination offset |
+| `limit` | query | Page size |
+
+---
+
+## Search Service (`/search-service/`)
+
+Design discovery, navigation categories, trending, and related content.
+
+### GET /v1/search-service/homepage/nav
+
+Get homepage navigation structure (categories, featured sections).
+
+### GET /v1/search-service/recommand/youlike
+
+Get "recommended for you" designs.
+
+> **Note:** The API has a typo — it's `recommand`, not `recommend`.
+
+### GET /v1/search-service/select/design/nav
+
+Browse designs by navigation category.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `navKey` | query | Category key (see table below) |
+| `offset` | query | Pagination offset |
+| `limit` | query | Page size (default 20) |
+
+**Known category keys:**
+
+| navKey | Category |
+|--------|----------|
+| `Trending` | Trending designs |
+| `category_400` | Toys & Games |
+| `category_800` | Home & Living |
+
+```bash
+# Trending designs
+curl -s "https://api.bambulab.com/v1/search-service/select/design/nav?navKey=Trending&offset=0&limit=20" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+### GET /v1/search-service/design/{designId}/relate
+
+Get designs related to a specific design.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `designId` | path | Design ID |
+| `offset` | query | Pagination offset |
+| `limit` | query | Page size |
+| `scene` | query | Relation scene (`1` = similar) |
+
+---
+
+## Operation Service (`/operation-service/`)
+
+App-level configuration and dynamic content.
+
+### GET /v1/operation-service/apphomepage
+
+Get app homepage configuration (banners, featured content, section ordering).
+
+### GET /v1/operation-service/configuration
+
+Get app-wide configuration (feature flags, URLs, global settings).
+
+---
+
+## Aftersale Service (`/aftersale-service/`)
+
+### GET /v1/aftersale-service/trouble/totalunreadcount
+
+Get count of unread support trouble tickets.
+
+### GET /v1/aftersale-service/makerworld/totalunreadcount
+
+Get count of unread MakerWorld-related support items.
+
+---
+
+## Point Service (`/point-service/`)
+
+### GET /v1/point-service/boost/boostdesign
+
+Get boost status for a design (points-based promotion system).
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `designId` | query | Design ID |
+
+---
+
+## Report Service (`/report-service/`)
+
+### GET /v1/report-service/report/classification
+
+Get report/moderation classification options.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `source` | query | Report source: `message`, `design`, etc. |
+
+---
+
+## Task Service (`/task-service/`)
+
+### GET /v1/task-service/user/taskv2/multi
+
+Get multiple onboarding/achievement task statuses.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `taskNames` | query | Comma-separated: `app_newbie_task_v2`, `app_newbie_task_v3` |
+
+---
+
+## Analysis Service (`/analysis-st/`)
+
+### GET /v1/analysis-st/tag/
+
+Get user analytics/tracking tags.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `UID` | query | User analytics UUID |
+
+---
+
+## Additional User Service Endpoints
+
+These extend the existing [user-service docs](cloud-http.md#get-v1user-servicemymessages).
+
+### GET /v1/user-service/my/message/count
+
+Get unread message count across all categories.
+
+### GET /v1/user-service/my/message/latest
+
+Get the most recent message.
+
+### POST /v1/user-service/my/message/read
+
+Mark messages as read.
+
+### GET /v1/user-service/my/message/device/taskstatus
+
+Get device task notification status (for badge counts).
+
+### POST /v1/user-service/my/message/device/tasks/read
+
+Mark device task notifications as read.
+
+### GET /v1/user-service/my/messages (extended)
+
+The existing `/my/messages` endpoint supports these `type` values:
+
+| type | Category |
+|------|----------|
+| `1` | System notifications |
+| `2` | Comment notifications |
+| `3` | Like notifications |
+| `4` | Follow notifications |
+| `5` | Print task notifications |
+
+### GET /v1/user-service/my/task/{taskId}
+
+Get a specific print task by ID (distinct from `/iot-service/api/user/task/{taskId}`).
+
+### GET /v1/user-service/my/task/printedplates
+
+Get printed plate info for a design instance.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `instanceId` | query | Design instance ID |
+
+### GET /v1/user-service/my/model/profile
+
+Get model/printer profile linked to user.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `profileId` | query | Profile ID |
+| `modelId` | query | Printer model ID (e.g., `US932767835d32ea`) |
+
+### POST /v1/user-service/user/devicetoken
+
+Register device push notification token (FCM/APNs).
+
+### GET /v1/user-service/latest/app
+
+Check for app updates. Returns latest version info.
+
+---
+
+## Common Patterns
+
+### Pagination
+
+All list endpoints use `offset` + `limit` pagination:
+
+```
+?offset=0&limit=20    # First page
+?offset=20&limit=20   # Second page
+```
+
+### Resource IDs
+
+| Resource | Format | Example |
+|----------|--------|---------|
+| User ID | Numeric (10 digits) | `3469901296` |
+| Design ID | Numeric (7 digits) | `2416782` |
+| Instance ID | Numeric (7 digits) | `2650240` |
+| Comment ID | Numeric (7 digits) | `4177733` |
+| Task ID | Numeric (9 digits) | `788462557` |
+| Profile ID | Numeric (9 digits) | `635995371` |
+| Printer serial | `{region}{hex}` | `USf86740b8413939` |
+| Analytics UID | UUID v1 | `65c31ea0-cd74-11ed-b18f-39cf197fa3d4` |
+
+### Event/Telemetry Service
+
+The app sends analytics events to a separate domain:
+
+- `POST https://event.bblmw.com/app2/home` — Home screen events
+- `POST https://event.bblmw.com/app2/makerworld` — MakerWorld browsing events
+
+### IP Geolocation
+
+On startup, the app calls:
+```
+GET http://ip-api.com/json/?fields=status,message,continent,continentCode,...
+```
+Used for regional content serving.
+
+---
+
+## Complete Print-from-MakerWorld Workflow
+
+```
+1. Browse      → GET /search-service/select/design/nav?navKey=Trending
+2. View design → GET /design-service/design/{designId}
+3. Check fav   → GET /design-service/my/design/favoriteslist?designId={id}
+4. Get ratings → GET /comment-service/commentandrating?designId={id}
+5. Download    → GET /design-service/instance/{instanceId}/f3mf?type=download
+6. Upload      → FTP to printer SD card (port 990, FTPS)
+7. Print       → MQTT command on device/{serial}/request
+```
+
+---
+
+## Discovery Method
+
+These endpoints were reverse-engineered from the Bambu Handy Flutter app using:
+
+1. **APK static analysis** — jadx decompilation + URL pattern extraction
+2. **Live traffic capture** — Flutter Dio interceptor logs via `adb logcat -s flutter:*`
+3. **Token extraction** — Heap dump scan for JWT tokens
+4. **Tooling**: [apkre](https://github.com/schwarztim/bambu-mcp) automated API discovery
+
+---
+
+# Cloud-relayed video
+
+Source: https://github.com/doridian/openbambuapi/blob/main/cloud-video.md
+
+# Cloud-relayed video
+
+The on-printer video servers described in [`video.md`](./video.md) only
+help while the consumer is on the same LAN as the printer. For
+off-LAN access Bambu's network plugin opens one of several cloud-relay
+transports and surfaces them behind a single `bambu:///…` URL string.
+A client that wants to consume the video without using the proprietary
+network plugin needs to recognise the URL form and implement the
+matching transport.
+
+## URL scheme dispatch table
+
+The plugin's `Bambu_Create` / `Bambu_Open` entry point in
+`libBambuSource.so` selects the transport from the URL prefix.
+Observed prefixes (verified by triggering each path under
+captured slicer sessions):
+
+| Prefix | Transport | Notes |
+|---|---|---|
+| `bambu:///tutk?uid=<UID>&authkey=<KEY>&passwd=<PW>&region=<R>` | ThroughTek Kalay (TUTK) P2P | The `UID`/`authkey` come from the `POST /v1/iot-service/api/user/ttcode` cloud endpoint already documented in [`cloud-http.md`](./cloud-http.md). The plugin then drives the standard TUTK / IOTC AVAPI sequence (`IOTC_Initialize2` → `IOTC_Connect_ByUIDEx` → `avClientStartEx` → `avSendIOCtrl(IOTYPE_USER_IPCAM_START)` → `avRecvFrameData2`). |
+| `bambu:///agora?app=<APP>&...` | Agora.io P2P | Used for the "go-live" / collaborative-print path. The query parameters carry app id, channel, and a per-session token. |
+| `bambu:///local/<host>?...` | LAN port-6000 BambuTunnel | Direct TCP/6000 to the printer's IP; same transport described in [`video.md`](./video.md) for A1/P1 series. |
+| `bambu:///rtsps___<rtsps-url>` | LAN RTSPS via live555 | The `<rtsps-url>` is a normal RTSPS URL with `://` replaced by `___` so the bambu:/// host shape is preserved. Used for X1 and P2S — points at port 322 on the printer. |
+| `bambu:///rtsp___<rtsp-url>` | LAN RTSP (no TLS) via live555 | Same `___` substitution as the `rtsps___` variant; observed on a couple of dev/test builds. |
+
+Same URL string round-trips through the plugin's
+`bambu_network_get_camera_url` callback API, so a custom client
+re-implementing that callback only needs to return one of these forms
+to drive the matching transport in `libBambuSource.so`. A client
+re-implementing the consumer side (i.e. replacing `libBambuSource.so`)
+needs to be ready to dispatch on the same prefix list.
+
+### URL fingerprint suffix
+
+When `MediaPlayCtrl` in the slicer hands a `bambu:///…` URL off to
+`Bambu_Create`, it appends a set of identifying query parameters:
+
+```
+&device=<dev_id>
+&net_ver=<network plugin version>
+&dev_ver=<printer firmware version>
+&cli_id=<slicer's UUID, app_config slicer_uuid>
+&cli_ver=<slicer version e.g. 02.07.00.55>
+```
+
+Independent clients that talk to `Bambu_Create` directly (rather than
+via the slicer GUI) are observed to need to mirror these fields — the
+plugin appears to fingerprint them, and `bambu:///tutk` opens have
+failed in captures where the device or net_ver suffix was missing.
+Verified on `bambu_network_agent/02.07.00.50`; other plugin builds may
+relax this.
+
+## H.264 codec-extradata format (BambuSource consumer side)
+
+When a `libBambuSource.so` client calls the equivalent of
+`Bambu_GetStreamInfo` on an open H.264 tunnel (the `tutk`, `agora`, or
+`rtsps___` schemes above), the returned `StreamInfo.format_buffer`
+field contains the codec extradata — the bytes a decoder needs to bring
+up the parameter sets before it can decode any frame.
+
+The observed layout in captures from H2S and H2D firmwares (other
+models / firmwares not exhaustively re-checked):
+
+- One SPS NAL unit (NAL type 7) followed immediately by one PPS NAL
+  unit (NAL type 8).
+- The two NALs are simply **concatenated**, with no length prefix and
+  no start-code delimiter between them.
+- Different captured streams have been seen to use either Annex-B
+  framing (`0x00 0x00 0x00 0x01` start codes) or AVCC framing (each
+  NAL prefixed with its 32-bit length in big-endian), and in some
+  captures the buffer is bare NAL-unit bodies with no framing at all.
+
+A defensive parser therefore needs to handle all three layouts. The
+recipe that has been verified to feed the standard RFC-6184
+`sprop-parameter-sets` field of an SDP and produce a decodable stream:
+
+```c
+// pseudocode
+buf = format_buffer; sz = format_size;
+while (sz > 0) {
+    // try Annex-B start code (3 or 4 bytes)
+    n = consume_annexb_start_code(buf, sz);
+    if (n) { buf += n; sz -= n; }
+    else {
+        // try AVCC length prefix (u32 big-endian)
+        len = read_u32_be(buf);
+        if (len > 0 && len + 4 <= sz) {
+            nal = buf + 4; nal_len = len;
+            buf += 4 + len; sz -= 4 + len;
+        } else {
+            // fall through: treat whatever remains as one bare NAL
+            nal = buf; nal_len = sz;
+            buf += sz; sz = 0;
+        }
+    }
+    nal_type = nal[0] & 0x1F;
+    if      (nal_type == 7) sps = nal[0..nal_len];
+    else if (nal_type == 8) pps = nal[0..nal_len];
+}
+```
+
+Treating `format_buffer` as a single SPS NAL (i.e. assigning the entire
+buffer to `sps` and leaving `pps` empty) decodes to a black screen
+because the SDP `sprop-parameter-sets` ends up missing the PPS — that's
+the failure mode that surfaced the parsing requirement.
+
+---
+
+# X.509 Certificate Authentication
+
+Source: https://github.com/doridian/openbambuapi/blob/main/cloud-x509-auth.md
+
+# X.509 Certificate Authentication
+
+> Post-January 2025 firmware authentication flow  
+> Captured from Bambu Handy app (v3.x) communicating with a P1S printer
+
+## Background
+
+In January 2025, Bambu Lab pushed firmware requiring X.509 certificate authentication for local MQTT commands. The app exchanges a token with the cloud API to obtain per-device certificates, then signs all MQTT command payloads.
+
+See also: [Hackaday: X.509 Certificate and Private Key Extracted](https://hackaday.com/2025/01/19/bambu-connects-authentication-x-509-certificate-and-private-key-extracted/)
+
+## Certificate Exchange Flow
+
+### 1. Request Device Certificate
+
+```
+GET /v1/iot-service/api/user/applications/{appToken}/cert?aes256={encrypted}&ver=1
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `appToken` | path | Base64url-encoded application token (generated client-side) |
+| `aes256` | query | AES-256 encrypted payload containing device identity |
+| `ver` | query | Endpoint version selector; observed value is `1` |
+
+The app token is a long base64url string (100+ chars). The AES payload is similarly encoded.
+
+Recent slicer builds are observed to always include `&ver=1` as an
+additional query parameter; the endpoint appears to require it.
+
+**Example URL (tokens redacted):**
+```
+https://api.bambulab.com/v1/iot-service/api/user/applications/QqTHQ6X9gFy9...=/cert?aes256=ViXLbxLlpySi...&ver=1
+```
+
+**Response:** X.509 certificate and private key for the specific printer.
+
+### 2. List Active Certificates
+
+The app queries active certificates via MQTT:
+
+```json
+{
+  "security": {
+    "sequence_id": "2040",
+    "command": "app_cert_list",
+    "timestamp": 1772675132281,
+    "type": "app"
+  }
+}
+```
+
+**Response (on MQTT report topic):**
+
+```json
+{
+  "security": {
+    "sequence_id": "2040",
+    "command": "app_cert_list",
+    "timestamp": 1772675132281,
+    "type": "app",
+    "cert_ids": [
+      "9bed8c27b4bf69582d58f11abaaad99fCN=GLOF3813734089.bambulab.com",
+      "77bcfb6303214f046175eb6681a46d83CN=GLOF3813734089.bambulab.com"
+    ]
+  }
+}
+```
+
+Multiple certificates can be active simultaneously.
+
+### 3. Sign MQTT Commands
+
+All MQTT commands include a `header` object with the RSA signature:
+
+```json
+{
+  "user_id": "3469901296",
+  "print": {
+    "ams_id": 0,
+    "command": "extrusion_cali_sel",
+    "filament_id": "GFL99",
+    "nozzle_diameter": "0.4",
+    "nozzle_volume_type": "normal",
+    "sequence_id": "2039",
+    "timestamp": 1772675132270,
+    "tray_id": 3
+  },
+  "header": {
+    "sign_ver": "v1.0",
+    "sign_alg": "RSA_SHA256",
+    "sign_string": "iq3gpC6U2UijAp+v+YDJduXkPIDO5UaUjq1k72Xw6Ps...",
+    "cert_id": "77bcfb6303214f046175eb6681a46d83CN=GLOF3813734089.bambulab.com",
+    "payload_len": 225
+  }
+}
+```
+
+## Certificate ID Format
+
+The `cert_id` format is:
+
+```
+{hex_fingerprint}CN={serialNumber}.bambulab.com
+```
+
+Where:
+- `hex_fingerprint` is a 32-char lowercase hex string. In captured envelopes
+  captured this matched the leaf certificate's
+  `tbsCertificate.serialNumber` rather than an MD5 over the cert. You can
+  check against your own capture with:
+
+  ```sh
+  # leaf.pem = the cert the client presented for this session
+  openssl x509 -in leaf.pem -serial -noout
+  # → the hex value should match the cert_id prefix (before any CN= suffix)
+  ```
+- `serialNumber` is the printer's serial number (e.g., `GLOF3813734089`)
+
+## Signing Details
+
+| Field | Value |
+|-------|-------|
+| `sign_ver` | `v1.0` |
+| `sign_alg` | `RSA_SHA256` |
+| `sign_string` | Base64-encoded RSA-SHA256 signature of the payload |
+| `cert_id` | Certificate identifier (see format above) |
+| `payload_len` | Byte length of the signed payload |
+
+The `sign_string` is computed by:
+1. Serializing the command payload (everything except `header`) as JSON
+2. Signing with RSA-SHA256 using the private key from the certificate exchange
+3. Base64-encoding the signature
+
+## Envelope Construction
+
+The notes below cover the exact construction used to build a `header`
+envelope that the firmware accepts, so an independent client can
+produce byte-identical envelopes. The shape was deterministic across
+multiple captured envelopes from different slicer sessions.
+
+### Header field semantics
+
+| Field | Value type | Derivation |
+|---|---|---|
+| `sign_ver` | string | `"v1.0"` (only value observed) |
+| `sign_alg` | string | `"RSA_SHA256"` (RSA PKCS#1 v1.5 padding, SHA-256 digest) |
+| `cert_id` | string | leaf certificate's `tbsCertificate.serialNumber` as a lowercase 32-char hex string, optionally suffixed with `CN=<leaf-host>` (see "Certificate ID Format" above) |
+| `payload_len` | integer | byte length of the canonical bytes-to-sign described below |
+| `sign_string` | string | base64 of the RSA-SHA256 signature over the canonical bytes-to-sign |
+
+### Canonical bytes-to-sign
+
+The signing input is reconstructed from the top-level command class
+(only `print` has been observed to require signing, per the auth
+requirements table further down) and a canonicalised JSON
+serialisation of the inner object:
+
+```
+bytes_to_sign = '{"<top-key>":' + canonical_json(envelope[<top-key>]) + '}'
+```
+
+where `canonical_json()` is JSON serialised with:
+
+- keys sorted alphabetically (recursively, at every depth)
+- no whitespace anywhere
+- `,` and `:` as the only separators
+
+In Python this matches:
+
+```python
+json.dumps(payload, sort_keys=True, separators=(",", ":"))
+```
+
+`payload_len` is then the byte length of the resulting `bytes_to_sign`
+string (UTF-8 / ASCII, since the canonical form contains no
+non-ASCII bytes for any observed envelope).
+
+### Verification recipe
+
+The construction can be verified end-to-end against a captured envelope
+and the corresponding leaf certificate (selected via the `cert_id`
+prefix):
+
+```python
+import base64, json
+from cryptography.hazmat.primitives.asymmetric.padding import PKCS1v15
+from cryptography.hazmat.primitives.hashes import SHA256
+from cryptography.x509 import load_pem_x509_certificate
+
+env = json.load(open("envelope.json"))
+cert = load_pem_x509_certificate(open("leaf.pem", "rb").read())
+pubkey = cert.public_key()
+
+canonical_inner = json.dumps(env["print"], sort_keys=True,
+                             separators=(",", ":"))
+to_sign = b'{"print":' + canonical_inner.encode() + b"}"
+
+assert len(to_sign) == env["header"]["payload_len"]
+sig = base64.b64decode(env["header"]["sign_string"])
+pubkey.verify(sig, to_sign, PKCS1v15(), SHA256())
+print("Signature verified.")
+```
+
+Corrections welcome if the canonicalisation differs for other
+command classes or firmware tracks not yet captured.
+
+## Per-Printer Client Certificates
+
+> The notes below are from observing a slicer talk to a single printer over LAN MQTT; some of this may be incomplete or wrong for other firmware tracks. Contributions / corrections are always welcome.
+
+The cert returned by the `/cert` endpoint above is a per-printer client certificate. Observations about the certificate:
+- The leaf has `CN=<printer serial>` and chains up to BBL CA (the same chain bundled in [`examples/ca_cert.pem`](./examples/ca_cert.pem)).
+- It appears to be long-lived (the leaves I've looked at have ~10-year validity windows).
+- The printer firmware appears to accept any client cert that chains to BBL CA and whose CN matches its own serial; I haven't found other constraints.
+
+A given slicer install ends up holding one such cert+key per printer it has been bound to.
+
+### Where it's used
+
+The cert+key is presented during the TLS handshake to the printer's MQTT broker (`mqtts://<printer-ip>:8883`). It is *separate* from the `bblp` / LAN access code username+password, which is checked after the TLS handshake completes.
+
+### Auth requirements per command class
+
+For local MQTT, the cert+key on the TLS handshake is one layer; the `header`-signed envelope described above is a second layer that only some command classes require. Best guess from captured slicer traffic:
+
+| Top-level JSON key | TLS client cert+key | Signed envelope (`header`) | Firmware response if envelope missing/bad |
+|---|---|---|---|
+| `pushing.*` / `info.*` | Required to subscribe to `/report`; publish accepted with cert+key alone | No | n/a |
+| `system.*` / `camera.*` / `xcam.*` | Required (broker rejects the TLS handshake otherwise) | No | n/a |
+| `print.*` (publish to `/request`) | Required | Required | `result:"failed"`, `reason:"mqtt message verify failed"`, `err_code:0x05024007` if no envelope; `0x05024009` if envelope is present but malformed |
+| `print.*` (subscribe via `/report`) | Required | n/a | n/a |
+
+The two `err_code` values above seem to be firmware-defined and are easy to misattribute to credential or topic-ACL problems, so they're probably worth knowing about when implementing a client.
+
+### Obtaining the cert+key for testing
+
+If you have your own slicer install bound to your own printer, the per-printer cert+key can be recovered without modifying the slicer or its plugin: after the slicer has connected to the printer at least once, the leaf cert and private key live in the network plugin process's heap in PEM form, and can be recovered by scanning anonymous-memory regions of `/proc/<pid>/mem` for `-----BEGIN CERTIFICATE-----` and `-----BEGIN PRIVATE KEY-----` markers (ptrace is sufficient; no plugin patching required). This is the currently known user-facing extraction method. If others are found, PRs welcome!
+
+## Inner `param_enc` transform (gcode_line only)
+
+For `print.command = "gcode_line"` payloads, the network plugin appears to
+apply an additional transform **before** the outer envelope above is
+built and signed: the plaintext `param` field is removed and replaced
+with `param_enc`, whose value is the original gcode string RSA-encrypted
+with the **printer's** RSA public key (distinct from the per-slicer
+client certificate's keypair used for the outer signature). The
+resulting JSON is then run through the canonical-bytes-to-sign
+computation and signed as usual.
+
+Schematically:
+
+```jsonc
+// what an application produces
+{
+  "print": {
+    "command": "gcode_line",
+    "param": "M1002 set_gcode_claim_speed_level: 5\n",
+    "sequence_id": "1234"
+  }
+}
+
+// what is actually published to MQTT
+{
+  "print": {
+    "command": "gcode_line",
+    "param_enc": "<base64 of RSA-encrypted bytes of the param string>",
+    "sequence_id": "1234"
+  },
+  "header": { /* sign_string covers the param_enc form */ }
+}
+```
+
+Properties observed in captures (P1S / H2S firmwares; not exhaustively
+re-checked against every printer model):
+
+- The same plaintext `param` yields a different `param_enc` value each
+  publish — consistent with PKCS#1 v1.5 padding (random padding bytes).
+- The transform applies only to `gcode_line`. Other `print.*` payloads
+  (`gcode_file`, `pause`, `resume`, `stop`, `print_speed`, …) keep
+  their fields verbatim and rely on the outer signature alone.
+- The encryption key is the printer's RSA pubkey, not the slicer's
+  client certificate keypair. The slicer obtains it through a
+  `cert_report` reply that the printer publishes after the MQTT
+  subscription is established (the same round-trip
+  `install_device_cert` triggers).
+
+A native re-implementation of the signing path therefore needs to:
+
+1. Subscribe to the printer's MQTT report topic and capture the
+   `cert_report` reply, then parse out the printer's RSA pubkey.
+2. For `gcode_line` only, RSA-encrypt the `param` value with that
+   pubkey, base64-encode it, and place it under `param_enc`.
+3. Run the canonical-bytes-to-sign computation in §"Signing Details" on
+   the resulting JSON (with `param_enc`, not `param`).
+
+Without this inner transform, the firmware appears to respond with
+`result:"failed"` on the `/report` topic and the gcode line is
+silently dropped.
+
+## Additional MQTT Commands Observed
+
+### extrusion_cali_sel
+
+Select filament for extrusion calibration (not in original OpenBambuAPI docs):
+
+```json
+{
+  "print": {
+    "ams_id": 0,
+    "cali_idx": -1,
+    "command": "extrusion_cali_sel",
+    "filament_id": "GFL99",
+    "nozzle_diameter": "0.4",
+    "nozzle_volume_type": "normal",
+    "sequence_id": "2039",
+    "timestamp": 1772675132270,
+    "tray_id": 3
+  }
+}
+```
+
+## TUTK (ThroughTek) P2P Protocol
+
+The app uses ThroughTek Kalay for P2P camera streaming alongside MQTT:
+
+```json
+{
+  "json": {
+    "cmdtype": 256,
+    "sequence": 2376,
+    "notify": {
+      "topic": "device/01P00C5A1002021/report",
+      "size": 243
+    }
+  },
+  "data_length": 243
+}
+```
+
+TUTK connection codes are obtained via:
+
+```
+POST /v1/iot-service/api/user/ttcode
+```
+
+(Already documented in [cloud-http.md](cloud-http.md))
+
+## Filament IDs
+
+| ID | Material |
+|-----|----------|
+| `GFL99` | Bambu PLA Basic |
+| `GFL98` | Bambu PLA Matte |
+| `GFL00` | Bambu PLA Basic (Red) |
+| `GFA00` | Bambu PLA Basic (Black) |
+| `GFA05` | Bambu PLA Basic (White) |
+| `GFB99` | Bambu PETG Basic |
+| `GFN99` | Bambu PA6-CF |
+| `GFS99` | Bambu Support W |
+| `GFU99` | Bambu TPU 95A |
+
+---
+
+# Basics
+
+Source: https://github.com/doridian/openbambuapi/blob/main/ftp.md
+
+# Basics
+
+URL: `ftps://{DEVICE_IP}:990`
+
+TLS: implicit
+
+**Username:** `bblp`
+
+**Password:** `dev_access_code` from a `Device` object (aka the LAN access code).
+
+---
+
+# Basics
+
+Source: https://github.com/doridian/openbambuapi/blob/main/gcode.md
+
+# Basics
+
+This file describes both GCode macros Bambu uses as well as custom GCode found.
+
+# Headers
+
+At least some of comment lines at the beginning of the file are necessary for functioning of the print. There are three major blocks with start and end guards:
+
+- `HEADER_BLOCK_START`/`HEADER_BLOCK_END`
+- `CONFIG_BLOCK_START`/`CONFIG_BLOCK_END`
+- `EXECUTABLE_BLOCK_START`/`EXECUTABLE_BLOCK_END`
+
+Excerpt:
+
+```
+; CONFIG_BLOCK_START
+; accel_to_decel_enable = 1
+; accel_to_decel_factor = 50%
+```
+
+Without some or most of these, the printer will hang with "Unzip" shown on the screen. 
+
+# Macros
+
+## AMS unload
+
+```gcode
+M620 S255
+M104 S250
+G28 X
+G91
+G1 Z3.0 F1200
+G90
+G1 X70 F12000
+G1 Y245
+G1 Y265 F3000
+M109 S250
+G1 X120 F12000
+G1 X20 Y50 F12000
+G1 Y-3
+T255
+M104 S25
+G1 X165 F5000
+G1 Y245
+G91
+G1 Z-3.0 F1200
+G90
+M621 S255
+```
+
+## AMS load
+
+```gcode
+M620 S[next_tray_index]
+M104 S250
+G28 X
+G91
+G1 Z3.0 F1200
+G90
+G1 X70 F12000
+G1 Y245
+G1 Y265 F3000
+M109 S250
+G1 X120 F12000
+G1 X20 Y50 F12000
+G1 Y-3
+T[next_tray_index]
+G1 X54  F12000
+G1 Y265
+M400
+M106 P1 S0
+G92 E0
+G1 E40 F200
+M400
+M109 S[new_filament_temp]
+M400
+M106 P1 S255
+G92 E0
+G1 E5 F300
+M400
+M106 P1 S0
+G1 X70  F9000
+G1 X76 F15000
+G1 X65 F15000
+G1 X76 F15000
+G1 X65 F15000
+G1 X70 F6000
+G1 X100 F5000
+G1 X70 F15000
+G1 X100 F5000
+G1 X70 F15000
+G1 X165 F5000
+G1 Y245
+G91
+G1 Z-3.0 F1200
+G90
+M621 S[next_tray_index]
+```
+
+## Manual axis move X, Y or Z
+
+```gcode
+M211 S
+M211 X1 Y1 Z1
+M1002 push_ref_mode
+G91
+G1 X# F#
+M1002 pop_ref_mode
+M211 R
+```
+
+## Manual E move
+
+```gcode
+M83
+G0 E# F#
+```
+
+## Model scan for first layer
+
+```
+M976 S1 P1
+M400 P100
+```
+
+# Custom commands
+
+## G28
+
+- `G28 Z P0 T300; home z with low precision,permit 300deg temperature`
+
+## G29
+
+Bambu does not follow Marlin's G29 manual.
+
+- `G29.2 S0 ; turn off ABL`
+- `G29.2 S1` - Probably enables recording of height when probe detects collision and also could load saved calibration
+- `G29 A1 X-1.4281 Y82.682 I67.984 J98.7461` - Probably does bed probing, guarded by g29_before_print_flag
+
+## G39.4
+
+Fires a canned command to detect build plate. Usually flag-guarded and followed by `M400`. It's likely important that Automatic Build Leveling is turned off first (with `G29.2 S0`).
+
+## G380
+
+Some have claimed it's a variant of `G38`, which is called "Probe Target". One use is in the section where the nozzle rubs itself on build plate overhang during cleaning, with code like:
+
+```
+G0 X90 Y-4 F30000
+G380 S3 Z-5 F1200
+G1 Z2 F1200
+G1 X91 F10000
+G380 S3 Z-5 F1200
+G1 Z2 F1200
+...
+```
+
+`Z` is the axis being zeroed and its movement direction, `F` is feedrate. `S` is custom to Bambu and unknown. There are two known values, `S2` and `S3`. `S2` is only used in this one section:
+
+```
+;=====avoid end stop =================
+G91
+G380 S2 Z30 F1200
+G380 S3 Z-20 F1200
+G1 Z5 F1200
+G90
+```
+
+The above section is used early and the head moves up, down, and back up slightly, just as it appears.
+
+## G392
+
+- `G392 S0` - Appears to *toggle* "clog detect"? Because it's commented as both enabling and disabling clog detect at different times.
+  Done just after initial bed heating and before the "avoid end stop" then "reset machine status" sections.
+
+## M73.2
+
+- `M73.2   R1.0 ;Reset left time magnitude`
+
+## M106
+
+- `M106 P1 S0-255` - set part cooling fan speed (0 off, 255 100%)
+- `M106 P2 S0-255` - set aux fan speed
+- `M106 P3 S0-255` - set chamber fan speed
+
+## M109
+
+Causes screen to update to say "Heating", in addition to the usual wait for heating.
+
+## M400
+
+M400 is "Finish Moves". Marlin doesn't document any arguments. Bambu uses these:
+
+- `M400 S#` - sleep for about # seconds
+- `M400 P300` - probably sleep 300 milliseconds; S & P probably can be used together
+
+## M620
+
+- `M620 C#` - calibrate AMS by AMS index
+- `M620 R#` - refresh AMS by tray index
+- `M620 P#` - select AMS tray by tray index
+- `M620 M` - Commented ";enable remap"; only done once before the first M620 command.
+- `M620 S#` - Starts a branch; if "Enable AMS" is NOT checked, then gcode is skipped until the matching `M621 S#` is found. Commented "select AMS by tray index", but that likely refers to the whole block of commands and not this single command.
+  - Seems to only be used for unloading filament during machine_end_gcode since at least 20221103.
+  - `#` = 255 when unloading filament at end of print for non-H2D. It's just a constant that was in AMS code from the beginning.
+  - `#` = 65535 and 65279 are used during H2D unload. They are simply hardcoded in the machine end code. (65279 is 0x100 less than 65535)
+- `M620 S#A` - Starts a branch; if "Enable AMS" is NOT checked, then gcode is skipped until the matching `M621 S#A` is found.
+  - Not sure what the `A` does differently. Used for filament change during print, and not for the final unload during machine end sequence.
+  - Does being in this branch as an effect on `T` commands? The `T1000` falls outside a `M620` branch, but `T255` is within the matching one.
+  - Does this branch if the intended filament is already loaded?
+  - What happens if external filament is loaded?
+
+## M620.1
+
+- `M620.1 E F[old_filament_e_feedrate] T{nozzle_temperature_range_high[previous_extruder]}` - Seems to set extrusion parameters that will be used by `T` during load/unload.
+  - Used before and after `T` during filament changes and shortly after `T` during initial load.
+- `M620.1 X# Y# F# P<0/1/2>` - Prefaced with comment "; get travel path for change filament" when used with X1 and AMS? See [comment](https://github.com/bambulab/BambuStudio/issues/1661#issuecomment-1522800180).
+
+## M620.3
+
+- `M620.3 W1; === turn on filament tangle detection===`
+
+## M620.10
+
+- `M620.10 A0 F[old_filament_e_feedrate]` - It's used just prior to a `T` opcode during filament changes, but not during initial load or unload. Introduced with long retraction.
+- M620.10 A1 F[new_filament_e_feedrate] L[flush_length] H[nozzle_diameter] T[nozzle_temperature_range_high] - Used shortly after `T` during filament change. 
+
+## M620.11
+
+Introduced with "long retraction when cut".
+
+- `M620.11 S1 I[previous_extruder] E-{retraction_distances_when_cut[previous_extruder]} F1200` - Run before tool change if the current filament has long retraction enabled.
+- `M620.11 S1 I[previous_extruder] E{retraction_distances_when_cut[previous_extruder]} F{old_filament_e_feedrate}` - Run after tool change if the old filament had retraction enabled.
+- `M620.11 S0` run when the filament-being-unloaded does not have a long retraction before and after tool change (`T`).
+- `M620.11 S1 I# E# F#` - Does not cause any action to occur
+  - `I` always matches the number of the `M620 S#` block, but unknown whether this is enforced.
+
+## M621
+
+- `M621 S#` - End of branch from `M620 S#`
+- `M621 S#A` - End of branch from `M620 S#A`
+
+## M622
+
+Flags are judged by `M1002`.
+
+- `M622 J1` If last judged flag was true, then continue; otherwise skip commands until `M623` is found.
+- `M622 J0` If last judged flag was false, then continue; otherwise skip commands until `M623` is found.
+
+## M622.1
+
+- `M622.1 S0` - Always run just before dynamic extrusion M9833
+- `M622.1 S1 ; for prev firware, default turned on` - seems this turns on whatever this is that is usually already on.
+
+## M623
+
+- `M623` end of branch from `M622`
+
+## M630
+
+- `M630 S0 P0` - used early in "reset machine status", unknown purpose
+
+## M960
+
+- `M960 S5 P0/1`- turn off (0) or on (1) the logo light on toolhead
+- `M960 S4 P0/1`- turn off (0) or on (1) the nozzle light 
+
+## M971
+
+Take photo (for timelapse).
+
+## M973
+
+- `M973 S1` - likely enable scanner
+- `M973 S2 P16000` - likely perform scan
+- `M973 S3 P1` - camera start stream
+- `M973 S4` - disable scanner
+
+## M975
+
+- `M975 S1` - turn on vibration supression
+  - Run many times so something could be resetting it
+
+## M976
+
+- `M976 S1 P1` - first layer scan
+- `M976 S2 P1` - hot bed scan before print
+
+## M981
+
+- `M981 S0 P20000` - disable spaghetti detector
+- `M981 S1 P20000` - enable spaghetti detector
+
+## M982.2
+
+- `M982.2 S1 ; turn on cog noise reduction`
+
+## M991
+
+- `M991 S0 P{layer_num}` - commented "notify layer change"
+- `M991 S0 P-1` - commented "end timelapse at safe pos" but that doesn't seem right.
+
+
+## M1002
+
+- `M1002 gcode_claim_action : 0` - Display message on screen, 0 is probably clear message. [More numbers on forum.bambulab](https://forum.bambulab.com/t/bambu-lab-x1-specific-g-code/666). Notably:
+  - 1 is auto bed leveling
+  - 2 is heatbed preheating
+  - 4 is changing filament
+  - 5 is M400 U1 pause
+  - [Full(?) list at bambulab forum](https://forum.bambulab.com/t/bambu-lab-x1-specific-g-code/666)
+- `M1002 set_filament_type:TYPE` - Probably updates display? TYPE can be `UNKNOWN` or `PETG`, `PLA`, `TPU-AMS`, `TPU`, etc.
+- `M1002 judge_flag FLAGNAME` - Used by `M622` to branch. Some FLAGNAMEs:
+  - `build_plate_detect_flag` - whether you have build plate detection enabled
+  - `g29_before_print_flag` - G29 is automatic bed leveling
+  - `extrude_cali_flag` if "Flow Dynamics Calibration" is enabled when starting print
+  - `filament_need_cali_flag` - ??
+  - `timelapse_record_flag` - If timelapse is enabled when starting print
+  - `g39_3rd_layer_detect_flag`
+
+## M1003
+
+- `M1003 S0` - disable power loss recovery
+- `M1003 S1` - enable power loss recovery
+
+## M1006
+
+Allows playing music with the stepper coils. If the printer is configured not to play the tone, it doesn't do anything, presumably. Example line:
+
+- `M1006 A44 B20 L100 C39 D20 M100 E48 F20 N100`
+
+## M1007
+
+- `M1007 S0` - unknown purpose.
+  - Done as second command following clog detect disable, during i.e. filament change
+- `M1007 S1` - done before printing following filament change and during after initialization shortly before printing starts.
+
+## M9833.2
+
+- `M9833.2` - follows turning off clog detect in the beginning; unknown purpose.
+
+## T
+
+Tool change.
+
+- `T255` (also `T65535` in H2D I think) - Only used during tool change when AMS is unloaded when the print is over. At least causes it to cut and have AMS retract filament.
+- `T1000` - Used twice in the following sequence during startup only AFAICT:
+
+  ```
+  M975 S1 ; turn on vibration compensation
+  G90     ; Absolute positioning
+  M83     ; override G90 and put the E axis into relative mode independent of the other axes
+  T1000   ; ???
+  ```
+
+  What does it do if there is a filament already loaded? What does it do if it doesn't?
+
+- `T#` - Many canned actions to orchestrate movements of AMS motor and extruder. Cuts filament, goes to purge location, has AMS retract current filament, uses both AMS and extruder motors in a delicate dance mediated by sensors (will try 3 times to load filament, for example, then error). The number is zero-indexed, but references the one-indexed list of filaments displayed in the GUI and also written in `slice_info.config` in the 3MF.
+  - If a bare `M17` hasn't been run since steppers were last messed with, this command will freeze.
+  - Seems to freeze if not set up perfectly; the printer will allow you to press stop and cancel print, but then the print is never cancelled. Requires power cycle. Unsure how many of the setup commands are required.
+
+---
+
+# Basics
+
+Source: https://github.com/doridian/openbambuapi/blob/main/lan-file-tunnel.md
+
+# Basics
+
+Some Bambu printers expose a file-transfer protocol on TCP `6000`, distinct
+from the FTPS server on port `990`. It carries directory listing, upload,
+download, and delete operations against the printer's storage.
+
+The same TCP port (`6000`) is used by the A1 and P1 series for [video
+streaming](./video.md) instead — the role appears to be model-dependent.
+
+## Transport
+
+- **Host**: `{PRINTER_IP}:6000`
+- **TLS**: [yes](./tls.md) (observed: TLS 1.2, `ECDHE-RSA-AES256-GCM-SHA384`)
+- **Authentication**: required, single packet immediately after the TLS handshake
+
+### Auth packet
+
+A 64-byte fixed-size packet:
+
+| Offset | Length | Field |
+|-------:|-------:|-------|
+| `0x00` | 8      | `bblp\0\0\0\0` (literal) |
+| `0x08` | 32     | `dev_access_code` (the 8-char LAN access code, zero-padded) |
+| `0x28` | 24     | reserved (zero) |
+
+Observed reply on success: nothing (the server proceeds straight to accepting framed messages).
+
+## Framing
+
+After auth, each message is a 16-byte header followed by a JSON body. All integers little-endian.
+
+| Offset | Length | Field          | Notes                                 |
+|-------:|-------:|----------------|---------------------------------------|
+| `0x00` | 4      | `payload_size` | length of the JSON body in bytes      |
+| `0x04` | 4      | `sequence`     | client-chosen request id, echoed back |
+| `0x08` | 4      | `cmdtype`      | command class (see below)             |
+| `0x0c` | 4      | `mtype`        | message kind: `0x3001` control, `0x3003` start-of-data |
+
+The JSON body is the canonical envelope used elsewhere on the printer:
+
+```json
+// request
+{ "cmdtype": <int>, "sequence": <int>, "req": { … } }
+
+// reply
+{ "cmdtype": <int>, "sequence": <int>, "result": <int>, "reply": { … } }
+```
+
+`result == 0` indicates success; other values are command-specific.
+
+## Commands (`cmdtype` values observed)
+
+| `cmdtype` | Name                    | Direction | Notes |
+|----------:|-------------------------|-----------|-------|
+| `1`       | `LIST_INFO`             | req/reply | Directory listing. |
+| `2`       | `SUB_FILE`              | req/reply | Subscribe to file change notifications. |
+| `3`       | `FILE_DEL`              | req/reply | Delete a file. |
+| `4`       | `FILE_DOWNLOAD`         | streaming | Reply uses additional `mtype 0x3003` frames carrying file chunks. |
+| `5`       | `FILE_UPLOAD`           | streaming | Same shape as download, in reverse. |
+| `7`       | `REQUEST_MEDIA_ABILITY` | req/reply | Probe for which media features the printer supports. |
+
+These names match the symbols in Bambu's open-source `bambu_net_oss`
+reference implementation (`LocalControlTunnel.cpp`).
+
+## Caveats
+
+- On H2S firmware `01.02.00.00`, `LIST_INFO` (cmdtype `1`) returns
+  `{ "cmdtype": 0xFFFFFFFF, "mtype": 0x3001, "result": 2 }`. The opcode
+  appears to have been retired on that firmware; other H2 firmwares were
+  not tested.
+- A1 (and possibly P1-series) printers serve [MJPEG video](./video.md) on
+  TCP `6000` instead of this protocol, so probing the port is not a
+  reliable feature-detect.
+
+---
+
+# GNU Free Documentation License
+
+Source: https://github.com/doridian/openbambuapi/blob/main/LICENSE.md
+
+# GNU Free Documentation License
+
+Version 1.3, 3 November 2008
+
+Copyright (C) 2000, 2001, 2002, 2007, 2008 Free Software Foundation,
+Inc. <https://fsf.org/>
+
+Everyone is permitted to copy and distribute verbatim copies of this
+license document, but changing it is not allowed.
+
+## 0. PREAMBLE
+
+The purpose of this License is to make a manual, textbook, or other
+functional and useful document "free" in the sense of freedom: to
+assure everyone the effective freedom to copy and redistribute it,
+with or without modifying it, either commercially or noncommercially.
+Secondarily, this License preserves for the author and publisher a way
+to get credit for their work, while not being considered responsible
+for modifications made by others.
+
+This License is a kind of "copyleft", which means that derivative
+works of the document must themselves be free in the same sense. It
+complements the GNU General Public License, which is a copyleft
+license designed for free software.
+
+We have designed this License in order to use it for manuals for free
+software, because free software needs free documentation: a free
+program should come with manuals providing the same freedoms that the
+software does. But this License is not limited to software manuals; it
+can be used for any textual work, regardless of subject matter or
+whether it is published as a printed book. We recommend this License
+principally for works whose purpose is instruction or reference.
+
+## 1. APPLICABILITY AND DEFINITIONS
+
+This License applies to any manual or other work, in any medium, that
+contains a notice placed by the copyright holder saying it can be
+distributed under the terms of this License. Such a notice grants a
+world-wide, royalty-free license, unlimited in duration, to use that
+work under the conditions stated herein. The "Document", below, refers
+to any such manual or work. Any member of the public is a licensee,
+and is addressed as "you". You accept the license if you copy, modify
+or distribute the work in a way requiring permission under copyright
+law.
+
+A "Modified Version" of the Document means any work containing the
+Document or a portion of it, either copied verbatim, or with
+modifications and/or translated into another language.
+
+A "Secondary Section" is a named appendix or a front-matter section of
+the Document that deals exclusively with the relationship of the
+publishers or authors of the Document to the Document's overall
+subject (or to related matters) and contains nothing that could fall
+directly within that overall subject. (Thus, if the Document is in
+part a textbook of mathematics, a Secondary Section may not explain
+any mathematics.) The relationship could be a matter of historical
+connection with the subject or with related matters, or of legal,
+commercial, philosophical, ethical or political position regarding
+them.
+
+The "Invariant Sections" are certain Secondary Sections whose titles
+are designated, as being those of Invariant Sections, in the notice
+that says that the Document is released under this License. If a
+section does not fit the above definition of Secondary then it is not
+allowed to be designated as Invariant. The Document may contain zero
+Invariant Sections. If the Document does not identify any Invariant
+Sections then there are none.
+
+The "Cover Texts" are certain short passages of text that are listed,
+as Front-Cover Texts or Back-Cover Texts, in the notice that says that
+the Document is released under this License. A Front-Cover Text may be
+at most 5 words, and a Back-Cover Text may be at most 25 words.
+
+A "Transparent" copy of the Document means a machine-readable copy,
+represented in a format whose specification is available to the
+general public, that is suitable for revising the document
+straightforwardly with generic text editors or (for images composed of
+pixels) generic paint programs or (for drawings) some widely available
+drawing editor, and that is suitable for input to text formatters or
+for automatic translation to a variety of formats suitable for input
+to text formatters. A copy made in an otherwise Transparent file
+format whose markup, or absence of markup, has been arranged to thwart
+or discourage subsequent modification by readers is not Transparent.
+An image format is not Transparent if used for any substantial amount
+of text. A copy that is not "Transparent" is called "Opaque".
+
+Examples of suitable formats for Transparent copies include plain
+ASCII without markup, Texinfo input format, LaTeX input format, SGML
+or XML using a publicly available DTD, and standard-conforming simple
+HTML, PostScript or PDF designed for human modification. Examples of
+transparent image formats include PNG, XCF and JPG. Opaque formats
+include proprietary formats that can be read and edited only by
+proprietary word processors, SGML or XML for which the DTD and/or
+processing tools are not generally available, and the
+machine-generated HTML, PostScript or PDF produced by some word
+processors for output purposes only.
+
+The "Title Page" means, for a printed book, the title page itself,
+plus such following pages as are needed to hold, legibly, the material
+this License requires to appear in the title page. For works in
+formats which do not have any title page as such, "Title Page" means
+the text near the most prominent appearance of the work's title,
+preceding the beginning of the body of the text.
+
+The "publisher" means any person or entity that distributes copies of
+the Document to the public.
+
+A section "Entitled XYZ" means a named subunit of the Document whose
+title either is precisely XYZ or contains XYZ in parentheses following
+text that translates XYZ in another language. (Here XYZ stands for a
+specific section name mentioned below, such as "Acknowledgements",
+"Dedications", "Endorsements", or "History".) To "Preserve the Title"
+of such a section when you modify the Document means that it remains a
+section "Entitled XYZ" according to this definition.
+
+The Document may include Warranty Disclaimers next to the notice which
+states that this License applies to the Document. These Warranty
+Disclaimers are considered to be included by reference in this
+License, but only as regards disclaiming warranties: any other
+implication that these Warranty Disclaimers may have is void and has
+no effect on the meaning of this License.
+
+## 2. VERBATIM COPYING
+
+You may copy and distribute the Document in any medium, either
+commercially or noncommercially, provided that this License, the
+copyright notices, and the license notice saying this License applies
+to the Document are reproduced in all copies, and that you add no
+other conditions whatsoever to those of this License. You may not use
+technical measures to obstruct or control the reading or further
+copying of the copies you make or distribute. However, you may accept
+compensation in exchange for copies. If you distribute a large enough
+number of copies you must also follow the conditions in section 3.
+
+You may also lend copies, under the same conditions stated above, and
+you may publicly display copies.
+
+## 3. COPYING IN QUANTITY
+
+If you publish printed copies (or copies in media that commonly have
+printed covers) of the Document, numbering more than 100, and the
+Document's license notice requires Cover Texts, you must enclose the
+copies in covers that carry, clearly and legibly, all these Cover
+Texts: Front-Cover Texts on the front cover, and Back-Cover Texts on
+the back cover. Both covers must also clearly and legibly identify you
+as the publisher of these copies. The front cover must present the
+full title with all words of the title equally prominent and visible.
+You may add other material on the covers in addition. Copying with
+changes limited to the covers, as long as they preserve the title of
+the Document and satisfy these conditions, can be treated as verbatim
+copying in other respects.
+
+If the required texts for either cover are too voluminous to fit
+legibly, you should put the first ones listed (as many as fit
+reasonably) on the actual cover, and continue the rest onto adjacent
+pages.
+
+If you publish or distribute Opaque copies of the Document numbering
+more than 100, you must either include a machine-readable Transparent
+copy along with each Opaque copy, or state in or with each Opaque copy
+a computer-network location from which the general network-using
+public has access to download using public-standard network protocols
+a complete Transparent copy of the Document, free of added material.
+If you use the latter option, you must take reasonably prudent steps,
+when you begin distribution of Opaque copies in quantity, to ensure
+that this Transparent copy will remain thus accessible at the stated
+location until at least one year after the last time you distribute an
+Opaque copy (directly or through your agents or retailers) of that
+edition to the public.
+
+It is requested, but not required, that you contact the authors of the
+Document well before redistributing any large number of copies, to
+give them a chance to provide you with an updated version of the
+Document.
+
+## 4. MODIFICATIONS
+
+You may copy and distribute a Modified Version of the Document under
+the conditions of sections 2 and 3 above, provided that you release
+the Modified Version under precisely this License, with the Modified
+Version filling the role of the Document, thus licensing distribution
+and modification of the Modified Version to whoever possesses a copy
+of it. In addition, you must do these things in the Modified Version:
+
+-   A. Use in the Title Page (and on the covers, if any) a title
+    distinct from that of the Document, and from those of previous
+    versions (which should, if there were any, be listed in the
+    History section of the Document). You may use the same title as a
+    previous version if the original publisher of that version
+    gives permission.
+-   B. List on the Title Page, as authors, one or more persons or
+    entities responsible for authorship of the modifications in the
+    Modified Version, together with at least five of the principal
+    authors of the Document (all of its principal authors, if it has
+    fewer than five), unless they release you from this requirement.
+-   C. State on the Title page the name of the publisher of the
+    Modified Version, as the publisher.
+-   D. Preserve all the copyright notices of the Document.
+-   E. Add an appropriate copyright notice for your modifications
+    adjacent to the other copyright notices.
+-   F. Include, immediately after the copyright notices, a license
+    notice giving the public permission to use the Modified Version
+    under the terms of this License, in the form shown in the
+    Addendum below.
+-   G. Preserve in that license notice the full lists of Invariant
+    Sections and required Cover Texts given in the Document's
+    license notice.
+-   H. Include an unaltered copy of this License.
+-   I. Preserve the section Entitled "History", Preserve its Title,
+    and add to it an item stating at least the title, year, new
+    authors, and publisher of the Modified Version as given on the
+    Title Page. If there is no section Entitled "History" in the
+    Document, create one stating the title, year, authors, and
+    publisher of the Document as given on its Title Page, then add an
+    item describing the Modified Version as stated in the
+    previous sentence.
+-   J. Preserve the network location, if any, given in the Document
+    for public access to a Transparent copy of the Document, and
+    likewise the network locations given in the Document for previous
+    versions it was based on. These may be placed in the "History"
+    section. You may omit a network location for a work that was
+    published at least four years before the Document itself, or if
+    the original publisher of the version it refers to
+    gives permission.
+-   K. For any section Entitled "Acknowledgements" or "Dedications",
+    Preserve the Title of the section, and preserve in the section all
+    the substance and tone of each of the contributor acknowledgements
+    and/or dedications given therein.
+-   L. Preserve all the Invariant Sections of the Document, unaltered
+    in their text and in their titles. Section numbers or the
+    equivalent are not considered part of the section titles.
+-   M. Delete any section Entitled "Endorsements". Such a section may
+    not be included in the Modified Version.
+-   N. Do not retitle any existing section to be Entitled
+    "Endorsements" or to conflict in title with any Invariant Section.
+-   O. Preserve any Warranty Disclaimers.
+
+If the Modified Version includes new front-matter sections or
+appendices that qualify as Secondary Sections and contain no material
+copied from the Document, you may at your option designate some or all
+of these sections as invariant. To do this, add their titles to the
+list of Invariant Sections in the Modified Version's license notice.
+These titles must be distinct from any other section titles.
+
+You may add a section Entitled "Endorsements", provided it contains
+nothing but endorsements of your Modified Version by various
+partiesâ€”for example, statements of peer review or that the text has
+been approved by an organization as the authoritative definition of a
+standard.
+
+You may add a passage of up to five words as a Front-Cover Text, and a
+passage of up to 25 words as a Back-Cover Text, to the end of the list
+of Cover Texts in the Modified Version. Only one passage of
+Front-Cover Text and one of Back-Cover Text may be added by (or
+through arrangements made by) any one entity. If the Document already
+includes a cover text for the same cover, previously added by you or
+by arrangement made by the same entity you are acting on behalf of,
+you may not add another; but you may replace the old one, on explicit
+permission from the previous publisher that added the old one.
+
+The author(s) and publisher(s) of the Document do not by this License
+give permission to use their names for publicity for or to assert or
+imply endorsement of any Modified Version.
+
+## 5. COMBINING DOCUMENTS
+
+You may combine the Document with other documents released under this
+License, under the terms defined in section 4 above for modified
+versions, provided that you include in the combination all of the
+Invariant Sections of all of the original documents, unmodified, and
+list them all as Invariant Sections of your combined work in its
+license notice, and that you preserve all their Warranty Disclaimers.
+
+The combined work need only contain one copy of this License, and
+multiple identical Invariant Sections may be replaced with a single
+copy. If there are multiple Invariant Sections with the same name but
+different contents, make the title of each such section unique by
+adding at the end of it, in parentheses, the name of the original
+author or publisher of that section if known, or else a unique number.
+Make the same adjustment to the section titles in the list of
+Invariant Sections in the license notice of the combined work.
+
+In the combination, you must combine any sections Entitled "History"
+in the various original documents, forming one section Entitled
+"History"; likewise combine any sections Entitled "Acknowledgements",
+and any sections Entitled "Dedications". You must delete all sections
+Entitled "Endorsements".
+
+## 6. COLLECTIONS OF DOCUMENTS
+
+You may make a collection consisting of the Document and other
+documents released under this License, and replace the individual
+copies of this License in the various documents with a single copy
+that is included in the collection, provided that you follow the rules
+of this License for verbatim copying of each of the documents in all
+other respects.
+
+You may extract a single document from such a collection, and
+distribute it individually under this License, provided you insert a
+copy of this License into the extracted document, and follow this
+License in all other respects regarding verbatim copying of that
+document.
+
+## 7. AGGREGATION WITH INDEPENDENT WORKS
+
+A compilation of the Document or its derivatives with other separate
+and independent documents or works, in or on a volume of a storage or
+distribution medium, is called an "aggregate" if the copyright
+resulting from the compilation is not used to limit the legal rights
+of the compilation's users beyond what the individual works permit.
+When the Document is included in an aggregate, this License does not
+apply to the other works in the aggregate which are not themselves
+derivative works of the Document.
+
+If the Cover Text requirement of section 3 is applicable to these
+copies of the Document, then if the Document is less than one half of
+the entire aggregate, the Document's Cover Texts may be placed on
+covers that bracket the Document within the aggregate, or the
+electronic equivalent of covers if the Document is in electronic form.
+Otherwise they must appear on printed covers that bracket the whole
+aggregate.
+
+## 8. TRANSLATION
+
+Translation is considered a kind of modification, so you may
+distribute translations of the Document under the terms of section 4.
+Replacing Invariant Sections with translations requires special
+permission from their copyright holders, but you may include
+translations of some or all Invariant Sections in addition to the
+original versions of these Invariant Sections. You may include a
+translation of this License, and all the license notices in the
+Document, and any Warranty Disclaimers, provided that you also include
+the original English version of this License and the original versions
+of those notices and disclaimers. In case of a disagreement between
+the translation and the original version of this License or a notice
+or disclaimer, the original version will prevail.
+
+If a section in the Document is Entitled "Acknowledgements",
+"Dedications", or "History", the requirement (section 4) to Preserve
+its Title (section 1) will typically require changing the actual
+title.
+
+## 9. TERMINATION
+
+You may not copy, modify, sublicense, or distribute the Document
+except as expressly provided under this License. Any attempt otherwise
+to copy, modify, sublicense, or distribute it is void, and will
+automatically terminate your rights under this License.
+
+However, if you cease all violation of this License, then your license
+from a particular copyright holder is reinstated (a) provisionally,
+unless and until the copyright holder explicitly and finally
+terminates your license, and (b) permanently, if the copyright holder
+fails to notify you of the violation by some reasonable means prior to
+60 days after the cessation.
+
+Moreover, your license from a particular copyright holder is
+reinstated permanently if the copyright holder notifies you of the
+violation by some reasonable means, this is the first time you have
+received notice of violation of this License (for any work) from that
+copyright holder, and you cure the violation prior to 30 days after
+your receipt of the notice.
+
+Termination of your rights under this section does not terminate the
+licenses of parties who have received copies or rights from you under
+this License. If your rights have been terminated and not permanently
+reinstated, receipt of a copy of some or all of the same material does
+not give you any rights to use it.
+
+## 10. FUTURE REVISIONS OF THIS LICENSE
+
+The Free Software Foundation may publish new, revised versions of the
+GNU Free Documentation License from time to time. Such new versions
+will be similar in spirit to the present version, but may differ in
+detail to address new problems or concerns. See
+<https://www.gnu.org/licenses/>.
+
+Each version of the License is given a distinguishing version number.
+If the Document specifies that a particular numbered version of this
+License "or any later version" applies to it, you have the option of
+following the terms and conditions either of that specified version or
+of any later version that has been published (not as a draft) by the
+Free Software Foundation. If the Document does not specify a version
+number of this License, you may choose any version ever published (not
+as a draft) by the Free Software Foundation. If the Document specifies
+that a proxy can decide which future versions of this License can be
+used, that proxy's public statement of acceptance of a version
+permanently authorizes you to choose that version for the Document.
+
+## 11. RELICENSING
+
+"Massive Multiauthor Collaboration Site" (or "MMC Site") means any
+World Wide Web server that publishes copyrightable works and also
+provides prominent facilities for anybody to edit those works. A
+public wiki that anybody can edit is an example of such a server. A
+"Massive Multiauthor Collaboration" (or "MMC") contained in the site
+means any set of copyrightable works thus published on the MMC site.
+
+"CC-BY-SA" means the Creative Commons Attribution-Share Alike 3.0
+license published by Creative Commons Corporation, a not-for-profit
+corporation with a principal place of business in San Francisco,
+California, as well as future copyleft versions of that license
+published by that same organization.
+
+"Incorporate" means to publish or republish a Document, in whole or in
+part, as part of another Document.
+
+An MMC is "eligible for relicensing" if it is licensed under this
+License, and if all works that were first published under this License
+somewhere other than this MMC, and subsequently incorporated in whole
+or in part into the MMC, (1) had no cover texts or invariant sections,
+and (2) were thus incorporated prior to November 1, 2008.
+
+The operator of an MMC Site may republish an MMC contained in the site
+under CC-BY-SA on the same site at any time before August 1, 2009,
+provided the MMC is eligible for relicensing.
+
+## ADDENDUM: How to use this License for your documents
+
+To use this License in a document you have written, include a copy of
+the License in the document and put the following copyright and
+license notices just after the title page:
+
+        Copyright (C)  YEAR  YOUR NAME.
+        Permission is granted to copy, distribute and/or modify this document
+        under the terms of the GNU Free Documentation License, Version 1.3
+        or any later version published by the Free Software Foundation;
+        with no Invariant Sections, no Front-Cover Texts, and no Back-Cover Texts.
+        A copy of the license is included in the section entitled "GNU
+        Free Documentation License".
+
+If you have Invariant Sections, Front-Cover Texts and Back-Cover
+Texts, replace the "with â€¦ Texts." line with this:
+
+        with the Invariant Sections being LIST THEIR TITLES, with the
+        Front-Cover Texts being LIST, and with the Back-Cover Texts being LIST.
+
+If you have Invariant Sections without Cover Texts, or some other
+combination of the three, merge those two alternatives to suit the
+situation.
+
+If your document contains nontrivial examples of program code, we
+recommend releasing these examples in parallel under your choice of
+free software license, such as the GNU General Public License, to
+permit their use in free software.
+
+---
+
+# Local Printer API (LAN)
+
+Source: https://github.com/doridian/openbambuapi/blob/main/local-printer-api.md
+
+# Local Printer API (LAN)
+
+> Documented from the [bambu-printer-manager](https://synman.github.io/bambu-printer-manager/api-reference/) project by Synman.
+
+The local printer API is a REST interface exposed by self-hosted printer management tools (like bambu-printer-manager) that communicate with Bambu Lab printers over MQTT on the local network. This is **not** a Bambu Lab official API — it's a community-built management layer.
+
+## Connection
+
+The management server connects to the printer's local MQTT broker (see [mqtt.md](mqtt.md)) and exposes a REST API on a configurable local port.
+
+## Endpoints
+
+### Printer Status
+
+#### GET /api/printer
+
+Returns the complete serialized printer object with all current state.
+
+Returns `304 Not Modified` if no live data is available.
+
+#### GET /api/health_check
+
+Health check endpoint. Returns 200 with printer JSON when healthy, 500 when no live data. Both include full printer state.
+
+---
+
+### Temperature Control
+
+#### GET /api/set_tool_target_temp
+
+Sets the nozzle temperature for the active extruder.
+
+| Parameter | Type | Required | Description                                    |
+| --------- | ---- | -------- | ---------------------------------------------- |
+| `temp`    | int  | yes      | Target temperature in C (clamped to 0 minimum) |
+
+For single-extruder printers sends `M104 S{temp}`. For H2D dual-extruder models sends `M104 S{temp} T{active_tool}`.
+
+#### GET /api/set_bed_target_temp
+
+Sets the heated bed temperature.
+
+| Parameter | Type | Required | Description                 |
+| --------- | ---- | -------- | --------------------------- |
+| `temp`    | int  | yes      | Target bed temperature in C |
+
+#### GET /api/set_chamber_target_temp
+
+Sets the chamber temperature. Uses `SET_CHAMBER_TEMP_TARGET` + `SET_CHAMBER_AC_MODE` (mode 0 for <40C, mode 1 for >=40C).
+
+| Parameter | Type | Required | Description                     |
+| --------- | ---- | -------- | ------------------------------- |
+| `temp`    | int  | yes      | Target chamber temperature in C |
+
+---
+
+### Fan Control
+
+#### GET /api/set_fan_speed_target
+
+Sets the part-cooling fan speed.
+
+| Parameter | Type | Required | Description              |
+| --------- | ---- | -------- | ------------------------ |
+| `percent` | int  | yes      | Speed percentage (0-100) |
+
+#### GET /api/set_aux_fan_speed_target
+
+Sets the auxiliary fan speed.
+
+| Parameter | Type | Required | Description              |
+| --------- | ---- | -------- | ------------------------ |
+| `percent` | int  | yes      | Speed percentage (0-100) |
+
+#### GET /api/set_exhaust_fan_speed_target
+
+Sets the exhaust/chamber fan speed.
+
+| Parameter | Type | Required | Description              |
+| --------- | ---- | -------- | ------------------------ |
+| `percent` | int  | yes      | Speed percentage (0-100) |
+
+---
+
+### Print Job Control
+
+#### GET /api/print_3mf
+
+Starts a 3MF print job.
+
+| Parameter     | Type   | Required | Description                                                                                                                         |
+| ------------- | ------ | -------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| `filename`    | string | yes      | Full SD card path to the `.3mf` file                                                                                                |
+| `platenum`    | int    | no       | Plate index within the file (0-based, default: 0)                                                                                   |
+| `plate`       | string | yes      | Plate type: `AUTO`, `COOL_PLATE`, `ENG_PLATE`, `HOT_PLATE`, `TEXTURED_PLATE`, `NONE`                                                |
+| `use_ams`     | bool   | no       | `"true"` to enable AMS filament feeding                                                                                             |
+| `ams_mapping` | string | no       | JSON-encoded array of absolute tray IDs (0-103 for 4-slot AMS, 128-135 for single-slot HT, 254 for external spool, -1 for unmapped) |
+| `bl`          | bool   | no       | `"true"` to enable bed levelling                                                                                                    |
+| `flow`        | bool   | no       | `"true"` to enable flow-rate calibration                                                                                            |
+| `tl`          | bool   | no       | `"true"` to enable timelapse recording                                                                                              |
+
+#### GET /api/pause_printing
+
+Pauses the active print job.
+
+#### GET /api/resume_printing
+
+Resumes a paused print job.
+
+#### GET /api/stop_printing
+
+Cancels or stops the current print job.
+
+#### GET /api/skip_objects
+
+Skips specified objects during an active print.
+
+| Parameter | Type   | Required | Description                                          |
+| --------- | ------ | -------- | ---------------------------------------------------- |
+| `objects` | string | yes      | Comma-separated list of `identify_id` values to skip |
+
+Object IDs are obtained from `get_3mf_props_for_file`.
+
+---
+
+### Filament Management
+
+#### GET /api/load_filament
+
+Loads filament from a specified AMS slot or external spool.
+
+| Parameter | Type | Required | Description                                    |
+| --------- | ---- | -------- | ---------------------------------------------- |
+| `slot`    | int  | yes      | AMS slot index (0-3) or 254 for external spool |
+
+#### GET /api/unload_filament
+
+Unloads the currently loaded filament.
+
+#### GET /api/refresh_spool_rfid
+
+Re-reads the RFID tag for a specific AMS slot. Only RFID-equipped Bambu spools carry tag data.
+
+| Parameter | Type | Required | Description                             |
+| --------- | ---- | -------- | --------------------------------------- |
+| `slot_id` | int  | yes      | Slot position within the AMS unit (0-3) |
+| `ams_id`  | int  | yes      | AMS unit ID (typically 0-3)             |
+
+#### GET /api/set_spool_details
+
+Sets custom filament details for an AMS tray. Sleeps 2 seconds after issuing the command.
+
+| Parameter         | Type   | Required | Description                                                       |
+| ----------------- | ------ | -------- | ----------------------------------------------------------------- |
+| `tray_id`         | int    | yes      | Global tray ID (0-15 for 4-slot AMS, 254/255 for external spools) |
+| `tray_info_idx`   | string | yes      | Bambu filament preset index (e.g., `GFL99`)                       |
+| `tray_id_name`    | string | no       | Display name for the spool                                        |
+| `tray_type`       | string | no       | Filament material type (e.g., `PLA`, `PETG-CF`)                   |
+| `tray_color`      | string | no       | Spool colour as hex (e.g., `#FF5733`)                             |
+| `nozzle_temp_min` | int    | no       | Minimum nozzle temp in C (-1 to leave unchanged)                  |
+| `nozzle_temp_max` | int    | no       | Maximum nozzle temp in C (-1 to leave unchanged)                  |
+
+---
+
+### File Management (SD Card)
+
+#### GET /api/get_sdcard_contents
+
+Returns the cached SD card file tree. Alphabetically sorted with folders before files.
+
+#### GET /api/refresh_sdcard_contents
+
+Refreshes the SD card listing from the printer via FTPS.
+
+#### GET /api/get_sdcard_3mf_files
+
+Returns SD card tree filtered to `.3mf` files only.
+
+#### GET /api/refresh_sdcard_3mf_files
+
+Refreshes both the full and 3MF-only SD card caches via FTPS.
+
+#### GET /api/delete_sdcard_file
+
+Deletes a file or folder from the SD card.
+
+| Parameter | Type   | Required | Description                                                 |
+| --------- | ------ | -------- | ----------------------------------------------------------- |
+| `file`    | string | yes      | SD card path. Trailing slash for folders (recursive delete) |
+
+#### GET /api/make_sdcard_directory
+
+Creates a new directory on the SD card.
+
+| Parameter | Type   | Required | Description                     |
+| --------- | ------ | -------- | ------------------------------- |
+| `dir`     | string | yes      | Full path for the new directory |
+
+#### GET /api/rename_sdcard_file
+
+Renames or moves a file/folder on the SD card.
+
+| Parameter | Type   | Required | Description      |
+| --------- | ------ | -------- | ---------------- |
+| `src`     | string | yes      | Source path      |
+| `dest`    | string | yes      | Destination path |
+
+#### POST /api/upload_file_to_host
+
+Uploads a file to the management server's `./uploads/` directory.
+
+**Form data:** `myFile` (file)
+
+#### GET /api/upload_file_to_printer
+
+Transfers a file from the server's uploads directory to the printer SD card via FTPS.
+
+| Parameter | Type   | Required | Description                              |
+| --------- | ------ | -------- | ---------------------------------------- |
+| `src`     | string | yes      | Filename in `./uploads/` (basename only) |
+| `dest`    | string | yes      | Full destination path on SD card         |
+
+#### GET /api/download_file_from_printer
+
+Downloads a file from the printer SD card.
+
+| Parameter | Type   | Required | Description              |
+| --------- | ------ | -------- | ------------------------ |
+| `src`     | string | yes      | Full path on the SD card |
+
+#### GET /api/get_3mf_props_for_file
+
+Parses and returns metadata for a `.3mf` file.
+
+| Parameter | Type   | Required | Description                          |
+| --------- | ------ | -------- | ------------------------------------ |
+| `file`    | string | yes      | Full SD card path to the `.3mf` file |
+| `plate`   | int    | no       | Plate number (1-based, default: 1)   |
+
+#### GET /api/get_current_3mf_props
+
+Returns metadata for the currently active print job.
+
+---
+
+### Tool Control (Dual Extruder — H2D/H2D Pro)
+
+#### GET /api/toggle_active_tool
+
+Switches between right (0) and left (1) extruders.
+
+#### GET /api/set_nozzle_details
+
+Sets nozzle diameter and material type for the active extruder.
+
+| Parameter         | Type   | Required | Description                                                                       |
+| ----------------- | ------ | -------- | --------------------------------------------------------------------------------- |
+| `nozzle_diameter` | float  | yes      | Diameter in mm: `0.2`, `0.4`, `0.6`, `0.8`                                        |
+| `nozzle_type`     | string | yes      | Material: `STAINLESS_STEEL`, `HARDENED_STEEL`, `TUNGSTEN_CARBIDE`, `BRASS`, `E3D` |
+
+#### GET /api/refresh_nozzles
+
+Requests the printer push current nozzle info in its next status message.
+
+---
+
+### Detection & Safety
+
+#### GET /api/set_buildplate_marker_detector
+
+| Parameter | Type | Required | Description                              |
+| --------- | ---- | -------- | ---------------------------------------- |
+| `enabled` | bool | yes      | `"true"` enables, anything else disables |
+
+#### GET /api/set_spaghetti_detector
+
+| Parameter     | Type   | Required | Description                              |
+| ------------- | ------ | -------- | ---------------------------------------- |
+| `enabled`     | bool   | yes      | `"true"` enables, anything else disables |
+| `sensitivity` | string | no       | `"low"`, `"medium"` (default), `"high"`  |
+
+#### GET /api/set_purgechutepileup_detector
+
+| Parameter     | Type   | Required | Description                              |
+| ------------- | ------ | -------- | ---------------------------------------- |
+| `enabled`     | bool   | yes      | `"true"` enables, anything else disables |
+| `sensitivity` | string | no       | `"low"`, `"medium"` (default), `"high"`  |
+
+#### GET /api/set_nozzleclumping_detector
+
+| Parameter     | Type   | Required | Description                              |
+| ------------- | ------ | -------- | ---------------------------------------- |
+| `enabled`     | bool   | yes      | `"true"` enables, anything else disables |
+| `sensitivity` | string | no       | `"low"`, `"medium"` (default), `"high"`  |
+
+#### GET /api/set_airprinting_detector
+
+| Parameter     | Type   | Required | Description                              |
+| ------------- | ------ | -------- | ---------------------------------------- |
+| `enabled`     | bool   | yes      | `"true"` enables, anything else disables |
+| `sensitivity` | string | no       | `"low"`, `"medium"` (default), `"high"`  |
+
+---
+
+### AMS Control
+
+#### GET /api/send_ams_control_command
+
+| Parameter | Type   | Required | Description                   |
+| --------- | ------ | -------- | ----------------------------- |
+| `cmd`     | string | yes      | `PAUSE`, `RESUME`, or `RESET` |
+
+#### GET /api/set_ams_user_setting
+
+| Parameter | Type   | Required | Description                                                           |
+| --------- | ------ | -------- | --------------------------------------------------------------------- |
+| `setting` | string | yes      | `CALIBRATE_REMAIN_FLAG`, `STARTUP_READ_OPTION`, or `TRAY_READ_OPTION` |
+| `enabled` | bool   | yes      | `"true"` enables, anything else disables                              |
+
+---
+
+### Advanced Settings
+
+#### GET /api/send_gcode
+
+Sends raw G-code commands to the printer. Use `|` to separate multiple commands (converted to newlines).
+
+| Parameter | Type   | Required | Description      |
+| --------- | ------ | -------- | ---------------- | --------------- |
+| `gcode`   | string | yes      | G-code string (` | ` for newlines) |
+
+**Warning:** Direct G-code bypasses safety interlocks.
+
+#### GET /api/set_print_option
+
+| Parameter | Type   | Required | Description                                                                                                                 |
+| --------- | ------ | -------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `option`  | string | yes      | `AUTO_RECOVERY`, `FILAMENT_TANGLE_DETECT`, `SOUND_ENABLE`, `AUTO_SWITCH_FILAMENT`, `NOZZLE_BLOB_DETECT`, `AIR_PRINT_DETECT` |
+| `enabled` | bool   | yes      | `"true"` enables, anything else disables                                                                                    |
+
+#### GET /api/set_light_state
+
+Controls chamber and column LED lights.
+
+| Parameter | Type   | Required | Description                              |
+| --------- | ------ | -------- | ---------------------------------------- |
+| `state`   | string | yes      | `"on"` turns on, anything else turns off |
+
+#### GET /api/set_speed_level
+
+Sets the print speed profile.
+
+| Parameter | Type   | Required | Description                                                        |
+| --------- | ------ | -------- | ------------------------------------------------------------------ |
+| `level`   | string | yes      | `"1"` (silent), `"2"` (standard), `"3"` (sport), `"4"` (ludicrous) |
+
+---
+
+### Telemetry
+
+#### GET /api/get_all_data
+
+Returns full telemetry history combined with current printer state.
+
+#### GET /api/zoom_in
+
+Zooms in on a telemetry chart (reduces visible window by 500s, minimum 500s).
+
+| Parameter | Type   | Required | Description                                                                                                |
+| --------- | ------ | -------- | ---------------------------------------------------------------------------------------------------------- |
+| `name`    | string | yes      | Collection: `tool`, `bed`, `chamber`, `fan`, `aux_fan`, `exhaust_fan`, `heatbreak_fan`, `tool_0`, `tool_1` |
+
+#### GET /api/zoom_out
+
+Zooms out on a telemetry chart (increases visible window by 500s).
+
+| Parameter | Type   | Required | Description                      |
+| --------- | ------ | -------- | -------------------------------- |
+| `name`    | string | yes      | Same collection names as zoom_in |
+
+#### GET /api/dump_data_ds.collections
+
+Dumps all internal data collections as JSONL (newline-delimited JSON).
+
+---
+
+### System & Diagnostics
+
+#### GET /api/toggle_session
+
+Pauses or resumes the MQTT connection.
+
+#### GET /api/trigger_printer_refresh
+
+Forces printer reconnection. If disconnected: `quit()` + `start_session()`. If connected: `refresh()`.
+
+#### GET /api/toggle_verbosity
+
+Toggles root logger between DEBUG and INFO.
+
+| Parameter | Type | Required | Description                             |
+| --------- | ---- | -------- | --------------------------------------- |
+| `verbose` | bool | no       | `"true"` for verbose, default `"false"` |
+
+#### GET /api/dump_log
+
+Returns contents of `./output.log`.
+
+#### GET /api/truncate_log
+
+Clears the log file.
+
+#### GET /api/fake_error
+
+Test endpoint that raises `ZeroDivisionError` to test error handling.
+
+---
+
+### OpenAPI / Swagger
+
+#### GET /api/openapi.json
+
+Returns the generated OpenAPI 3.0 schema.
+
+#### GET /api/docs
+
+Serves Swagger UI for interactive API exploration.
+
+---
+
+# Basics
+
+Source: https://github.com/doridian/openbambuapi/blob/main/mqtt.md
+
+# Basics
+
+All messages on the MQTT broker are JSON encoded
+
+There is two ways to connect to the MQTT broker
+
+## Cloud MQTT server
+
+URL: `mqtt://us.mqtt.bambulab.com:8883`
+
+TLS: **yes**
+
+Authentication: **required**
+
+**Username:** `u_{USER_ID}`, where the user id can be grabbed via [the GET /v1/design-user-service/my/preference
+ API](cloud-http.md#get-v1design-user-servicemypreference)
+
+**Password:** `{ACCESS_TOKEN}` (the entire access token, no prefix or suffix)
+
+## Local MQTT server
+
+URL: `mqtt://{PRINTER_IP}:8883`
+
+TLS: **yes**
+
+Authentication: **required**
+
+**Username:** `bblp`
+
+**Password:** `dev_access_code` from a `Device` object (aka the LAN access code).
+
+Wildcard subscriptions with `#` possible
+
+> [!IMPORTANT]  
+> Check out the [TLS Certificates](tls.md) page for more information on how to securely connect.
+
+# Topics
+
+## device/{DEVICE_ID}/report
+
+For information from the device to the slicer, including responses to commands
+
+## device/{DEVICE_ID}/request
+
+For commands to the device from the slicer
+
+# Requests and reports
+
+## Overview
+
+**Request structure**
+
+```json
+{
+    "{TYPE}": {
+        "sequence_id": "0", // Incremented by 1 on each command
+        "command": "{COMMAND}",
+        ...
+    }
+}
+```
+
+**Report structure**
+
+```json
+{
+    "{TYPE}": {
+        "sequence_id": "0", // Same as the one sent in the request
+        "command": "{COMMAND}",
+
+        "result": "success", // Case insensitive!
+        "reason": "", // Might not be present for some commands
+
+        ... // All parameters from the original command
+    }
+}
+```
+
+## info.get_version
+
+Get current version of printer
+
+**Request**
+
+```json
+{
+    "info": {
+        "sequence_id": "0",
+        "command": "get_version"
+    }
+}
+```
+
+**Report**
+
+```json
+{
+    "info": {
+        "command": "get_version",
+        "module": [
+            {
+                "hw_ver": "",
+                "name": "ota",
+                "sn": "",
+                "sw_ver": "01.01.01.00"
+            },
+            {
+                "hw_ver": "AP05",
+                "name": "rv1126",
+                "sn": "[REDACTED]",
+                "sw_ver": "00.00.14.74"
+            },
+            {
+                "hw_ver": "TH07",
+                "name": "th",
+                "sn": "[REDACTED]",
+                "sw_ver": "00.00.03.79"
+            },
+            {
+                "hw_ver": "MC07",
+                "name": "mc",
+                "sn": "[REDACTED]",
+                "sw_ver": "00.00.10.48/00.00.10.48"
+            },
+            {
+                "hw_ver": "",
+                "name": "xm",
+                "sn": "",
+                "sw_ver": "00.00.00.00"
+            }
+        ],
+        "sequence_id": "0"
+    }
+}
+```
+
+## pushing.pushall
+
+Reports the complete status of the printer. 
+
+This is unnecessary for the X1 series since it already transmits the full object each time. However, the P1 series only sends the values that have been updated compared to the previous report.
+
+> [!CAUTION]
+> As a rule of thumb, refrain from executing this command at intervals less than 5 minutes on the P1P, as it may cause lag due to its hardware limitations.
+
+**Request**
+
+```json
+{
+    "pushing": {
+        "sequence_id": "0",
+        "command": "pushall",
+        "version": 1,
+        "push_target": 1
+    }
+}
+```
+
+**Report**
+
+```json
+{
+    "print": {
+        "ams": {
+            "ams": [
+              {
+                "humidity": "4",
+                "id": "0",
+                "temp": "22.7",
+                "tray": [
+                    {
+                        "id": "0" // an empty tray
+                    },
+                    {
+                        "bed_temp": "0",
+                        "bed_temp_type": "0",
+                        "cols": [
+                            "000000FF"
+                        ],
+                        "drying_temp": "0",
+                        "drying_time": "0",
+                        "id": "1",
+                        "nozzle_temp_max": "240",
+                        "nozzle_temp_min": "190",
+                        "remain": 0,
+                        "tag_uid": "0000000000000000",
+                        "tray_color": "000000FF",
+                        "tray_diameter": "0.00",
+                        "tray_id_name": "",
+                        "tray_info_idx": "GFA00",
+                        "tray_sub_brands": "",
+                        "tray_type": "PLA",
+                        "tray_uuid": "00000000000000000000000000000000",
+                        "tray_weight": "0",
+                        "xcam_info": "000000000000000000000000"
+                    },
+                    {
+                        "bed_temp": "0",
+                        "bed_temp_type": "0",
+                        "cols": [
+                            "DFE2E3FF"
+                        ],
+                        "drying_temp": "0",
+                        "drying_time": "0",
+                        "id": "2",
+                        "nozzle_temp_max": "240",
+                        "nozzle_temp_min": "190",
+                        "remain": 0,
+                        "tag_uid": "0000000000000000",
+                        "tray_color": "DFE2E3FF",
+                        "tray_diameter": "0.00",
+                        "tray_id_name": "",
+                        "tray_info_idx": "GFA05",
+                        "tray_sub_brands": "",
+                        "tray_type": "PLA",
+                        "tray_uuid": "00000000000000000000000000000000",
+                        "tray_weight": "0",
+                        "xcam_info": "000000000000000000000000"
+                    },
+                    {
+                        "bed_temp": "0",
+                        "bed_temp_type": "0",
+                        "cols": [
+                            "F95959FF"
+                        ],
+                        "drying_temp": "0",
+                        "drying_time": "0",
+                        "id": "3",
+                        "nozzle_temp_max": "240",
+                        "nozzle_temp_min": "190",
+                        "remain": 0,
+                        "tag_uid": "0000000000000000",
+                        "tray_color": "F95959FF",
+                        "tray_diameter": "0.00",
+                        "tray_id_name": "",
+                        "tray_info_idx": "GFL00",
+                        "tray_sub_brands": "",
+                        "tray_type": "PLA",
+                        "tray_uuid": "00000000000000000000000000000000",
+                        "tray_weight": "0",
+                        "xcam_info": "000000000000000000000000"
+                    }
+                ]
+            }
+        ],
+        "ams_exist_bits": "1",
+        "insert_flag": true,
+        "power_on_flag": false,
+        "tray_exist_bits": "e",
+        "tray_is_bbl_bits": "e",
+        "tray_now": "255", // 254 if external spool / vt_tray, otherwise is ((ams_id * 4) + tray_id) for current tray (ams 2 tray 2 would be (1*4)+1 = 5)
+        "tray_pre": "255",
+        "tray_read_done_bits": "e",
+        "tray_reading_bits": "0",
+        "tray_tar": "255",
+        "version": 4
+        },
+        "ams_rfid_status": 6,
+        "ams_status": 0,
+        "aux_part_fan": true, // is aux fan installed
+        "bed_target_temper": 25.0,
+        "bed_temper": 25.0,
+        "big_fan1_speed": "0", // Auxilliary fan
+        "big_fan2_speed": "0", // Chamber fan
+        "chamber_temper": 24.0,
+        "command": "push_status",
+        "cooling_fan_speed": "0", // Part Cooling fan
+        "fail_reason": "0",
+        "fan_gear": 0,
+        "filam_bak": [],
+        "force_upgrade": false,
+        "gcode_file": "",
+        "gcode_file_prepare_percent": "0",
+        "gcode_start_time": "0",
+        "gcode_state": "IDLE",
+        "heatbreak_fan_speed": "0",
+        "hms": [],
+        "home_flag": 0,
+        "hw_switch_state": 1,
+        "ipcam": {
+            "ipcam_dev": "1",
+            "ipcam_record": "disable",
+            "resolution": "1080p",
+            "timelapse": "disable"
+        },
+        "layer_num": 0,
+        "lifecycle": "product",
+        "lights_report": [
+            {
+                "mode": "on",
+                "node": "chamber_light"
+            },
+            {
+                "mode": "flashing",
+                "node": "work_light"
+            }
+        ],
+        "maintain": 3,
+        "mc_percent": 0,
+        "mc_print_error_code": "0",
+        "mc_print_stage": "1",
+        "mc_print_sub_stage": 0,
+        "mc_remaining_time": 0,
+        "mess_production_state": "active",
+        "nozzle_diameter": "0.4",
+        "nozzle_target_temper": 25.0,
+        "nozzle_temper": 25.0,
+        "online": {
+            "ahb": false,
+            "rfid": false,
+            "version": 9
+        },
+        "print_error": 0,
+        "print_gcode_action": 0,
+        "print_real_action": 0,
+        "print_type": "",
+        "profile_id": "",
+        "project_id": "",
+        "queue_number": 0,
+        "sdcard": true,
+        "sequence_id": "2021",
+        "spd_lvl": 2,
+        "spd_mag": 100,
+        "stg": [],
+        "stg_cur": -1,
+        "subtask_id": "",
+        "subtask_name": "",
+        "task_id": "",
+        "total_layer_num": 0,
+        "upgrade_state": {
+            "ahb_new_version_number": "",
+            "ams_new_version_number": "",
+            "consistency_request": false,
+            "dis_state": 0,
+            "err_code": 0,
+            "force_upgrade": false,
+            "message": "",
+            "module": "null",
+            "new_version_state": 2,
+            "ota_new_version_number": "",
+            "progress": "0",
+            "sequence_id": 0,
+            "status": "IDLE"
+        },
+        "upload": {
+            "file_size": 0,
+            "finish_size": 0,
+            "message": "Good",
+            "oss_url": "",
+            "progress": 0,
+            "sequence_id": "0903",
+            "speed": 0,
+            "status": "idle",
+            "task_id": "",
+            "time_remaining": 0,
+            "trouble_id": ""
+        },
+        "vt_tray": { // external spool
+            "bed_temp": "0",
+            "bed_temp_type": "0",
+            "cols": [
+                "00000000"
+            ],
+            "drying_temp": "0",
+            "drying_time": "0",
+            "id": "254",
+            "nozzle_temp_max": "0",
+            "nozzle_temp_min": "0",
+            "remain": 0,
+            "tag_uid": "0000000000000000",
+            "tray_color": "00000000",
+            "tray_diameter": "0.00",
+            "tray_id_name": "",
+            "tray_info_idx": "",
+            "tray_sub_brands": "",
+            "tray_type": "",
+            "tray_uuid": "00000000000000000000000000000000",
+            "tray_weight": "0",
+            "xcam_info": "000000000000000000000000"
+            },
+        "wifi_signal": "-45dBm",
+        "xcam": {
+            "allow_skip_parts": false,
+            "buildplate_marker_detector": false,
+            "first_layer_inspector": true,
+            "halt_print_sensitivity": "medium",
+            "print_halt": true,
+            "printing_monitor": true,
+            "spaghetti_detector": true
+        },
+        "xcam_status": "0"
+    }
+}
+```
+
+## upgrade.upgrade_confirm
+
+Part of firmware upgrade process
+
+**Request**
+
+```json
+{
+    "upgrade": {
+        "sequence_id": "0",
+        "command": "upgrade_confirm",
+        "src_id": 1 // src_id is always 1 for the slicer
+    }
+}
+```
+
+**Report**
+
+TODO
+
+
+## upgrade.consistency_confirm
+
+Part of firmware upgrade process
+
+**Request**
+
+```json
+{
+    "upgrade": {
+        "sequence_id": "0",
+        "command": "consistency_confirm",
+        "src_id": 1 // src_id is always 1 for the slicer
+    }
+}
+```
+
+**Report**
+
+TODO
+
+## upgrade.start
+
+Part of firmware upgrade process
+
+**Request**
+
+```json
+{
+    "upgrade": {
+        "sequence_id": "0",
+        "command": "start",
+        "src_id": 1, // src_id is always 1 for the slicer
+        "url": "...",
+        "module": "ota", // ota or ams
+        "version": "",
+    }
+}
+```
+
+**Report**
+
+TODO
+
+## upgrade.get_history
+
+Return the firmware history of the printer
+
+**Request**
+
+```json
+{
+    "upgrade": {
+        "sequence_id": "0",
+        "command": "get_history"
+    }
+}
+```
+
+**Report**
+
+```json
+{
+  "upgrade": {
+    "command": "get_history",
+    "firmware_optional": [
+      {
+        "ams": [
+          {
+            "address": 0,
+            "dev_model_name": "BL-A001",
+            "device_id": "{DEVICE_ID}",
+            "firmware": [
+              {
+                "description": "",
+                "force_update": false,
+                "url": "http://public-cdn.bambulab.com/upgrade/device/BL-A001/00.00.05.96/product/ams-ota_v00.00.05.96-20230106163615.json.sig",
+                "version": "00.00.05.96"
+              }
+            ],
+            "firmware_current": null
+          }
+        ],
+        "firmware": {
+          "description": "",
+          "force_update": false,
+          "url": "https://public-cdn.bambulab.com/upgrade/device/BL-P001/01.04.01.00/product/ota-v01.04.01.00-20230227162230.json.sig",
+          "version": "01.04.01.00"
+        }
+      }
+    ],
+    "reason": "",
+    "result": "success",
+    "sequence_id": "0"
+  }
+}
+```
+
+## Trigger downgrade
+TODO
+
+## print.stop
+
+Stops a print. Sent with QoS of **1** for higher priority.
+
+**Request**
+
+```json
+{
+    "print": {
+        "sequence_id": "0",
+        "command": "stop",
+        "param": "", // Always empty
+    }
+}
+```
+
+**Report**
+
+See basic structure
+
+## print.pause
+
+Pauses a print. Sent with QoS of **1** for higher priority.
+
+**Request**
+
+```json
+{
+    "print": {
+        "sequence_id": "0",
+        "command": "pause",
+        "param": "", // Always empty
+    }
+}
+```
+
+**Report**
+
+See basic structure
+
+## print.resume
+
+Resumes a print. Sent with QoS of **1** for higher priority.
+
+**Request**
+
+```json
+{
+    "print": {
+        "sequence_id": "0",
+        "command": "resume",
+        "param": "", // Always empty
+    }
+}
+```
+
+**Report**
+
+See basic structure
+
+## print.ams_change_filament
+
+Tells printer to perform a filament change using AMS.
+
+**Request**
+
+```json
+{
+    "print": {
+        "sequence_id": "0",
+        "command": "ams_change_filament",
+        "target": 0, // ID of filament tray
+        "curr_temp": 0, // Old print temperature
+        "tar_temp": 0 // New print temperature
+    }
+}
+```
+
+**Report**
+
+TODO
+
+## print.ams_get_rfid
+
+Read RFID info
+
+**Request**
+
+```json
+{
+    "print": {
+        "sequenceId": "0",
+        "command": "ams_get_rfid",
+        "ams_id": 0, // Index of the AMS
+        "slot_id": 0 // Index of the Tray
+    }
+}
+```
+
+**Report**
+
+```json
+{
+    "print": {
+        "sequenceId": "0",
+        "command": "ams_get_rfid",
+        "result": "success",
+        "reason": "success",
+        "ams_id": 0,
+        "slot_id": 0
+    }
+}
+```
+
+## print.ams_user_setting
+
+Changes the AMS settings of the given unit.
+
+**Request**
+
+```json
+{
+    "print": {
+        "sequence_id": "0",
+        "command": "ams_user_setting",
+        "ams_id": 0, // Index of the AMS
+        "startup_read_option": true, // Read RFID on startup
+        "tray_read_option": true // Read RFID on insertion
+    }
+}
+```
+
+**Report**
+
+TODO
+
+## print.ams_filament_setting
+
+Changes the setting of the given filament in the given AMS.
+
+**Request**
+
+```json
+{
+    "print": {
+        "sequence_id": "0",
+        "command": "ams_filament_setting",
+        "ams_id": 0, // Index of the AMS
+        "tray_id": 0, // Index of the tray
+        "tray_info_idx": "", // Probably the setting ID of the filament profile
+        "tray_color": "00112233", // Formatted as hex RRGGBBAA (alpha is always FF)
+        "nozzle_temp_min": 0, // Minimum nozzle temp for filament (in C)
+        "nozzle_temp_max": 0, // Maximum nozzle temp for filament (in C)
+        "tray_type": "PLA" // Type of filament, such as "PLA" or "ABS"
+    }
+}
+```
+
+**Report**
+
+TODO
+
+## print.ams_control
+
+Gives basic control commands for the AMS.
+
+**Request**
+
+```json
+{
+    "print": {
+        "sequence_id": "0",
+        "command": "ams_control",
+        "param": "resume" // "resume", "reset" or "pause"
+    }
+}
+```
+
+**Report**
+
+TODO
+
+## print.print_speed
+
+Set print speed to one of the 4 presets.
+
+**Request**
+
+```json
+{
+    "print": {
+        "sequence_id": "0",
+        "command": "print_speed",
+        "param": "2" // Print speed level as a string
+                     // 1 = silent
+                     // 2 = standard
+                     // 3 = sport
+                     // 4 = ludicrous
+    }
+}
+```
+
+**Report**
+
+See basic structure
+
+## print.gcode_file
+
+Print a gcode file. This takes absolute paths.
+
+**Request**
+
+```json
+{
+    "print": {
+        "sequence_id": "0",
+        "command": "gcode_file",
+        "param": "filename.gcode" // Filename (on the printer's filesystem) to print
+    }
+}
+```
+
+**Report**
+
+See basic structure
+
+## print.gcode_line
+
+Send raw GCode to the printer.
+
+**Request**
+
+```json
+{
+    "print": {
+        "sequence_id": "0",
+        "command": "gcode_line",
+        "param": "M420", // Gcode to execute, can use \n for multiple lines
+        "user_id": "1234" // Optional
+    }
+}
+```
+
+**Report**
+
+See basic structure
+
+## print.calibration
+
+Starts calibration process.
+
+**Note:** Some printers might need `gcode_file` with `/usr/etc/print/auto_cali_for_user.gcode` instead!
+
+**Note:** The options parameter should be a bitmask like this:
+```
+ if (lidarCalibration) bitmask |= 1;
+ if (bedLevelling) bitmask |= 1 << 1;
+ if (vibrationCompensation) bitmask |= 1 << 2;
+ if (motorCancellation) bitmask |= 1 << 3;
+```
+
+**Request**
+
+```json
+{
+    "print": {
+        "sequence_id": "0",
+        "command": "calibration",
+        "option": 0,
+    }
+}
+```
+
+**Report**
+
+TODO
+
+## print.unload_filament
+
+Unloads the filament.
+
+**Note:** Some printers might need `gcode_file` with `/usr/etc/print/filament_unload.gcode` instead!
+
+**Request**
+
+```json
+{
+    "print": {
+        "sequence_id": "0",
+        "command": "unload_filament"
+    }
+}
+```
+
+**Report**
+
+```json
+{
+    // TODO
+}
+```
+
+## print.project_file
+
+Prints a "project"
+
+**Request**
+```json
+{
+    "print": {
+        "sequence_id": "0",
+        "command": "project_file",
+        "param": "Metadata/plate_X.gcode",
+        "project_id": "0", // Always 0 for local prints
+        "profile_id": "0", // Always 0 for local prints
+        "task_id": "0", // Always 0 for local prints
+        "subtask_id": "0", // Always 0 for local prints
+        "subtask_name": "",
+
+        "file": "", // Filename to print, not needed when "url" is specified with filepath
+        "url": "file:///mnt/sdcard", // URL to print. Root path, protocol can vary. E.g., if sd card, "ftp:///myfile.3mf", "ftp:///cache/myotherfile.3mf"
+        "md5": "",
+
+        "timelapse": true,
+        "bed_type": "auto", // Always "auto" for local prints
+        "bed_levelling": true,
+        "flow_cali": true,
+        "vibration_cali": true,
+        "layer_inspect": true,
+        "ams_mapping": "",
+        "use_ams": false
+    }
+}
+```
+
+
+
+**Report**
+
+See basic structure
+
+
+## AMS Mapping Configuration (`ams_mapping`)
+
+### Overview
+
+The `ams_mapping` parameter is crucial for multi-color print jobs when using the AMS (Automatic Material System). It defines which AMS slot corresponds to each color in your print file.
+
+### Structure
+
+```json
+{
+  "print": {
+    "ams_mapping": [
+      -1,
+      -1,
+      -1,
+      1,
+      0
+    ],
+    // ... rest of print command
+  }
+}
+```
+
+### How AMS Mapping Works
+
+The `ams_mapping` array uses a **reverse indexing system** where:
+- **Array positions** represent color indices in your print file (starting from 0)
+- **Array values** represent AMS slot numbers (0-3 for typical 4-slot AMS)
+- **-1** indicates unused color slots
+
+#### Key Rules:
+1. **Fixed array length**: Always use 5 elements (supports up to 4 colors + padding)
+2. **Right-to-left assignment**: Color assignments fill from the end of the array
+3. **Pad with -1**: Fill unused positions at the beginning with -1
+
+
+| Colors Used | Array Pattern | Description |
+|----------|---------------|-------------|
+| 1 color     | `[-1, -1, -1, -1, X]` | Single color uses AMS slot X |
+| 2 colors    | `[-1, -1, -1, X, Y]` | Colors map to slots X and Y |
+| 3 colors    | `[-1, -1, X, Y, Z]` | Colors map to slots X, Y, and Z |
+| 4 colors    | `[-1, W, X, Y, Z]` | Colors map to slots W, X, Y, and Z |
+
+### Important Notes
+
+- **AMS slot numbers** are zero-indexed (0, 1, 2, 3)
+- **Color indices** in your print file start from 0
+- The printer will just pause and won't start if the mapping is not correct
+- Ensure the specified AMS slots contain the correct filament types and colors
+- Always set `"use_ams": true` when using AMS mapping
+- Verify your AMS is properly loaded before sending the print job
+---
+
+## print.skip_objects
+
+Skips object ids defined in slice_info.config
+
+**Request**
+```json
+{
+  "print": {
+    "sequence_id": "0",
+    "command": "skip_objects",
+    "timestamp": {unix_timestamp} // Current Unix timestamp, seems to be optional. 
+    "obj_list": [ 
+      206 // List of canceled object IDs. 
+    ]
+  }
+}
+```
+
+**Report**
+
+Updates [`pushing.pushall`](#pushingpushall) with 
+```json
+"s_obj": [
+      {obj ids}
+    ],
+```
+
+## print.print_option
+
+Modifies the printer's settings.
+
+**Request**
+```json
+{
+  "print": {
+    "sequence_id": "0",
+    "command": "print_option",
+    "auto_recovery": true // can be "auto_recovery", "air_print_detect", "filament_tangle_detect", "nozzle_blob_detect", or "sound_enable"
+  }
+}
+
+```
+
+**Report**
+
+See basic structure
+
+## system.ledctrl
+
+Controls the LEDs of the printer.
+
+**Request**
+
+```json
+{
+    "system": {
+        "sequence_id": "0",
+        "command": "ledctrl",
+        "led_node": "chamber_light", // Either "chamber_light" or "work_light"
+        "led_mode": "on", // "on", "off" or "flashing"
+
+        // The below effects are only used for "flashing" mode
+        // but required to be present always
+        "led_on_time": 500, // LED on time in ms
+        "led_off_time": 500, // LED off time in ms
+        "loop_times":  1, // How many times to loop
+        "interval_time": 1000 // Looping interval
+    }
+}
+```
+
+**Report**
+
+See basic structure
+
+## system.get_access_code
+
+Gets the LAN access code of the printer
+
+**Request**
+```json
+{
+    "system": {
+        "sequence_id": "0",
+        "command": "get_access_code"
+    }
+}
+```
+
+**Report**
+
+```json
+{
+    "system": {
+        "sequence_id": "0",
+        "command": "get_access_code",
+        "access_code": "{ACCESS_CODE}",
+        "result": "success"
+    }
+}
+```
+
+## system.set_accessories.nozzle
+
+Update the nozzle type and diameter.
+
+```json
+{
+    "system": {
+        "sequence_id": "0",
+        "accessory_type": "nozzle",
+        "command": "set_accessories",
+        "nozzle_diameter": 0.4,
+        "nozzle_type": "stainless_steel" // "stainless_steel" or "hardened_steel"
+    }
+}
+```
+
+## camera.ipcam_record_set
+
+Turns on or off creating a recording of prints.
+
+**Request**
+
+```json
+{
+    "camera": {
+        "sequence_id": "0",
+        "command": "ipcam_record_set",
+        "control": "enable" // "enable" or "disable"
+    }
+}
+```
+
+**Report**
+
+See basic structure
+
+## camera.ipcam_timelapse
+
+Turns on or off creating a timelapse of prints.
+
+**Request**
+
+```json
+{
+    "camera": {
+        "sequence_id": "0",
+        "command": "ipcam_timelapse",
+        "control": "enable" // "enable" or "disable"
+    }
+}
+```
+
+**Report**
+
+See basic structure
+
+
+## xcam.xcam_control_set
+
+Configures the XCam (camera AI features, including Micro LIDAR features).
+
+**Request**
+
+```json
+{
+    "xcam": {
+        "sequence_id": "0",
+        "command": "xcam_control_set",
+        "module_name": "first_layer_inspector", // "first_layer_inspector", "buildplate_marker_detector", "printing_monitor", "pileup_detector", "airprint_detector", "clump_detector", or "spaghetti_detector"
+        "control": true, // Enable the module
+        "print_halt": false // Cause the module to halt the print on error
+    }
+}
+```
+
+**Report**
+
+See basic structure
+
+# Unsolicited (or semi-solicited) reports
+
+## print.push_status
+
+Reports printer status
+
+### X1 Series
+The X1 series always responds with the full object. See [`pushing.pushall`](#pushingpushall) for said object.
+
+### P1 Series
+Due to performance limitations the P1P uses the same object, but only actually responds with values that have been changed since the previous report. The full data can be requested using the [`pushing.pushall`](#pushingpushall) request.
+
+## mc_print.push_info
+
+Reports log lines of the printer. Can be requested with the [`pushing.pushall`](#pushingpushall) request.
+
+```json
+{
+    "mc_print": {
+        "command": "push_info",
+        "param": "[LINK] GcodeLine (8) l=15 from 0600 ok: M106 P2 S255 \n\n",
+        "sequence_id": "107"
+    }
+}
+```
+
+## mc_print.command = "push_info", mc_print.param = "[BMC] M900 KX.XXXX, LX.XXXXX, MX.XXXXX"
+
+Report after Lidar calibration of the pressure advance (the reported K value)
+
+```json
+{
+    "mc_print": {
+        "command": "push_info",
+        "param": "[BMC] M900 KX.XXXX, LX.XXXXX, MX.XXXXX",
+        "sequence_id": "2004"
+    }
+}
+```
+
+## mc_print.command = "push_info", mc_print.param = "[AMS][TASK]amsX temp:XX.X;humidity:XX%;humidity_idx:X"
+
+Report for the raw value for AMS humidity % per AMS id
+
+```json
+{
+    "mc_print": {
+        "command":"push_info",
+        "param":"[AMS][TASK]ams0 temp:18.4;humidity:30%;humidity_idx:4",
+        "sequence_id":"83"
+    }
+}
+```
+
+---
+
+# TLS Certificates
+
+Source: https://github.com/doridian/openbambuapi/blob/main/tls.md
+
+# TLS Certificates
+
+When working with cloud or local printer APIs, proper certificate validation is essential to prevent man-in-the-middle (MITM) attacks.
+
+## Example Code
+
+See the [examples folder](./examples/) for Python and Node.js.
+This is the easiest way to get started without worrying about the technical details.
+
+## Who issued the certificate?
+
+The most basic check is to ensure that the certificate is issued by a trusted Certificate Authority (CA).
+
+### Cloud
+
+Typically automatically validated by libraries.
+
+- These certificates are issued by `DigiCert, Inc.`.
+
+### Printer
+
+Configure your MQTT/FTP/TLS libraries to trust [BBL CA](./examples/ca_cert.pem).
+
+- The certificate in your printer is issued by Bambu Lab.
+
+## Who is the certificate issued to?
+
+This is another important check to ensure you are not only communicating with _any_ server, but the _correct_ server.
+
+Certificates contain a common name (CN) field that specifies the host name of the server.
+
+### Cloud
+
+Typically automatically validated by libraries.
+
+- Example: certificate contains `CN=*.mqtt.bambulab.com`, you connect to `us.mqtt.bambulab.com`
+
+### Printer
+
+Requires [Server Name Indication (SNI)](https://en.wikipedia.org/wiki/Server_Name_Indication).
+
+- Example: certificate contains `CN=<printer's serial number>`, you connect to `192.168.0.5`
+- Not all libraries support SNI, in this case you need to manually check the common name or disable host name validation at your own risk.
+
+## Common Errors
+
+**Do not** disable all SSL/TLS validations when encountering errors like the following. If it's not clear how to fix it, please open an issue at the libraries you are using or at [OpenBambuAPI](https://github.com/Doridian/OpenBambuAPI/issues/new).
+
+- ```text
+  [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: self-signed certificate in certificate chain
+  ```
+
+  This errors can happen when connecting to a printer without trusting the Bambu Lab CA.
+
+  **Fix**: Refer to [Who issued the certificate?](#who-issued-the-certificate)
+
+- ```text
+  [ERR_TLS_CERT_ALTNAME_INVALID]: Hostname/IP does not match certificate's altnames: IP: 192.168.0.5 is not in the cert's list
+
+  [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: IP address mismatch, certificate is not valid for '192.168.0.1'
+  ```
+
+  These errors can happen when connecting to a printer without configuring SNI.
+
+  **Fix**: Refer to [Who is the certificate issued to?](#who-is-the-certificate-issued-to)
+
+- ```text
+  [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: CA cert does not include key usage extension
+  ```
+
+  This error can happen when using python 3.13+ to connect to a printer.
+
+  **Workaround**: Refer to note about [VERIFY_X509_STRICT](https://docs.python.org/3/library/ssl.html#ssl.create_default_context).
+
+---
+
+# Basics
+
+Source: https://github.com/doridian/openbambuapi/blob/main/video.md
+
+# Basics
+
+## X1 and P2S
+
+The X1 series and P2S printers run a RTSP server that streams video over the network.
+
+### Local RTSP Server
+
+- **URL**: `rtsps://{PRINTER_IP}:322/streaming/live/1`
+- **TLS**: [yes](./tls.md)
+- **Authentication**: required
+- **Username**: `bblp`
+- **Password**: `dev_access_code` from a `Device` object (aka the LAN access code).
+
+## H2 series
+
+H2S and H2D printers also serve the same `rtsps://{PRINTER_IP}:322/streaming/live/1`
+RTSPS feed, but on the firmwares observed (H2S `01.02.00.00`, H2D
+`01.02.00.00`) the LAN-RTSPS server appears to be **off by default**:
+port 322 closes the TCP connection immediately and the printer's
+`push_status` reports `ipcam.rtsp_url = "disable"`.
+
+To enable it, on the printer's touchscreen:
+
+1. Settings → General → LAN Mode Liveview (label varies by firmware track)
+2. Toggle "LAN Only Liveview" / "Local RTSP Stream" to on.
+
+After the toggle, `push_status` reports `ipcam.rtsp_url =
+"rtsps://{PRINTER_IP}:322/streaming/live/1"` and the port begins
+accepting connections. The same `bblp` + `dev_access_code` credentials
+apply.
+
+If the local toggle is left off, the printer is still reachable via
+the proprietary cloud-relay transports (TUTK / Agora P2P) and the
+slicer's MediaPlayCtrl path falls through to those automatically; only
+the direct `rtsps://` URL is gated.
+
+## A1 and P1
+
+The A1 and P1 series printers run a simple TCP server that streams 1280x720 JPEG images over the network.
+Integers are encoded in little-endian byte order.
+
+### Local Video Server
+
+- **Host**: `{PRINTER_IP}:6000`
+- **TLS**: [yes](./tls.md)
+- **Authentication**: required
+- **Username**: `bblp`
+- **Password**: `dev_access_code` from a `Device` object (aka the LAN access code).
+
+### Authentication
+
+This packet must be sent when connecting to the server.
+
+| Offset | Size     | Value                                                    |
+| ------ | -------- | -------------------------------------------------------- |
+| 0      | 4 bytes  | Inlined Payload size (0x40)                              |
+| 4      | 4 bytes  | Type (0x3000)                                            |
+| 8      | 4 bytes  | Flags (0)                                                |
+| 12     | 4 bytes  | 0                                                        |
+| 16     | 32 bytes | Username encoded as ASCII, right-padded with null bytes. |
+| 48     | 32 bytes | Password encoded as ASCII, right-padded with null bytes. |
+
+### Header
+
+The server sends a 16-byte header for each frame.
+
+| Offset | Size    | Value        |
+| ------ | ------- | ------------ |
+| 0      | 4 bytes | Payload size |
+| 4      | 4 bytes | itrack (0)   |
+| 8      | 4 bytes | Flags (1)    |
+| 12     | 4 bytes | 0            |
+
+### Image
+
+After the header, the server sends a total of `payload size` bytes containing the JPEG image.
+
+The image data might be received in multiple chunks (e.g. up to 4096 bytes each), depending on the programming language and operating system. These chunks need to be concatenated to reconstruct the complete image.
+
+The following magic bytes can be checked to verify that the image has been successfully received:
+
+- Start of Image: `FF D8`
+- End of Image: `FF D9`
+
+---

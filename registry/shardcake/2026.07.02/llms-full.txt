@@ -1,0 +1,702 @@
+# Shardcake
+
+Source: https://github.com/devsisters/shardcake/blob/series/2.x/README.md
+
+# Shardcake
+
+[![Release Artifacts][Badge-SonatypeReleases]][Link-SonatypeReleases]
+
+[Link-SonatypeReleases]: https://central.sonatype.com/artifact/com.devsisters/shardcake-core_2.13 "Sonatype Releases"
+[Badge-SonatypeReleases]: https://img.shields.io/maven-central/v/com.devsisters/shardcake-core_2.13.svg "Sonatype Releases"
+
+**Shardcake** is a **Scala open source library** that makes it easy to distribute entities across multiple servers and interact with those entities using their ID without knowing their actual location (this is also known as *location transparency*). 
+
+Shardcake exposes a **purely functional API** and depends heavily on [ZIO](https://zio.dev).
+
+The [Documentation](https://devsisters.github.io/shardcake/) explains how to use Shardcake, in particular:
+- how to [get started](https://devsisters.github.io/shardcake/docs/)
+- the [architecture](https://devsisters.github.io/shardcake/docs/architecture.html) behind Shardcake
+- how to [configure](https://devsisters.github.io/shardcake/docs/config.html) it
+- parts you can [customize](https://devsisters.github.io/shardcake/docs/customization.html)
+
+---
+
+# About
+
+Source: https://github.com/devsisters/shardcake/blob/series/2.x/vuepress/docs/about/README.md
+
+# About
+
+**Shardcake** is a project developed at [**Devsisters**](https://www.devsisters.com) by the team behind the popular game [**Cookie Run: Kingdom**](https://www.cookierun-kingdom.com). 
+We have been successfully using this project in production since March 2022.
+
+If you happen to be in South Korea, we are [recruiting](https://careers.devsisters.com/ko/position?occupations=%EA%B0%9C%EB%B0%9C)!
+
+**Shardcake** was developed after years of experience with [**Akka Cluster Sharding**](https://doc.akka.io/docs/akka/current/typed/cluster-sharding.html).
+Even though code has nothing in common with Akka, credits go to them for some ideas and concepts.
+
+![kingdom image](/shardcake/kingdom.png)
+
+---
+
+# Architecture
+
+Source: https://github.com/devsisters/shardcake/blob/series/2.x/vuepress/docs/docs/architecture.md
+
+# Architecture
+
+Make sure to read the [Getting Started](README.md#getting-started) and [Terminology](README.md#terminology) first.
+
+## Main Concepts
+
+![architecture diagram](/shardcake/arch2.png)
+
+- The **Shard Manager** is a single node in charge of maintaining the pods <-> shards assignments.
+  Only one Shard Manager should be alive at any given time.
+- Pods **register** to the Shard Manager when they start and **unregister** when they stop.
+- Pods **read the shard assignments** from the Storage layer (including updates) and cache them locally.
+When the Shard Manager **assigns** or **unassigns** shards to/from pods, it notifies them directly.
+- When a pod **sends a message** to a given entity, 
+it checks which shard this entity belongs to and redirects the message to the pod in charge of that shard.
+That pod will then start the entity behavior locally if it was not already started.
+- The **Shard ID** assigned to an entity is calculated as follows:
+`shardId = abs(entityId.hashCode % numberOfShards) + 1`. In other words, it is a stable number between 1 and the number of shards.
+- When a pod is **unresponsive**, other pods will notify the Shard Manager, who will check with the Health API if the pod is still alive.
+It will then unassign shards from this pod only if the pod is not alive
+(as long as it’s alive, we can’t reassign its shards because it might cause an entity to be alive in 2 different pods).
+
+::: tip No single point of failure
+The Shard Manager is actually involved only when pods are added or removed.
+
+The rest of the time, it does nothing since pods have a cached version of shard assignments and communicate between themselves directly.
+That means they are able to work even if the Shard Manager is down.
+:::
+
+## Detailed flows
+
+### Pod Start (`Sharding#register`)
+
+1. Pod gets shard assignments from the Storage layer.
+2. Pod exposes the sharding API (e.g. starts a gRPC server) so that it can be contacted by the Shard Manager and other pods.
+3. Pod calls the `register` endpoint of the Shard Manager. This will eventually trigger a rebalance, and some shards may be assigned to this pod.
+When that happens, the Shard Manager will call the `assign` API of this pod.
+
+### Pod Stop (`Sharding#unregister`)
+
+1. Pod prevents any new entity to be started locally. Any message received from other pods will return the `EntityNotManagedByThisPod` error and be retried.
+2. Pod stops all local entities by sending them the termination message. Messages currently in progress are processed.
+3. Once all entities are stopped, pod calls the `unregister` endpoint of the Shard Manager. This will trigger an instant rebalance, so that shards handled by this pod will be assigned to other pods.
+4. Pod stops the sharding API and is ready to stop.
+
+### Sending a message to an entity (`Messenger#send`)
+
+1. Pod1 needs to send a message to a given entity.
+2. Pod1 calculates the shard ID for that entity.
+3. Pod1 checks in local shard assignments cache which pod is responsible for this entity. It is Pod2. If Pod1 == Pod2, the next step is skipped.
+4. Pod1 calls the `sendMessage` endpoint of Pod2's sharding API.
+5. Pod2 redirects the message to its `EntityManager`
+6. Pod2 `EntityManager` calculates the shard ID for that entity and checks that this shards ID should be handled locally. If not, it returns the `EntityNotManagedByThisPod` error.
+7. Pod2 starts the entity if it was not already started and forward the message to it.
+8. When a response is produced, the response is sent back to Pod1.
+
+::: tip Unresponsive Pod
+If Pod2 is not responsive, Pod1 will call the `notifyUnhealthyPod` endpoint of the Shard Manager.
+The Shard Manager will check with the Health API (e.g. Kubernetes) if the pod is still alive and unregister it if not.
+Pod1 will keep retrying and hopefully a new pod will be assigned very soon.
+:::
+
+### Rebalance Algorithm
+
+The rebalance process is the action of assigning or unassigning shards from/to pods.
+It is triggered:
+- when the first pod registers (it will be assigned all shards)
+- when a pod unregisters
+- on a regular interval defined by `rebalanceInterval` (see [Config](config.md#shard-manager-configuration))
+
+The workflow is designed so that a shard can never be assigned to 2 different pods at the same time.
+
+1. Shard Manager decides which shards should be assigned and unassigned (see [Assignment Algorithm](#assignment-algorithm)).
+2. Shard Manager pings all pods involved in assignments and unassignments to check that they are responsive (default timeout = 3s, defined by `pingTimeout` (see [Config](config.md#shard-manager-configuration))). 
+This step is to avoid dealing with dead nodes, which would slow down the rebalance process.
+Unresponsive pods are removed from assignments and unassignments.
+Pings are done in parallel.
+3. Shard Manager calls the `unassign` endpoint of all pods that have shards to unassign.
+This is done in parallel.
+When `unassign` succeeds, it means all local entities on those shards have been stopped and are ready to be reassigned.
+4. Any shard that failed to be unassigned is removed from the assignment list.
+5. Shard Manager calls the `assign` endpoint of all pods that have shards to assign.
+This is done in parallel.
+6. If there were any pods that failed to be pinged, unassigned or assigned, we check with the Health API if those pods are still alive.
+If they are not, we unregister them and trigger another rebalance immediately after.
+7. Shard Manager persists the new assignments to the chosen Storage and pods get notified of the changes.
+8. If anything failed, another rebalance will be triggered after a retry interval defined by `rebalanceRetryInterval` (see [Config](config.md#shard-manager-configuration)).
+
+### Assignment Algorithm
+
+The assignment algorithm aims at giving the same amount of shards to each pod.
+It also cares about the pod version, so that in case of a rolling update, shards are assigned in priority to "new" pods in order to limit the number of assignments.
+
+1. Shard Manager calculates the average number of shards per pod (`number of shards / number of pods`).
+2. For each pod: if the number of shards assigned to this pod is higher than the average, randomly pick a number of these shards equal to the difference.
+Those are called `extraShardsToAllocate`.
+If some pods have different versions, `extraShardsToAllocate` is set to empty (it means we’re in the middle of a rolling update, we don’t want to rebalance).
+3. Shards to rebalance =  unassigned shards + `extraShardsToAllocate`.
+We sort them to handle unassigned shards first, then shards on the pods with most shards, then shards on old pods.
+4. For each shard to rebalance:
+  1. Find the pod that has the least amount of shards. Pods that don’t have the latest version are excluded from this search (we don’t want to assign shards to old pods since they will be stopped soon).
+  2. If that pod is the pod the shard is currently assigned to, don’t create any assignments.
+  3. If that pod has only 1 less shard than the currently assigned pod, don’t create any assignments (not worth rebalancing if they have only 1 difference).
+  4. Otherwise, create a new assignment for that shard to that pod, and an unassignment for that shard from its previous pod (if any).
+
+---
+
+# Configuration
+
+Source: https://github.com/devsisters/shardcake/blob/series/2.x/vuepress/docs/docs/config.md
+
+# Configuration
+
+## Sharding Configuration
+
+Here's the list of thing you can configure on the pod side:
+- `numberOfShards`: number of shards
+::: tip How to choose the number of shards?
+`numberOfShards` is used to calculate the shard ID from the entity ID. For that reason, it should be the same on all pods, and can not be changed while the app is running.
+
+If this value is lower than the number of pods, some pods will have no shards (and host no entities), which is inefficient.
+If this value is too low, a difference of 1 shard between 2 pods will be quite significant and introduce some unbalance between the number of entities hosted on each pod.
+On the other hand, if there are too many shards, each pod will have a lot of shards, which will produce an unnecessary overhead.
+
+A good rule of thumb is to set the number of shards to 10x the maximum number of pods that you expect to have.
+:::
+- `selfHost`: hostname or IP address of the current pod
+- `shardingPort`: port used for pods to communicate together
+- `shardManagerUri`: url of the Shard Manager GraphQL API
+- `serverVersion`: version of the current pod
+::: tip What's the version?
+When performing a rolling update (upgrading all pods one by one without downtime), we want to avoid assigning shards to pods that will be stopped soon.
+Ideally, we want to move each shard only once during the whole process.
+
+This `serverVersion` allows the Shard Manager to know which pods are old and which are new. It will then pick the new pods to assign shards.
+:::
+- `entityMaxIdleTime`: time of inactivity (without receiving any message) after which an entity will be stopped
+::: tip Termination Message
+`registerEntity` takes an optional parameter called `terminationMessage`. This allows defining a message that will be sent to your entities before they are stopped (either by a rebalance or because of inactivity).
+
+If no termination message is provided, the entity queues will simply be shutdown.
+But if you want to ensure entities are stopped "cleanly" after processing their last message, define a termination message and stop the behavior yourself (by calling `ZIO.interrupt`) after receiving that message.
+
+Termination messages must contain a promise which you need to complete to indicate that shutdown is complete. See the [example here](https://github.com/devsisters/shardcake/tree/series/2.x/examples/src/main/scala/example/complex).
+:::
+- `entityTerminationTimeout`: time we give to an entity to handle the termination message before interrupting it
+- `sendTimeout`: timeout when calling `sendMessage`
+- `refreshAssignmentsRetryInterval`: retry interval in case of failure getting shard assignments from storage
+- `unhealthyPodReportInterval`: interval to report unhealthy pods to the Shard Manager (this exists to prevent calling the Shard Manager for each failed message)
+- `simulateRemotePods`: disable optimizations when sending a message to an entity hosted on the local shards (this will force serialization of all messages)
+
+## Shard Manager Configuration
+
+Here's the list of thing you can configure on the Shard Manager side:
+- `numberOfShards`: number of shards (see above)
+- `apiPort`: port to expose the GraphQL API
+- `rebalanceInterval`: interval for regular rebalancing of shards
+- `rebalanceRetryInterval`: retry interval for rebalancing when some shards failed to be rebalanced
+- `pingTimeout`: time to wait for a pod to respond to a ping request
+- `persistRetryInterval`: retry interval for persistence of pods and shard assignments
+- `persistRetryCount`: max retry count for persistence of pods and shard assignments
+- `rebalanceRate`: max ratio of shards to rebalance in a single iteration
+- `podHealthCheckInterval`: interval for checking pod health
+::: tip Rebalance Rate
+The rebalance rate is there to prevent too many shards being assigned immediately to new pods.
+Instead of reaching a perfect spread right away, we can use several iterations to make sure new pods are able to handle the new shards. 
+This is particularly useful if starting entities has a performance cost (e.g. loading state) and we don't want to start too many at once.
+
+When a pod is leaving, its shards need to be immediately rebalanced so the ratio is not used in that case.
+:::
+
+---
+
+# Customization
+
+Source: https://github.com/devsisters/shardcake/blob/series/2.x/vuepress/docs/docs/customization.md
+
+# Customization
+
+As demonstrated in the [Getting Started](README.md#key-components), there are several parts of the system that are entirely customizable.
+For each of them, Shardcake provides at least a fake implementation for testing and a prod-ready implementation using common technologies. 
+
+Feel free to implement your own!
+
+![architecture diagram](/shardcake/arch.png)
+
+## Storage
+
+The `Storage` trait defines how to store and access pods and shards assignments.
+It contains 5 methods: `getAssignments`/`saveAssignments` to store assignments, `getPods`/`savePods` to store pods, and `assignmentsStream` to receive assignment updates.
+
+```scala
+trait Storage {
+  def getAssignments: Task[Map[ShardId, Option[PodAddress]]]
+  def saveAssignments(assignments: Map[ShardId, Option[PodAddress]]): Task[Unit]
+  
+  def assignmentsStream: ZStream[Any, Throwable, Map[Int, Option[PodAddress]]]
+  
+  def getPods: Task[Map[PodAddress, Pod]]
+  def savePods(pods: Map[PodAddress, Pod]): Task[Unit]
+}
+```
+
+For testing, you can use the `Storage.memory` layer that keeps data in memory.
+
+Shardcake provides an implementation of `Storage` using Redis with the Redis4cats library (there's also an alternative using Redisson). To use it, add the following dependency:
+```scala
+libraryDependencies += "com.devsisters" %% "shardcake-storage-redis" % "2.7.1"
+```
+You can then simply use the `StorageRedis.live` layer.
+
+It requires a `RedisConfig` with the following options:
+- `assignmentsKey`: the key to store shard assignments in Redis
+- `podsKey`: the key to store registered pods in Redis
+
+It also requires a `Redis` object, which is an alias to `RedisCommands[Task, String, String] with PubSubCommands[fs2Stream, String, String]` from the [redis4cats](https://redis4cats.profunktor.dev/) library used under the hood.
+Here's an example how to build it:
+
+```scala
+import com.devsisters.shardcake.StorageRedis.Redis
+import dev.profunktor.redis4cats.Redis
+import dev.profunktor.redis4cats.connection.RedisClient
+import dev.profunktor.redis4cats.data.RedisCodec
+import dev.profunktor.redis4cats.effect.Log
+import dev.profunktor.redis4cats.pubsub.PubSub
+import zio.interop.catz._
+import zio.{ Task, ZEnvironment, ZIO, ZLayer }
+
+val redis: ZLayer[Any, Throwable, Redis] =
+  ZLayer.scopedEnvironment {
+    implicit val runtime: zio.Runtime[Any] = zio.Runtime.default
+    implicit val logger: Log[Task]         = new Log[Task] {
+      override def debug(msg: => String): Task[Unit] = ZIO.unit
+      override def error(msg: => String): Task[Unit] = ZIO.logError(msg)
+      override def info(msg: => String): Task[Unit]  = ZIO.logDebug(msg)
+    }
+
+    (for {
+      client   <- RedisClient[Task].from("redis://foobared@localhost")
+      commands <- Redis[Task].fromClient(client, RedisCodec.Utf8)
+      pubSub   <- PubSub.mkPubSubConnection[Task, String, String](client, RedisCodec.Utf8)
+    } yield ZEnvironment(commands, pubSub)).toScopedZIO
+  }
+```
+
+## Messaging Protocol
+
+The `Pods` trait defines how to communicate with remote pods.
+It is used both by the Shard Manager for assigning and unassigning shards, and by pods for internal communication (forward messages to each other).
+
+```scala
+trait Pods {
+  def assignShards(pod: PodAddress, shards: Set[ShardId]): Task[Unit]
+  def unassignShards(pod: PodAddress, shards: Set[ShardId]): Task[Unit]
+  def ping(pod: PodAddress): Task[Unit]
+  
+  def sendMessage(pod: PodAddress, message: BinaryMessage): Task[Option[Array[Byte]]]
+  def sendMessageStreaming(pod: PodAddress, message: BinaryMessage): ZStream[Any, Throwable, Array[Byte]]
+}
+```
+For testing, you can use the `Pods.noop` layer that does nothing.
+
+Shardcake provides an implementation of `Pods` using the gRPC protocol. To use it, add the following dependency:
+```scala
+libraryDependencies += "com.devsisters" %% "shardcake-protocol-grpc" % "2.7.1"
+```
+You can then simply use the `GrpcPods.live` layer.
+
+On pods, you also need expose the gRPC API. This is done by adding the `GrpcShardingService.live` layer to your environment. You don't need this one on the Shard Manager.
+
+## Serialization
+
+The `Serialization` trait defines how to serialize user messages that will be sent between pods.
+It contains 2 methods `encode` and `decode` that define how to transform a give type from and to bytes.
+
+```scala
+trait Serialization {
+  def encode(message: Any): Task[Array[Byte]]
+  def decode[A](bytes: Array[Byte]): Task[A]
+}
+```
+For testing, you can use the `Serialization.javaSerialization` layer that uses Java Serialization (not recommended in production).
+
+Shardcake provides an implementation of `Serialization` using the [Kryo](https://github.com/EsotericSoftware/kryo) binary serialization library. To use it, add the following dependency:
+```scala
+libraryDependencies += "com.devsisters" %% "shardcake-serialization-kryo" % "2.7.1"
+```
+You can then simply use the `KryoSerialization.live` layer.
+
+::: tip Server updates and message versioning
+- Messages are not persisted, which means that if you stop and restart the whole system, you can change anything in the messages format.
+- On the other hand, if you wish to do rolling updates (update servers progressively without downtime), you need to be careful with changes in the messages format.
+- What you can do largely depends on your serialization mechanism, some solutions allow changes while some others are very restrictive.
+  [Kryo](https://github.com/EsotericSoftware/kryo) by default is pretty strict and won't support most changes, but there are settings to support more (at the cost of some performance or message size).
+- When you can't modify existing messages, an option is to create new messages that won't be used until the rolling update is finished (so you won't have cases where old nodes receive new messages).
+:::
+
+## Health
+
+The `PodsHealth` trait defines how to know if a pod is still alive or is dead (in which case, we should reassign all its shards).
+
+```scala
+trait PodsHealth {
+  def isAlive(podAddress: PodAddress): UIO[Boolean]
+}
+```
+For testing, you can use the `PodsHealth.noop` layer that always returns true, or the `PodsHealth.local` layer that uses `ping` from the [Messaging Protocol](#messaging-protocol) to check if a pod is alive.
+
+Shardcake provides an implementation of `PodsHealth` using the [Kubernetes](https://kubernetes.io) API. To use it, add the following dependency:
+```scala
+libraryDependencies += "com.devsisters" %% "shardcake-health-k8s" % "2.7.1"
+```
+You can then simply use the `K8sPodsHealth.live` layer. This is requiring a `Pods` layer that comes from [zio-k8s](https://coralogix.github.io/zio-k8s/docs/overview/overview_gettingstarted).
+
+::: tip Examples
+Check the [examples](https://github.com/devsisters/shardcake/tree/series/2.x/examples/src/main/scala/example/complex) folder that contains a full example using Redis, gRPC and Kryo seralization.
+:::
+
+---
+
+# Metrics
+
+Source: https://github.com/devsisters/shardcake/blob/series/2.x/vuepress/docs/docs/metrics.md
+
+# Metrics
+
+Shardcake exposes a few metrics to give you better visibility into the state of your cluster.
+Those metrics are exposed via [ZIO Metrics](https://zio.dev/reference/observability/metrics/), which allows you to use the [backend of your choice](https://zio.dev/zio-metrics-connectors/).
+
+## Shard Manager Metrics
+- `shardcake.pods` (gauge): Number of pods currently registered
+- `shardcake.shards_assigned` (gauge): Number of shards currently assigned to a pod
+- `shardcake.shards_unassigned` (gauge): Number of shards currently not assigned to any pod
+- `shardcake.rebalances` (counter): Number of rebalances that have occurred
+- `shardcake.pod_health_checked` (counter): Number of times the health of a pod has been checked
+
+## Pod Metrics
+- `shardcake.shards` (gauge): Number of shards currently assigned to the pod
+- `shardcake.entities` (gauge): Number of entities currently running on the pod
+- `shardcake.singletons` (gauge): Number of singletons currently running on the pod
+
+---
+
+# Getting Started
+
+Source: https://github.com/devsisters/shardcake/blob/series/2.x/vuepress/docs/docs/README.md
+
+# Getting Started
+
+**Shardcake** is a **Scala open source library** that makes it easy to distribute entities across multiple servers and interact with those entities using their ID without knowing their actual location (this is also known as *location transparency*). 
+
+Shardcake exposes a **purely functional API** and depends heavily on [ZIO](https://zio.dev). It is recommended to be familiar with ZIO to read this documentation.
+
+## A simple use case
+
+We are building a multiplayer game where **users** can join **guilds**.
+We expect our game to be successful, so we need to be able to scale out (deploy it on multiple servers to handle the load).
+
+A guild is limited to 30 members.
+Let's consider the case where 2 users try to join a guild at the exact same time, but our guild already had 29 members.
+
+![naive diagram](/shardcake/usecase1.png)
+
+If we implement this naively, 2 different servers might receive our 2 requests to join the guild.
+They will both check the current size of the guild at the same time, which will be 29 and they will both accept the new guild member. Now our guild has 31 members :scream:.
+
+There are 2 common approaches to deal with this issue:
+- **Global lock** approach: when checking the members of the guild, acquire a lock that is shared between the different game servers, and release it after saving the new member. 
+That way, if 2 different game servers try to do it at the same time, the 2nd one will wait for the first one to finish.
+- **Single writer** approach: instead of handling the requests on 2 game servers concurrently, redirect the 2 requests to a single entity that will handle them sequentially.
+
+**Entity Sharding** is a way to implement the second approach. In this case our entities (here, our guilds) will be spread across our game servers so that
+each entity exists in only one place at the time.
+
+![single writer diagram](/shardcake/usecase2.png)
+
+If our entity might be on any game server, how do we know where it is? This is the second characteristic of entity sharding, known as location transparency: we only need to know the entity ID.
+Using the entity ID, the sharding system will be able to find on which server the entity is located.
+
+**Shardcake** provides components to:
+- automatically manage the assignments of entities to game servers
+- send messages to your entities using their IDs
+
+Once sharding is setup, it will let you write code like the following (sending a message to guild regardless of its location):
+
+```scala
+def joinGuild(guildId: GuildId): ZIO[Context, Throwable, GuildState] =
+  for {
+    userId     <- getCurrentUserFromContext
+    guildState <- guild.send(guildId)(JoinGuild(userId, _))
+  } yield guildState
+```
+
+## Terminology
+
+Before we go further, let's define a few terms:
+- An **entity** is a small message handler that can be addressed by ID. 
+For example, `User A` or `Guild B` are entities. In this case we say that `User` and `Guild` are **entity types**.
+- A **pod** is an application server that can host entities.
+Entities usually run on multiple pods, but a single entity will only run on a single pod at the time. You will never have the same entity running on 2 different pods.
+- A **shard** is a logical group of entities that will always be located on the same pod.
+There might be millions of entities, so instead of keeping millions of entities-to-pods mappings, we group entities into shards and maintain reasonably-sized shards-to-pods mappings.
+
+![terminology diagram](/shardcake/terminology.png)
+
+## Key components
+
+Shardcake is composed of 2 main components:
+- The **Shard Manager** is an independent component that needs a single instance running. It is in charge of assigning shards to pods.
+- **Entities** will run on your application servers and process messages that are sent to them. Note that the entity behavior (including entity persistence) is entirely up to you.
+Shardcake only takes care of starting entities on the right pods as well as the communication between them.
+
+There are 4 pluggable parts that can be implemented with the technology of your choice.
+- The `Storage` trait defines where shard assignments will be stored. Shardcake provides an implementation using **Redis**.
+- The `Pods` trait defines how to communicate with remote pods. Shardcake provides an implementation using **gRPC** as the protocol.
+- The `Serialization` defines how to encode and decode messages. Shardcake provides an implementation using **Kryo**.
+- The `PodsHealth` trait defines how to check if a pod is healthy or not. Shardcake provides an implementation using the **k8s API**.
+
+![architecture diagram](/shardcake/arch.png)
+
+## An example
+
+### Shard Manager
+The first thing we need to do is starting the Shard Manager. This component is available by importing the `shardcake-manager` dependency, and requires implementations of `Storage`, `Pods` and `PodsHealth` to work.
+
+To make it simpler and run our example without 3rd parties, we're going to run a simple `PodsHealth` implementation that just pings a pod to see if it's alive, and in-memory `Storage`.
+We need a proper messaging protocol to communicate with pods, so we're going to use `shardcake-protocol-grpc`.
+```
+libraryDependencies += "com.devsisters" %% "shardcake-manager"       % "2.7.1"
+libraryDependencies += "com.devsisters" %% "shardcake-protocol-grpc" % "2.7.1"
+```
+The Shard Manager exposes a small GraphQL API, which means we need to start a small webserver. This can be done by calling `Server.run` and providing all the required dependencies.
+```scala
+import com.devsisters.shardcake._
+import com.devsisters.shardcake.interfaces._
+import zio._
+
+object ShardManagerApp extends ZIOAppDefault {
+  def run: Task[Nothing] =
+    Server.run.provide(
+      ZLayer.succeed(ManagerConfig.default),
+      ZLayer.succeed(GrpcConfig.default),
+      PodsHealth.local, // just ping a pod to see if it's alive
+      GrpcPods.live,    // use gRPC protocol
+      Storage.memory,   // store data in memory
+      ShardManager.live // shard manager logic
+    )
+}
+```
+That's it! Running this small app will start the Shard Manager and its API. It is now ready to receive registration from pods.
+
+### Entity Behavior
+We now need to define our **entity behavior**: what kind of messages can our entity receive, and what to do when it receives those messages. We will model our **Guild** example.
+
+First, we need the following dependencies:
+```
+libraryDependencies += "com.devsisters" %% "shardcake-entities"      % "2.7.1"
+libraryDependencies += "com.devsisters" %% "shardcake-protocol-grpc" % "2.7.1"
+```
+
+Let's start with defining the messages our entities can receive. We will have 2: one for joining a guild and one for leaving.
+We create a `sealed trait` that will contain all the possible message types.
+Any message that can be replied needs to contain a `Replier[A]` where `A` is the response type.
+
+```scala
+sealed trait GuildMessage
+
+object GuildMessage {
+  case class Join(userId: String, replier: Replier[Try[Set[String]]]) extends GuildMessage
+  case class Leave(userId: String)                                    extends GuildMessage
+}
+```
+We also need to define an **Entity Type**. This is done by extending `EntityType` with the message type as well as a unique `String` identifier for this type.
+```scala
+object Guild extends EntityType[GuildMessage]("guild")
+```
+
+The behavior itself is a function with the following signature:
+```scala
+def behavior(entityId: String, messages: Queue[GuildMessage]): RIO[Sharding, Nothing]
+```
+It takes an `entityId` and a `Queue[GuildMessage]` and returns a `ZIO` that never ends (hence the return type `Nothing`).
+That function is just supposed to consume `messages` forever.
+
+Let's first define how to handle a single `GuildMessage`.
+
+We will use a `Ref[Set[String]]` to hold our state (the list of users in the guild).
+When we receive a `Join` request, we check if the guild is already full (here, we hardcode the max to 5) and respond with a failure or modify the state and respond with a success.
+We use `replier.reply` to send a response to the sender (here, sending the full list of guild members wrapped in a `Try` to express errors).
+```scala
+def handleMessage(state: Ref[Set[String]], message: GuildMessage): RIO[Sharding, Unit] =
+  message match {
+    case GuildMessage.Join(userId, replier) =>
+      state.get.flatMap(members =>
+        if (members.size >= 5)
+          replier.reply(Failure(new Exception("Guild is already full!")))
+        else
+          state.updateAndGet(_ + userId).flatMap { newMembers =>
+            replier.reply(Success(newMembers))
+          }
+      )
+    case GuildMessage.Leave(userId)         =>
+      state.update(_ - userId)
+  }
+```
+
+We are now ready to create our behavior, starting from an empty state when the entity is created:
+```scala
+def behavior(entityId: String, messages: Queue[GuildMessage]): RIO[Sharding, Nothing] =
+  Ref
+    .make(Set.empty[String])
+    .flatMap(state => messages.take.flatMap(handleMessage(state, _)).forever)
+```
+
+### Run the application
+
+To run our entities, we need to register their behavior to the Sharding system, which is done by calling `Sharding.registerEntity`, passing the entity type and the behavior.
+
+We then need to notify the Shard Manager that a new pod is now ready to run entities, and shards may be assigned to it.
+This is done by calling `Sharding.registerScoped` (which is the equivalent of calling `Sharding.register` when the program starts and `Sharding.unregister` when the program ends).
+
+To communicate with our entities, we need a `Messenger[GuildMessage]`, which we get by calling `Sharding.messenger`. You can even use `messenger` on a pod that is not hosting any entities.
+```scala
+  val program =
+    for {
+      _     <- Sharding.registerEntity(Guild, behavior)
+      _     <- Sharding.registerScoped
+      guild <- Sharding.messenger(Guild)
+      _     <- guild.send("guild1")(Join("user1", _)).debug
+      _     <- guild.send("guild1")(Join("user2", _)).debug
+      _     <- guild.send("guild1")(Join("user3", _)).debug
+      _     <- guild.send("guild1")(Join("user4", _)).debug
+      _     <- guild.send("guild1")(Join("user5", _)).debug
+      _     <- guild.send("guild1")(Join("user6", _)).debug
+    } yield ()
+```
+
+Finally, we provide all required dependencies as we did for the Shard Manager.
+```scala
+def run: Task[Unit] =
+  ZIO.scoped(program).provide(
+    ZLayer.succeed(Config.default),
+    ZLayer.succeed(GrpcConfig.default),
+    Serialization.javaSerialization, // use java serialization for messages
+    Storage.memory,                  // store data in memory
+    ShardManagerClient.liveWithSttp, // client to communicate with the Shard Manager
+    GrpcPods.live,                   // use gRPC protocol
+    GrpcShardingService.live,        // expose gRPC service
+    Sharding.live                    // sharding logic
+  )
+```
+
+We can now run our program. It will successively send 6 `Join` messages to our guild and print the result:
+```
+Success(Set(user1))
+Success(Set(user1, user2))
+Success(Set(user1, user2, user3))
+Success(Set(user1, user2, user3, user4))
+Success(HashSet(user1, user5, user4, user2, user3))
+Failure(java.lang.Exception: Guild is already full!)
+```
+
+#### Streaming
+In addition to `send`, you can also use `sendStream` to get a stream of replies rather than a single reply.
+That function gives you a `StreamReplier[A]` instead of a `Replier[A]`, which allows the entity to reply with a stream.
+
+#### One more thing...
+`Sharding` also exposes 2 methods that can be interesting for some use cases:
+- `registerSingleton` lets you register some background processes that will run in only one pod at any given time. Singletons can't receive messages and they are not stopped in case of inactivity.
+- `registerTopic` lets you broadcast messages to all registered pods (use `Sharding.broadcaster` instead of `Sharding.messenger`).
+
+### Where to go from there?
+In this simple example, we only had a single pod so there was no real benefit from using sharding.
+But we could run the exact same code on multiple pods, and the sharding system would ensure that each guild is only running on a single pod.
+In other words, all messages sent to `guild1` would be handled by the same pod.
+
+The only changes we would need to make would be:
+- to use an actual `Storage` implementation for sharding (e.g. Redis)
+- to save our guild state somewhere instead of in memory, so that we don't lose this state if the guild entity is moved from one pod to another
+
+The running code for this example [can be found here](https://github.com/devsisters/shardcake/tree/series/2.x/examples/src/main/scala/example/simple), 
+as well as [a more complex example](https://github.com/devsisters/shardcake/tree/series/2.x/examples/src/main/scala/example/complex) using Redis to persist data and where you can run multiple pods.
+
+To understand how Sharding works under the hood, have a look at the [Architecture](architecture.md) section.
+The [Configuration](config.md) section explains how to configure the sharding system.
+Finally, the [Customization](customization.md) section describes how you can use your own storage, serialization or messaging protocol, as well as the options provided by Shardcake.
+
+::: tip Differences with Akka Cluster Sharding ?
+[Akka Cluster Sharding](https://doc.akka.io/docs/akka/current/typed/cluster-sharding.html) is the main alternative for sharding in Scala.
+Here is how Shardcake differs from Akka:
+- Shardcake is a **purely functional library** based on `ZIO`, while Akka is a library leaning towards the "better Java" style of Scala and is based on `Future`.
+
+- With Akka, all application servers **must be part of a cluster**. This is particularly tricky to configure and sensitive to all kinds of failures.
+This is not the case with Shardcake since the Shard Manager is an external component that relies on systems like Kubernetes to monitor pod health.
+
+- Akka is way more than a sharding library, this is basically an entire framework that has a lot of features.
+Shardcake is much **simpler and modular**. It lets you customize multiple things, including the messaging protocol between pods.
+
+- Akka is backed by [Lightbend](https://www.lightbend.com), who provides **commercial support**,
+while Shardcake is backed by [Devsisters](https://www.devsisters.com) and the **ZIO community**.
+:::
+
+---
+
+# FAQ
+
+Source: https://github.com/devsisters/shardcake/blob/series/2.x/vuepress/docs/faq/README.md
+
+# FAQ
+
+### Is the Shard Manager a single point of failure?
+
+Not really. The Shard Manager is a single point of coordination, not a single point of failure.
+In fact, 99% of the time, the Shard Manager doesn't do anything. Pods can communicate with each other without needing the Shard Manager.
+It is only required when a new pod starts or when an existing pod is removed. In such cases, the Shard Manager reassigns shards to the remaining pods.
+
+You can safely restart the Shard Manager pod without affecting the running pods.
+
+### I get timeouts during a rolling update, what can I do?
+
+The primary recommendation is to check the Shard Manager's logs to see what happens during the rolling update.
+
+A common issue is that stopping pods may not unregister themselves from the Shard Manager. This can occur for several reasons:
+- The pod is stopped abruptly without handling the KILL signal, preventing the main fiber from being interrupted.
+- The pod loses network connectivity and cannot call the `unregister` endpoint (this can occur when using an Istio proxy, for example).
+- The pod is stuck in a deadlock during the shutdown process.
+In such cases, it's crucial to understand why the pod isn't unregistering and address the underlying issue.
+
+### Is Shardcake a replacement for Akka/Pekko?
+
+No. Shardcake is a library that covers only a small portion of what Akka/Pekko does, specifically the "Cluster Sharding" feature.
+ZIO provides tools for "local" concurrency (e.g., Queue, Hub, Promise), while Shardcake adds the "distributed" component.
+However, Shardcake does not address features like event sourcing or actor persistence.
+
+If you need these features, you are encouraged to implement them on top of ZIO and Shardcake.
+
+---
+
+# README.md
+
+Source: https://github.com/devsisters/shardcake/blob/series/2.x/vuepress/docs/README.md
+
+---
+home: true
+heroImage: /shardcake.png
+actionText: Get Started →
+actionLink: /docs/
+features:
+- title: Single writer pattern
+  details: Ensure that each entity exists in only one place at the time across all your servers.
+- title: Location transparency
+  details: Communicate with your remote entities using their ID, regardless of their physical location.
+- title: Customization
+  details: Bring your own storage, serialization, messaging protocol... or use the ones provided.
+---
+
+---

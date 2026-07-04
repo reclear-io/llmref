@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate fullcontext registry snapshots and catalog index."""
+"""Validate llm-txts registry snapshots and catalog index."""
 from __future__ import annotations
 
 import hashlib
@@ -138,14 +138,13 @@ def validate_llms_txt(path: Path, llms_txt: str, source_root: str) -> bool:
     ok = True
 
     links = MARKDOWN_LINK_RE.findall(llms_txt)
-    if not links:
-        error(f"{path}/llms.txt: must contain at least one markdown link")
+    # Real-world llms.txt files (ingested verbatim from a site) legitimately mix
+    # doc links with mailto:, tel:, and in-page #anchor links. Require at least
+    # one http(s) doc link; ignore the non-http ones rather than failing.
+    http_links = [link for link in links if is_valid_url(link)]
+    if not http_links:
+        error(f"{path}/llms.txt: must contain at least one http(s) documentation link")
         ok = False
-
-    for link in links:
-        if not is_valid_url(link):
-            error(f"{path}/llms.txt: invalid link URL '{link}'")
-            ok = False
 
     if source_root and not llms_txt.strip():
         error(f"{path}/llms.txt: must not be empty")
@@ -154,7 +153,7 @@ def validate_llms_txt(path: Path, llms_txt: str, source_root: str) -> bool:
     return ok
 
 
-def validate_meta(meta: dict, tech_id: str, version: str, snapshot_dir: Path, llms_full: str, llms_txt: str) -> bool:
+def validate_meta(meta: dict, tech_id: str, version: str, snapshot_dir: Path, llms_full: str, has_full: bool, llms_txt: str) -> bool:
     ok = True
     meta_path = snapshot_dir / "meta.json"
 
@@ -200,7 +199,10 @@ def validate_meta(meta: dict, tech_id: str, version: str, snapshot_dir: Path, ll
     if not isinstance(fingerprint, str) or not FINGERPRINT_RE.fullmatch(fingerprint):
         error(f"{meta_path}: content_fingerprint must be a 64-character hex SHA-256 digest")
         ok = False
-    else:
+    elif has_full:
+        # Reserved-license snapshots withhold llms-full.txt, so the fingerprint
+        # (still computed by the pipeline from the withheld text) can only be
+        # verified against the file when it is present.
         expected = fingerprint_of(llms_full)
         if fingerprint.lower() != expected:
             error(
@@ -209,22 +211,56 @@ def validate_meta(meta: dict, tech_id: str, version: str, snapshot_dir: Path, ll
             )
             ok = False
 
-    linked_pages = len(LLMS_LINK_RE.findall(llms_txt))
+    # page_count is informational metadata. For native llms.txt the number of
+    # sections the pipeline fetched rarely equals the raw link count (files list
+    # more links than are fetched as pages), so require only a sane lower bound
+    # rather than an exact match.
     page_count = meta.get("page_count")
-    expected_page_count = linked_pages if linked_pages > 0 else 1
-    if isinstance(page_count, int):
-        if page_count < 1:
-            error(f"{meta_path}: page_count must be at least 1")
-            ok = False
-        elif page_count != expected_page_count:
-            error(
-                f"{meta_path}: page_count {page_count} does not match llms.txt link count "
-                f"{expected_page_count}"
-            )
-            ok = False
+    if isinstance(page_count, int) and page_count < 1:
+        error(f"{meta_path}: page_count must be at least 1")
+        ok = False
 
     ok = validate_llms_txt(snapshot_dir, llms_txt, source_root) and ok
     return ok
+
+
+def validate_license(meta: dict, meta_path: Path) -> tuple[bool, bool, bool]:
+    """Validate the optional ``license`` block.
+
+    Returns ``(ok, has_license, redistribution_allowed)``. A snapshot with no
+    license block is a legacy snapshot and is validated as before (full text
+    required). When present, the block gates whether ``llms-full.txt`` may/must
+    ship: ``redistribution_allowed`` true requires it, false forbids it.
+    """
+    lic = meta.get("license")
+    if lic is None:
+        return True, False, False
+    if not isinstance(lic, dict):
+        error(f"{meta_path}: license must be an object")
+        return False, True, False
+
+    ok = True
+    spdx = lic.get("spdx")
+    if not isinstance(spdx, str) or not spdx.strip():
+        error(f"{meta_path}: license.spdx must be a non-empty string")
+        ok = False
+
+    redistribution = lic.get("redistribution_allowed")
+    if not isinstance(redistribution, bool):
+        error(f"{meta_path}: license.redistribution_allowed must be a boolean")
+        ok = False
+        redistribution = False
+
+    for optional_bool in ("share_alike",):
+        if optional_bool in lic and not isinstance(lic[optional_bool], bool):
+            error(f"{meta_path}: license.{optional_bool} must be a boolean")
+            ok = False
+    for optional_str in ("source", "reference", "notice"):
+        if optional_str in lic and not isinstance(lic[optional_str], str):
+            error(f"{meta_path}: license.{optional_str} must be a string")
+            ok = False
+
+    return ok, True, bool(redistribution)
 
 
 def validate_snapshot(tech_id: str, version: str, snapshot_dir: Path) -> tuple[bool, dict | None]:
@@ -235,31 +271,54 @@ def validate_snapshot(tech_id: str, version: str, snapshot_dir: Path) -> tuple[b
             error(f"{snapshot_dir}: unexpected {'directory' if entry.is_dir() else 'file'} '{entry.name}'")
             ok = False
 
-    missing = [name for name in ALLOWED_SNAPSHOT_FILES if not (snapshot_dir / name).is_file()]
-    if missing:
-        error(f"{snapshot_dir}: missing required files: {', '.join(sorted(missing))}")
-        return False, None
+    # llms.txt and meta.json are always required; llms-full.txt is required or
+    # forbidden depending on the license (checked below).
+    for name in ("llms.txt", "meta.json"):
+        if not (snapshot_dir / name).is_file():
+            error(f"{snapshot_dir}: missing required file: {name}")
+            return False, None
 
-    llms_txt = (snapshot_dir / "llms.txt").read_text(encoding="utf-8")
-    llms_full = (snapshot_dir / "llms-full.txt").read_text(encoding="utf-8")
-    if not llms_txt.strip():
-        error(f"{snapshot_dir}/llms.txt: must not be empty")
-        ok = False
-    if not llms_full.strip():
-        error(f"{snapshot_dir}/llms-full.txt: must not be empty")
-        ok = False
-
+    meta_path = snapshot_dir / "meta.json"
     try:
-        meta = load_json(snapshot_dir / "meta.json")
+        meta = load_json(meta_path)
     except json.JSONDecodeError as exc:
-        error(f"{snapshot_dir}/meta.json: invalid JSON ({exc})")
+        error(f"{meta_path}: invalid JSON ({exc})")
         return False, None
 
     if not isinstance(meta, dict):
-        error(f"{snapshot_dir}/meta.json: must be a JSON object")
+        error(f"{meta_path}: must be a JSON object")
         return False, None
 
-    ok = validate_meta(meta, tech_id, version, snapshot_dir, llms_full, llms_txt) and ok
+    license_ok, has_license, redistribution = validate_license(meta, meta_path)
+    ok = license_ok and ok
+
+    has_full = (snapshot_dir / "llms-full.txt").is_file()
+    if has_license:
+        if redistribution and not has_full:
+            error(f"{snapshot_dir}: license permits redistribution but llms-full.txt is missing")
+            ok = False
+        if not redistribution and has_full:
+            error(
+                f"{snapshot_dir}: license does not permit redistribution, so llms-full.txt "
+                "must be omitted from the registry"
+            )
+            ok = False
+    elif not has_full:
+        # Legacy snapshot without a license block: full text is required.
+        error(f"{snapshot_dir}: missing required file: llms-full.txt")
+        return False, None
+
+    llms_txt = (snapshot_dir / "llms.txt").read_text(encoding="utf-8")
+    if not llms_txt.strip():
+        error(f"{snapshot_dir}/llms.txt: must not be empty")
+        ok = False
+
+    llms_full = (snapshot_dir / "llms-full.txt").read_text(encoding="utf-8") if has_full else ""
+    if has_full and not llms_full.strip():
+        error(f"{snapshot_dir}/llms-full.txt: must not be empty")
+        ok = False
+
+    ok = validate_meta(meta, tech_id, version, snapshot_dir, llms_full, has_full, llms_txt) and ok
     return ok, meta
 
 

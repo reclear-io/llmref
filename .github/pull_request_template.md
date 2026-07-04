@@ -19,11 +19,11 @@
 
 ## Checklist
 
-- [ ] registry/<technology-id>/<version>/ contains llms.txt, llms-full.txt, and meta.json (Contributions only)
+- [ ] registry/<technology-id>/<version>/ contains llms.txt and meta.json, plus llms-full.txt **only if** `meta.json` `license.redistribution_allowed` is `true` (Contributions only)
+- [ ] `meta.json` includes a `license` block (`spdx`, `redistribution_allowed`) — see [SCHEMA.md](../SCHEMA.md#license)
 - [ ] registry/index.json updated (Contributions only)
 - [ ] python3 scripts/verify_registry.py passes locally (Contributions only, CI will also run this)
 - [ ] Official public documentation only
-- [ ] Upstream license/terms do not restrict redistribution of docs content
 
 **If Update:** `content_fingerprint` changed and the reason is explained above.
 

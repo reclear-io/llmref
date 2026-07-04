@@ -1,0 +1,483 @@
+# marimo-lsp
+
+Source: https://github.com/marimo-team/marimo-lsp/blob/main/README.md
+
+# marimo-lsp
+
+
+A language server and VS Code extension for
+[marimo](https://github.com/marimo-team/marimo).
+
+**[Learn more about the extension](extension/README.md)** | **[Contributing](CONTRIBUTING.md)**
+
+---
+
+# marimo-lsp Architecture
+
+Source: https://github.com/marimo-team/marimo-lsp/blob/main/ARCHITECTURE.md
+
+# marimo-lsp Architecture
+
+## Overview
+
+marimo-lsp lets marimo notebooks run natively inside VS Code's notebook UI by
+bridging three independent runtimes. Three distinct LSP channels connect the
+extension to the server, and the server in turn proxies to the kernel:
+
+```
+┌──────────────────┐                           ┌──────────────────┐                        ┌───────────────┐
+│     VS Code      │                           │   LSP server     │                        │ marimo kernel │
+│                  │                           │    (Python)      │                        │   (Session)   │
+├──────────────────┤  LSP notebook protocol    ├──────────────────┤                        │               │
+│  notebook editor │◄─────────────────────────►│  document sync   │                        │               │
+│  (vscode host)   │  didOpen / didChange / …  │                  │                        │               │
+├──────────────────┤  custom LSP commands      ├──────────────────┤   Session methods      │               │
+│    extension     │──────────────────────────►│ command handler  │───────────────────────►│    runtime    │
+│ (KernelManager)  │  marimo.run, interrupt, … │                  │                        │               │
+├──────────────────┤  marimo/operation push    ├──────────────────┤   SessionConsumer      │               │
+│    extension     │◄──────────────────────────│ session consumer │◄───────────────────────│   messages    │
+│ (KernelManager)  │                           │                  │                        │               │
+└──────────────────┘                           └──────────────────┘                        └───────────────┘
+```
+
+Each row is one channel with distinct semantics:
+
+- **Top (document sync)** is standard LSP. VS Code streams notebook cell text
+  to the server; the server keeps an in-memory view so it can answer cell
+  questions without touching disk. The kernel is not involved.
+- **Middle (custom commands)** is the extension's outbound path. The
+  extension's `KernelManager` dispatches commands like `marimo.run`; the
+  server's command handler translates each into calls on the relevant
+  `Session` and its kernel subprocess.
+- **Bottom (operation push)** is the inbound path. The kernel emits messages
+  (cell state, variables, dataset previews, alerts, package install
+  progress); the server's session consumer wraps each in a `marimo/operation`
+  notification tagged with the notebook URI; the extension's `KernelManager`
+  receives them and fans them out to interested services.
+
+The kernel has no direct line to VS Code — the server is always in the
+middle, which makes the extension↔server protocol the load-bearing surface.
+The extension's `KernelManager` is the matched pair for the server's command
+handler (outbound) and session consumer (inbound).
+
+## Messaging
+
+Three channels carry traffic between extension and server.
+
+**1. Document sync (standard LSP notebook protocol).** VS Code streams cell
+text to the server with `notebookDocument/didOpen`, `didChange`, `didSave`,
+`didClose`. The server uses these to keep an in-memory view of each notebook
+so it can answer questions about cells (codes, configs, names) without
+touching disk.
+
+**2. Language features (standard LSP).** `textDocument/completion` powers
+things like `@cell-name` cross-references; `textDocument/codeAction` offers
+conversion actions (e.g. Python / Jupyter → marimo). Normal request/response.
+
+**3. Custom commands and notifications.** Anything kernel-shaped rides on
+workspace commands (client → server) and server-pushed notifications. By
+category:
+
+- *Lifecycle*: `marimo.run`, `marimo.interrupt`, `marimo.restart`. Creating a
+  session is a side effect of the first `marimo.run` on a given notebook URI
+  + Python executable.
+- *Interactivity*: `marimo.set_ui_element_value`, `marimo.function_call_request`.
+  UI widgets rendered inside cells bubble back through the extension and into
+  these commands.
+- *Conversion*: `marimo.serialize` / `marimo.deserialize` convert between the
+  notebook document and marimo's `.py` file format; `marimo.convert` creates a
+  new marimo file from Jupyter / plain Python input.
+- *Server push*: `marimo/operation` is the firehose. Every kernel state
+  update (cell execution transitions, variable diffs, dataset previews,
+  alerts, package-install progress, …) is tagged with a notebook URI and
+  streamed to the extension as a single notification type, carrying a
+  discriminated `operation` payload.
+
+The exact request/response shapes live in the server's Python models and the
+extension's generated OpenAPI types. Treat this doc as the map, the code as
+the territory.
+
+## A message in flight: running a cell
+
+A concrete end-to-end flow:
+
+1. **Extension** dispatches `marimo.run` with the notebook URI, the Python
+   executable, and the cells to run.
+2. **Server** looks up or creates the `Session` for that URI. On creation it
+   spins up a kernel subprocess (with `marimo` available in the user's
+   environment), wires stdio plumbing, and starts a `SessionConsumer` that
+   forwards kernel messages outward.
+3. **Kernel** receives the run request, executes the cell (and any reactively
+   dependent cells), and emits a stream of messages: queued → running →
+   outputs → idle, plus variable diffs, dataset previews, and anything else
+   touched by the execution.
+4. **Server** wraps each kernel message in a `marimo/operation` notification
+   tagged with the notebook URI and pushes it to the extension.
+5. **Extension** routes each operation to interested services in parallel —
+   cell execution state, output rendering, variables panel, datasources
+   panel, package install progress. Services subscribe by operation type, so
+   a single operation can fan out to many consumers.
+
+Interruption (`marimo.interrupt`) and UI interaction
+(`marimo.set_ui_element_value`) follow the same pattern: a command from the
+extension, a kernel side effect, a stream of operations back.
+
+## Composition
+
+### Python side — adapting marimo's runtime to LSP
+
+The server is a thin adapter. The heavy lifting (execution, reactivity, UI
+element state) is marimo's; the LSP layer replaces a few seams so marimo can
+drive from a live notebook document rather than a file.
+
+- **Session manager** owns the notebook URI → `Session` mapping (see "Kernel
+  lifecycle" below for how that mapping is created and torn down).
+- **App file manager** adapts marimo's `AppFileManager` to read cells from
+  the in-memory LSP document state instead of a `.py` file — how a user's
+  live edits in VS Code reach the kernel's reactivity graph.
+- **Kernel manager** wraps the kernel subprocess, including interrupts and
+  cleanup.
+- **Session consumer** implements marimo's `SessionConsumer` interface and
+  forwards everything the kernel emits to the extension as `marimo/operation`
+  notifications.
+
+### Kernel lifecycle
+
+Kernels live inside the server, not the extension. A few properties matter
+for debugging:
+
+- **Lazy creation.** Opening a notebook doesn't start a kernel. The first
+  `marimo.run` for a given notebook URI + Python executable creates the
+  `Session` and spawns its subprocess.
+- **Saved notebooks keep their kernel when closed.** Reopening picks up the
+  same session without losing state. Only *untitled* notebooks get cleaned
+  up on `didClose`, since there's no stable URI to come back to.
+- **Switching the Python interpreter restarts the kernel.** Creating a
+  session against a different executable closes and replaces the existing
+  one for that URI.
+- **Interrupt vs. restart.** `marimo.interrupt` sends SIGINT to the
+  subprocess (cancels the current execution, preserves state). Restarting
+  tears the session down and starts a new one.
+- **Server shutdown closes every session.** All live kernels terminate with
+  the `marimo-lsp` process.
+
+> [!IMPORTANT]
+> The session map is keyed by notebook URI, which can be unstable across
+> rename and untitled-to-saved transitions. As long as a document's URI
+> doesn't change during a session, its cell URIs remain stable — that's what
+> the extension relies on to correlate kernel messages back to cell metadata.
+
+### TypeScript side — fanning out operations
+
+The extension is composed as Effect services assembled into a single `Layer`.
+The notebook/kernel-shaped pieces:
+
+- **Kernel manager** owns the `marimo/operation` subscription, parses each
+  operation, and offers it to downstream services.
+- **Execution registry** translates `cell-op` operations (queued / running /
+  idle) into `NotebookCellExecution` state on VS Code's notebook API,
+  including output rendering.
+- **Cell state manager** tracks staleness (cells whose source has drifted
+  from the last executed version) and flips context keys that drive UI
+  enablement.
+- **Notebook renderer** renders marimo's custom MIME outputs inside cells and
+  routes user interactions back through the extension to
+  `marimo.set_ui_element_value` / `marimo.function_call_request`.
+- **Variables / datasources / packages** services back the corresponding
+  tree views, each subscribing to its own operation types and maintaining a
+  local cache.
+
+The key property is that a single kernel operation can feed multiple services
+at once (e.g. `cell-op` drives execution state *and* updates visible output),
+and services can be added or swapped without changing the transport layer.
+
+---
+
+# CLAUDE.md
+
+Source: https://github.com/marimo-team/marimo-lsp/blob/main/CLAUDE.md
+
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Repo layout
+
+This is a **dual-stack monorepo**: a Python LSP server and a TypeScript VS Code extension that talk to each other.
+
+- `src/marimo_lsp/` — Python LSP server (pygls-based). Bridges VS Code's notebook protocol to a marimo `Session`/kernel.
+- `extension/` — VS Code extension (TypeScript, Effect-TS). Consumes the LSP, renders cells, manages kernels.
+- `tests/` — pytest tests for the LSP server (uses `pytest-lsp` for in-process client).
+- `extension/src/**/__tests__/` — vitest unit tests, colocated with source.
+- `extension/tests/` — `@vscode/test-cli` integration tests that launch a real VS Code instance.
+- `scripts/` — release / maintenance Python scripts (e.g. `generate_release_notes.py`).
+
+The Python server is pinned to a specific `marimo` version (`.marimo-version`). For local dev, clone `marimo-team/marimo` as a sibling directory and check out that tag — the extension links `@marimo-team/frontend`, `@marimo-team/openapi`, and `@marimo-team/smart-cells` from `../../marimo/`. CI does this automatically.
+
+## Common commands
+
+Toolchain: **`uv`** for Python, **`pnpm`** for Node, **`just`** as task runner.
+
+**NEVER** invoke `python`/`pip` directly — use `uv run ...` / `uv pip ...`.
+
+Run `just --list` to see available recipes. They're bucketed into `lint`, `fix`, `test`, `build`, and `setup` groups; recipes that accept pytest/vitest args take them as trailing positional args (`just test-py -v -k name`, `just test-ts --watch`).
+
+To launch the extension for manual testing, open the repo in VS Code and press **F5**.
+
+## Architecture
+
+Read `ARCHITECTURE.md` first — it documents the custom LSP protocol (commands like `marimo.run`, `marimo.serialize`, `marimo.set_ui_element_value`, and the `marimo/operation` server→client notification stream). The key mental model:
+
+1. **VS Code notebook protocol** handles cell text sync (`notebookDocument/didOpen`, `didChange`, ...).
+2. **Custom LSP commands** drive kernel actions (run cells, interrupt, call UI element functions, (de)serialize).
+3. **`marimo/operation` notifications** stream kernel output/state (`cell-op`, `variables`, `data-*-preview`, `alert`, package install progress, …) from server to client.
+
+### Python side (`src/marimo_lsp/`)
+
+- `server.py` — pygls `LanguageServer` with handlers for notebook lifecycle + custom commands.
+- `session_manager.py` — `LspSessionManager`: notebook URI → marimo `Session`. Sessions are created lazily on first `marimo.run` and closed on untitled-close, executable change, or shutdown. **URIs are the session key** — they're unstable across rename, so some operations can lose track.
+- `session.py`, `session_consumer.py`, `app_file_manager.py`, `kernel_manager.py` — LSP-flavored adapters around marimo's internals (`SessionConsumer`, `AppFileManager`, `KernelManager`) that read from in-memory LSP documents instead of files.
+- `completions.py`, `diagnostics.py`, `_rules.py` — language features (trigger-char completion for `@cell_name`, diagnostics).
+- `package_manager.py`, `api.py`, `models.py` — package-install flow and shared LSP request/response schemas.
+
+### TypeScript side (`extension/src/`)
+
+Built on **Effect-TS**. Everything is wired as `Layer`s (services) assembled in `layers/Main.ts` via `makeActivate(...)` in `features/Main.ts`. Directory roles:
+
+- `features/` — top-level layers that only register side effects (commands, codelens, file detection, theme sync, debug, cell-metadata bindings).
+- `services/`, `kernel/`, `notebook/`, `config/`, `lsp/`, `platform/`, `python/`, `telemetry/` — the actual services composed into `MainLive`. E.g. `KernelManager` consumes `marimo/operation`, `ExecutionRegistry` drives `NotebookCellExecution` state, `CellStateManager` tracks stale cells and the `marimo.notebook.hasStaleCells` context key, `NotebookRenderer` renders `application/vnd.marimo+html` MIME outputs, `VariablesService`/`DatasourcesService`/`PackagesService` back the tree views.
+- `commands/` — one file per VS Code command registered in `package.json`.
+- `renderer/` — webview-side notebook renderer (`renderer.tsx`) that embeds marimo's frontend.
+- `panel/`, `views/` — tree views for recents, variables, datasources, packages.
+- `lsp/` — language-client wiring + inner servers (`RuffLanguageServer`, `TyLanguageServer`) used when managed language features are enabled.
+- `lib/`, `utils/`, `schemas/`, `vendor/`, `__mocks__/` — supporting code.
+
+Cells use a dedicated language id `mo-python` so external Python LSPs don't double up on completions/diagnostics. Users can opt out with `marimo.disableManagedLanguageFeatures`.
+
+## Philosophy
+
+Tests, types, and lints are pedantic on purpose: they're load-bearing tools, not ceremony. Opting out is rarely the right call, but is allowed only with a thoughtful and clear explanation of *why*.
+
+## Effect-TS
+
+**Treat Effect as part of this codebase, not a third-party library.** The extension is built on Effect top-to-bottom — services, layers, fibers, scopes, schemas, streams — and writing idiomatic extension code means reaching for the right Effect primitive instead of reinventing it. Before adding a new abstraction (a queue, a cache, a retry wrapper, a resource lifecycle), ask whether Effect already has it.
+
+For repo-specific patterns, start with the `/effect-ts` skill ([`.claude/skills/effect-ts/SKILL.md`](.claude/skills/effect-ts/SKILL.md)) — it indexes per-module pattern files under `patterns/`.
+
+When writing Effect code, inspect `repos/effect/` for examples of idiomatic usage, tests, module structure, and API design. Treat it as the source of truth for Effect patterns; the upstream's own agent guidance lives at `repos/effect/AGENTS.md`. Run `just vendor-effect` to populate the directory (gitignored, pinned to the version this repo resolves).
+
+Treat `repos/` as read-only reference — never edit files there, and never import from it. Application code continues to import from the normal `effect` and `@effect/*` packages.
+
+### Local Effect conventions (from `CONTRIBUTING.md`)
+
+- Use Effect's native logger primitives — no custom logging utilities.
+- Name top-level functions: `Effect.fn("namespace.operation")(function*(){...})`.
+- Put variable data in `Effect.annotateLogs({ … })` / `Effect.annotateCurrentSpan(...)`, not interpolated into the message.
+- Wrap important external calls with `Effect.withSpan("lsp.executeCommand", { attributes: {...} })`.
+
+### Prefer Schema or type guards over type assertions
+
+Think of `as T`, `!` (non-null), and `as unknown as T` the way Rust thinks of `unsafe`: the compiler's contract is off and you're staking your word that you know more than it does. Sometimes that's true — but rarely. A wrong type assertion surfaces as neither a type error nor a runtime error, just silent propagation, and that throws away the exact property we picked Effect for (`Effect<A, E, R>` making every error and dependency explicit).
+
+The convention: reach for real checks by default; assertions only in the rare case you genuinely know more than the compiler.
+
+**Use instead:**
+- **`Schema`** (Effect's `Schema`) at boundaries — once data is parsed, the type is earned.
+- **Type guards / predicates** (`function isUser(x): x is User`) for narrowing within flow.
+- **Plain narrowing** — `typeof`, `instanceof`, equality, discriminants — is often enough. In `catch`, narrow with `instanceof` or let typed Effect errors carry the shape.
+- **`assert(...)`** for runtime invariants the compiler can't see; it narrows *and* crashes loudly on violation, which is the point.
+
+**When a type assertion is warranted**, leave a `// SAFETY:` comment right above it — same convention Rust uses for every `unsafe` block. State the invariant you're staking, not what the code does, so the next reader can check your reasoning.
+
+```ts
+// SAFETY: routeOperation only forwards cell-op messages whose cellId
+// is present in `executions`; we guard the lookup on line 84.
+const execution = executions.get(cellId) as NotebookCellExecution;
+```
+
+No `// SAFETY:` comment, no type assertion.
+
+This extends to tests. Don't `{} as FooService` your way to a mock — fully `implements` the interface (see `src/__mocks__/Test*.ts`), or introduce a test-scoped branded type / helper that restricts the surface *and* gets checked. If the mock is hard to write, the seam is wrong, not the types.
+
+Background: [Be assertive](https://trevorma.nz/blog/be-assertive), [Catch errors carefully](https://trevorma.nz/blog/catch-errors-carefully).
+
+## Testing
+
+**Write tests. Not too many. Mostly integration.** ([write-tests](https://kentcdodds.com/blog/write-tests)) Integration tests are where real confidence lives — unit tests that mock out everything around the code under test give you a green bar without proving the pieces fit. For most bugfixes there's a high-value test worth adding; take a quiet moment to think about what shape of test would actually catch the bug next time, and how to make it reviewable as a diff.
+
+**`just test-vscode` (`@vscode/test-cli`)** drives the real extension inside a real VS Code instance (`extension/tests/*.test.cjs`). This is where most user-facing confidence is earned: a green test here proves the extension behaves the way a user actually uses it, end-to-end. Slower per run, but the runner is good enough to make reliable integration coverage worth the wall-clock.
+
+**`just test-py` (pytest + `pytest-lsp`)** is integration-shaped by default: it spins up a real `marimo-lsp` subprocess over stdio and drives the full protocol. The obvious place for anything that touches an LSP request/response shape.
+
+**`just test-ts` (vitest)** gives high leverage on individual services in partial isolation — the service-oriented layering means you can feed a service the events it'd normally receive from upstream and assert on what it does, without booting the whole runtime. `src/__mocks__/Test*.ts` has real `implements`-based stand-ins; `Effect.die("not implemented")` on methods the code-under-test shouldn't touch makes boundary violations loud instead of silent. Effect's `Layer` pattern makes mocking frictionless, which also makes over-mocking tempting — ask whether the test is still exercising behavior a user could observe.
+
+**Snapshot tests pull a lot of weight** — `inline-snapshot` (pytest) and `toMatchInlineSnapshot` (vitest) put the expected shape of a protocol message or serialized output right next to the test body, so PR reviewers see the expected output in the diff and regressions surface as line-by-line changes. Regen with `uv run pytest --inline-snapshot=create` (or `=fix`); pair with `dirty-equals` matchers to keep non-deterministic fields out of the recorded shape.
+
+## Other conventions
+
+### Python
+
+- Ruff is configured with `select = ["ALL"]` plus a curated ignore list in `pyproject.toml`. Tests have extra ignores (asserts allowed, no docstring requirement, etc.).
+- Type-check with `ty` (not mypy). Extension files are excluded from `ty`.
+- `inline-snapshot` is wired up with `ruff format` — regenerate with `uv run pytest --inline-snapshot=create` (or `=fix`).
+
+### Python kernel compatibility
+
+Two distinct version pins live in `pyproject.toml`:
+
+- `dependencies.marimo == <exact>` — the version the LSP server *ships with* (bundled frontend + Python API). Auto-bumped by the `update-marimo-version` cron.
+- `[tool.marimo-lsp] minimum-kernel-version` — the floor we claim to support in the *user's* kernel env. Bumped manually when intentionally dropping support.
+
+Don't conflate these when editing. The cron only touches the first.
+
+## Gotchas
+
+- **Marimo controllers leave `executionOrder` undefined.** Tests that wait for `executionOrder` to increment will hang forever — gate on cell state or output instead.
+- **`ARCHITECTURE.md` file-path references can lag the code** (services were renamed/moved from `services/` into subdirs like `kernel/`, `notebook/`, `config/`). Prefer grep over trusting a stale path.
+
+---
+
+# Press `F5` in VS Code (or "Run and Debug" > "Run Extension" in the UI).
+
+Source: https://github.com/marimo-team/marimo-lsp/blob/main/CONTRIBUTING.md
+
+## Quick Start
+
+1. Open this project in VS Code
+2. Press `F5` to launch a new VS Code window with the extension loaded
+3. Open a marimo notebook (or create a new one)
+
+## Development
+
+This project requires [uv](https://docs.astral.sh/uv/),
+[pnpm](https://pnpm.io/), and [just](https://just.systems/).
+
+**Quickstart**
+
+```sh
+cd marimo-lsp
+code .
+# Press `F5` in VS Code (or "Run and Debug" > "Run Extension" in the UI).
+```
+
+> [!NOTE]
+> The extension builds against a specific version of
+> [`marimo-team/marimo`](https://github.com/marimo-team/marimo), specified in
+> the `.marimo-version` file. Both repositories must be cloned side-by-side:
+>
+> ```
+> parent-folder/
+> ├── marimo/          # Main marimo codebase
+> └── marimo-lsp/      # This project
+> ```
+>
+> For local development, checkout the matching version in the `marimo` directory:
+>
+> ```sh
+> cd ../marimo
+> git checkout $(cat ../marimo-lsp/.marimo-version)
+> ```
+>
+> CI automatically checks out the version specified in `.marimo-version`. To update
+> the pinned version, change `.marimo-version` to a tag (e.g., `0.18.4`), branch, or
+> commit SHA.
+
+### Pre-commit Hooks
+
+To install pre-commit hooks:
+
+```sh
+uvx pre-commit install
+```
+
+This will run linting and formatting checks automatically before each commit.
+
+### Common Commands
+
+This project uses [just](https://just.systems/) for common development tasks.
+Run `just --list` to see all recipes, grouped into `lint`, `fix`, `test`,
+`build`, and `setup`. Highlights:
+
+| Command              | Action                                       |
+| -------------------- | -------------------------------------------- |
+| `just lint`          | Lint + typecheck everything (py + ts)        |
+| `just fix`           | Autofix + format everything (py + ts)        |
+| `just test`          | Run all tests (`test-py` + `test-ts`)        |
+| `just test-vscode`   | VS Code extension integration tests (slow)   |
+| `just build`         | Embed the Python sdist and bundle the extension |
+
+Recipes that wrap pytest or vitest forward trailing args:
+
+```sh
+just test-py -v                    # pytest with verbose output
+just test-py tests/test_foo.py     # specific test file
+just test-ts --watch               # vitest in watch mode
+```
+
+## Architecture
+
+See [ARCHITECTURE.md](./ARCHITECTURE.md) for details on how the LSP server and
+extension work together.
+
+## Logging (Extension)
+
+Use Effect's native logging primitives. Avoid custom logging utilities.
+
+### Named Effect Functions
+
+Add a name to `Effect.fn` for automatic span creation. Use `Effect.fnUntraced`
+for inner/callback functions to avoid span overhead:
+
+```ts
+// Do: Named function at entry points
+export const myCommand = Effect.fn("command.myCommand")(function* () {
+  // Do: Untraced for callbacks (avoids extra span overhead)
+  yield* SynchronizedRef.updateEffect(ref, Effect.fnUntraced(function* (value) { ... }));
+});
+
+// Don't: Anonymous at entry points
+export const myCommand = Effect.fn(function* () { ... });
+```
+
+### Logging with Annotations
+
+Put variable data in annotations, not the message:
+
+```ts
+// Do
+yield *
+  Effect.logInfo("Created notebook").pipe(
+    Effect.annotateLogs({ uri: notebook.uri.toString() }),
+  );
+
+// Don't
+yield * Effect.logDebug(`Processing ${count} items`);
+```
+
+### Span Annotations
+
+Use `Effect.annotateCurrentSpan` to add context to the enclosing span:
+
+```ts
+const refresh = Effect.fn("ControllerRegistry.refresh")(function* () {
+  yield* Effect.annotateCurrentSpan("environmentCount", envs.length);
+  // ...
+});
+```
+
+### Explicit Spans
+
+Use `Effect.withSpan` for important operations:
+
+```ts
+yield *
+  client
+    .executeCommand(cmd)
+    .pipe(
+      Effect.withSpan("lsp.executeCommand", {
+        attributes: { command: cmd.command },
+      }),
+    );
+```
+
+---
