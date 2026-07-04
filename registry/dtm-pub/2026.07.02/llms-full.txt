@@ -1,0 +1,5441 @@
+# document for dtm
+
+Source: https://github.com/dtm-labs/dtm.pub/blob/main/README.md
+
+# document for dtm
+
+---
+
+# 缓存一致性
+
+Source: https://github.com/dtm-labs/dtm.pub/blob/main/docs/app/cache.md
+
+# 缓存一致性
+
+## 概述
+大量的实际的项目中，都会引入 Redis 缓存来缓解数据库的查询压力，此时由于一个数据在 Redis 和数据库两处进行了存储，就会有数据一致性的问题。目前业界尚未见到成熟的能够确保最终一致性的方案，特别是当如下场景发生时，会直接导致缓存数据与数据库数据不一致。
+
+![cache-version](../imgs/cache-version.svg)
+
+在上述场景下，缓冲中的数据最终版本为v1，而数据库的最终版本为v2，可能给应用带来较大问题。​
+
+很多人容易想到通过分布式锁，来解决上述问题，但依旧存在问题，参见下图（来自DDIA作者 Martin Kleppmann 关于redis锁的讨论）
+
+![unsafe-lock](../imgs/unsafe-lock.png)
+
+[dtm-labs](https://github.com/dtm-labs) 致力于解决数据一致性问题，在分析了行业的现有做法后，提出了新解决方案[dtm-labs/dtm](https://github.com/dtm-labs/dtm)+[dtm-labs/rockscache](https://github.com/dtm-labs/rockscache)，彻底解决了上述问题。
+
+该方案具备以下特性：
+- 最终一致：极端情况也能确保缓存的最终一致
+- 强一致：支持给应用提供强一致的访问
+- 高性能：与常见的缓存方案对比，性能无大的差别
+- 防击穿：给出更好的防击穿方案
+- 防穿透
+- 防雪崩
+- 非常易用：仅提供极简的两个函数，对应用无要求
+
+关于管理缓存的现有方案，本文不再赘述，不太了解的同学可以参考下面这两篇文章
+- 这篇通俗易懂些：[聊聊数据库与缓存数据一致性问题](https://juejin.cn/post/6844903941646319623)
+- 这篇更加深入：[携程最终一致和强一致性缓存实践](https://www.infoq.cn/article/hh4iouiijhwb4x46vxeo)
+
+## 问题与方案
+在上述这个时序图中，由于服务1发生了进程暂停（例如由于GC导致），因此当它往缓存当中写入v1时，覆盖了缓存中的v2，导致了最终的不一致（DB中为v2，缓存中为v1）。对于上述这类问题应当如何解决？目前现存的方案，全都没有彻底解决该问题，一般有以下几种方案：
+- 设定稍短的过期时间兜底：在这个过期时间之内，会不一致。缺点是较短的过期时间意味着数据库的负载会更高
+- 延时双删：先删除一次缓存，延时几百毫秒再删除一次。这种做法只能够进一步降低不一致的概率，但无法保证
+- 在应用层引入类似版本的机制：对应用层有要求，通用性受限，不易复用
+
+我们实现的缓存“标记删除”方案，能够彻底解决这个问题，确保缓存与数据库之间的数据保持一致。解决原理如下：
+
+缓存中的数据是一个hash，里面有以下几个字段：
+- value: 数据本身
+- lockUtil: 数据锁定到期时间，当某个进程查询缓存无数据，那么先锁定缓存一小段时间，然后查询DB，然后更新缓存
+- owner: 数据锁定者uuid
+
+查询缓存时：
+1. 如果数据为空，且被锁定，则睡眠100ms后，重新查询
+2. 如果数据为空，且未被锁定，同步执行"取数据"，返回结果
+3. 如果数据不为空，那么立即返回结果，并异步执行"取数据"
+
+其中"取数据"的操作定义为：
+1. 判断是否需要更新缓存，下面两个条件满足其一，则需要更新缓存
+	- 数据为空，并且未被锁定
+	- 数据的锁定已过期
+2. 如果需要更新，则锁定缓存，查询DB，校验锁持有者无变化，写入缓存，解锁缓存
+
+当DB数据更新时，通过dtm确保数据更新成功时，将缓存"标记删除"（保证原子操作的原理，后面一节展开详细讲解）
+- 标记删除会将数据过期时间设定为10s，将锁设置为已过期，触发下一次查询缓存时的“取数据”
+
+在上述的策略下：
+
+假如最后写入数据库的版本为Vi，最后写入到缓存的版本为V，写入V的uuid为uuidv，那么一定存在以下事件序列：
+
+数据库写入Vi -> 缓存数据被标记为删除 -> 某个查询锁定数据并写入uuidv -> 查询数据库结果V -> 缓存中的锁定者为uuidv，写入结果V
+
+在这个序列中，V的读取发生在写入Vi之后，所以V等于Vi，保证了缓存的数据的最终一致性。
+
+[dtm-labs/rockscache](https://github.com/dtm-labs/rockscache)已经实现了上述方法，能够确保缓存数据的最终一致性。
+- `Fetch`函数实现了前面的查询缓存
+- `TagDeleted`函数实现了标记删除的逻辑
+
+感兴趣的同学，可以参考[dtm-cases/cache](https://github.com/dtm-labs/dtm-cases/tree/main/cache)，里面有详细的例子
+
+## DB与缓存操作的原子性 {#atomic}
+对于缓存的管理，一般业界会采用写完数据库后，删除/更新缓存数据的策略。由于保存到缓存和保存到数据库两个操作之间不是原子的，一定会有时间差，因此这两个数据之间会有一个不一致的时间窗口，通常这个窗口不大，影响较小。但是两个中间可能发生宕机，也可能发生各种网络错误，因此就有可能发生完成了其中一个，但是未完成另一个，导致数据会出现长时间不一致。
+
+举一个场景来说明上述不一致的情况，数据用户将数据 A 修改为 B ，应用修改完数据库之后，再去删除/更新缓存，如果未发生异常，那么数据库和缓存的数据是一致的，没有问题。但是分布式系统中，可能会发生进程crash、宕机等事件，因此如果更新完数据库，尚未删除/更新缓存时，出现进程crash，那么数据库和缓存的数据就可能出现长时间的不一致。
+
+面对这里的长时间不一致的情况，想要彻底解决，并不是一件容易的事，我们下面分各种应用情况来介绍解决方案。
+
+#### 方案一：较短的缓存时间
+这个方案，是最简单的方案，适合并发量不大应用。如果应用的并发不高，那么整个缓存系统，只需要设置了一个较短的缓存时间，例如一分钟。这种情况下数据库需要承担的负载是：大约每一分钟，需要将访问到的缓存数据全部生成一遍，在并发量不大的情况下，这种策略是可行的。
+
+上述这种策略非常简单，易于理解和实现，缓存系统提供的语义是，大多数情况下，缓存和数据库之间不一致的时间窗口是很短的，在较低概率发生进程crash的情况下，不一致的时间窗口会达到一分钟。
+
+应用在上述约束下，需要将一致性要求不高的数据读取，从缓存读取；而将一致性要求较高的读，不走缓存，直接从数据库查询。
+
+#### 方案二：消息队列保证一致
+假如应用的并发量很高，缓存过期时间需要比一分钟更长，而且应用中的大量请求不能够容忍较长时间的不一致，那么这个时候，可以通过使用消息队列的方式，来更新缓存。具体的做法是：
+- 更新数据库时，同时将更新缓存的消息写入本地表，随着数据库更新操作的提交而提交。
+- 写一个轮询任务，不断轮询这部分消息，发给消息队列。
+- 消费消息队列中的消息，更新/删除缓存
+
+这种做法可以保证数据库更新之后，缓存一定会被更新。但这种这种架构方案很重，这几个部分开发维护成本都不低：消息队列的维护；高效轮询任务的开发与维护。
+
+#### 方案三：订阅 binlog
+这个方案适用场景与方案二非常类似，原理又与数据库的主从同步类似，数据库的主从同步是通过订阅binlog，将主库的更新应用到从库上，而这个方案则是通过订阅binlog，将数据库的更新应用到缓存上。具体做法是：
+- 部署并配置阿里开源的 canal ，让它订阅数据库的binlog
+- 通过 canal等工具 监听数据更新，同步更新/删除缓存
+
+这种方案也可以保证数据库更新之后，缓存一定会被更新，但是这种架构方案跟前面的消息队列方案一样，也非常重。一方面 canal 的学习维护成本不低，另一方面，开发者可能只需要少量数据更新缓存，通过订阅所有的 binlog 来做这个事情，浪费了很多资源。
+
+#### 方案四： dtm 二阶段消息方案
+dtm 里的二阶段消息模式，非常适合这里的修改数据库之后更新/删除缓存，主要代码如下：
+
+``` Go
+msg := dtmcli.NewMsg(DtmServer, gid).
+	Add(busi.Busi+"/DeleteRedis", &Req{Key: key1})
+err := msg.DoAndSubmitDB(busi.Busi+"/QueryPrepared", db, func(tx *sql.Tx) error {
+  // update db data with key1
+})
+```
+
+这段代码，DoAndSubmitDB会进行本地数据库操作，进行数据库的数据修改，修改完成后，会提交一个二阶段消息事务，消息事务将会异步调用 DeleteRedis。假如本地事务执行之后，就立刻发生了进程 crash 事件，那么 dtm 会进行回查调用 QueryPrepared ，保证本地事务提交成功的情况下，DeleteRedis 会被最少成功执行一次。
+
+回查的逻辑非常简单，只需要copy类似下面这样的代码即可：
+``` Go
+	app.GET(BusiAPI+"/QueryPrepared", dtmutil.WrapHandler(func(c *gin.Context) interface{} {
+		return MustBarrierFromGin(c).QueryPrepared(dbGet())
+	}))
+```
+
+这种方案的优点：
+- 方案简单易用，代码简短易读
+- dtm 本身是一个无状态的普通应用，依赖的存储引擎 redis/mysql 是常见的基础设施，不需要额外维护消息队列或者 canal
+- 相关的操作模块化，易维护，不需要像消息队列或者 canal 在其他地方写消费者的逻辑
+
+#### 从库延时
+上述的方案中，假定缓存删除后，服务进行数据查询，总是能够查到最新的数据。但是实际的生产环境中，可能会出现主从分离的架构，而主从延时并不是一个可控的变量，那么这时候又要怎么处理？
+
+处理方案两种：一是区分最终一致性很高和不高的缓存数据，查询数据时，将要求很高的数据必须从主库读取，而把要求不高的数据从从库读取。对于使用了rockscache的应用来说，高并发的请求都会在Redis这一层被拦截，对于一个数据，最多只会有一个请求到达数据库，因此数据库的负载已大幅降低，采用主库读取是一个实际可行的方案。
+
+另一种方案是，主从分离需要采用不分叉的单链架构，那么链条末尾的从库必定是延迟最长的从库，此时采用监听binlog的方案，需要监听链条做末端的从库binlog，当收到数据变更通知时，按照上述方案将缓存标记为删除。
+
+这两个方案各有优缺点，业务可以根据自己的特点采用。
+
+## 防缓存击穿
+rockscache还可以防缓存击穿。当数据变更时，业界现有做法既可以选择更新缓存，也可以选择删除缓存，各有优劣。而标记删除法综合了两种方法的优势，并克服了两种方法的劣势：
+
+#### 更新缓存
+采取更新缓存策略，那么会为所有的DB数据更新生成缓存，不区分冷热数据，那么会存在以下问题：
+- 内存上，即使一个数据没有被读取，也会保存在缓存里，浪费了宝贵的内存资源；
+- 在计算上，即使一个数据没有被读取，也可能因为多次更新，被多次计算，浪费了宝贵的计算资源。
+- 上述的乱序不一致发生的概率会较高，当两个临近的更新中出现延迟，就可能触发。
+
+#### 删除缓存
+因为前面的更新缓存做法问题较多，因此大多数的实践采用的是删除缓存策略，查询时再按需生成缓存。这种做法解决了更新缓存中的问题，但是又带来新问题：
+- 那么在高并发的情况下，如果删除了一个热点数据，那么此时会有大量请求会无法命中缓存，产生缓存击穿。
+
+为了防止缓存击穿，通用的做法是使用分布式 Redis 锁保证只有一个请求到数据库，等缓存生成之后，其他请求进行共享。这种方案能够适合很多的场景，但有些场景却不适合。
+- 例如有一个重要的热点数据，计算代价比较高，需要3s才能够获得结果，那么上述方案在删除一个这种热点数据之后，就会在这个时刻，有大量请求3s才返回结果，一方面可能造成大量请求超时，另一方面3s没有释放链接，会导致并发连接数量突然升高，可能造成系统不稳定。
+- 另外使用 Redis 锁时，未获得锁的这部分用户，通常会定时轮询，而这个睡眠时间不好设定。如果设定比较大的睡眠时间1s，那么对于10ms就计算出结果的缓存数据，返回太慢了；如果设定的睡眠时间太短，那么很消耗 CPU 和 Redis 性能
+
+#### 标记删除法
+前面介绍的[dtm-labs/rockscache](https://github.com/dtm-labs/rockscache)实现的标记删除法也属于删除法，但它彻底解决了删除缓存中的击穿问题，以及击穿带来的附带问题。
+1. 缓存击穿问题：标记删除法中，如果缓存中的数据不存在，那么会锁定缓存中的这条数据，因此避免了多个请求打到后端数据库。
+2. 上述大量请求3s才返回数据，以及定时轮询的问题，在标记删除中也不存在，因为热点数据被标记删除时，旧版本的数据还在缓存中，会被立即返回，无需等待。
+
+我们来看看不同的数据访问频率下，标记删除法的表现如何：
+1. 热点数据，每秒1K qps，计算缓存时间5ms，此时标记删除法，大约5~8ms左右的时间里，会返回过期数据，而先更新DB，再更新缓存，因为更新缓存需要时间，也会有大约0~3ms返回过期数据，因此两者差别不大。
+2. 热点数据，每秒1K qps，计算缓存时间3s，此时标记删除法，大约3s的时间里，会返回过期数据。对比于等待3s后再返回数据，那么返回旧数据，通常是更好的行为。
+3. 普通数据，每秒50 qps，计算缓存时间1s，此时标记删除法的行为分析，类似2，没有问题。
+4. 低频数据，5秒访问一次，计算缓存时间3s，此时标记删除法的行为与删除缓存策略基本一样，没有问题
+5. 冷数据，10分钟访问一次，此时标记删除法，与删除缓存策略基本一样，只是数据比删除缓存的方式多保存10s，占用空间不大，没有问题
+
+有一种极端情况是，那就是原先缓存中没有数据，突然大量请求到来，这种场景对，更新缓存法删除缓存法，标记删除法，都是不友好的。这种的场景是开发人员需要避免的，需要通过预热来解决，而不应当直接扔给缓存系统。当然，由于标记删除法已经把打到数据库的请求量降到最低，因此表现也不弱于任何其他方案。
+
+## 防缓存穿透与缓存雪崩
+[dtm-labs/rockscache](https://github.com/dtm-labs/rockscache)还实现了防缓存穿透与缓存雪崩。
+
+缓存穿透是指，缓存和数据库都没有的数据，被大量请求。由于数据不存在，缓存就也不会存在该数据，所有的请求都会直接穿透到数据库。rockscache中可以设定`EmptyExipire`设定对空结果的缓存时间，如果设定为0，那么不缓存空数据，关闭防缓存穿透
+
+缓存雪崩是指缓存中有大量的数据，在同一个时间点，或者较短的时间段内，全部过期了，这个时候请求过来，缓存没有数据，都会请求数据库，则数据库的压力就会突增，扛不住就会宕机。rockscache可以设定`RandomExpireAdjustment`，对过期时间加上随机值，避免同时过期。
+
+## 应用能否做到强一致？
+上面已经介绍了缓存一致性的各种场景，以及相关的解决方案，那么是否可以保证使用缓存的同时，还提供强一致的数据读写呢？强一致的读写需求比前面的最终一致的需求场景少，但是在金融领域，也是有不少场景的。
+
+当我们在这里讨论强一致时，我们需要先把一致性的含义做一下明确。
+
+开发者最直观的强一致性很可能理解为，数据库和缓存保持完全一致，写数据的过程中以及写完之后，无论从数据库直接读，或者从缓存直接读，都能够获得最新写入的结果。对于这种两个独立系统之间的“强一致性”，可以非常明确的说，理论上是不可能的，因为更新数据库和更新缓存在不同的机器上，无法做到同时更新，无论如何都会有时间间隔，在这个时间间隔里，一定是不一致的。
+
+但是应用层的强一致性，则是可以做到的。可以简单考虑我们熟悉的场景：CPU的缓存作为内存的缓存，内存作为磁盘的缓存，这些都是缓存的场景，从来没有发生过一致性问题。为什么？其实很简单，要求所有的数据使用方，只能够从缓存读取数据，而不能同时从缓存和底层存储同时读取数据。
+
+对于DB和Redis，如果所有的数据读取，只能够由缓存提供，就可以很容易的做到强一致，不会出现不一致的情况。下面我们来根据DB和Redis的特点，来分析其中的设计：
+
+#### 先更新缓存还是DB
+类比CPU缓存与内存，内存缓存与磁盘，这两个系统都是先修改缓存，再修改底层存储，那么到了现在的DB缓存场景是否也先修改缓存再修改DB？
+
+在绝大多数的应用场景下，开发者会认为Redis作为缓存，当Redis出现故障时，那么应用需要支持降级处理，依旧能够访问数据库，提供一定的服务能力。考虑这种场景，一旦出现降级，先写缓存再写DB方案就有问题，一方面会丢失数据，另一方面会发生先读取到缓存中的新版本v2，再读取到旧版本v1。因此在Redis作为缓存的场景下，绝大部分系统会采取先写入DB，再写入缓存的这种设计
+
+#### 写入DB成功缓存失败情况
+假如因为进程crash，导致写入DB成功，但是标记删除第一次失败怎么办？虽然间隔几秒之后，会重试成功，但这几秒钟的时间里，用户去读取缓存，依旧还是旧版本的数据。例如用户发起了一笔充值，资金已经进入到DB，只是更新缓存失败，导致从缓存看到的余额还是旧值。这种情况的处理很简单，用户充值时，写入DB成功时，应用不要给用户返回成功，而是等缓存更新也成功了，再给用户返回成功；用户查询充值交易时，要查询DB和缓存是否都成功了（可以查询二阶段消息全局事务是否已成功），只有两者都成功了，才返回成功。
+
+在上述的处理策略下，当用户发起充值后，在缓存更新完成之前，用户看到的是，这笔交易还在处理中，结果未知，此时是符合强一致要求的；当用户看到交易已经处理成功，也就是缓存已更新成功，那么所有从缓存中拿到的数据都是更新后的数据，那么也符合强一致的要求。
+
+[dtm-labs/rockscache](https://github.com/dtm-labs/rockscache)也实现了强一致的读取需求。当打开`StrongConsistency`选项，那么rockscache里`Fetch`函数就提供了强一致的缓存读取。其原理与标记删除法差别不大，仅做了很小的改变，就是不再返回旧版本的数据，而是同步等待“取数据”的最新结果
+
+当然这个改变会带来性能上的下降，对比与最终一致的数据读取，强一致的读取一方面要等待当前“取数据”的最新结果，增加了返回延迟，另一方面要等待其他进程的结果，会产生sleep等待，耗费资源。
+
+## 缓存降级升级中的强一致
+上述的强一致方案中，说明了其强一致的前提是：“所有的数据读取，只能够由缓存”。不过如果Redis如果发生故障，需要进行降级，那么降级的过程可能很短只有几秒，但是这个几秒内如果不能接受不可访问，还严苛的要求提供访问的话，就会出现读取缓存和读取DB混用情况，就不满足这个前提。不过因为Redis故障的频率不高，要求强一致性的应用通常配备专有Redis，因此遇见故障降级的概率很低，很多应用不会在这个地方提出苛刻的要求。
+
+不过dtm-labs作为数据一致性领域的领导者，也深入研究了这个问题，并给出这种苛刻条件下的解决方案。
+
+#### 升降级的过程
+现在我们来考虑应用在Redis缓存出现问题的升降级处理。一般情况下这个升降级的开关在配置中心，当修改配置后，各个应用进程会陆续收到降级配置变更通知，然后在行为上降级。在降级的过程中，会出现缓存与DB混合访问的情况，这时我们上面的方案就有可能出现不一致。那么如何处理才能够保证在这种混合访问的情况下，依旧能够让应用获取到强一致的结果呢？
+
+混合访问的过程中，我们可以采取下面这个策略，来保证DB和缓存混合访问时的数据一致性。
+- 更新数据时，使用分布式事务，保证以下操作为原子操作
+  - 将缓存标记为“锁定中”
+  - 更新DB
+  - 将缓存“锁定中”标记去除，标记为删除
+- 读取缓存数据时，对于标记为“锁定中”的数据，睡眠等待后再次读取；对于标记删除的数据，不返回旧数据，等待新数据完成再返回。
+- 读取DB数据时，直接读取，无需任何额外操作
+
+这个策略跟前面不考虑降级场景的强一致方案，差别不大，读数据部分完全不变，需要变的是更新数据。rockscache假定更新DB是一个业务上可能失败的操作，于是采用一个SAGA事务来保证原子操作，详情参见例子[dtm-cases/cache](https://github.com/dtm-labs/dtm-cases/tree/main/cache)
+
+升降级的开启关闭有顺序要求，不能够同时开启缓存读和写，而是需要在开启缓存读的时候，所有的写操作都已经确保会更新缓存。
+
+降级的详细过程如下：
+1. 最初状态：
+	- 读：混合读
+	- 写：DB+缓存
+2. 读降级：
+	- 读：关闭缓存读。混合读 => 全部DB读
+	- 写：DB+缓存
+3. 写降级：
+	- 读：全部DB读；
+	- 写：关闭缓存写。DB+缓存 => 只写DB
+
+升级的过程与此相反，如下：
+1. 最初状态：
+	- 读：全部读DB
+	- 写：全部只写DB
+2. 写升级：
+	- 读：全部读DB
+	- 写：打开写缓存。只写DB => 写DB+缓存
+4. 读升级：
+	- 读：部分读缓存。全部读DB => 混合读
+	- 写：写DB+缓存
+
+[dtm-labs/rockscache](https://github.com/dtm-labs/rockscache)已实现了上述强一致的缓存管理方法。
+
+感兴趣的同学，可以参考[dtm-cases/cache](https://github.com/dtm-labs/dtm-cases/tree/main/cache)，里面有详尽的例子
+
+## 小结
+这篇文章很长，许多的分析比较晦涩，最后将Redis缓存的使用方式做个总结：
+- 最简单的方式为：较短的缓存时间，允许少量数据库修改，未同步删除缓存
+- 保证最终一致，并且可防缓存击穿的方式为：二阶段消息+标记删除(rockscache)
+- 强一致：二阶段消息+强一致(rockscache)
+- 一致性要求最严苛的方式为：二阶段消息+强一致(rockscache)+升降级兼容
+
+对于后两种方式，我们都推荐使用[dtm-labs/rockscache](https://github.com/dtm-labs/rockscache)来作为您的缓存方案
+
+---
+
+# 秒杀
+
+Source: https://github.com/dtm-labs/dtm.pub/blob/main/docs/app/flash.md
+
+# 秒杀
+本文介绍一种全新的秒杀架构，完全解决了秒杀架构中的核心痛点。该架构能够支持每秒超万单精准扣库存，并且保证创建订单和扣减库存的数据最终严格一致。
+
+## 现有秒杀系统的问题
+现有的秒杀架构，为了支持高并发，通常把库存放在Redis中，收到订单请求时，在Redis中进行库存扣减。这种的设计，导致创建订单和库存扣减不是原子操作，如果两个操作中间，遇到进程crash等问题，就会导致数据不一致。
+
+即使库存扣减不放在Redis中，而是放在数据库，不一致问题也通常是存在的。业务系统为了模块化，减少耦合，会将库存服务与订单服务分开。只要是分开的服务，那么数据不一致的情况就是无法避免的。
+
+进程crash等问题，虽然发生的概率不高，但即使占比百分之一，甚至千分之一，都会产生数据不一致，例如扣减的库存量和创建成功的订单不一致。
+
+库存与订单数据不一致是必须解决的难题，常见做法是，开发人员通过订单数据，去校准库存数据，这部分的工作非常繁琐复杂，耗费大量的开发工作，而且很多时候需要人工介入，对数据进行人工校验和修复。
+
+下面我们来看看新架构如何优雅解决这个问题
+## 整体架构
+我们明确业务场景，我们把秒杀系统的核心要点提取出来，为以下几点：
+- 用户进行秒杀，会在某个时间点发送大量的请求到后端，请求量会大大高于库存数量
+- 后端需要保证库存扣减和订单创建是最终严格一致的，即使中间发生进程crash，最终数据不会受到影响
+
+上述的场景下，绝大部分扣减库的描述请求，都会失败，时序图如下：
+
+![flash-sales-fail](../imgs/flash-sales-fail.svg)
+
+在这个架构中，使用了分布式事务框架dtm。上述的时序图中，扣减库存是在Redis中进行的，与dtm相关的注册全局事务和取消全局事务也是在Redis中处理的，全程依赖Redis，与数据库无关，因此能够支持极高的并发，从后面的测试数据中可以看到，该架构可以轻易处理每秒上万单的秒杀请求。
+
+虽然大部分请求因为扣减库存失败而结束，但是会有一定数量的请求，扣减库存成功，这种情况的时序图如下：
+
+![flash-sales](../imgs/flash-sales.svg)
+
+在这个时序图中，扣减库存成功后，会进入到订单服务，进行订单相关的创建，以及后续的支付。在这个新架构中，订单服务仅需要处理有效订单，此时并发量已经大幅下降，只需要通过常规的方法，例如订单分库分表、消息队列削峰处理，就可以轻松解决问题了。
+
+## 原子操作
+在上述的架构中，如果在Redis中扣减库存后，在提交全局事务前，发生进程crash，就会导致两个操作没有同时完成，那么这种情况后续会怎么样？新架构如何保证数据最终严格一致？这种情况的整个的时序图如下：
+
+![flash-sales-down](../imgs/flash-sales-down.svg)
+
+一旦发生这类进程crash，导致两个操作过程中断，那么dtm服务器会轮询超时未完成的事务，如果出现已Prepare、未Submit的全局任务，那么他会调用反查接口，询问应用，库存扣减是否成功扣减。如果已扣减，则将全局事务提交，并进行后续的调用；如果未扣减，则将全局事务标记为失败，不再处理。
+
+保证原子操作的原理，以及发生各种情况dtm的处理策略，可以参考[二阶段消息](../practice/msg)，这里不做详细的描述。
+
+## 核心代码
+
+秒杀接口的核心代码如下：
+``` Go
+gid := "{a}flash-sale-" + activityID + "-" + uid
+msg := dtmcli.NewMsg(DtmServer, gid).
+	Add(busi.Busi+"/createOrder", gin.H{activity_id: activityID, UID: uid})
+err := msg.DoAndSubmit(busi.Busi+"/QueryPreparedRedis", func(bb *BranchBarrier) error {
+  return bb.RedisCheckAdjustAmount(rds, "{a}stock-"+stockID, -1, 86400)
+})
+```
+
+- 行1: 一般的秒杀活动，一个用户仅能购买一次，因此按照活动id+用户id作为全局事务ID，能够保证用户最多生成一个全局事务，最多创建一个订单
+- 行2: 创建一个二阶段消息的对象，填入dtm服务器地址，以及全局事务id
+- 行3: 给二阶段消息添加一个分支事务，该事务分支为创建订单服务
+- 行4: 调用二阶段消息的DoAndSubmit，该函数第一个参数为反查的URL（见上图中的反查）；第二个参数为一个回调函数，里面会包含业务逻辑。该函数会执行业务，并在成功后提交全局事务，保证执行业务和全局事务的提交是“原子的”
+- 行5: 调用RedisCheckAdjustAmount，该函数会进行库存扣减，这个函数进行库存扣减时，如果库存不够，则会返回错误；如果库存足够，则会扣减库存，并记录库存已扣减成功，这样可以保证这个操作幂等，并且保证后续的反查能够获得正确的结果
+
+反查的核心代码如下：
+``` Go
+	app.GET(BusiAPI+"/QueryPreparedRedis", dtmutil.WrapHandler2(func(c *gin.Context) interface{} {
+		return MustBarrierFromGin(c).RedisQueryPrepared(rds)
+	}))
+```
+开发人员编写反查的逻辑很简单，对于Redis里面的数据，只需要复制粘贴这上面的代码就行。反查的详细原理参考[二阶段消息](../practice/msg)，二阶段消息的文档里介绍的是数据库中如何做，而这里则是用Redis来完成类似的反查逻辑，就不详细说明了。
+
+## 性能
+从上面的介绍中，可以看到，对于大部分扣减库存失败的请求，只需要进行三个Redis操作，1. 注册全局事务；2. 扣减库存；3. 修改全局事务为已失败。这个三个操作都是lua脚本实现。一个普通的redis，每秒大约能够支持6w个lua脚本操作，照此分析，我们的新架构，理论上每秒能够支持2w个秒杀请求。我做的性能测试报告显示，当dtm与扣库存共享一个redis时，每秒可以轻松完成1.2w个秒杀订单，达到理论极限值的60%，详情可以参考后面的性能测试报告
+
+更进一步分析，扣减库存与全局事务可以使用不同的Redis，那么
+- 扣减库存：若由单独一个Redis来支持，那么扣库存的理论上限值为6w/s，预估的实际值为6*0.6=3.6w/s，如果更进一步，采用 Redis6 的多线程IO，可以获得更高的性能，大约达到6 * 2.5 * 0.6=9w/s。
+- 全局事务操作：而这里面的dtm只需要部署多组，或者未来使用集群版，就可以提供远超9w/s的支持。
+- 所以采用新架构的情况下，预计可以达到9w/s的秒杀请求流量
+
+上述的分析还仅仅限于普通云厂商虚拟机上的自己安装Redis，假如通过简单的硬件升级，或者使用云厂商提供的Redis，那么Redis能提供更强劲的性能，上述的9w/s还能够再提高一个台阶。
+
+参考一下阿里双十一的峰值订单：58.3万笔/秒，那么上述预估的9w/s，几乎足以应对所有的秒杀活动
+
+## 代码示例
+完整的可运行的代码示例，可以参考[dtm-cases/flash](https://github.com/dtm-labs/dtm-cases/tree/main/flash)
+
+## 秒杀性能测试详情
+测试的环境，两台阿里云主机，类型为：ecs.hfc5.3xlarge 12核 CPU 3.1GHz/3.4GHz PPS 130万
+- 一台机器运行Redis
+- 另一台机器运行测试程序
+
+测试过程：
+#### 准备Redis
+选择虚拟机 A 安装 Redis
+
+``` bash
+apt-get install -y redis
+# 修改 /etc/redis/redis.conf
+# bind 127.0.0.1 => 0.0.0.0
+
+systemctl redis restart
+```
+
+#### 准备dtm
+选择虚拟机 B 安装 dtm
+``` bash
+apt update
+apt install -y git
+
+wget https://golang.org/dl/go1.17.1.linux-amd64.tar.gz
+rm -rf /usr/local/go && tar -C /usr/local -xzf go1.17.1.linux-amd64.tar.gz && cp -f /usr/local/go/bin/go /usr/local/bin/go
+
+git clone https://github.com/dtm-labs/dtm.git && cd dtm && git checkout v1.11.0 && cd bench && make
+# 修改 dtm/bench/test-flash-sales.sh
+# export BUSI_REDIS=localhost:6379 => 虚拟机A 的私网ip
+```
+
+#### 运行测试
+
+``` bash
+sh test-flash-sales.sh
+```
+
+#### 获取结果
+
+我的结果显示，每秒大约能够完成1.2w个秒杀请求：
+```
+Requests per second:    11970.21 [#/sec] (mean)
+```
+
+## 小结
+我们提出了一个全新的秒杀架构，可以保证创建订单和扣减库存的原子性，并且预估可以快速支撑9w/s的秒杀请求流量。帮助大家更好更快的解决秒杀的业务需求。
+
+---
+
+# 概述
+
+Source: https://github.com/dtm-labs/dtm.pub/blob/main/docs/app/intro.md
+
+# 概述
+dtm 解决跨服务更新数据的一致性问题，提供了相关问题的一站式解决方案。
+
+几乎每一个非单体的系统，几乎每一个订单系统，都会出现跨服务更新数据的需求，这样的需求是非常广泛的存在的，也是服务化/微服务化之后，带来的一个挑战。面对这样的情况，当前业内普遍认为分布式事务很难，问题很多，所以能不用就不用，因此多数情况下为了避免使用分布式事务框架，业务会自己做重试，定时检查数据一致性。
+
+dtm 则彻底解决了分布式事务的各项难题，提供了一个非常易用的接口，整体方案大大优于业务自己手动解决，优于业务自己做重试，自己检查数据一致性等。dtm 就是要让大家回归到分布式事务本质，将应当由分布式事务框架解决的问题，交给分布式事务框架，改变“能不用就不用的”的现状，将“专业”的事情交给“专业”的组件去做。
+
+dtm 将分布式事务的场景大致分为两类，一类不需要回滚，一类需要回滚。对于不需要回滚的场景，dtm 推荐使用二阶段消息，对于需要回滚的场景，dtm 推荐使用saga。
+
+## 二阶段消息
+对于不需要回滚的场景，当前业内大多使用本地消息表或事务消息，其中本地消息表，也称为发件箱模式。dtm 则在两者的基础上进行了创新，提出了二阶段消息，具备以下很多优点，而没有硬伤：
+- 将本地消息表或事务消息中，一两百行的代码，简化为五六行
+- 不用维护本地消息表中的轮询任务或订阅binlog
+- 自动处理事务消息中的回查，解决了 RocketMQ 回查在极端情况下回出现的数据不一致问题（已申请了专利）
+- 提供面向 API 的接口，用户只需要关心 API 调用，而不需要关心任何消息队列
+- 提供半同步的选项，允许调用者等待最终事务完成再返回用户，改善用户体验
+
+二阶段提供的主要函数为 DoAndSubmit ，它让用户指定自己的业务处理逻辑，然后保证业务处理逻辑和后续的API调用的“原子性”（最终都完成）
+
+## SAGA
+对于需要回滚的场景，当前业内知名的项目 Seata 推荐 AT 模式，而 dtm 推荐 SAGA 模式。 个人认为 Seata 主推的 AT 模式目前暂未获得大量的应用，其主要原因如下：
+
+- 原理复杂：AT 模式虽然提供了注解的这种简洁的使用方式，但是的原理非常复杂，涉及全局事务锁、镜像前数据、写数据锁等，上手难度很高。
+- 并发低：AT 与 XA 都会在事务进行过程中，锁住修改的数据，限制了并发，在订单系统扣减同一个库存商品的场景下，通常每秒只能够一二十单，因此这种方案不适合高并发场景。
+- 易出问题：AT 要求对分布式事务中修改的数据，如果其他服务进行了修改，必须加GlobalLock，否则会有脏写无法回滚的问题，而这样的约束是一个大一些的团队协作中，很难保证
+- 不支持全部SQL：AT 并不支持所有的SQL，官方文档里面有详细的说明
+
+而 dtm 的 SAGA 模式原理以及使用都非常简单，用户只需要写好业务的正向操作和补偿操作，然后将所有的事务分支 URL 提交给 dtm 就可以了，剩下的事情全部由 dtm 去完成。 dtm 还有以下的优点：
+- dtm 还首创了子事务屏障技术，通过一个简单的函数调用，就可以解决掉幂等，空补偿，悬挂这样的乱序问题，极大的降低了业务编写人员的负担
+- dtm 的子事务屏障还支持了Redis，也很容易扩展到 mongo ，可以将各种多数据源组合为一个全局事务
+- dtm 支持多语言，可以将多个语言的微服务组合成一个全局事务，使用场景很广
+
+## 其他模式
+dtm 也支持了其他模式，使用的场景如下：
+- TCC: 如果业务对一致性要求高，不能接受 SAGA 模式中先修改再补偿的做法，那么可以考虑 TCC 模式，该模式可以由业务方自定义可见性，只有确定事务一定能成功，再修改数据
+- XA: 如果业务对并发的要求不高，不会出现热点数据争抢，那么可以使用 XA 模式
+
+## 典型应用场景
+dtm 可以在以下场景中，优雅的解决相关的问题
+
+#### 秒杀系统
+现有的秒杀架构，为了支持高并发，通常把库存放在Redis中，收到订单请求时，在Redis中进行库存扣减。这种的设计，导致创建订单和库存扣减不是原子操作，如果两个操作中间，遇到进程crash等问题，就会导致数据不一致。
+
+dtm 提出了一种全新的秒杀架构，完全解决了秒杀架构中的核心痛点。该架构能够支持每秒超万单精准扣库存，并且保证创建订单和扣减库存的数据最终严格一致。详情参见 [秒杀系统](./flash)
+
+#### 订单系统
+绝大多数的订单系统都已经服务化，会将订单系统拆分为订单服务、库存服务、优惠券服务、支付服务、账户服务等等。通常一个下单操作会涉及：创建订单、扣减库存、扣减优惠券、创建支付单等等，如果这中间发生进程crash，那么会导致几个服务间数据不一致的问题，非常头疼。
+
+dtm 建议采用上述的saga方式，来解决订单问题，可以保证数据的最终严格一致。用户只需要写好了相关服务的正向操作和补偿操作即可，就不需要担心数据一致性问题了。
+
+详细的讲解和例子，可以参考 [订单系统](./order)
+
+#### 缓存一致性
+缓存是现在系统中必备的基础设施，用来缓解数据库的压力。但是一旦引入了缓存，那么数据就在两个地方进行了存储，那么如何才能够保证两者的一致性呢？业界已经有很多方案，典型的会依赖消息队列或者订阅数据库的binlog，这些方案都比较重，需要维护消息队列或canel，是个不小的负担。
+
+dtm 致力于解决一致性问题，因此也提出了基于dtm的更加轻量级的方案，详情可以参考 [缓存一致性](./cache)
+
+
+## 小结
+dtm 在易用性上面做得非常优秀，如果你还在自己做重试，或者做手动补偿，那么请参考并试用 dtm ，你会发现 dtm 会给你带来简单优雅的架构方案，大幅提升你在这方面的开发效率，降低维护成本，彻底改观你对分布式事务“能不用就不用”的印象。
+
+---
+
+# 订单系统
+
+Source: https://github.com/dtm-labs/dtm.pub/blob/main/docs/app/order.md
+
+# 订单系统
+dtm 可以应用于订单系统，可以大幅简化订单系统的架构，下面详细说明
+
+## 现有问题
+大多数的订单系统都已经服务化，会将订单系统拆分为订单服务、库存服务、优惠券服务、支付服务、账户服务等等。整个订单处理过程中，有许多的操作（例如创建订单与扣减库存）需要保证原子性，但是在分布式系统中，保证这些操作的原子性，有大量的难题需要解决，下面我们来详细探讨其中一个典型的问题，逐步给出更好的架构方案。
+
+场景：当前端的用户提交订单，服务端需要完成以下操作：
+- 创建订单：需要在订单表中创建订单，唯一键为订单ID
+- 扣减库存：需要给用户下单的商品扣减库存
+- 扣减优惠券：用户在下单前，选择了可使用的优惠券，提交订单时，则扣减这部分优惠券
+- 创建支付单：提交订单后，需要创建支付单，最后告诉用户跳转到支付页
+
+对于上述这个场景，如果在单体订单系统中，很容易使用数据库的事务来解决。但是一旦服务化了之后，那就需要考虑分布式系统中的问题，我们将逐步分析其中的问题，并给出解决方案。
+
+#### 进程 crash 问题
+我们在下单api中，按顺序调用: 创建订单->扣减库存->扣减优惠券->创建支付单，但是在这个调用过程中，有一定的概率会发生进程 crash ，导致这几个步骤，仅完成了一部分，还有一部分未完成。
+
+这是一个常见问题，只要订单量变大，就会常见。有以下几种处理方案：
+- 允许不一致：很小的公司可能会允许这种不一致数据出现，反馈到客服，或者监测到这种情况发生，则开发人员人肉处理；
+- 消息队列保证最少成功一次：为了避免上述不一致的情况，可以把下单中的各个操作放到消息队列，当出现进程 crash ，那么相关消息还在队列中，会再次被消费，保证至少成功一次，但是队列无法保证有且仅有一次，因此相关操作都必须幂等，详细情况后面小节详述
+- 状态机实现：很多大厂通过实现复杂的状态机，来定义订单的每个状态、每个操作的状态流转。这个方案非常复杂，多数中小厂，没有这么强的研发力量
+
+#### 幂等问题
+一旦到了分布式系统中，会有一定的概率出现重复请求。例如前面的消息队列方案，保证至少被成功消费一次，但是可能被多次消费，这就会出现重复请求。另外在微服务领域，为了防止网络临时失败，导致请求失败，也常常会配置重试策略。
+
+假设这样的场景，扣减库存的数据库事务提交之后，进程 crash 了，那么这次的请求结果未知，按照前面介绍的场景，会进行重试。当处理重复请求时，库存服务需要判断出这是重复请求，不能再扣减库存，而是直接返回扣减成功。
+
+扣减优惠券、创建支付单等其他操作，也需要做幂等处理，这类的处理虽然难度并不高，但依旧有不小的工作量，而且不易复现所有的异常情况，因此线上出现重复请求时，容易出现问题，耗费开发人员大量的时间
+
+#### 回滚问题
+假如订单的多个步骤中，有一个步骤出现了问题，例如库存不足，或者用户在两个终端同时下单，导致其中一笔订单的优惠券扣减失败，就需要回滚。一旦要处理回滚，就会发现订单系统的实现难度就很高了。如果采用消息队列，那么会往消息队列里插入回滚补偿的消息，而这个补偿消息的处理会很复杂，需要判断进度，然后进行补偿；如果采用状态机，这类回滚操作，也会给状态机增加不少的状态，导致系统变得更加复杂
+
+#### 精准补偿问题
+业务进行补偿时，也是一个难度很高的问题，难在哪？我们考虑库存扣减这个问题，如果库存服务收到库存扣减的请求，进行处理，那么本地事务可能已提交，也可能因为进程 crash 未提交。此时再收到回滚库存的请求，则需要识别出库存是否已修改，对于已修改的库存，需要进行补偿修改；对于未修改的库存，需要略过。
+
+这种补偿问题同时存在于消息队列方案和状态机方案中，想要做到每个资源都妥善处理了这个精准补偿，会耗费大量的开发精力。
+
+## dtm 解决方案
+面对上述问题，dtm 首创了极简方案，方案详情参见 [dtm-cases/order](https://github.com/dtm-labs/dtm-cases/tree/main/order)：
+
+我们下面来解析这个方案，以及该方案是如何解决我们前面提出的问题的，首先看看，下单 api 的主要处理过程：
+
+``` go
+app.POST("/api/busi/submitOrder", common.WrapHandler(func(c *gin.Context) interface{} {
+  req := common.MustGetReq(c)
+  saga := dtmcli.NewSaga(conf.DtmServer, "gid-"+req.OrderID).
+    Add(conf.BusiUrl+"/orderCreate", conf.BusiUrl+"/orderCreateRevert", &req).
+    Add(conf.BusiUrl+"/stockDeduct", conf.BusiUrl+"/stockDeductRevert", &req).
+    Add(conf.BusiUrl+"/couponUse", conf.BusiUrl+"couponUseRevert", &req).
+    Add(conf.BusiUrl+"/payCreate", conf.BusiUrl+"/payCreateRevert", &req)
+  return saga.Submit()
+}))
+```
+
+在这个代码中，定义了一个saga事务，包含上述下单过程中需要的四个步骤，以及四个步骤需要的补偿操作。
+- **进程crash问题** dtm的saga事务进行过程中，如果发生进程crash，那么dtm会进行重试，保证操作会最终完成
+- **回滚问题** 上述这个saga事务中，如果扣减库存时发现库存不足，则返回failure，会进行回滚。dtm 会记录哪些操作已完成，并回滚相关的操作
+
+然后我们选取扣减库存和回滚库存的代码进一步分析：
+``` go
+app.POST("/api/busi/stockDeduct", common.WrapHandler(func(c *gin.Context) interface{} {
+  req := common.MustGetReq(c)
+  return common.MustBarrierFrom(c).CallWithDB(common.DBGet(), func(tx *sql.Tx) error {
+    affected, err := dtmimp.DBExec(tx,
+      "update busi.stock set stock=stock-?, update_time=now() where product_id=? and stock >= ?",
+      req.ProductCount, req.ProductID, req.ProductCount)
+    if err == nil && affected == 0 {
+      return dtmcli.ErrFailure // not enough stock, return Failure to rollback
+    }
+    return err
+  })
+}))
+app.POST("/api/busi/stockDeductRevert", common.WrapHandler(func(c *gin.Context) interface{} {
+  req := common.MustGetReq(c)
+  return common.MustBarrierFrom(c).CallWithDB(common.DBGet(), func(tx *sql.Tx) error {
+    _, err := dtmimp.DBExec(tx,
+      "update busi.stock set stock=stock+?, update_time=now() where product_id=?",
+      req.ProductCount, req.ProductID)
+    return err
+  })
+}))
+```
+
+上述的代码，核心的业务逻辑就是扣减库存和回滚库存，那么幂等与精准扣减库存怎么处理？核心就在下面这行代码上：
+``` go
+  common.MustBarrierFrom(c).CallWithDB(common.DBGet(), func(tx *sql.Tx) error { /* ... */ })
+```
+
+当我们把数据库的操作放到上述代码内部时，就能够自动处理：
+- **幂等：** 重复请求里面的业务操作会被上述代码过滤，数据库操作仅在非重复请求时被调用
+- **精准补偿：** 如果 stockDeduct 中没有提交相关的数据库操作，stockDeductRevert 中数据库操作，会被上述代码过滤
+- **悬挂：** 上述代码不仅处理了幂等和精准补偿问题，还处理了悬挂请求
+
+上述代码的使用了 dtm 首创的子事务屏障技术，详细原理参见 [子事务屏障](https://dtm.pub/practice/barrier.html)
+
+## 例子源码
+详细的源代码可以参见 [dtm-cases/order](https://github.com/dtm-labs/dtm-cases/tree/main/order)
+
+在这个项目中，你可以便捷的试验本文所讲的全部内容
+
+## 小结
+非单体的订单系统，需要花费大量时间处理分布式系统中出现的新问题，而 dtm 则是一个专业的解决方案，提供了非常优雅易用的方案，可以大幅简化现有的消息队列架构或状态机架构。
+
+希望通过本文的分析，以及简单优雅的项目代码，让大家快速了解dtm，改变大家“分布式事务能不用就不用”的旧观念，将分布式事务相关逻辑全部交由 dtm 处理，而让大家关注于业务本身，只需要安心写好相关操作和补偿操作。
+
+---
+
+# 管理后台
+
+Source: https://github.com/dtm-labs/dtm.pub/blob/main/docs/deploy/admin.md
+
+# 管理后台
+dtm 从 v1.14.0之后，添加了管理后台，您可以通过36789端口访问，本地启动的情况下，可以访问网址：
+`http://localhost:36789`
+
+* 如果您下载预编译的二进制安装包，或者官方docker镜像，那么dtm启动后，已经预编译了管理后台
+* 如果您通过源码启动dtm，那么在管理后台未编译打包的情况下，dtm会将管理后台的访问代理到dtm的站点，访问速度可能会稍慢
+
+## 功能
+* 全局事务列表
+  - 按照gid、状态、事务类型、创建时间段查询
+  - redis引擎下，部分全局事务可能会重复，详情原因参考 [Redis的Scan命令](https://redis.io/commands/scan/)
+* 全局事务详情
+  - 展示事务详情
+  - 强制结束全局事务
+  - 重置下次执行时间
+
+---
+
+# 基础
+
+Source: https://github.com/dtm-labs/dtm.pub/blob/main/docs/deploy/base.md
+
+# 基础
+
+## 概览
+
+本小节说明的是线上部署方式，如果您仅在本地运行，可以参考[安装](../guide/start)
+
+dtm的整个分布式事务中，各个参与者，分为AP、RM、TM三个角色，详情参见指南中的 dtm 架构。当您需要将一个分布式事务应用上线时，您需要以下几步：
+- 准备 RM 中使用的子事务屏障表，需要在你的业务数据库中创建
+- 准备 DTM 服务器中使用的事务状态存储表，只有DTM采用数据库存储才需要
+- 设计你的部署方案：可采用的方案包括，直接二进制部署、docker部署、K8S 部署。这当中可能还跟您接入的微服务有关
+- 设计你的 dtm 多副本方案：线上应用不建议单副本部署。dtm与普通的无状态应用一样，直接多副本即可
+- 配置你的 dtm 服务器
+
+## 注意点
+- **dtm服务器如果使用数据库，那么一定要使用主库。一方面dtm是写多读少，读写分离，对于dtm的负载分摊有限；另一方面dtm对数据的一致性要求较高，从库延时会导致各种问题。**
+- **dtm服务器的时区需要与数据库的时区保持一致**
+- **dtm服务器的时间需要与数据库的时间保持一致，差别不要超过3s**
+
+## 准备 RM 数据表
+RM 因为涉及本地资源管理，因此使用DTM提供的子事务屏障技术则需要在本地数据库中创建子事务屏障相关的表，建表语句详见：[建表SQL](https://github.com/dtm-labs/dtm/blob/main/sqls/)中的barrier文件
+
+## 准备 DTM 数据表
+DTM 作为TM角色，如果选择数据库作为存储引擎，那么会将全局事务信息保存在数据库中，需要在相应数据库中创建相关表，建表语句详见[建表SQL](https://github.com/dtm-labs/dtm/blob/main/sqls/)中的storage文件
+
+## 部署方案
+这部分内容较多，详情参见[部署](./deploy)
+
+## dtm 多副本方案
+线上应用不建议单副本部署，dtm 也不例外。你需要根据您的部署方案，进行多副本部署
+- 微服务部署，如go-zero、polaris：这类微服务协议，已有多副本方案，参考具体的微服务情况即可
+- 二进制部署、Docker部署时，您可以参考您的其他 RM 应用多副本部署方案，对 dtm 进行多副本部署
+- K8S部署：可以直接指定副本数
+
+dtm 的多副本如何协作，避免问题，可以参考 [dtm架构](../practice/arch)中的高可用部分
+
+## DTM配置
+DTM支持环境变量和文件两种配置，如果同时有环境变量和文件，那么配置文件的优先级高
+
+#### 环境变量
+为了友好支持容器化和云原生，DTM支持环境变量进行配置
+
+所有可配置的选项参考: [yml样板配置文件](https://github.com/dtm-labs/dtm/blob/main/conf.sample.yml)，对于每个配置文件里的配置，都可以通过环境变量设置，对应规则如下：
+
+```
+MicroService.EndPoint => MICRO_SERVICE_END_POINT
+```
+
+一个使用mysql的配置文件样例如下：
+``` yml
+Store:
+  Driver: 'mysql'
+  Host: 'localhost'
+  User: 'root'
+  Password: ''
+  Port: 3306
+```
+
+最详细的配置说明参考上述yml样板配置文件里面，每个配置项的注释
+
+#### yml文件配置
+为了方便直接部署和调试，DTM也支持yml配置文件，详细配置项参考[yml样板配置文件](https://github.com/dtm-labs/dtm/blob/main/conf.sample.yml)
+
+采用yml配置dtm时，需要通过命令行指定配置文件，采用如下命令：
+
+`dtm -c ./conf.sample.yml`
+
+## 问题诊断
+dtm相关问题可以通过日志来诊断，日志分为：
+- dtm服务器日志，日志会直接输出到控制台，通过设定环境变量 `LOG_LEVEL=debug` 或者命令行参数 `dtm -d` 来打开详细日志
+- dtm SDK日志，跟dtm相关的详细日志，可以通过 `logger.InitLog("debug")`来打开
+
+通常的诊断步骤为：
+- 确认你把dtm的旧数据清理掉，如果dtm数据存储在mysql中，那么truncate trans_global表即可
+- 启动dtm 服务器，打开dtm服务器详细日志
+- 如果您是微服务协议，那么启动后，检查dtm是否成功注册到注册中心了，如果没有，检查服务器配置和日志
+- 检查能否正常访问dtm服务器（使用docker启动dtm的同学，容易碰见网络问题），默认地址为: localhost:36789
+- 启动业务服务器，打开dtm SDK日志
+- 如果您是微服务协议，那么业务服务器启动后，检查是否成功注册到注册中心了，如果没有，检查业务服务器配置和日志
+- 检查您的业务服务器网络是否正确（docker启动时，容易出现网络问题），是否能够被正常访问
+- 从业务服务新发起一个全局事务，检查业务服务的dtm SDK日志是否有报错
+- 检查dtm服务器中的日志，检查日志是否有报错
+
+一般按照上述步骤下来，通常就能够找到最初出错的地方，就能够根据错误信息找到配置问题解决掉
+
+如果您完成了上述步骤，还是问题还未解决，可以在微信群，或者在dtm项目的issue里面提出，并提供相关日志，我们通常会在较短的时间内给您回复
+
+---
+
+# 云上服务
+
+Source: https://github.com/dtm-labs/dtm.pub/blob/main/docs/deploy/cloud.md
+
+# 云上服务
+
+dtm提供云上服务（目前为测试，未来有更多需求，会考虑提供高性能、高可用的dtm服务）
+
+## 使用
+
+您只需要将例子里面的DtmServer地址换成下面地址即可：
+
+国内地址：https://dtm.pub/api/dtmsvr
+
+国外地址：https://en.dtm.pub/api/dtmsvr
+
+## 重试次数限制
+
+因为这是测试服务，因此容易出现用户填错地址，或者用户的服务不可访问，所以限定重试次数为6，否则会出现无限重试
+
+## 查询事务状态
+
+### 查询批量订单
+
+``` bash
+curl https://dtm.pub/api/dtmsvr/all?last_id=
+```
+
+last_id: 上一个请求的订单id，这个id不是gid，而是全局订单表里面的id字段
+
+响应结果为id小于last_id的100条数据，按照id倒序排列：
+
+``` json
+{
+    "transactions":[
+        {
+            "ID":64,
+            "CreateTime":"2021-09-14T19:10:50+08:00",
+            "UpdateTime":"2021-09-14T19:10:50+08:00",
+            "gid":"xaRollback",
+            "trans_type":"xa",
+            "data":"",
+            "status":"failed",
+            "query_prepared":"",
+            "protocol":"http",
+            "CommitTime":null,
+            "FinishTime":null,
+            "RollbackTime":"2021-09-14T19:10:50+08:00",
+            "NextCronInterval":10,
+            "NextCronTime":"2021-09-14T19:11:00+08:00"
+        }
+    ]
+}
+```
+
+### 查询特定订单
+
+``` bash
+curl https://dtm.pub/api/dtmsvr/query?gid=xaRollback
+```
+
+gid: 订单gid，必选字段
+
+响应结果：
+
+``` json
+{
+    "branches":[
+        {
+            "ID":195,
+            "CreateTime":"2021-09-14T19:10:50+08:00",
+            "UpdateTime":"2021-09-14T19:10:50+08:00",
+            "Gid":"xaRollback",
+            "url":"http://localhost:8081/api/busi/xa",
+            "Data":"",
+            "branch_id":"0101",
+            "BranchType":"commit",
+            "Status":"prepared",
+            "FinishTime":null,
+            "RollbackTime":null
+        },
+        {
+            "ID":194,
+            "CreateTime":"2021-09-14T19:10:50+08:00",
+            "UpdateTime":"2021-09-14T19:10:50+08:00",
+            "Gid":"xaRollback",
+            "url":"http://localhost:8081/api/busi/xa",
+            "Data":"",
+            "branch_id":"0101",
+            "BranchType":"rollback",
+            "Status":"succeed",
+            "FinishTime":"2021-09-14T19:10:50+08:00",
+            "RollbackTime":null
+        }
+    ],
+    "transaction":{
+        "ID":64,
+        "CreateTime":"2021-09-14T19:10:50+08:00",
+        "UpdateTime":"2021-09-14T19:10:50+08:00",
+        "gid":"xaRollback",
+        "trans_type":"xa",
+        "data":"",
+        "status":"failed",
+        "query_prepared":"",
+        "protocol":"http",
+        "CommitTime":null,
+        "FinishTime":null,
+        "RollbackTime":"2021-09-14T19:10:50+08:00",
+        "NextCronInterval":10,
+        "NextCronTime":"2021-09-14T19:11:00+08:00"
+    }
+}
+```
+
+---
+
+# 部署
+
+Source: https://github.com/dtm-labs/dtm.pub/blob/main/docs/deploy/deploy.md
+
+# 部署
+
+## 可执行文件部署
+
+dtm 目前已支持brew直接安装，暂未支持apt/yum等方式直接安装，您可以从github上面下载相应版本，或者通过go环境，编译出相关的二进制文件。
+
+#### 编译
+
+您需要有go 1.16以上的环境，通过下面命令编译出二进制文件
+```
+go build
+```
+
+#### 配置
+
+您可以设置相关的环境变量(参见[部署基础](./base))，也可以在工作目录下，参考[配置样板文件](https://github.com/dtm-labs/dtm/blob/main/conf.sample.yml)创建conf.yml文件
+
+#### 启动
+
+dtm会监听
+- HTTP: 36789
+- gRPC: 36790
+
+```
+./dtm -c ./conf.yml
+```
+
+## Docker部署
+
+#### Docker启动
+
+``` bash
+docker run --name dtm -p 36789:36789 -p 36790:36790 -e STORE_DRIVER=mysql -e STORE_HOST=localhost -e STORE_USER=root -e STORE_PASSWORD= -e STORE_PORT=3306 yedf/dtm:latest
+```
+
+各个参数，详见[部署基础](./base)
+
+#### docker-compose启动
+示例 docker-compose.yaml 文件:
+``` yml
+version: '3'
+services:
+  dtm:
+    image: yedf/dtm
+    environment:
+      STORE_DRIVER: mysql
+      STORE_HOST: localhost
+      STORE_USER: root
+      STORE_PASSWORD: ''
+      STORE_PORT: 3306
+    ports:
+      - '36789:36789'
+      - '36790:36790'
+```
+
+#### 容器其他命令
+
+交互式使用dtm容器
+
+``` docker exec -it dtm sh ```
+
+查看日志
+
+```docker logs -f dtm ```
+
+## Kubernetes部署
+
+当前dtm支持http协议，可以把前面docker部署的方式，增加K8S的deployment配置，完成K8S部署，下面给出一个deployment.yml的一个参考
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dtm
+  labels:
+    app: dtm
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: dtm
+  template:
+    metadata:
+      labels:
+        app: dtm
+    spec:
+      containers:
+        - name: dtm
+          image: yedf/dtm:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - "-c=/app/dtm/configs/config.yaml"
+          volumeMounts:
+            - mountPath: /app/dtm/configs
+              name: config
+          ports:
+            - containerPort: 36789
+              protocol: TCP
+              name: http
+            - containerPort: 36790
+              protocol: TCP
+              name: grpc
+          livenessProbe:
+            httpGet:
+              path: /api/ping
+              port: 36789
+              scheme: HTTP
+          readinessProbe:
+            httpGet:
+              path: /api/ping
+              port: 36789
+              scheme: HTTP
+          resources:
+            requests:
+              cpu: 200m
+              memory: 200Mi
+      volumes:
+        - name: config
+          configMap:
+            name: dtm-conf
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dtm-conf
+  labels:
+    app: dtm
+data:
+  config.yaml: |-
+    Store:
+      Driver: mysql # 此处以 mysql 为例，其他数据库可自行替换
+      Host: dtm-db  # 此处设置为集群外部的数据库 host，或者集群内部的数据库 svc-dns
+      Port: 3306
+      User: root
+      Password: ''
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dtm-svc
+  labels:
+    app: dtm
+spec:
+  ports:
+    - port: 36790
+      targetPort: 36790
+      name: grpc
+      appProtocol: grpc # Kubernetes v1.20 [stable]，低版本请剔除此行
+    - port: 36789
+      targetPort: 36789
+      name: http
+      appProtocol: http # Kubernetes v1.20 [stable]，低版本请剔除此行
+  selector:
+    app: dtm
+  type: ClusterIP
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: dtm-ing
+spec:
+  rules:
+    - host: "your-domain.com"
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: dtm-svc
+                port:
+                  number: 36789 # 此处为 http server，grpc server 的设置，请访问 https://kubernetes.github.io/ingress-nginx/examples/grpc/
+  ingressClassName: nginx # 使用了其他的 ingressClassName， 请自行查询
+```
+
+
+## Helm部署
+
+### 使用
+
+安装 DTM chart:
+
+```bash
+helm install --create-namespace -n dtm-system dtm ./charts
+```
+
+升级 DTM chart:
+
+```bash
+helm upgrade -n dtm-system dtm ./charts
+```
+
+拆卸 DTM chart:
+
+```bash
+helm delete -n dtm-system dtm
+```
+
+### 参数
+
+#### Configuration 参数
+
+| Key             | Description                                                                                                    | Value |
+|-----------------|----------------------------------------------------------------------------------------------------------------|-------|
+| `configuration` | DTM 配置. 为 DTM 生成 `config.yaml`, 参考: [sample config](https://github.com/dtm-labs/dtm/blob/main/conf.sample.yml) | `""`  |
+
+
+
+#### Autoscaling 参数
+
+| Name                                            | Description        | Value   |
+|-------------------------------------------------|--------------------|---------|
+| `autoscaling.enabled`                           | 为 DTM 启用 pods 弹性伸缩 | `false` |
+| `autoscaling.minReplicas`                       | DTM 副本的最小数量        | `1`     |
+| `autoscaling.maxReplicas`                       | DTM 副本的最大数量        | `10`    |
+| `autoscaling.targetCPUUtilizationPercentage`    | 目标cpu使用率           | `80`    |
+| `autoscaling.targetMemoryUtilizationPercentage` | 目标内存使用率            | `80`    |
+
+#### Ingress 参数
+
+| Key                            | Description                                      | Value               |
+|--------------------------------|--------------------------------------------------|---------------------|
+| `ingress.enabled`              | 为 DTM 启用 ingress                                 | `false`             |
+| `ingress.className`            | 为 Ingress 指定一个 Ingress class。 (Kubernetes 1.18+) | `"nginx"`           |
+| `ingress.annotations`          | 配置 TLS 证书的自动签发注解等.                               | `{}`                |
+| `ingress.hosts.host`           | 为 DTM 指定主机名.                                     | `"your-domain.com"` |
+| `ingress.hosts.paths.path`     | 为 DTM 配置匹配路径                                     | `"/"`               |
+| `ingress.hosts.paths.pathType` | Ingress 匹配类型, `Prefix` 或 `Exact`                 | `"Prefix"`          |
+| `ingress.tls`                  | 为 DTM 主机名配置 TLS secret                           | `[]`                |
+
+---
+
+# 运维
+
+Source: https://github.com/dtm-labs/dtm.pub/blob/main/docs/deploy/maintain.md
+
+# 运维
+
+## 报警
+
+正常情况下，全局事务会很快结束，结果在dtm.trans_global的status记录为succeed/failed，即使出现临时的网络问题等，通常也会在一两次重试之后，最终结束。
+
+如果重试次数超过3，通常意味着异常情况，最好能够监测起来，建议的查询条件为：
+
+``` SQL
+select * from dtm.trans_global where status not in ('succeed', 'failed') and
+  create_time between date_add(now(), interval -3600 second) and date_add(now(), interval -120 second)
+```
+
+项目在v1.1.0版本后支持Prometheus监控，访问接口为 `http://localhost:36789/api/metrics`。该接口提供网络接口(HTTP/gRPC)的可用性和响应时间以及执行事务和分支操作结果的统计。
+
+具体的metrics为
+
+- `dtm_server_process_total`
+- `dtm_server_response_duration`
+- `dtm_transaction_process_total`
+- `dtm_branch_process_total`
+
+例如，如果对`confirm/cancel`分支操作的失败情况进行监控，一个可行的PromQL触发条件为
+
+```
+sum(dtm_branch_process_total{branchtype=~"confirm|cancel",status="fail"}) by (gid, branchid) > 3
+```
+
+## 触发全局事务立即重试
+
+dtm对每个事务的重试是指数退避策略，具体为间隔是每失败一次，间隔加倍，避免过多的重试，导致系统负载异常上升。
+
+如果您经过长时间的的宕机，因指数退避算法导致要很久才会重试。如果您想要手动触发立即重试，您可以手动把相应事务的next_cron_time(Redis存储引擎的该功能还在开发中)修改为当前时间，就会在数秒内被定时轮询，事务就会继续往前执行。
+
+---
+
+# 升级指南
+
+Source: https://github.com/dtm-labs/dtm.pub/blob/main/docs/deploy/upgrade.md
+
+# 升级指南
+
+## 1.6.x 升级到 1.7.x
+dtm在1.7中引入新的存储引擎，因此重写了配置相关的代码。您只需要按照新的配置格式进行dtm服务器的配置即可
+
+## 1.9.x 升级到 1.10.x
+dtm在1.10中，引入了新的表示错误协议，该协议与旧协议不同，但做了兼容。做法如下：
+
+1.9.x 及更低版本行为 [旧协议参考](../nomenu/proto)
+
+- SUCCESS http：状态码 200 && 结果内容含 SUCCESS； grpc: err == nil
+- FAILURE http: 状态码 200 && 结果内容含 FAILURE； grpc: Code == Aborted && Message == FAILURE
+- ONGOING http: 状态码 200 && 结果内容含 ONGOING； grpc: Code == Aborted && Message == ONGOING
+
+变更为（同时会兼容旧的 [新协议参考](../practice/arch#proto))
+
+- SUCCESS http: 状态码 200； grpc： err == nil
+- FAILURE http: 状态码 409 (http.StatusConflict)；grpc Code == Aborted
+- ONGOING http: 状态码 425 (http.StatusTooEarly)；grpc Code == FailedPrecondition
+
+新版本的DTM服务器和客户端SDK是这么做兼容的：
+- 服务端返回 SUCCESS  http：状态码 200 && 结果包含 SUCCESS；grpc： err == nil
+- 服务端返回 FAILURE  http：状态码 409 && 结果包含 FAILURE；grpc： Code == Aborted && Message == FAILURE
+- SDK与服务端判断 SUCCESS  http：状态码 200 && 结果不包含 FAILURE|ONGOING； grpc：err == nil
+- SDK与服务端判断 FAILURE  http：状态码 409 || 结果包含 FAILURE；grpc： Code == Aborted && Message != ONGOING
+- SDK与服务端判断 ONGOING  http：状态码 425 || 结果包含 ONGOING；grpc： Code == FailedPrecondition || Message == ONGOING
+
+新版本的SDK可以和新旧版本的协议兼容；新版本的服务器能够与新旧版本的协议兼容。因此理论上可以随意升级。
+
+但是从稳定性和渐进式迁移的角度来看，建议先逐步升级SDK，再升级dtm服务器。逐步升级一部分应用的SDK版本，过程中，可以充分灰度，监控出现的问题。然后再逐步灰度dtm服务器
+
+---
+
+# 二阶段消息例子
+
+Source: https://github.com/dtm-labs/dtm.pub/blob/main/docs/guide/e-msg.md
+
+# 二阶段消息例子
+本文将介绍一个完整的二阶段消息例子，让读者对二阶段消息型事务有一个准确的了解
+
+## 业务场景
+跨行转账是典型的分布式事务场景，在这里，A需要跨行转账给B，假设需求场景是：只有转出A可能失败，转入B是能够最终成功的
+
+## 二阶段消息
+
+二阶段消息是dtm首创的事务模式，用于替换本地事务表和事务消息这两种现有的方案。它能够保证本地事务的提交和全局事务提交是“原子的”，适合解决不需要回滚的分布式事务场景。下面我们来看看二阶段消息，如何解决这个业务场景的问题。
+
+## 核心业务
+
+首先我们创建账户余额表：
+``` Go
+CREATE TABLE dtm_busi.`user_account` (
+  `id` int(11) AUTO_INCREMENT PRIMARY KEY,
+  `user_id` int(11) not NULL UNIQUE ,
+  `balance` decimal(10,2) NOT NULL DEFAULT '0.00',
+  `trading_balance` decimal(10,2) NOT NULL DEFAULT '0.00',
+  `create_time` datetime DEFAULT now(),
+  `update_time` datetime DEFAULT now()
+);
+```
+
+然后编写核心业务代码，调整用户的账户余额
+
+``` Go
+func SagaAdjustBalance(db dtmcli.DB, uid int, amount int, result string) error {
+	_, err := dtmimp.DBExec(db, "update dtm_busi.user_account set balance = balance + ? where user_id = ?", amount, uid)
+	return err
+}
+```
+
+再来编写具体的处理函数
+
+``` GO
+app.POST(BusiAPI+"/SagaBTransIn", dtmutil.WrapHandler2(func(c *gin.Context) interface{} {
+  barrier := MustBarrierFromGin(c)
+  return barrier.Call(txGet(), func(tx *sql.Tx) error {
+    return SagaAdjustBalance(tx, TransInUID, reqFrom(c).Amount, "")
+  })
+}))
+```
+
+这些处理函数的核心逻辑都是是调整余额。这里面的`barrier.Call`主要是用于处理幂等，保证重复调用不会多次调整余额，详情参见[异常与子事务屏障](../practice/barrier)
+
+## 二阶段消息事务
+
+到此各个子事务的处理函数已经OK了，然后是开启二阶段消息事务，进行分支调用
+``` GO
+		msg := dtmcli.NewMsg(DtmServer, shortuuid.New()).
+			Add(busi.Busi+"/SagaBTransIn", &TransReq{ Amount: 30 })
+		err := msg.DoAndSubmitDB(busi.Busi+"/QueryPreparedB", dbGet(), func(tx *sql.Tx) error {
+			return busi.SagaAdjustBalance(tx, busi.TransOutUID, -req.Amount)
+		})
+```
+
+这段代码中，会保证 DoAndSubmitDB 中的业务提交和全局事务提交是“原子的”，保证了TransOut和TransIn的同时成功，或同时失败。其中 DoAndSubmitDB 中的第一个参数为回查URL，他的代码如下：
+``` go
+app.GET(BusiAPI+"/QueryPreparedB", dtmutil.WrapHandler2(func(c *gin.Context) interface{} {
+  bb := MustBarrierFromGin(c)
+  return bb.QueryPrepared(dbGet())
+}))
+```
+
+至此，一个完整的二阶段消息分布式事务编写完成。
+
+## 按topic投递消息
+
+您还可以通过按topic投递消息来实现分支事务调用。
+
+首先为执行分支事务的API订阅名为`TransIn` 的topic：
+
+> 这一步可以在管理后台完成
+
+```go
+resp, err := dtmcli.GetRestyClient().R().SetQueryParams(map[string]string{
+		"topic":  "TransIn",
+		"url":    busi.Busi+"/SagaBTransIn",
+		"remark": "trans in api",
+	}).Get(dtmutil.DefaultHTTPServer + "/subscribe")
+```
+
+然后开启二阶段消息事务，通过向该topic投递消息实现分支事务调用
+
+```go
+		msg := dtmcli.NewMsg(DtmServer, shortuuid.New()).
+			AddTopic("TransIn", &TransReq{ Amount: 30 })
+		err := msg.DoAndSubmitDB(busi.Busi+"/QueryPreparedB", dbGet(), func(tx *sql.Tx) error {
+			return busi.SagaAdjustBalance(tx, busi.TransOutUID, -req.Amount)
+		})
+```
+
+需要注意的是，topic订阅信息的变更有一个生效时间，由`ConfigUpdateInterval`参数决定。
+
+## 运行
+如果您想要完整运行一个成功的示例，步骤如下：
+1. 运行dtm
+``` bash
+git clone https://github.com/dtm-labs/dtm && cd dtm
+go run main.go
+```
+
+2. 运行例子
+
+``` bash
+git clone https://github.com/dtm-labs/dtm-examples && cd dtm-examples
+go run main.go http_msg_doAndCommit
+```
+
+## 如何保证原子性
+
+二阶段消息如何保证本地事务和全局事务要么都成功，要么都失败呢？假定本地事务提交完成后，提交全局事务前，进程crash会如何？下面时序图很好的讲解了二阶段消息是如何处理这个问题的：
+
+![msg_query](../imgs/msg_query.jpg)
+
+图中的回查处理逻辑，dtm已经做了自动处理，用户只需要粘贴上述的代码即可
+
+## 小结
+
+本文给出了一个完整的二阶段消息事务方案，是一个可以实际运行的二阶段消息，您只需要在这个示例的基础上进行简单修改，就能够用于解决您的真实问题
+
+关于更多二阶段消息的原理，可以参见[二阶段消息](../practice/msg)
+
+---
+
+# SAGA 例子
+
+Source: https://github.com/dtm-labs/dtm.pub/blob/main/docs/guide/e-saga.md
+
+# SAGA 例子
+本文将介绍一个完整的 SAGA 例子，让读者对 SAGA 型事务有一个准确的了解
+
+## 业务场景
+跨行转账是典型的分布式事务场景，在这里，A需要跨行转账给B，假设需求场景是：转出A和转入B都有可能成功和失败，需要最终转入转出都成功，或者都失败
+
+## SAGA
+
+Saga是这一篇数据库论文[SAGAS](https://www.cs.cornell.edu/andru/cs711/2002fa/reading/sagas.pdf)提到的一个分布式事务方案。其核心思想是将长事务拆分为多个本地短事务，由Saga事务协调器协调，如果各个本地事务成功完成那就正常完成，如果某个步骤失败，则根据相反顺序一次调用补偿操作。
+
+## 核心业务
+
+对于我们要进行的银行转账的例子，我们将在正向操作中，进行转入转出，在补偿操作中，做相反的调整。
+
+首先我们创建账户余额表：
+``` Go
+CREATE TABLE dtm_busi.`user_account` (
+  `id` int(11) AUTO_INCREMENT PRIMARY KEY,
+  `user_id` int(11) not NULL UNIQUE ,
+  `balance` decimal(10,2) NOT NULL DEFAULT '0.00',
+  `trading_balance` decimal(10,2) NOT NULL DEFAULT '0.00',
+  `create_time` datetime DEFAULT now(),
+  `update_time` datetime DEFAULT now()
+);
+```
+
+然后编写核心业务代码，调整用户的账户余额
+
+``` Go
+func SagaAdjustBalance(db dtmcli.DB, uid int, amount int, result string) error {
+	_, err := dtmimp.DBExec(db, "update dtm_busi.user_account set balance = balance + ? where user_id = ?", amount, uid)
+	return err
+}
+```
+
+再来编写具体的正向操作/补偿操作的处理函数
+
+``` GO
+app.POST(BusiAPI+"/SagaBTransIn", dtmutil.WrapHandler2(func(c *gin.Context) interface{} {
+  barrier := MustBarrierFromGin(c)
+  return barrier.Call(txGet(), func(tx *sql.Tx) error {
+    return SagaAdjustBalance(tx, TransInUID, reqFrom(c).Amount, "")
+  })
+}))
+app.POST(BusiAPI+"/SagaBTransInCom", dtmutil.WrapHandler2(func(c *gin.Context) interface{} {
+  barrier := MustBarrierFromGin(c)
+  return barrier.Call(txGet(), func(tx *sql.Tx) error {
+    return SagaAdjustBalance(tx, TransInUID, -reqFrom(c).Amount, "")
+  })
+}))
+app.POST(BusiAPI+"/SagaBTransOut", dtmutil.WrapHandler2(func(c *gin.Context) interface{} {
+  barrier := MustBarrierFromGin(c)
+  return barrier.Call(txGet(), func(tx *sql.Tx) error {
+    return SagaAdjustBalance(tx, TransOutUID, -reqFrom(c).Amount, "")
+  })
+}))
+app.POST(BusiAPI+"/SagaBTransOutCom", dtmutil.WrapHandler2(func(c *gin.Context) interface{} {
+  barrier := MustBarrierFromGin(c)
+  return barrier.Call(txGet(), func(tx *sql.Tx) error {
+    return SagaAdjustBalance(tx, TransOutUID, reqFrom(c).Amount, "")
+  })
+}))
+```
+
+这些处理函数的核心逻辑都是是调整余额，对于这里面的`barrier.Call`作用，后面会详细解释
+
+## SAGA 事务
+
+到此各个子事务的处理函数已经OK了，然后是开启SAGA事务，进行分支调用
+``` GO
+	req := &gin.H{"amount": 30} // 微服务的载荷
+	// DtmServer为DTM服务的地址
+	saga := dtmcli.NewSaga(DtmServer, shortuuid.New()).
+		// 添加一个TransOut的子事务，正向操作为url: qsBusi+"/TransOut"， 逆向操作为url: qsBusi+"/TransOutCom"
+		Add(qsBusi+"/SagaBTransOut", qsBusi+"/SagaBTransOutCom", req).
+		// 添加一个TransIn的子事务，正向操作为url: qsBusi+"/TransOut"， 逆向操作为url: qsBusi+"/TransInCom"
+		Add(qsBusi+"/SagaBTransIn", qsBusi+"/SagaBTransInCom", req)
+	// 提交saga事务，dtm会完成所有的子事务/回滚所有的子事务
+	err := saga.Submit()
+
+```
+
+至此，一个完整的SAGA分布式事务编写完成。
+
+## 运行
+如果您想要完整运行一个成功的示例，步骤如下：
+1. 运行dtm
+``` bash
+git clone https://github.com/dtm-labs/dtm && cd dtm
+go run main.go
+```
+
+2. 运行例子
+
+``` bash
+git clone https://github.com/dtm-labs/dtm-examples && cd dtm-examples
+go run main.go http_saga_barrier
+```
+
+时序图如下：
+![saga_normal](../imgs/saga_normal.jpg)
+
+## 处理网络异常
+
+假设提交给dtm的事务中，调用转入操作时，出现短暂的故障怎么办？dtm 会重试未完成的操作，此时就会要求全局事务中的各个子事务是幂等的。dtm 框架首创子事务屏障技术，提供 BranchBarrier 工具类，可以帮助用户简单的处理幂等。它提供了一个函数 Call ，保证这个函数内部的业务，会被最多调用一次：
+``` go
+func (bb *BranchBarrier) Call(tx *sql.Tx, busiCall BarrierBusiFunc) error
+```
+
+该 BranchBarrier 不仅能够自动处理幂等，还能够自动处理空补偿、悬挂的问题，详情可以参考[异常与子事务屏障](../practice/barrier)
+
+## 处理回滚
+
+假如银行将金额准备转入用户2时，发现用户2的账户异常，返回失败，会怎么样？我们调整处理函数，让转入操作返回失败
+
+``` go
+app.POST(BusiAPI+"/SagaBTransIn", dtmutil.WrapHandler2(func(c *gin.Context) interface{} {
+  return dtmcli.ErrFailure
+}))
+```
+
+我们给出事务失败交互的时序图
+
+![saga_rollback](../imgs/saga_rollback.jpg)
+
+这里有一点，TransIn的正向操作什么都没有做，就返回了失败，此时调用TransIn的补偿操作，会不会导致反向调整出错了呢？
+
+不用担心，前面的子事务屏障技术，能够保证TransIn的错误如果发生在提交之前，则补偿为空操作；TransIn的错误如果发生在提交之后，则补偿操作会将数据提交一次。
+
+您可以将返回错误的TransIn改成：
+``` Go
+app.POST(BusiAPI+"/SagaBTransIn", dtmutil.WrapHandler2(func(c *gin.Context) interface{} {
+  barrier := MustBarrierFromGin(c)
+  barrier.Call(txGet(), func(tx *sql.Tx) error {
+    return SagaAdjustBalance(tx, TransInUID, reqFrom(c).Amount, "")
+  })
+  return dtmcli.ErrFailure
+}))
+```
+最后的结果余额依旧会是对的，详情可以参考[异常与子事务屏障](../practice/barrier)
+
+## 小结
+
+本文给出了一个完整的 SAGA 事务方案，是一个可以实际运行的 SAGA，您只需要在这个示例的基础上进行简单修改，就能够用于解决您的真实问题
+
+关于更多SAGA的原理，可以参见[SAGA](../practice/saga)
+
+---
+
+# TCC 例子
+
+Source: https://github.com/dtm-labs/dtm.pub/blob/main/docs/guide/e-tcc.md
+
+# TCC 例子
+
+本文将介绍一个完整的 TCC 例子，让读者对 TCC 型事务有一个准确的了解
+
+## 业务场景
+跨行转账是典型的分布式事务场景，在这里，A需要跨行转账给B，假设需求场景是：转出A和转入B都有可能成功和失败，需要最终转入转出都成功，或者都失败。
+
+同时这里还有一个要求，假如发生回滚，SAGA 模式下会发生A发现自己的余额被扣减了，但是收款方B迟迟没有收到余额，那么会对A造成很大的困扰。业务上面希望不要出现这种情况
+
+## TCC组成
+TCC分为3个阶段
+
+- Try 阶段：尝试执行，完成所有业务检查（一致性）, 预留必须业务资源（准隔离性）
+- Confirm 阶段：如果所有分支的Try都成功了，则走到Confirm阶段。Confirm真正执行业务，不作任何业务检查，只使用 Try 阶段预留的业务资源
+- Cancel 阶段：如果所有分支的Try有一个失败了，则走到Cancel阶段。Cancel释放 Try 阶段预留的业务资源。
+
+如果我们要进行一个类似于银行跨行转账的业务，转出（TransOut）和转入（TransIn）分别在不同的微服务里，一个成功完成的TCC事务典型的时序图如下：
+![tcc_normal](../imgs/tcc_normal.jpg)
+
+## 核心业务
+首先我们创建账户余额表，其中 trading_balance 表示被冻结的金额：
+```
+create table if not exists dtm_busi.user_account(
+  id int(11) PRIMARY KEY AUTO_INCREMENT,
+  user_id int(11) UNIQUE,
+  balance DECIMAL(10, 2) not null default '0',
+  trading_balance DECIMAL(10, 2) not null default '0',
+  create_time datetime DEFAULT now(),
+  update_time datetime DEFAULT now(),
+  key(create_time),
+  key(update_time)
+);
+```
+
+我们先编写核心代码，冻结/解冻资金操作，会检查约束balance+trading_balance >= 0，如果约束不成立，执行失败
+
+``` go
+func tccAdjustTrading(db dtmcli.DB, uid int, amount int) error {
+	affected, err := dtmimp.DBExec(db, `update dtm_busi.user_account
+		set trading_balance=trading_balance+?
+		where user_id=? and trading_balance + ? + balance >= 0`, amount, uid, amount)
+	if err == nil && affected == 0 {
+		return fmt.Errorf("update error, maybe balance not enough")
+	}
+	return err
+}
+
+func tccAdjustBalance(db dtmcli.DB, uid int, amount int) error {
+	affected, err := dtmimp.DBExec(db, `update dtm_busi.user_account
+		set trading_balance=trading_balance-?,
+		balance=balance+? where user_id=?`, amount, amount, uid)
+	if err == nil && affected == 0 {
+		return fmt.Errorf("update user_account 0 rows")
+	}
+	return err
+}
+```
+
+下面我们来编写具体的Try/Confirm/Cancel的处理函数
+
+
+``` go
+app.POST(BusiAPI+"/TccBTransOutTry", dtmutil.WrapHandler2(func(c *gin.Context) interface{} {
+  bb := MustBarrierFromGin(c)
+  return bb.Call(txGet(), func(tx *sql.Tx) error {
+    return tccAdjustTrading(tx, TransOutUID, -req.Amount)
+  })
+}))
+app.POST(BusiAPI+"/TccBTransOutConfirm", dtmutil.WrapHandler2(func(c *gin.Context) interface{} {
+  bb := MustBarrierFromGin(c)
+  return bb.Call(txGet(), func(tx *sql.Tx) error {
+    return tccAdjustBalance(tx, TransOutUID, -reqFrom(c).Amount)
+  })
+}))
+app.POST(BusiAPI+"/TccBTransOutCancel", dtmutil.WrapHandler2(func(c *gin.Context) interface{} {
+  bb := MustBarrierFromGin(c)
+  return bb.Call(txGet(), func(tx *sql.Tx) error {
+    return tccAdjustTrading(tx, TransOutUID, req.Amount)
+  })
+}))
+app.POST(BusiAPI+"/TccBTransInTry", dtmutil.WrapHandler2(func(c *gin.Context) interface{} {
+  bb := MustBarrierFromGin(c)
+  return bb.Call(txGet(), func(tx *sql.Tx) error {
+    return tccAdjustTrading(tx, TransInUID, req.Amount)
+  })
+}))
+app.POST(BusiAPI+"/TccBTransInConfirm", dtmutil.WrapHandler2(func(c *gin.Context) interface{} {
+  bb := MustBarrierFromGin(c)
+  return bb.Call(txGet(), func(tx *sql.Tx) error {
+    return tccAdjustBalance(tx, TransInUID, reqFrom(c).Amount)
+  })
+}))
+app.POST(BusiAPI+"/TccBTransInCancel", dtmutil.WrapHandler2(func(c *gin.Context) interface{} {
+  bb := MustBarrierFromGin(c)
+  return bb.Call(txGet(), func(tx *sql.Tx) error {
+    return tccAdjustTrading(tx, TransInUID, -req.Amount)
+  })
+}))
+```
+
+到此各个子事务的处理函数已经OK了，这些处理函数的核心逻辑都是冻结和调整余额，对于这里面的`bb.Call`作用，后面会详细解释
+
+## TCC 事务
+然后是开启TCC事务，进行分支调用
+
+``` go
+// TccGlobalTransaction 会开启一个全局事务
+_, err := dtmcli.TccGlobalTransaction(DtmServer, func(tcc *dtmcli.Tcc) (rerr error) {
+  // CallBranch 会将事务分支的Confirm/Cancel注册到全局事务上，然后直接调用Try
+  res1, rerr := tcc.CallBranch(&TransReq{Amount: 30}, host+"/api/TccBTransOutTry", host+"/api/TccBTransOutConfirm", host+"/api/TccBTransOutCancel"
+  if err != nil {
+    return resp, err
+  }
+  return tcc.CallBranch(&TransReq{Amount: 30}, host+"/api/TccBTransInTry", host+"/api/TccBTransInConfirm", host+"/api/TccBTransInCancel")
+})
+```
+
+至此，一个完整的TCC分布式事务编写完成。
+
+## 运行
+如果您想要完整运行一个成功的示例，步骤如下：
+1. 运行dtm
+``` bash
+git clone https://github.com/dtm-labs/dtm && cd dtm
+go run main.go
+```
+
+2. 运行例子
+
+``` bash
+git clone https://github.com/dtm-labs/dtm-examples && cd dtm-examples
+go run main.go http_tcc_barrier
+```
+
+## 处理网络异常
+
+假设提交给dtm的事务中，这些步骤中，出现短暂的故障怎么办？dtm 会重试未完成的操作，此时就会要求全局事务中的各个子事务是幂等的。dtm 框架首创子事务屏障技术，提供 BranchBarrier 工具类，可以帮助用户简单的处理幂等。它提供了一个函数 Call ，保证这个函数内部的业务，会被最多调用一次：
+``` go
+func (bb *BranchBarrier) Call(tx *sql.Tx, busiCall BarrierBusiFunc) error
+```
+
+该 BranchBarrier 不仅能够自动处理幂等，还能够自动处理空补偿、悬挂的问题，详情可以参考[异常与子事务屏障](../practice/barrier)
+
+### TCC的回滚
+假如银行将金额准备转入用户2时，发现用户2的账户异常，返回失败，会怎么样？我们修改代码，模拟这种情况：
+``` go
+app.POST(BusiAPI+"/TccBTransInTry", dtmutil.WrapHandler2(func(c *gin.Context) interface{} {
+  return dtmcli.ErrFailure
+}))
+```
+这是事务失败交互的时序图
+![tcc_rollback](../imgs/tcc_rollback.jpg)
+
+这个跟成功的TCC差别就在于，当某个子事务返回失败后，后续就回滚全局事务，调用各个子事务的Cancel操作，保证全局事务全部回滚。
+
+这里有一点，TransInTry的正向操作什么都没有做，就返回了失败，此时调用TransInCancel补偿操作，会不会导致反向调整出错了呢？
+
+不用担心，前面的子事务屏障技术，能够保证TransInTry的错误如果发生在提交之前，则补偿为空操作；TransInTry的错误如果发生在提交之后，则补偿操作会将数据提交一次。
+
+您可以将 `TccBTransInTry`改成
+``` go
+app.POST(BusiAPI+"/TccBTransInTry", dtmutil.WrapHandler2(func(c *gin.Context) interface{} {
+  bb := MustBarrierFromGin(c)
+  bb.Call(txGet(), func(tx *sql.Tx) error {
+    return tccAdjustTrading(tx, TransInUID, req.Amount)
+  })
+  return dtmcli.ErrFailure
+}))
+```
+
+最后的结果余额依旧会是对的，详情可以参考[异常与子事务屏障](../practice/barrier)
+
+### 小结
+
+本文给出了一个完整的 TCC 事务方案，是一个可以实际运行的 TCC，您只需要在这个示例的基础上进行简单修改，就能够用于解决您的真实问题
+
+关于更多TCC的原理，可以参见[TCC](../practice/tcc)
+
+---
+
+# 安装运行DTM
+
+Source: https://github.com/dtm-labs/dtm.pub/blob/main/docs/guide/install.md
+
+# 安装运行DTM
+
+这里的安装运行主要是为了快速上手，如果您需要将DTM部署到线上，请参考 [线上部署](../deploy/base)
+
+DTM的安装运行非常简单，已支持零配置启动，零依赖，只需要运行dtm可执行文件即可。您可以通过以下多种方式安装DTM
+
+## MAC Homebrew 安装
+
+```
+brew install dtm
+```
+
+输入下面命令，即可启动运行
+```
+dtm
+```
+
+brew还会额外安装一个命令 dtm-qs，这是一个quick-start客户端，用于运行一个简单的例子。在dtm启动之后，运行下面命令：
+```
+dtm-qs
+```
+
+可以看到控制台打印出TransOut、TransIn成功，一个完整的分布式事务就完成了
+
+## docker安装
+需要docker 20.04版本及以上
+
+```
+docker run -itd  --name dtm -p 36789:36789 -p 36790:36790  yedf/dtm:latest
+```
+
+## 二进制包下载安装
+github上面的[发布版本](https://github.com/dtm-labs/dtm/releases/latest)提供了各个版本的二进制包下载，提供了Mac、linux、windows三个平台的可运行文件：
+
+- 苹果m1：dtm_$ver_darwin_arm64.tar.gz
+- 苹果非m1：dtm_$ver_darwin_amd64.tar.gz
+- linux：dtm_$ver_linux_amd64.tar.gz
+- windows：dtm_$ver_windows_amd64.tar.gz
+
+下载安装包，解压后即可运行
+
+## 源码编译安装
+需要go语言环境1.16以上
+
+```
+git clone https://github.com/dtm-labs/dtm && cd dtm
+go build
+```
+
+`./dtm` 即可运行
+
+## 运行
+dtm运行后，会监听两个端口
+- http：36789
+- grpc：36790
+
+---
+
+# 介绍
+
+Source: https://github.com/dtm-labs/dtm.pub/blob/main/docs/guide/start.md
+
+# 介绍
+
+## DTM是什么
+
+DTM是一款开源的分布式事务管理器，解决跨数据库、跨服务、跨语言栈更新数据的一致性问题。
+
+通俗一点说，DTM提供跨服务事务能力，一组服务要么全部成功，要么全部回滚，避免只更新了一部分数据产生的一致性问题。
+
+您可以在[为什么选DTM](./why)中了解更多DTM的设计初衷。
+
+## 谁在使用dtm
+
+[Tencent 腾讯](../other/using#tencent)
+
+[ByteDance 字节](../other/using#bytedance)
+
+[360](../other/using#qihu)
+
+[更多](../other/using)
+
+## 快速开始
+
+::: tip 具备的基础知识
+本教程也假设您有一定的编程基础，能够大致明白GO语言代码的意思，如果您在阅读Go代码方面遇见问题，可以访问[golang](https://golang.google.cn/)
+:::
+
+如果您不是Go语言，不熟悉Go环境，您可以转到[SDK](../ref/sdk#go)，找到对应语言的QuickStart
+
+#### 运行dtm
+
+``` bash
+git clone https://github.com/dtm-labs/dtm && cd dtm
+go run main.go
+```
+
+#### 启动并运行一个saga示例
+下面运行一个类似跨行转账的示例，包括两个事务分支：资金转出（TransOut)、资金转入（TransIn)。DTM保证TransIn和TransOut要么全部成功，要么全部回滚，保证最终金额的正确性。
+
+`go run qs/main.go`
+
+## 示例详解
+
+#### 接入代码
+``` GO
+  // 具体业务微服务地址
+  const qsBusi = "http://localhost:8081/api/busi_saga"
+  req := &gin.H{"amount": 30} // 微服务的载荷
+  // DtmServer为DTM服务的地址，是一个url
+  DtmServer := "http://localhost:36789/api/dtmsvr"
+  saga := dtmcli.NewSaga(DtmServer, shortuuid.New()).
+    // 添加一个TransOut的子事务，正向操作为url: qsBusi+"/TransOut"， 补偿操作为url: qsBusi+"/TransOutCompensate"
+    Add(qsBusi+"/TransOut", qsBusi+"/TransOutCompensate", req).
+    // 添加一个TransIn的子事务，正向操作为url: qsBusi+"/TransIn"， 补偿操作为url: qsBusi+"/TransInCompensate"
+    Add(qsBusi+"/TransIn", qsBusi+"/TransInCompensate", req)
+  // 提交saga事务，dtm会完成所有的子事务/回滚所有的子事务
+  err := saga.Submit()
+```
+
+成功运行后，可以看到TransOut、TransIn依次被调用，完成了整个分布式事务
+
+#### 时序图
+整个事务最终成功完成，时序图如下：
+
+![saga_normal](../imgs/saga_normal.jpg)
+
+#### 失败情况
+在实际的业务中，子事务可能出现失败，例如转入的子账号被冻结导致转账失败。我们对业务代码进行修改，让TransIn的正向操作失败，然后看看结果
+
+``` go
+	app.POST(qsBusiAPI+"/TransIn", func(c *gin.Context) {
+		log.Printf("TransIn")
+		c.JSON(409, "") // Status 409 表示失败，不再重试，直接回滚
+	})
+```
+
+再运行这个例子，整个事务最终失败，时序图如下：
+
+![saga_rollback](../imgs/saga_rollback.jpg)
+
+在转入操作失败的情况下，TransIn和TransOut的补偿操作被执行，保证了最终的余额和转账前是一样的。
+
+## 准备好了吗？
+
+我们刚才简单介绍了一个完整的分布式事务，包括了一个成功的，以及一个回滚的。现在您应该对分布式事务有了具体的认识，本教程将带你逐步学习分布式事务的原理，然后是具体的技术方案和技巧。
+
+## 交流群
+
+请加 yedf2008 好友或者扫码加好友，验证回复 dtm 按照指引进群
+
+![yedf2008](https://service.ivydad.com/cover/dubbingb6b5e2c0-2d2a-cd59-f7c5-c6b90aceb6f1.jpeg)
+
+如果您觉得[dtm](https://github.com/dtm-labs/dtm)不错，或者对您有帮助，请赏颗星吧！
+
+---
+
+# 为什么dtm
+
+Source: https://github.com/dtm-labs/dtm.pub/blob/main/docs/guide/why.md
+
+# 为什么dtm
+
+## 现实问题
+
+dtm项目起源于实际项目中的问题。我们在公司内部，涉及订单支付的服务，会将所有业务相关逻辑放到一个大的本地事务，这会导致大量耦合，复杂度大幅提升。
+
+我们在进行go语言的微服务化过程中，需要将原先的事务拆分成分布式事务。我们调研了一遍市场上面的开源项目，只有java有成熟的分布式事务解决方案，golang没有，其他语言也没有。因此我们的选择有两个：
+
+- 第一种方式是全部转用java开发，使用Java中应用最广泛的seata方案。这种方案代价非常高，需要将原有大量的业务使用Java重写
+- 第二种方式是自己开发一套分布式事务管理器，现有的业务还保留当前语言，渐进式微服务化
+
+## dtm能带来什么
+
+我们细致的评估完第二种方案后，发现我们计划自主开发的分布式事务管理器dtm大大优于第一种，有以下几点：
+
+- 可以提供非常简单易用的接口，拆分具体业务接入分布式事务，普通几年开发经验的工程师就能够胜任
+- 我们可以对多语言栈进行了支持，这个特性对于小公司切换语言栈，以及大公司采用多语言栈，具有重大意义
+- 我们有一项核心技术子事务屏障，可以大大降低开发者处理子事务乱序的处理难度，在seata上进行该技术的开发，难度很高，而自己的方案则简单很多
+
+## 开源
+
+综合下来，简单易用性、多语言支持、减轻业务负担三个重要方面，我们的方案dtm都非常优秀，相较于我们调研看到的其他开源方案，亮点突出，因此我们决定自己开发。
+
+因为我们的实践表明dtm确实非常优秀，能够极大的降低分布式事务的使用门槛，能够解决当前市面上许多无法解决的问题，因此我们将它开源，反哺开源社区。
+
+---
+
+# index.md
+
+Source: https://github.com/dtm-labs/dtm.pub/blob/main/docs/index.md
+
+---
+home: true
+heroImage: /dtm.svg
+actionText: 开始
+actionLink: /guide/start
+
+features:
+  - title: 💡 极易接入
+    details: 零配置启动服务，提供非常简单的HTTP接口，极大降低上手分布式事务的难度，新手也能快速接入
+  - title: ⚡️ 跨语言
+    details: 可适合多语言栈的公司使用。方便go、python、php、nodejs、ruby、c# 各类语言使用。
+  - title: 🛠️ 使用简单
+    details: 开发者不再担心悬挂、空补偿、幂等等异常问题，首创子事务屏障技术代为处理
+  - title: 📦 易部署、易扩展
+    details: 依赖mysql|redis，部署简单，易集群化，易水平扩展
+  - title: 🔩 多种分布式事务协议支持
+    details: TCC、SAGA、XA、二阶段消息，一站式解决所有分布式事务问题
+footer: ''
+---
+
+---
+
+# 结果接口协议
+
+Source: https://github.com/dtm-labs/dtm.pub/blob/main/docs/nomenu/proto.md
+
+# 结果接口协议
+
+当前页面介绍的结果口协议，适用于1.9.x及更低版本，如果您的dtm版本大于等于1.10.x，采用本协议不会出错，但是建议采用新的协议。升级指南参考[升级指南](../deploy/upgrade)
+## 角色间通信协议
+
+目前dtm只支持了http和grpc协议。由于分布式事务涉及多个角色协作，某些参与者可能出现暂时不可用，需要重试；某些参与者明确告知失败，需要进行回滚。
+
+### HTTP
+
+下面对各种情况进行分类说明，定义各类情况的返回值。接口类似微信/支付宝订单成功回调的接口:
+- 如果接口返回的结果中，包含SUCCESS，则表示成功；
+- 如果接口返回的结果中，包含FAILURE，则表示失败;
+- 如果接口返回的结果中，包含ONGOING，则表示正常进行中，需要按照指定的时间间隔重试;
+- 其他则表示出错，需要进行重试，重试时采用退避算法，避免雪崩。
+
+上面的架构图中，主要有以下几类接口：
+
+#### AP调用TM的接口，主要为全局事务注册、提交，子事务注册等：
+  - 成功: { dtm_result: "SUCCESS" }
+  - 失败: { dtm_result: "FAILURE" }，表示这个请求状态不对，例如已经走fail的全局事务不允许再注册分支
+  - 其他表示状态不确定，可重试
+
+#### TM调用RM的接口，主要为二阶段的提交、回滚，以及saga的各分支操作
+  - 成功: { dtm_result: "SUCCESS" }
+  - 失败: { dtm_result: "FAILURE" }，表示这个接口业务失败，全局事务需要进行回滚。例如saga中的正向操作如果返回FAILURE，则整个saga事务失败回滚
+  - 进行中: { dtm_result: "ONGOING" }，表示这个接口正常进行中，后续按照固定间隔重试
+  - 其他结果则重试，一直按照退避算法重试，直到返回上述的两个结果之一
+
+#### AP调用RM的接口，跟业务相关，主要是被TCC、XA两种模式调用。
+考虑到许多微服务的治理，都有失败重试的机制，因此建议接口设计（由于是AP和RM之间的接口，dtm不做强制要求）如下：
+  - 成功: { dtm_result: "SUCCESS" }。返回的结果可以额外包含其他业务数据。
+  - 失败: { dtm_result: "FAILURE" }，表示这个接口业务失败，全局事务需要进行回滚。例如tcc中的Try动作如果返回FAILURE，则整个tcc全局事务回滚
+  - 其他返回值，应当允许重试，重试如果还是失败，需要允许全局事务回滚。主要是因为TCC、XA事务的下一步操作不保存在数据库，而是在AP里，它需要及时响应用户，无法长时间等待故障恢复。
+
+::: tip 接口数据注意点
+dtm框架通过resp.String()是否包含SUCCESS/FAILURE/ONGOING来判断成功和失败，因此请避免在子事务接口返回的业务数据里包含这两个词。
+:::
+
+### GRPC
+由于GRPC为强类型协议，并且定义好了各个错误状态码，并且能够定义不同的错误码，采用不同的重试策略，因此GRPC的协议如下：
+
+#### GRPC协议
+- 成功: OK。对应上述http协议中的{ dtm_result: "SUCCESS" }
+- 失败: Aborted && Message=="FAILURE"。对应上述http协议中的{ dtm_result: "FAILURE" }，表示失败;
+- 进行中: Aborted && Message=="ONGOING"。对应上述http协议中的{ dtm_result: "FAILURE" }，则表示正常进行中，需要按照指定的时间间隔重试;
+- 其他错误吗：状态未知，可重试，重试时采用退避算法，避免雪崩。
+
+#### AP调用TM的接口，主要为全局事务注册、提交，子事务注册等：
+- nil：成功
+- Aborted：表示这个请求状态不对，例如已经走fail的全局事务不允许再注册分支
+- 其他错误：表示状态未知，可重试
+
+``` go
+type DtmServer interface {
+  ...
+  Submit(context.Context, *DtmRequest) (*emptypb.Empty, error)
+}
+```
+
+#### TM调用RM的接口，主要为二阶段的提交、回滚，以及saga的各分支操作
+- nil：成功
+- Aborted && Message=="FAILURE"：表示失败，需要回滚事务
+- Aborted && Message=="ONGOING"：表示进行中，后续采用固定间隔重试
+- 其他错误：表示出错，采用退避算法重试
+
+#### AP调用RM的接口，跟业务相关，主要是被TCC、XA两种模式调用。返回的结果
+- 这部分接口用户完全自定义，dtm并不关心。建议用户采用“TM调用RM的接口”相同的设计，保持统一
+
+## 重试策略
+
+失败重试是微服务治理中，很重要的一个环节，上述http和grpc协议，能够很好的与主流的失败重试策略兼容
+
+当全局事务由于某些组件导致临时故障，那么全局事务会暂时中断，后续dtm会定时轮询未完成的全局事务，进行重试。一般多次重试则间隔每次加倍，避免雪崩。
+
+许多事务模式中的操作是要求不允许失败/最终成功的，含义见[最终成功](../practice/must-succeed)
+
+---
+
+# DTM开发测试指南
+
+Source: https://github.com/dtm-labs/dtm.pub/blob/main/docs/other/develop.md
+
+# DTM开发测试指南
+本文是为了给dtm做贡献的开发者准备的，或者是给准备调试dtm的开发者准备，普通开发者如果只是为了接入dtm，则不需要关注本文内容。
+
+## 基础环境
+dtm项目需要将数据存储在mysql|redis|postgres，因此需要准备好相关的服务器。
+
+推荐采用docker-compose的方式准备环境，您可以安装docker20.04以上版本，然后在dtm项目路径下，执行
+`docker-compose -f helper/compose.store.yml up -d`
+
+## 添加测试用例
+这步为可选，虽然这步为可选，但是对于bug或者新功能，强烈建议您添加测试用例，以便未来的每一个修改，都不会重新引入您已解决的问题
+
+您可以参考现有的测试用例，在合适的位置添加您的新用例。现有的用例是比较全面的，各种正常/异常情况，都有覆盖，整个测试覆盖率能够达到95%
+
+## 修改问题
+如果您已经添加了测试用例，那么先确认测试用例在您修改前是失败的
+
+您针对问题进行相关的代码修改，尽量做到代码简单清晰，让其他人容易读懂，逻辑复杂/奇怪的地方加上注释
+
+## 修改后的测试
+
+您完成相关问题的修改后，您可以通过go test运行相关的测试用例，确认已解决相关问题，然后再运行全部测试用例，保证您的新代码，没有引入新的问题
+
+dtm没有测试人员，他的稳定性主要是靠自动化的测试保证的。我们在测试覆盖率上面要求很高，1.0版本后，都要求覆盖率在95%+
+
+**注意！！！** 您完成修改后，请确保下面命令显示所有的测试用例已通过
+
+`make -f helper/Makefile`
+
+如果您的修改，涉及存储引擎部分，那么您需要设定环境变量，覆盖特定引擎下的测试用例
+
+```
+go test ./... # 默认情况下，使用redis引擎
+TEST_STORE=redis go test ./... # 测试redis引擎
+TEST_STORE=boltdb go test ./... # 测试boltdb引擎
+TEST_STORE=mysql go test ./... # 测试mysql引擎
+TEST_STORE=postgres go test ./... # 测试postgres引擎
+```
+
+## 发起PR
+您的修改完成后，按照流程发起PR，然后关注下面的内容
+
+- 您的PR是否通过了dtm的所有集成测试
+- 如果您新增代码，请关注您的代码[测试覆盖率](https://app.codecov.io/gh/dtm-labs/dtm)
+
+对于通过上述两条内容的PR，dtm的人员将会尽快给您反馈，如果无大的问题，将合并您的PR
+
+## 管理后台
+dtm 从1.14.0开始，添加了管理后台的功能，该管理后台采用的技术栈包括：
+* vue3
+* ant-design-vue
+* typescript
+* pinia
+* vite
+
+如果您修改的是管理后台功能，那么您按照前面的说明，启动了dtm服务器之后，进入admin目录，运行以下命令：
+```
+yarn dev
+```
+
+然后访问`localhost:6789`即可
+
+---
+
+# 对比其他框架
+
+Source: https://github.com/dtm-labs/dtm.pub/blob/main/docs/other/opensource2.md
+
+# 对比其他框架
+
+## 概况
+
+目前开源的分布式事务框架，暂未看到非Java语言的其他框架。而Java语言的较多，其中以Seata应用最为广泛。
+
+下面是DTM和SEATA的主要特性对比：
+
+|  特性| DTM | SEATA |备注|
+|:-----:|:----:|:----:|:----:|
+| [支持语言](#lang) |<span style="color:green">Go、Java、python、php、c#...</span>|<span style="color:orange">Java</span>|dtm可轻松接入一门新语言|
+|[存储引擎](#store) |<span style="color:green">支持数据库、Redis、Mongo</span>|<span style="color:orange">数据库</span>||
+|[异常处理](#exception)| <span style="color:green">子事务屏障自动处理</span>|<span style="color:orange">手动处理</span> |dtm解决了幂等、悬挂、空补偿|
+|[TCC事务](#tcc)| <span style="color:green">✓</span>|<span style="color:green">✓</span>||
+| [XA事务](#xa)|<span style="color:green">✓</span>|<span style="color:green">✓</span>||
+|[AT事务](#at)|<span style="color:green">建议使用XA</span>|<span style="color:green">✓</span>|AT与XA类似，性能稍好，但有脏读脏回滚|
+| [SAGA事务](#saga) |<span style="color:green">支持并发</span> |<span style="color:green">状态机模式</span> ||
+|[二阶段消息](#msg)|<span style="color:green">✓</span>|<span style="color:red">✗</span>|dtm提供类似rocketmq的二阶段消息|
+|[单服务多数据源](#multidb)|<span style="color:green">✓</span>|<span style="color:red">✗</span>||
+|[通信协议](#protocol)|HTTP、gRPC|dubbo等协议||
+|[star数量](#star)|<img src="https://img.shields.io/github/stars/dtm-labs/dtm.svg?style=social" alt="github stars"/>|<img src="https://img.shields.io/github/stars/seata/seata.svg?style=social" alt="github stars"/>|dtm从20210604发布0.1，发展快|
+
+从上面对比的特性来看，如果您的语言栈包含了Java之外的语言，那么dtm是您的首选。如果您的语言栈是Java，您也可以选择接入dtm，使用子事务屏障技术，简化您的业务编写。
+
+下面将详细介绍上述特性的对比（关于Seata的部分，可能更新不及时，如果读者发现已过时的部分，欢迎给我们提PR，我们会及时反馈与更新）
+
+## 支持语言 {#lang}
+dtm从设计之初就考虑了多语言支持，目前已经有多个语言的SDK，包括Go、Java、PHP、Python、C#、Node。
+
+dtm在架构上面，就把SDK层做的很薄，把能够在服务端完成的事情全部放到服务端，这样能够方便各个语言快捷的开发SDK。通常一门语言某个模式的SDK实现也就几十到一两百行的代码。
+
+dtm在接口设计上，也充分考虑了多语言支持。例如：
+- 提供的接口，是以 SDK 函数调用方式，很少采用少数语言才有的注解
+- Saga 未采用状态机，避免在 gRPC 协议下，无法提取自定义的结果
+
+Seata目前主要支持Java，对Java生态的支持较完备，另外采用了注解方式的接口，对Java开发人员较友好。因为它的SDK，相对较重，里面包含了大量的逻辑，想要在一门新语言中，实现SDK，工作量非常大。他在非Java的语言中，看到有seata-go，但目前还不是很成熟。
+
+## 存储引擎 {#store}
+dtm支持使用多个服务使用多种存储引擎组合成一个分布式事务，目前已支持数据库、Redis、Mongo三种，而且dtm可以很快速的支持其他的存储引擎，提供非常灵活的功能，让你的应用可以方便的选择最适合的方案。
+
+Seata目前只看到对数据库的支持，暂未看到对其他存储引擎的支持
+
+## 异常处理 {#exception}
+异常问题这里主要是指分布式系统中Network Delay和Process Pause造成的乱序，需要应用处理重复请求、悬挂、空补偿。这是一个非常棘手的问题，虽然每个分布式事务框架都给出了业务实现建议，但是业务实现这个非常困难，很容易掉坑，并且难以测试，详情可以参考[子事务屏障自动处理](../practice/barrier.html)
+
+dtm首创了子事务屏障技术，一方面系统性的处理了该问题，另一方面该技术极大的简化了问题处理，其他语言可以很容易参考实现，大大降低了分布式事务的使用门槛
+
+Seata目前版本(截止2021-12-25的版本为1.4.2)还是需要业务手动处理
+
+## TCC事务 {#tcc}
+dtm和Seata都支持了TCC事务。因为现在的微服务框架，或者服务网格通常会进行失败重试，因此dtm在这方面做了很好的设计，允许重试，不会产生任何问题。
+
+Seata的TCC对重试不友好，需要关闭重试，避免出现问题。
+
+## XA事务 {#xa}
+dtm和Seata都支持XA事务，他们的接口差别较大。dtm采用的是回调函数形式的接口，而Seata采用的是Java特有的注解形式接口
+
+## AT事务 {#at}
+AT事务是Seata独有的事务模式，我的观点是，该模式是XA的手动实现，在适用场景、性能、使用注意点，与XA都非常相近，但是有脏回滚的问题，因此建议读者如果遇见使用AT的场景，都可以考虑使用XA事务
+
+## SAGA事务 {#saga}
+Seata的Saga实现采用了状态机，优点是可以做到灵活配置，缺点是上手难度非常高。一个简单的分布式事务，使用Saga的状态机Json配置，可以达到将近90行，而这部分配置可读性很差，可调试性也很差。
+
+dtm在SAGA事务设计选择上，做了部分用户调研，发现使用状态机的用户非常少，许多经验丰富的程序员研究Seata的Saga状态机使用，也是困难重重。在收集了部分用户在长事务上面的需求之后，dtm选择了新的实现方式：支持并发的Saga。这项选择的重要结果是，dtm的用户中，很多人选择使用简单Saga。而部分高级需求可以通过一些简单的技巧解决，详情参考[SAGA](../practice/saga)
+
+## 二阶段消息 {#msg}
+dtm支持了二阶段消息事务模式，该模式受到RocketMQ的事务消息启发。这里我们起了一个新名字的主要原因是，“事务消息”和“事务模式”很容易就把大家弄混了。
+
+二阶段消息提供了比本地消息表和事务消息更简单的架构，更易用的接口：DoAndSubmitDB，该接口将本地消息表和事务消息的所有架构细节全部隐藏，新手只需要按照接口调用，填写相关的业务逻辑和下一阶段服务调用即可，其他内容不用关心。进一步降低了消息最终一致性问题的解决难度。
+
+二阶段消息也可以退化为一阶段消息，就跟普通的可靠消息类似，但是提供了更丰富的功能，例如支持同步选项。
+
+二阶消息是 DTM 提出的新架构适用于无需回滚的数据一致性场景，非常适合替换原有本地消息表和事务消息方案
+
+Seata暂时未支持这种事务模式，未来可能会对接RocketMQ
+
+## 单服务多数据 {#multidb}
+dtm的TCC和SAGA事务支持单服务多数据源，详细的使用方式会在近期补充进文档
+
+Seata暂未支持这种场景
+
+## 通信协议 {#protocol}
+dtm支持HTTP、gRPC，同时也支持基于gRPC的微服务协议，目前已支持go-zero、Polaris。未来可以非常便捷的接入更多新的协议，如有需求，也可以接入Spring cloud
+
+Seata则对Java领域的微服务协议支持较多，例如Spring cloud、Dubbo等
+
+## Star {#star}
+dtm从2021年6月开源以来，受到了大量的关注，star增长趋势很好，潜力非常好
+
+## DTM 的更多优点 {#more}
+
+#### 极快的上手速度
+DTM 支持brew一键安装，支持无配置启动，运行第一个事务，只需要几行命令即可，比分布式事务领域的其他框架，便捷很多，大幅降低新手上手速度
+
+#### 完整的性能测试报告
+DTM 在性能上也非常好，对于使用的 Mysql/Redis 存储引擎，可以充分利用他们的性能，达到理论上的性能上限。DTM 给出了性能测试的完整过程，也有部分用户进行了实际的压测，获得了近似的结果。
+
+SEATA 暂未看到官方的性能测试报告
+
+#### 文档齐全
+DTM 的定位是一站式分布式事务解决方案，能够大量应用于现代微服务场景，例如希望将 DTM 用于每个采用了微服务架构的订单系统，解决其中数据不一致的问题，而不仅仅是对一致性要求高的个别应用。
+
+因此 DTM 的文档，对分布式事务的理论进行了详细讲解，纠正了许多大家对分布式事中的错误理解，并提出了新的架构。另外 DTM 引入的多项创新，多项降低系统复杂度的核心技术，都会通过文档，详细介绍给大家，方便大家从旧方案，迁移到新方案。
+
+#### bug率低
+DTM 没有专门的测试人员，稳定性主要是通过自动化测试来保证的。DTM 的测试覆盖率达到 95+%，把重要的路径全部覆盖，因此在多个重度用户接入、到测试、到压测、到线上运行的过程中，通常是零bug，遇见的问题，多为需要新特性，多为环境兼容等问题。
+
+#### 迭代速度快
+因为 DTM 的稳定性是有自动化测试来保证的，因此添加新特性，重构等，只需要按照新特性添加相关的测试用例，而不需要担心引入新的bug，不用人工测试，因此可以获得极快的迭代速度
+
+可以从roadmap中看到，虽然 DTM 开源不久，但是已经添加了大量的特性
+
+
+---
+
+# Redis存储引擎性能测试报告
+
+Source: https://github.com/dtm-labs/dtm.pub/blob/main/docs/other/perform-redis.md
+
+# Redis存储引擎性能测试报告
+
+## 概述
+之前dtm给出了Mysql作为存储引擎的性能测试报告，在一个普通配置的机器上，2.68w IOPS，4核8G机器上，能够支持大约每秒900+分布式事务，能够满足大部分公司的业务需求。
+
+此次带来的是Redis存储引擎的测试报告，在一个普通配置的机器上，能够达到大约10800每秒的分布式事务能力，对比Mysql存储，有10倍左右的性能提升，满足绝大部分公司的业务需求。
+
+下面我们来详细说明测试的步骤，并分析其中影影响性能的各个因素。
+
+## 测试环境
+下面的服务器都来自阿里云，地区为东京（外网访问比较方便）
+
+Redis服务器：ecs.hfc6 4核8G CPU主频为3.1 GHz/3.5 GHz 内网收发包50万PPS ubuntu 20.04
+
+两台应用服务器：ecs.hfc6 8核16G CPU主频为3.1 GHz/3.5 GHz 内网收发包80万PPS ubuntu 20.04
+
+## 测试步骤：
+
+### 准备好Redis
+在上面的Redis上面准备好Redis，这次因为考虑到极限性能，因此不采用docker安装，而是采用apt install 安装，运行如下命令
+``` bash
+apt update
+apt install -y redis
+# 修改/etc/redis/redis.conf，找到其中的bind，改为bind 0.0.0.0
+systemctl restart redis-server
+```
+
+### 配置应用服务器
+``` bash
+apt update
+apt install -y git
+git clone https://github.com/dtm-labs/dtm.git && cd dtm && git checkout 5907f99 && cd bench && make
+```
+
+注意以下步骤是两台应用服务器都需要操作
+
+### 配置dtm
+修改 dtm目录下的conf.sample.yml，配置使用Redis，例如：
+```
+Store:
+  Driver: 'redis'
+	Host: 'redis ip'
+	Port: 6379
+
+# 另外再把ExamplesDB里面的配置删除，因为我们没有安装mysql
+```
+
+### 启动bench服务器
+`
+LOG_LEVEL=warn go run bench/main.go redis
+`
+
+### 启动测试
+`
+ab -n 1000000 -c 10 "http://127.0.0.1:8083/api/busi_bench/benchEmptyUrl"
+`
+
+### 获得结果
+
+我这看到ab的结果显示，每秒完成的操作数量两台应用服务器加总为10875
+
+## Redis性能分析
+我们首先来看Redis本身的性能，影响它的因素是哪些，先看下面的这些测试数据：
+
+`
+redis-benchmark -n 300000 SET 'abcdefg' 'ddddddd'
+`
+
+每秒完成的请求数10w
+
+`
+redis-benchmark -h 内网其他主机IP -p 6379 -n 300000 SET 'abcdefg' 'ddddddd'
+`
+
+每秒完成的请求数10w
+
+从这上面的两个结果看，本地Redis测试和远程Redis测试，性能差异并不明显。我也测试过其他更多的命令，也未发现明显差异，因此下面主要就测试本地Redis性能，不再比较本地和远程的差别。
+
+`
+redis-benchmark -n 300000 EVAL "redis.call('SET', 'abcdedf', 'ddddddd')" 0
+`
+
+Lua脚本每秒完成的请求数10w
+
+`
+redis-benchmark -n 300000 EVAL "redis.call('SET', KEYS[1], ARGS[1])" 1 'aaaaaaaaa' 'bbbbbbbbbb'
+`
+
+Lua脚本每秒完成的请求数10w
+
+`
+redis-benchmark -n 3000000 -P 50 SET 'abcdefg' 'ddddddd'
+`
+
+走Pipeline的话，每秒完成的请求数150w，这个性能对比单个Set操作有大幅提升。从这个数据和单个操作的对比看，Redis本身内存操作开销不大，很多的开销花在了网络IO上，因此批量任务能够大幅提升吞吐量
+
+`
+redis-benchmark -n 300000 EVAL "for k=1, 10 do; redis.call('SET', KEYS[1], ARGS[1]); end" 1 'aaaaaaaaa' 'bbbbbbbbbb'
+`
+
+我们在Lua内部，连续执行10次Set，每秒完成的请求数6.1w，和只执行1次Set差别没有很大。这个结果在我们的预期之内，因为前面Pipeline的结果显示Redis的内存操作开销大幅小于网络。
+
+`
+## dtm性能分析
+dtm需要跟踪全局分布式事务的进度，我们以测试的Saga举例，大概涉及以下操作：
+- 保存事务信息，含全局事务、事务分支、还有查找过期事务的索引，dtm用一个Lua脚本来完成这些操作
+- 每个事务分支完成时，修改事务分支状态。由于修改状态时，需要确认全局事务处于正确状态，避免回滚中的事务还往前执行，因此dtm也用一个Lua脚本来完成
+- 全局事务完成，修改全局事务为成功，此时也需要避免已超时回滚中的事务被覆盖，也需要确认状态修改，也是一个Lua脚本
+
+那么一个事务在Redis上的理论开销大约是4个Lua脚本的开销，那么从前面每秒能够完成大约6w个简单Lua脚本来看，每秒最理想能够完成1.5w个分布式事务。由于实际的Lua脚本比我们测试的更复杂，传输的数据量更大，因此最终每秒完成1.08w个事务，已经是差不多的性能极限值。
+
+## 展望
+每秒1w事务已经是非常高的性能，足够应对绝大多数的场景。包括消息队列、秒杀等。
+
+当Redis能够支撑这么大的事务量时，如果是长时间这么大的事务量，那么redis的存储空间很快就不够了，后续可能添加选项，允许及时清理掉已完成的事务
+
+未来dtm的性能是否还能提高？我们可以从两方面看：
+
+一个是在目前单进程的情况下，dtm能够达到1w事务每秒，在redis6.0上，官方的数据显示，4CPU性能大约提升150%，这样的话dtm预计能够支撑2.5w事务每秒。
+
+另一个是dtm往集群的方向发展，提供集群能力，允许动态扩容等。这方面需要看未来的使用情况，再做相关规划。
+
+
+---
+
+# Mysql存储引擎性能测试报告
+
+Source: https://github.com/dtm-labs/dtm.pub/blob/main/docs/other/performance.md
+
+# Mysql存储引擎性能测试报告
+
+因为其他的分布式事务框架没有官方的性能测试报告，所以没有与其他框架的对比数据。但我们做了dtm的性能与mysql的理想性能对比分析，分析结果显示dtm的额外开销很小，主要性能瓶颈在数据库的事务能力和sql吞吐量
+
+## 测试环境
+
+|  机型| CPU/内存 | 存储 |系统|Mysql|
+|:-----:|:----:|:----:|:----:|:----:|
+| 阿里云ecs.c7.xlarge | 4核8G | 500G ESSD IOPS 26800|Ubuntu 20.04|Docker mysql:5.7|
+
+## 测试过程
+
+``` bash
+# 在dtm目录下
+git checkout fec4957
+docker-compose -f helper/compose.mysql.yml up -d # 启动Mysql
+
+# 运行sysbench对mysql进行测试
+sysbench oltp_write_only.lua --time=60 --mysql-host=127.0.0.1 --mysql-port=3306 --mysql-user=root --mysql-password= --mysql-db=sbtest --table-size=1000000 --tables=10 --threads=10 --events=999999999 --report-interval=10 prepare
+sysbench oltp_write_only.lua --time=60 --mysql-host=127.0.0.1 --mysql-port=3306 --mysql-user=root --mysql-password= --mysql-db=sbtest --table-size=1000000 --tables=10 --threads=10 --events=999999999 --report-interval=10 run
+
+go run app/main.go bench > /dev/nul # 启动dtm的bench服务，日志较多，重定向到nul设备
+bench/run-dtm.sh # 新启动命令行，运行dtm相关的各项测试
+```
+
+PS：如果您需要动手进行测试，建议您购买香港或国外的主机，这样相关的github、docker访问会快很多，能够快速搭建好环境。我在国内购买的主机，访问github和docker，非常慢，有时连接不上，无法顺畅进行测试。
+
+## 测试指标
+
+我们会对以下几个指标进行对比：
+
+- Global-TPS：用户视角下，完成了多少个全局事务。
+- DB-TPS：各项测试中，在DB层面完成的事务数量
+- OPS：各项测试中，完成了多少个SQL语句
+
+## 结果对比
+
+| |Mysql|无DTM-2SQL|DTM-0SQL|DTM-2SQL|DTM-2SQL-Barrier|无DTM-10SQL|DTM-10SQL|DTM-10SQL-Barrier|
+|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+|Global-TPS|-|1232|935|575|531|551|357|341|
+|DB-TPS|2006|2464|1870|2300|2124|1102|1428|1364|
+|OPS|12039|4928|5610|5750|6372|10620|9282|9548|
+
+## Mysql性能
+
+我们首先用测试了Mysql自身的性能。在DTM的这次性能测试中，写操作较多，因此我们这次主要对Mysql的写进行了性能测试。
+
+我们采用了sysbench中的oltp_write_only基准，在这个基准中，每个事务包含6个写SQL（有insert/update/delete）。
+
+在这个基准下，每秒完成的事务数量大约为2006，完成SQL数量大约为为12039。这两项结果，会在后续的DTM相关测试中引用。
+
+## DTM测试
+
+分布式事务中涉及的事务模式有多种，我们选取一个有代表性的简单Saga模式作为代表，分析分布式事务DTM的性能。
+
+我们选取的Saga事务，包含两个子事务，一个是TransOut转出余额，一个是TransIn转入余额。转入转出各包含两个Sql，分别是更新余额和记录流水。
+
+### 无DTM-2SQL
+
+我们首先测试不采用DTM的情况，也就是直接调用TransOut和TransIn，测试结果是每秒完成了1232个全局事务。每个全局事务包含转出和转入两个子事务，因此DB-TPS为2464，然后每个子事务又包含两个SQL，因此总的SQL操作为4928。
+
+这个结果对比MYSQL，DB-TPS更高，而DB-SQL只有一半，主要原因为每个事务都需要将数据同步到磁盘，需要额外消耗性能，此时瓶颈主要在系统数据库的事务能力
+
+### DTM-0SQL
+
+我们接着测试采用DTM的情况，采用了DTM之后，一个SAGA事务的时序图如下：
+
+![saga-sqls.png](../imgs/saga-sqls.png)
+
+全局事务中DTM会包括2个事务：保存全局事务+分支操作、修改全局事务为已完成。将每个事务分支操作修改为已完成也各需要一个事务，但DTM采用异步写进行了合并，减少了事务。
+
+每个全局事务中dtm包括的SQL数量为：1个保存全局事务、1个保存分支操作、1个读所有分支操作、2个修改分支操作为完成、1个修改全局事务为完成，一共6个SQL。
+
+测试结果中，每秒完成全局事务数为935，那么DB-TPS为1870，OPS为5610。从这个结果看，一台4核8G机器上的mysql，能够承载935的每秒事务量，足够绝大部分公司使用了。
+
+### DTM-2SQL
+
+如果我们把业务中的SQL也包含进来，计算采用分布式事务方案后的总吞吐变化，那么
+
+全局事务会包括dtm的2个事务，以及TransIn、TransOut两个业务事务，一共是4个事务。
+
+全局事务包括的SQL数量为：6个dtm的SQL，加上业务子事务的4个SQL是10个。
+
+测试结果中，每秒完成全局事务数为575，那么DB-TPS为2300，OPS为5750，对比前面不采用DTM的方案，DB-TPS略有下降，OPS有一定的上升，瓶颈还是在系统数据库
+
+### DTM-2SQL-Barrier
+
+加入了子事务屏障后，每个事务分支操作会多一个insert语句，每个全局事务对应的SQL数量为12.
+
+测试结果中，每秒完成全局事务数为531，那么DB-TPS为2124，OPS为6372，对比前面DTM的方案，DB-TPS略有下降，OPS略有上升，符合预期
+
+### 无DTM-10SQL
+
+我们对压测的数据做调整，将每个子事务里的SQL数量，从2调整为10，将子事务中的SQL循环执行5次。
+
+无DTM的压测结果中，每秒完成的全局事务数为551，DB-TPS为1102，OPS为10620。这个结果中，OPS与MYSQL的接近，瓶颈主要在数据库的OPS。
+
+### DTM-10SQL
+
+这个压测结果中，每秒完成的全局事务数为357，DB-TPS为1428，OPS为9282，其中OPS比无DTM的情况下降了百分之十几，主要原因为DTM的表，有较多的字段及索引，每个SQL的执行开销会大一些，因此总OPS会更低。
+
+### DTM-10SQL-Barrier
+
+测试结果中，每秒完成全局事务数为341，那么DB-TPS为1364，OPS为9548，对比前面DTM的方案，DB-TPS略有下降，OPS略有上升，符合预期
+
+## 小结
+
+从DTM的压测结果与MYSQL的压测数据对比来看，DTM产生的额外开销很小，已经最大化的利用了数据库的能力。
+
+一台ecs.c7.xlarge+500G磁盘的阿里云服务器，安装mysql后，单独服务dtm的话，大约能够提供近一千的Global-TPS，每月费用为900元（2021年10月价格），这个成本对比提供的业务能力来说，已经很低了。
+
+如果您需要更强劲的性能，可以购买更高配的配置，也可以在应用层部署多组DTM，两种方案的代价并不大，足以满足绝大部分公司的需求。
+
+---
+
+# 谁在用
+
+Source: https://github.com/dtm-labs/dtm.pub/blob/main/docs/other/using.md
+
+# 谁在用
+
+如果您正在使用dtm，请帮忙在[这个链接](https://github.com/dtm-labs/dtm/issues/7)添加一个评论，帮助我们更好的扩散dtm。
+
+## 典型案例
+
+### 腾讯 {#tencent}
+腾讯内部有多个事业部使用了dtm，涵盖许多业务场景。
+
+dtm合并了多个腾讯同学提过来的PR，特性包括uber automaxprocs, MaxOpenConns, Polaris等等，特别感谢腾讯的同学们
+
+dtm的这几个特性是优先考虑腾讯同学的需求开发的：
+- 日志采用uber zap
+- Redis存储引擎
+- 并发Saga
+- 自定义Header支持
+
+[公司官网](https://www.tencent.com)
+
+### 字节 {#bytedance}
+字节内部某部门将dtm应用于环境的自动搭建。搭建环境是一个需要多处协调，耗时较长，中途容易出现中断的应用场景，通过引入dtm，做到了以下几点：
+
+- 通过dtm，避免环境搭建处于搭建一半的状态，做到最后要么搭建成功，要么全部被清理
+- 通过子事务屏障，避免部分环节被并发重入，导致问题
+- 通过dtm的重试，保证出错回滚的情况下，一定会有一个清理任务最终成功完成
+
+[公司官网](https://www.bytedance.com)
+
+### 360 {#qihu}
+360 公司的新交易平台使用了dtm，详细的使用情况参考这篇文章 [DTM在新交易平台的落地](https://mp.weixin.qq.com/s/iG9eKnZEdYCIVriktiXdYw)
+
+[公司官网](https://www.360.cn/)
+
+## 谁在使用
+
+下面仅包含部分使用者
+
+<div style='vertical-align: middle'>
+    <img alt='腾讯' height='160'  src='../imgs/company/tencent.jpeg'  />
+    <img alt='字节' height='160'  src='../imgs/company/bytedance.webp'  />
+    <img alt='360' height='80'  src='../imgs/company/360.png'  />
+    <img alt='聚爱优选' height='80'  src='../imgs/company/juaiyouxuan.png'  />
+    <img alt='竹芒科技' height='80'  src='../imgs/company/zhumangkeji.jpeg'  />
+    <img alt='金数智联' height='80'  src='../imgs/company/gdci.png'  />
+    <img alt='控维通信' height='80'  src='../imgs/company/cowave.png'  />
+    <img alt='托云信息' height='80'  src='../imgs/company/openim.png'  />
+    <img alt='遇乐网络' height='80'  src='../imgs/company/yzg.png'  />
+    <img alt='深信服科技' height='80'  src='../imgs/company/sangfor.png'  />
+    <img alt='华中时讯' height='80'  src='../imgs/company/sencent.png'  />
+    <img alt='云飞CLOUDFIT' height='80'  src='../imgs/company/cloudfit.png'  />
+    <img alt='建发致新' height='80'  src='../imgs/company/jfzx.png'  />
+</div>
+
+---
+
+# DTM架构
+
+Source: https://github.com/dtm-labs/dtm.pub/blob/main/docs/practice/arch.md
+
+# DTM架构
+
+我们先简单介绍一个完整的分布式事务，大家了解了分布式事务的过程后，再详细介绍DTM的架构。
+
+## 分布式事务过程
+
+假设我们要进行一个跨行转账，A转给B30元，因为A、B不在同一个数据库，无法通过本地事务解决，因此使用了SAGA分布式事务来解决这个问题，下面是一个成功的SAGA事务（更多SAGA详情，参考[SAGA](./saga)）的时序图：
+
+![saga_normal](../imgs/saga_normal.jpg)
+
+整个全局事务分为如下几步：
+1. 用户定义好全局事务所有的事务分支，包括action/compensate，然后提交给DTM，DTM持久化全局事务信息后，立即返回
+2. DTM取出第一个事务分支，这里是TransOut，调用该服务，该服务成功返回
+3. DTM取出第二个事务分支，这里是TransIn，调用该服务，该服务也成功返回
+4. DTM已完成所有的事务分支，将全局事务的状态，修改为已完成
+
+在理解了上述的这个时序图的基础上，我们来看dtm的架构
+
+## DTM架构图
+![arch](../imgs/arch.jpg)
+
+
+整个DTM架构中，一共有三个角色，分别承担了不同的功能
+
+- RM-资源管理器：RM是一个应用服务，负责管理全局事务中的本地事务，他通常会连接到一个数据库，负责相关数据的修改、提交、回滚、补偿等操作。例如在前面的这个SAGA事务中，步骤2、3中被调用的TransIn，TransOut服务都是RM，业务上负责A、B账户余额的修改
+- AP-应用程序：AP是一个应用服务，负责全局事务的编排，他会注册全局事务，注册子事务，调用RM接口。例如在前面的这个SAGA事务中，发起步骤1的是AP，它编排了一个包含TransOut、TransIn的全局事务，然后提交给TM
+- TM-事务管理器：TM就是DTM服务，负责全局事务的管理，每个全局事务都注册到TM，每个事务分支也注册到TM。TM会协调所有的RM，将同一个全局事务的不同分支，全部提交或全部回滚。例如在前面的SAGA事务中，TM在步骤2、3中调用了各个RM，在步骤4中，完成这个全局事务
+
+这里的角色划分中，有时候一个服务可能会同时承担AP和RM的功能，例如后续讲到的嵌套TCC情况。
+
+## 跨语言特性
+dtm本身由Go编写，他提供了多语言分布式事务的支持，为什么DTM支持了多语言，而其他的分布式事务框架，目前未看到多语言支持呢？
+
+目前看到其他框架中，在SDK层的设计里，都比较重，包括的逻辑多，还有部分框架在SDK层实现了自定义的XA协议，因此整个SDK很重，拓展到更多语言，需要大量大量的工作。
+
+而在上述DTM的架构中，SDK是AP中的蓝色部分，他在设计之初，定位就是很薄的一层，主要功能就是调用HTTP/gRPC协议通信，加上一些ID生成等。对于一门新语言，开发一个简单可用的SDK，一般只需要几十行到几百行的代码。目前dtm-labs下，已经有多门语言的SDK了，详情参见[多语言SDK](../ref/sdk)
+
+## 高可用
+在上述这个架构中，TM不是单点，而是一个服务集群。集群由多个dtm实例进程构成，多个dtm实例访问一个共享的高可用数据库（可以选Redis/Mysql/Postgres）。
+
+几乎所有的云厂商都会提供高可用的数据库，几乎所有要求业务高可用的公司内部，都会有高可用的数据库，因此将dtm对接到一个高可用数据库是毫无困难的。
+
+在实际的生产部署中，DTM是多实例的，连接的共享存储是高可用的，因此不存在单点，从而提供了高可用的DTM服务。
+
+## 多进程同时轮询
+
+全局事务的运行过程中，可能出现各种网络错误，导致全局事务无法一次完成，需要定时重试。
+
+DTM（默认配置下）会在每个进程实例中，去轮询超时需要处理的全局任务。为了保证上述高可用多进程部署中，一个超时任务不会被多个实例同时取出，dtm使用了类似乐观锁的机制，保证一个任务只会被一个dtm实例取出。
+
+- **DB存储引擎：** 采用update ... set owner=..., time=... where ... 这种方式，因为update的原子性，能够保证一条记录只被一个实例更新
+- **Redis存储引擎：** 采用lua脚本原子操作，保证一条记录只被一个实例取出
+
+当然极端情况下，还是有可能出现这个任务被两个进程取出，这个时候由于每个分支的结果是幂等的，所以最终不会影响结果的正确性。
+
+## 术语
+DTM在分布式事务的理论与实践中，常常会提到一些专业术语，下面定义这些术语：
+- 事务分支：我们把每个服务管理的全局事务组成部分，称为事务分支，例如前面的转账，分为转出和转入两个事务分支
+- 分支操作：每个事务分支，在SAGA、XA、TCC等事务模式下，会有多个操作，例如转出事务分支，包括正向操作TransOut和TransOutCompensate
+- 本地事务：转出事务分支中的正向操作，通常会开启一个事务，对余额进行扣减，我们将数据操作的这个事务，称为本地事务
+- GID：全局事务ID，用于标记全局事务，必须唯一。该ID可以采用UUID生成，也可以使用业务上的ID，例如订单ID等
+
+## 接口协议 {#proto}
+
+目前dtm只支持http和grpc协议，以及在这基础上的部分微服务协议。由于分布式事务涉及分布式协作，某些参与者可能出现暂时不可用或者返回500等异常情况是不可避免的。这些暂时不可用和500，与业务上的失败有非常大的区别。
+
+::: warning 接口错误与业务失败
+例如前面的转出金额操作，如果遇见暂时不可用，或者500，此时不应当认为转账失败，而进行回滚。
+
+有个dtm的用户，在未使用分布式事务的旧系统中，曾经遇到过这类事故，起因是开发人员在调用发红包后，因为调用超时，认为发红包失败，没有扣减用户的余额，但是当红包服务恢复正常后，发现红包已发出，这就导致了金额错误，造成了事故。
+
+因此进行分布式事务开发时，切记 **接口返回错误 不等于 业务失败**
+:::
+
+对于上述的 ”暂时不可用“ 及 ”500“，DTM 会进行重试。而对于成功或失败等确定的结果，则会更新分布式事务的进度。
+
+dtm系统中，调用分支事务的服务，有四种结果：
+- **SUCCESS:** 表示成功
+- **FAILURE:** 表示失败，这个失败是指确定的失败结果，不需要重试。例如子事务因转账余额不足而失败，dtm服务因为事务已完成不允许再次提交等
+- **ONGOING:** 表示未完成，还在正常进行中，此时dtm服务器需要采用固定间隔重试，而不是指数退避算法重试
+- **其他:** 表示临时错误，采用指数退避算法重试，避免出现故障或者bug，导致大量重试，导致负载过高
+
+::: tip ONGOING
+DTM 引入了一个特殊的结果 ONGOING，当 DTM 收到这个返回值时，认为这个子事务操作还在正常进行中，还未完成，需要进行重试。假如你需要预定旅游出行的机票，第三方可能需要1个小时才能够确认机票预定的结果，那么应用可以指定分布式事务的重试间隔时间，并在未获得确定结果时，返回 ONGOING，这样 DTM 会按照固定间隔时间重试。详情可以参见 [SAGA](../practice/saga)
+:::
+下面分别说明 HTTP 和 gRPC 中，如何表示含义明确的三种结果
+#### HTTP
+- **SUCCESS:** 状态码 200 StatusOK
+- **FAILURE:** 状态码 409 StatusConflict
+- **ONGOING:** 状态码 425 StatusTooEarly
+
+#### gRPC
+- **SUCCESS:** 状态码 OK
+- **FAILURE:** 状态码 Aborted
+- **ONGOING:** 状态码 FailedPrecondition
+
+以上 HTTP 和 gRPC 的几个结果定义，对于云原生上的重试策略是友好兼容的，默认情况下，如果微服务配置了重试策略，那么对于其他结果（通常为 HTTP 502 或者 gRPC Unavailable）会进行重试，而确定的结果，则不会被云原生上的重试策略重试。
+
+还有一点，对于某些不支持回滚的事务分支，例如Msg模式的分支，Saga模式的Compensation，Tcc模式的Confirm/Cancel，在这些分支里面不应当返回FAILURE。
+
+::: tip 接口协议变更
+dtm的接口协议在 1.10.0进行了变更升级，升级的同时保持了与旧版本的兼容，详情参见[升级指南](../deploy/upgrade)
+:::
+
+
+## 与XA DTP模型异同
+DTM的架构和角色，与X/Open XA的DTP模型一致，RM、AP、TM担当的功能都是一致的，只是将XA的DTP模型拓展到了服务/微服务架构上。
+
+DTM对比了其他事务框架的角色划分和DTP的角色划分，认为DTP在总体架构，依旧能够适用于跨服务这种分布式事务形式，因此保留了AP、RM、TM的划分
+
+![xa-dtp](../imgs/xa-dtp.png)
+
+主要区别如下：
+- TM不再是单点，而是集群部署，本身就具备高可用。原先2PC中的单点问题，就被集群化的dtm实例+共享的高可用存储解决了。这其中没有复杂的选举过程，而是依赖云服务上提供的高可用共享存储引擎（云服务商户进行故障重新选举，用户不用关心）
+- RM不是直接的数据库，而是服务，服务的与他背后数据库交互。TM与RM服务交互，而不会与数据库直接交互
+- AP不是直接的本地程序，而是服务，他对RM的访问，是通过网络的api请求，而不是本地SDK调用。
+
+## 小结
+DTM的整体架构具备高可用，易扩容等特点，复杂性都在内部解决，暴露给用户的是非常简单易上手的形式。
+
+---
+
+# AT vs XA
+
+Source: https://github.com/dtm-labs/dtm.pub/blob/main/docs/practice/at.md
+
+# AT vs XA
+AT 这种事务模式是阿里开源的seata主推的事务模式，本文先给出了XA 和 AT之间的特性比较，然后详解AT的原理，并对其中的问题进行深入探讨
+
+| | XA | AT |
+|:----:|:----:|:-----:|
+|[脏回滚](#dirty-write)|<span style="color:green">无</span>| <span style="color:red">存在</span>|
+|[SQL支持度](#sql-support)|<span style="color:green">全部支持</span>| <span style="color:red">部分支持</span>|
+|[脏读](#dirty-read)|<span style="color:green">无</span>| <span style="color:orange">有</span>|
+|[应用侵入性](#invade)|<span style="color:green">无侵入</span>| <span style="color:green">无侵入</span>|
+|[性能](#performance)|<span style="color:orange">较低</span>| <span style="color:orange">较低</span>|
+|[数据库支持](#db-support)|<span style="color:green">主流数据库都支持</span>| <span style="color:green">理论上可扩展至NoSQL</span>|
+
+
+## 原理
+AT 从原理上面看，与 XA 的设计有很多相近之处。XA 是数据库层面实现的二阶段提交， AT 则是应用/驱动层实现的二阶段提交。建议您了解了[XA](./xa)相关的知识后，来阅读这篇文章，这样能够更快更好的掌握 AT 的原理与设计。
+
+AT的角色和XA一样分为3个，但是起了不一样的名称，大家注意分辨：
+- RM 资源管理器，是业务服务，负责本地数据库的管理，与XA中的RM一致
+- TC 事务协调器，是Seata服务器，负责全局事务的状态管理，负责协调各个事务分支的执行，相当于XA中的TM
+- TM 事务管理器，是业务服务，负责全局事务的发起，相当于XA中的APP
+
+AT 的第一阶段为prepare，它在这一阶段会完成以下事情：
+1. RM 侧，用户开启本地事务
+2. RM 侧，用户每进行一次业务数据修改，假设是一个update语句，那么 AT 会做以下内容：
+    1. 根据update的条件，查询出修改前的数据，该数据称为BeforeImage
+    2. 执行update语句，根据BeforeImage中的主键，查询出修改后的数据，该数据称为AfterImage
+    3. 将BeforeImage和AfterImage保存到一张undolog表
+    4. 将BeforeImage中的主键以及表名，该数据称为lockKey，记录下来，留待后续使用
+3. RM 侧，用户提交本地事务时，AT 会做以下内容：
+    1. 将2.4中记录的所有的lockKey，注册到 TC（即事务管理器seata）上
+    2. 3.1中的注册处理会检查 TC 中，是否已存在冲突的主键+表名，如果有冲突，那么AT会睡眠等待后重试，没有冲突则保存
+    3. 3.1成功完成后，提交本地事务
+
+如果 AT 的第一阶段所有分支都没有错误，那么会进行第二阶段的commit，AT 会做以下内容：
+1. TC 会将当前这个全局事务所有相关的lockKey删除
+2. TC 通知与当前这个全局事务相关的所有业务服务，告知全局事务已成功，可以删除undolog中保存的数据
+3. RM 收到通知后，删除undolog中的数据
+
+如果 AT 的第一阶段有分支出错，那么会进行第二阶段的rollback，AT 会做以下内容：
+1. TC 通知与当前这个全局事务相关的所有业务服务，告知全局事务失败，执行回滚
+2. RM 收到通知后，对本地数据的修改进行回滚，回滚原理如下：
+    1. 从undolog中取出修改前后的BeforeImage和AfterImage
+    2. 如果AfterImage与数据库中的当前记录校验一致，那么使用BeforeImage中的数据覆盖当前记录
+    3. 如果AfterImage与数据库中的当前记录不一致，那么这个时候发生了**脏回滚**，此时需要人工介入解决
+3. TC 待全局事务所有的分支，都完成了回滚，TC 将此全局事务所有的lockKey删除
+
+## 脏回滚 {#dirty-write}
+AT 模式的一个突出问题是rollback中2.3的脏回滚难以避免。以下步骤能够触发该脏回滚：
+1. 全局事务g1对数据行A1进行修改 v1 -> v2
+2. 另一个服务将对数据行A1进行修改 v2 -> v3
+3. 全局事务g1回滚，发现数据行A1的当前数据为v3，不等于AfterImage中的v2，回滚失败
+
+这个脏回滚一旦发生，那么分布式事务框架没有办法保证数据的一致性了，必须要人工介入处理。想要避免脏回滚，需要把所有对这个表的写访问，都加上特殊处理（在Seata的Java客户端中，需要加上GlobalLock注解）。这种约束对于一个上了一定规模的复杂系统，是非常难以保证的。
+
+XA 在数据库系统层面实现了行锁，原理与普通事务相同，因此一旦出现两个事务访问同一行数据，那么后一个事务会阻塞，完全不会有脏回滚的问题
+
+## SQL支持度 {#sql-support}
+AT 模式并未支持所有的SQL，它的原理是在应用层解析SQL，然后根据不同的SQL生成BeforeImage和AfterImage，一方面不同的SQL可能需要采用不同的逻辑来生成这些Image，另一方面不同的数据库语法不同，因此不常见的SQL，AT可能不支持。
+
+XA 是数据库层面支持的，因此对所有的DML SQL都支持，不会出现问题
+
+## 脏读 {#dirty-read}
+AT 模式会发生脏读，在 AT 模式下发生如下的执行序列：
+1. 全局事务g1对数据行A1进行修改 v1 -> v2
+2. 另一个服务将读取数据行A1，获得数据 v2
+3. 全局事务g1回滚，将数据行A1改回 v2 -> v1
+
+这里面步骤2读取的数据是v2，是一个中间态数据。在Seata的手册中，虽然也有一些方法能够避免AT模式下，但是涉及到注解和sql改写，并不优雅。
+
+XA模式下，由于还没有进行xa commit，那么步骤2根据`MVCC`读取到的数据依然是v1，没有AT模式中的脏读的困扰。
+
+## 应用侵入性 {#invade}
+AT 在最简单的情况下，通过在代码中添加注解，就能够把分布式事务引入到应用中，因此很多人认为是无侵入的。但是前面给出的脏读，脏回滚，SQL支持等，是开发人员必须考虑的，并进行设计，否则引入了相关注解变成全局事务之后，发生这些问题，导致线上应用故障，产生的后果会更严重。因此AT的无侵入不是真正的无侵入，仅仅是表面上代码的“无侵入”，但是设计上“侵入”了（不可以用AT未支持的SQL），行为上“侵入”了（需要容忍脏回滚），还会“侵入”其他项目（如果其他项目也写了同一张表，也需要加GlobalLock注解）。
+
+XA 没有前面的问题，它的侵入性很低，在Java语言中，也同样做到通过加注解，而不用修改Java代码就完成分布式事务的引入。
+
+注解是Java中很有特色的语法，是面向切面编程的一个典范。注解也有一定的理解成本，在Go和其他语言领域，并未引入注解，一个重要的理由是，通过显式的代码调用，更容易让读者理解中间发生了什么，可读性更好。DTM 在各语言的SDK中保持了统一的接口，让多语言的分布式事务更加简单，因此各语言的SDK大多未采用注解的这种接口方式。
+
+## 性能分析 {#performance}
+从原理的详细步骤看，XA事务的性能应高于AT，分析如下：
+
+AT 模式下，RM侧，上述原理过程中，执行的SQL如下：
+1. 开启事务
+2. 查询BeforeImage数据
+3. 执行update
+4. 查询AfterImage数据
+5. 将BeforeImage，AfterImage插入到undolog中
+6. 提交事务
+7. 事务完成后，删除BeforeImage和AfterImage
+
+而 XA 模式下，RM侧，执行的SQL如下：
+1. xa begin
+2. 执行update
+3. xa end
+4. xa prepare
+5. xa commit
+
+两者对比，相关的开启/提交事务是两个模式都需要的，性能差异不大。但是从执行的DML操作来看，AT 下的 SQL 数量为：3 writes，2 read，比 XA 下仅一个update多出许多，因此在性能上会有较大的差距
+
+从上述理论分析，XA 事务性能会大幅高于AT，应当可以在postgres数据库上验证出来；而mysql数据库，在当前的5.8版本上，由于xa prepare后，需要将当前连接断开才能够在其他连接上xa commit，所以会有一个重新创建连接的开销。
+
+我同时也做了性能实测，详细的测试过程和结果数据，参考 [xa-at bench](https://github.com/dtm-labs/bench/tree/main/xaat)
+
+dtm实现的XA事务，为了在极端情况下，也能保证XA事务能够正确的被清理，会在业务事务中对子事务屏障表进行插入，因此会比上述理论分析中，多一个sql写入。
+
+我们可以看到，最终的结果XA性能优于AT。如果未来Mysql完善了XA的实现，可以不用关闭当前连接也能够允许其他连接提交xa事务，那么XA的性能还能够提升一大截。
+
+但AT和XA两种模式，由于数据锁在整个分布式事务期间的存在，降低了并发度，因此性能都低于其他模式。当您的并发度较高时，建议使用其他无全局锁的事务模式
+
+## 数据库支持 {#db-support}
+AT 目前支持了多个主流数据库，而且从理论上看，也能够扩展到非SQL数据库，但目前暂未看到支持非SQL数据库的扩展。
+- AT与Redis：虽然Redis也支持事务，但Redis的事务支持主要是通过lua脚本来做的，与传统数据库的Begin Transaction/Commit不一样，因此上述生成前后镜像的原理并不适用Redis，因此AT想要支持Redis会非常困难，目前未看到有这样的尝试
+- AT与Mongo：Mongo的事务支持与Mysql类似，但Mongo的操作类型很多，而且在主键规范上面，与SQL数据库有很大不同，想要正确生成前后镜像的工作量庞大，目前未看到有这样的尝试
+
+XA 模式则需要底层数据库支持，目前主流的数据库，Mysql，Postgres，Oracle等都已支持。如果分布式事务涉及mongo呢？这个时候需要考虑其他事务模式，DTM中有关于Redis，Mongo的事务例子
+
+## 小结
+mysql在版本5.6中，xa相关API存在bug。如果当前连接在xa prepare之后，连接断开，那么这个连接未完成的事务会被自动回滚。这样的bug导致mysql的XA模式是无法保证正确性的，在各种应用crash中，可能导致数据不一致。因此AT在mysql的5.6版本及更低版本使用中，是具有很高应用价值的。
+
+另外部分大厂的数据库是禁止使用XA事务的，这种特定场景下，选型AT模式，也是合理的。
+
+对于其他场景，建议优先考虑 XA 事务。
+
+作者对AT模式的完整实现源码，并未完整阅读。上述的相关原理是根据自己阅读相关资料，并参考了seata-golang的源代码而写。文中如果不准确之处，希望各位读者帮忙指正
+
+---
+
+# 异常与子事务屏障
+
+Source: https://github.com/dtm-labs/dtm.pub/blob/main/docs/practice/barrier.md
+
+# 异常与子事务屏障
+
+分布式事务之所以难，主要是因为分布式系统中的各个节点都可能发生各种非预期的情况。本文先介绍分布式系统中的异常问题，然后介绍这些问题带给分布式事务的挑战，接下来指出现有各种常见用法的问题，最后给出正确的方案。
+
+## NPC的挑战
+分布式系统最大的敌人可能就是NPC了，在这里它是Network Delay, Process Pause, Clock Drift的首字母缩写。我们先看看具体的NPC问题是什么：
+
+- Network Delay，网络延迟。虽然网络在多数情况下工作的还可以，虽然TCP保证传输顺序和不会丢失，但它无法消除网络延迟问题。
+- Process Pause，进程暂停。有很多种原因可以导致进程暂停：比如编程语言中的GC（垃圾回收机制）会暂停所有正在运行的线程；再比如，我们有时会暂停云服务器，从而可以在不重启的情况下将云服务器从一台主机迁移到另一台主机。我们无法确定性预测进程暂停的时长，你以为持续几百毫秒已经很长了，但实际上持续数分钟之久进程暂停并不罕见。
+- Clock Drift，时钟漂移。现实生活中我们通常认为时间是平稳流逝，单调递增的，但在计算机中不是。计算机使用时钟硬件计时，通常是石英钟，计时精度有限，同时受机器温度影响。为了在一定程度上同步网络上多个机器之间的时间，通常使用NTP协议将本地设备的时间与专门的时间服务器对齐，这样做的一个直接结果是设备的本地时间可能会突然向前或向后跳跃。
+
+分布式事务既然是分布式的系统，自然也有NPC问题。因为没有涉及时间戳，带来的困扰主要是NP。
+
+## 异常分类
+
+我们以分布式事务中的TCC作为例子，看看NP带来的影响。
+
+一般情况下，一个TCC回滚时的执行顺序是，先执行完Try，再执行Cancel，但是由于N，则有可能Try的网络延迟大，导致先执行Cancel，再执行Try。
+
+这种情况就引入了分布式事务中的两个难题：
+- **空补偿：** Cancel执行时，Try未执行，事务分支的Cancel操作需要判断出Try未执行，这时需要忽略Cancel中的业务数据更新，直接返回
+- **悬挂：** Try执行时，Cancel已执行完成，事务分支的Try操作需要判断出Cancel已执行，这时需要忽略Try中的业务数据更新，直接返回
+
+分布式事务还有一类需要处理的常见问题，就是重复请求
+- **幂等：** 由于任何一个请求都可能出现网络异常，出现重复请求，所有的分布式事务分支操作，都需要保证幂等性
+
+因为空补偿、悬挂、重复请求都跟NP有关，我们把他们统称为子事务乱序问题。在业务处理中，需要小心处理好这三种问题，否则会出现错误数据。
+
+## 异常原因
+
+下面看一个网络异常的时序图，更好的理解上述几种问题
+
+![exception](../imgs/exception.jpg)
+
+- 业务处理请求4的时候，Cancel在Try之前执行，需要处理空回滚
+- 业务处理请求6的时候，Cancel重复执行，需要幂等
+- 业务处理请求8的时候，Try在Cancel后执行，需要处理悬挂
+
+## 现有方案的问题
+我们看到开源项目dtm之外，包括各云厂商，各开源项目，他们给出的业务实现建议大多类似如下（这也是大多数用户最容易想到的方案）：
+
+- **空补偿：** “针对该问题，在服务设计时，需要允许空补偿，即在没有找到要补偿的业务主键时，返回补偿成功，并将原业务主键记录下来，标记该业务流水已补偿成功。”
+- **防悬挂：** “需要检查当前业务主键是否已经在空补偿记录下来的业务主键中存在，如果存在则要拒绝执行该笔服务，以免造成数据不一致。”
+
+上述的这种实现，能够在大部分情况下正常运行，但是上述做法中的“先查后改”在并发情况下是容易掉坑里的，我们分析以下如下场景：
+
+- 正常执行顺序下，Try执行时，在查完没有空补偿记录的业务主键之后，事务提交之前，如果发生了进程暂停P，或者事务内部进行网络请求出现了拥塞，导致本地事务等待较久
+- 全局事务超时后，Cancel执行，因为没有查到要补偿的业务主键，因此判断是空补偿，返回
+- Try的进程暂停结束，最后提交本地事务
+- 全局事务回滚完成后，Try分支的业务操作没有被回滚，产生了悬挂
+
+事实上，NPC里的P和C，以及P和C的组合，有很多种的场景，都可以导致上述竞态情况，就不一一赘述了。
+
+虽然这种情况发生的概率不高，但是在金融领域，一旦涉及金钱账目，那么带来的影响可能是巨大的。
+
+PS：幂等控制如果也采用“先查再改”，也是一样很容易出现类似的问题。解决这一类问题的关键点是要利用唯一索引，“以改代查”来避免竞态条件。
+
+## 子事务屏障
+
+我们在dtm中，首创了子事务屏障技术，使用该技术，能够非常便捷的解决异常问题，极大的降低了分布式事务的使用门槛。
+
+子事务屏障能够达到下面这个效果，看示意图：
+
+![barrier](../imgs/barrier.jpg)
+
+所有这些请求，到了子事务屏障后：不正常的请求，会被过滤；正常请求，通过屏障。开发者使用子事务屏障之后，前面所说的各种异常全部被妥善处理，业务开发人员只需要关注实际的业务逻辑，负担大大降低。
+子事务屏障提供了方法BranchBarrier.CallWithDB ，方法的原型为：
+
+
+``` go
+func (bb *BranchBarrier) CallWithDB(db *sql.DB, busiCall BusiFunc) error
+```
+
+业务开发人员，在busiCall里面编写自己的相关逻辑，调用 BranchBarrier.CallWithDB 。 BranchBarrier.CallWithDB 保证，在空回滚、悬挂等场景下，busiCall不会被调用；在业务被重复调用时，有幂等控制，保证只被提交一次。
+
+子事务屏障会管理TCC、SAGA、事务消息等，也可以扩展到其他领域
+
+## 原理
+
+子事务屏障技术的原理是，在本地数据库，建立分支操作状态表dtm_barrier，唯一键为全局事务id-分支id-分支操作（try|confirm|cancel）
+
+1. 开启本地事务
+2. 对于当前操作op(try|confirm|cancel)，insert ignore一条数据gid-branchid-op，如果插入不成功，提交事务返回成功（常见的幂等控制方法）
+3. 如果当前操作是cancel，那么在insert ignore一条数据gid-branchid-try，如果插入成功（注意是成功），则提交事务返回成功
+4. 调用屏障内的业务逻辑，如果业务返回成功，则提交事务返回成功；如果业务返回失败，则回滚事务返回失败
+
+在此机制下，解决了乱序相关的问题
+
+- 空补偿控制--如果Try没有执行，直接执行了Cancel，那么3中Cancel插入gid-branchid-try会成功，不走屏障内的逻辑，保证了空补偿控制
+- 幂等控制--2中任何一个操作都无法重复插入唯一键，保证了不会重复执行
+- 防悬挂控制--Try在Cancel之后执行，那么Cancel会在3中插入gid-branchid-try，导致Try在2中不成功，就不执行屏障内的逻辑，保证了防悬挂控制
+
+对于SAGA、二阶段消息，也是类似的机制。
+
+## 原理图解(可选读)
+下面我们以图的方式来详解子事务屏障，因为Confirm操作不涉及空补偿和悬挂，所以重点看Try与Cancel，Try对应图中的A，Cancel对应图中的C：
+
+子事务屏障中对应的幂等处理部分：
+
+![barrier-idem](../imgs/barrier-idem.png)
+
+这部分就是常规的幂等处理部分，往数据库中插入一个唯一键，如果是重复请求，那么插入失败，直接失败返回。
+
+子事务屏障技术就是在上述的幂等处理部分，添加一个步骤--补偿服务再插入一条A记录，正常流程下，会因为唯一键冲突导致插入失败，往下执行业务。
+
+![barrier-steps](../imgs/barrier-steps.svg)
+
+当发生乱序，假设C在A前面执行，那么会发生下面的时序图：
+
+![barrier-unordered](../imgs/barrier-unordered.svg)
+
+- 对于C操作，他先于A执行，是一个空补偿；此时C操作插入A记录时，发现插入成功，直接返回
+- 对于A操作，他在C之后执行，是一个悬挂；此时A操作插入A记录时，发现插入失败，直接返回
+
+这两种情况都会被子事务屏障拦截返回，而不执行内部的业务操作。可以看到子事务屏障非常巧妙的解决了幂等、空补偿和悬挂三个问题。
+
+## 竞态分析
+上面分析了Try和Cancel的执行时间没有重叠的情况下，能够解决空补偿和悬挂问题。如果出现了Try和Cancel执行时间重叠的情况，我们看看会发生什么。
+
+假设Try和Cancel并发执行，Cancel和Try都会插入同一条记录gid-branchid-try，由于唯一索引冲突，那么两个操作中只有一个能够成功，而另一个则会等持有锁的事务完成后返回。
+
+- 情况1，Try插入gid-branchid-try失败，Cancel操作插入gid-branchid-try成功，此时就是典型的空补偿和悬挂场景，按照子事务屏障算法，Try和Cancel都会直接返回
+- 情况2，Try插入gid-branchid-try成功，Cancel操作插入gid-branchid-try失败，按照上述子事务屏障算法，会正常执行业务，而且业务执行的顺序是Try在Cancel前
+- 情况3，Try和Cancel的操作在重叠期间又遇见宕机等情况，那么至少Cancel会被dtm重试，那么最终会走到情况1或2。
+
+综上各种情况的详细论述，子事务屏障能够在各种NP情况下，保证最终结果的正确性。
+
+## 优点
+
+事实上，子事务屏障有大量优点，包括：
+- 两个insert判断解决空补偿、防悬挂、幂等这三个问题，比其他方案的三种情况分别判断，逻辑复杂度大幅降低
+- dtm的子事务屏障是SDK层解决这三个问题，业务完全不需要关心
+- 性能高，对于正常完成的事务（一般失败的事务不超过1%），子事务屏障的额外开销是每个分支操作一个SQL，比其他方案代价更小。
+
+## 支持的存储
+目前子事务屏障已经支持了
+- 数据库：包括 Mysql, Postgres, 以及与Mysql，Postgres兼容的数据库
+- 缓存 Redis：采用 Lua 脚本事务支持
+- Mongo：采用 Mongo 的事务支持
+
+在子事务屏障的支持下，您可以将Redis、Mongo和数据库的事务组合在一起，形成一个全局事务。相关用法，可以在[dtm-examples](https://github.com/dtm-labs/dtm-examples)里面找到
+
+理论上支持事务的各种存储都可以轻松实现子事务屏障，例如 TiKV 等，如果较多用户有这样的需求，我们将会快速支持。
+## 对接orm库
+
+barrier提供了sql标准接口，但大家的应用通常都会引入更高级的orm库，而不是裸用sql接口，因此需要进行转化. 相关的对接参考[对接ORM](../ref/sdk#db)
+
+## 小结
+
+子事务屏障技术，为DTM首创，它的意义在于
+
+- 算法简单易实现
+- 系统统一的解决方案，易维护
+- 提供了简单易用的接口，易使用
+
+在这子事务屏障技术的帮助下，开发人员彻底的从网络异常的处理中解放出来。原先需要投入一位架构师处理这类异常，借助dtm的子事务屏障，只需要一个普通开发工程师就可以完成
+
+该技术目前需要搭配DTM事务管理器，目前SDK已经提供给Go、Java、Python、c#、PHP语言的开发者。其他语言的sdk正在规划中。对于其他的分布式事务框架，只要提供了合适的分布式事务信息，也能够按照上述原理，快速实现该技术。
+
+---
+
+# 如何选择事务模式
+
+Source: https://github.com/dtm-labs/dtm.pub/blob/main/docs/practice/choice.md
+
+# 如何选择事务模式
+
+## 特性对比
+
+- 二阶段消息模式: 适合不需要回滚的场景
+- saga模式: 适合需要回滚的场景
+- tcc事务模式: 适合一致性要求较高的场景
+- xa事务模式: 适合并发要求不高，没有数据库行锁争抢的场景
+
+## 应用场景
+
+- 秒杀场景：当秒杀访问量很大时，多数系统都会选择在redis中扣减库存，扣减成功后再创建订单。这种场景下没有回滚，适合二阶段消息。二阶段消息还能够保证出现进程崩溃的情况下，扣减的库存量与创建的订单量是完全相等的，详情参见[秒杀应用](../app/flash)
+- 缓存管理场景：使用redis缓存来提供数据，降低数据库的压力是非常常见的场景。通常情况下，会先更新DB，在更新缓存，不涉及回滚，适合二阶段消息。详情参见[缓存应用](../app/cache)
+- 假设您有一个订单业务，需要保证您的订单创建，库存扣减，优惠券扣减是同时成功或同时失败的。那么它适合Saga，因为Saga能够支持回滚，是支持回滚的分布式事务里，最易用的。详情参见[订单应用](../app/order)
+- 假设您有一个类似资金转账的业务，对一致性要求较高，不允许在转账失败的情况下，让用户看到中间的余额变动，这种情况适合TCC，它能够灵活的控制整个全局事务的数据可见性。详情参见[TCC事务](https://segmentfault.com/a/1190000040331793)
+- 假设您的业务，对并发性要求不高，也不会出现多个请求争用同一行数据（例如不会出现扣减同一个商品库存的情况），那么可以选用XA。
+
+---
+
+# 二阶段消息
+
+Source: https://github.com/dtm-labs/dtm.pub/blob/main/docs/practice/msg.md
+
+# 二阶段消息
+
+## 概述
+本文提出的二阶段消息，可以完美替代现有的事务消息或本地消息表架构。无论从复杂度、便利性、性能，还是代码量，新架构都完胜现有架构方案，是这个领域的革命性架构。
+
+下面我们以跨行转账作为例子，给大家详解这种新架构。业务场景介绍如下：
+
+我们需要跨行从A转给B 30元，我们先进行可能失败的转出操作TransOut，即进行A扣减30元。如果A因余额不足扣减失败，那么转账直接失败，返回错误；如果扣减成功，那么进行下一步转入操作，因为转入操作没有余额不足的问题，可以假定转入操作一定会成功。
+
+## HTTP 接入
+二阶段消息完成上述任务的核心代码如下所示：
+
+``` Go
+msg := dtmcli.NewMsg(DtmServer, gid).
+	Add(busi.Busi+"/TransIn", &TransReq{Amount: 30})
+err := msg.DoAndSubmitDB(busi.Busi+"/QueryPreparedB", db, func(tx *sql.Tx) error {
+	return busi.SagaAdjustBalance(tx, busi.TransOutUID, -req.Amount, "SUCCESS")
+})
+```
+::: tip gRPC
+gRPC 的接入和 HTTP 基本一样，这里不再赘述，有需要的读者，可以参考[dtm-labs/dtm-examples](https://github.com/dtm-labs/dtm-examples)中的例子
+:::
+
+这部分代码中
+- 首先生成一个DTM的msg全局事务，传递DTM的服务器地址和全局事务id
+- 给msg添加一个分支业务逻辑，这里的业务逻辑为余额转入操作TransIn，然后带上这个服务需要传递的数据，金额30元
+- 然后调用msg的DoAndSubmitDB，这个函数保证业务成功执行和msg全局事务提交，要么同时成功，要么同时失败
+	1. 第一个参数为回查URL，详细含义稍后说
+	2. 第二个参数为sql.DB，是业务访问的数据库对象
+	3. 第三个参数是业务函数，我们这个例子中的业务是给A扣减30元余额
+
+## 成功流程
+DoAndSubmitDB是如何保证业务成功执行与msg提交的原子性的呢？请看如下的时序图：
+![msg_normal](../imgs/msg_normal.jpg)
+
+一般情况下，时序图中的5个步骤会正常完成，整个业务按照预期进行，全局事务完成。这里面有个新的内容需要解释一下，就是msg的提交是按照两个阶段发起的，第一阶段调用Prepare，第二阶段调用Commit，DTM收到Prepare调用后，不会调用分支事务，而是等待后续的Submit。只有收到了Submit，开始分支调用，最终完成全局事务。
+
+## 提交后宕机流程 {#query}
+在分布式系统中，各类的宕机和网络异常都是需要考虑的，下面我们来看看可能发生的问题：
+
+首先我们要达到的最重要目标是业务成功执行和msg事务是原子操作，因此首先看如果在业务完成提交后，发送Submit消息前出现了宕机故障会怎么样，新架构如何保证原子性？
+
+我们来看看这种情况下的时序图：
+
+![msg_query](../imgs/msg_query.jpg)
+
+如果在本地事务提交之后，在发送Submit前，出现了进程Crash或者机器宕机会怎么样？这个时候DTM会在一定超时时间之后，取出只Prepare但未Submit的msg事务，调用msg事务指定的回查服务。
+
+您的回查服务逻辑，不需要手动编写，只需要按照如下代码进行调用即可：
+``` Go
+	app.GET(BusiAPI+"/QueryPreparedB", dtmutil.WrapHandler2(func(c *gin.Context) interface{} {
+		return MustBarrierFromGin(c).QueryPrepared(dbGet())
+	}))
+```
+
+这个回查函数，会到表里面查询，本地事务是否提交了：
+- **已提交：** 返回成功，DTM进行下一步子事务调用
+- **已回滚：** 返回失败，DTM终止全局事务，不再进行子事务调用
+- **进行中：** 这个回查会等待最终结果，然后按照前面的已提交/已回滚的情况处理
+- **未开始：** 这个回查会往 RM 本地数据库插入数据，保证本地事务最终失败
+
+## 提交前宕机流程
+我们来看看本地事务被回滚的时序图：
+![msg_rollback](../imgs/msg_rollback.jpg)
+
+如果在DTM收到Prepare调用后，AP在事务提交前，遇见故障宕机，那么数据库会检测到AP的连接断开，自动回滚本地事务。
+
+后续DTM轮询取出已经超时的，只Prepare但没有Submit的全局事务，进行回查。回查服务发现本地事务已回滚，返回结果给DTM。DTM收到已回滚的结果后，将全局事务标记为失败，并结束该全局事务。
+
+## 易用性
+采用新架构处理一致性问题，仅需要：
+- 定义好本地业务逻辑，指定下一步处理的服务即可
+- 定义QueryPrepared处理服务，复制粘贴例子代码即可。
+
+然后我们看看其他方案情况
+## 二阶段消息 vs 本地消息表
+
+上述的问题也可以采用本地消息表方案（方案详情参考[分布式事务最经典的七种解决方案](https://segmentfault.com/a/1190000040321750)），来保证数据的最终一致性。如果采用本地消息表，需要的工作包括：
+- 在本地事务中执行本地业务逻辑，将消息插入消息表并最后提交
+- 编写轮询任务，将本地消息表的消息，发给消息队列
+- 消费消息，并将消息发给相应的处理服务
+
+两者对比，二阶段消息有以下优点：
+- 无需学习或维护任何消息队列
+- 不需要处理轮询任务
+- 不需要消费消息
+
+## 二阶段消息 vs 事务消息
+
+上述的问题也可以采用RocketMQ的事务消息方案（方案详情参考[分布式事务最经典的七种解决方案](https://segmentfault.com/a/1190000040321750)），来保证数据的最终一致性。如果采用事务消息，需要的工作包括：
+- 发送半消息，开启本地事务，提交本地事务，发送commit消息到RocketMQ
+- 消费超时的半消息，对于收到的超时半消息，查询本地数据库，然后进行Commit/Rollback
+- 消费已提交的消息，并将消息发送给处理服务
+
+两者对比，二阶段消息有以下优点：
+- 无需学习或维护任何消息队列
+- 本地事务与发送消息之间的复杂操作需要手动处理，一不小心，可能出现bug。而二阶段消息则是全自动处理
+- 不需要消费消息
+
+二阶段消息在二阶段提交方面，与RocketMQ的事务消息相似，是受到RocketMQ的事务消息启发后提出的新架构。二阶段消息的命名，不再复用RocketMQ的事务消息，主要是因为二阶段消息在架构上有很大的改变，而另一方面，在分布式事务的上下文中，使用”事务消息“这个名字，容易带来理解上的混淆。
+
+## 更多的优点
+对比于前面讲述的队列方案，二阶段消息还有很多额外的优点：
+- 二阶段消息整个暴露的接口，完全与队列无关，只跟实际的业务和服务调用相关，对开发人员更加友好
+- 二阶段消息不用考虑消息队列消息堆积及其他故障等问题，因为二阶段消息只依赖DTM，开发人员可以认为DTM与系统中其他一个普通无状态服务一样，只依赖背后的存储 MySQL/Redis。
+- 消息队列是异步的，而二阶段消息同时支持异步和同步，默认异步，只需要打开msg.WaitResult=true，那么可以同步等待下游服务完成
+- 二阶段消息还支持同时指定多个下游服务
+
+::: tip
+关于同步模式，可以参考[事务选项](../ref/options)中的等待事务结果
+:::
+
+#### 二阶段消息的应用
+二阶段消息能够大幅降低消息最终一致性解决方案的难度，已获得广泛的应用，下面是两个典型的应用。
+- [秒杀系统](../app/flash)，该架构下单机可以轻松扛住上万个订单请求，并且保证库存数量和订单数量准确匹配
+- [缓存一致性](../app/cache) 通过二阶段消息，可以轻松保证DB与缓存的一致性，大大优于队列或订阅binlog的方案
+
+二阶段消息组合使用redis、Mongo存储引擎的使用示例，可以在[dtm-examples](https://github.com/dtm-labs/dtm-examples)里面找到
+## 回查原理剖析
+前面的时序图中，以及接口中都出现了回查服务，在二阶段消息中，是复制粘贴代码自动处理的，而RocketMQ的事务消息，则是手动处理的。那么自动处理的原理是什么？
+
+要进行回查，首先要在业务数据库实例中，建立一张独立的表，里面保存全局事务id。在处理业务事务时，会把gid写入到这张表。
+
+当我们用gid回查时，如果能够在表中查到gid，那么说明本地事务已提交，这样就可以返回DTM，告知本地事务已提交。
+
+当我们用gid回查时，没有在表中查到gid，那么说明本地事务未提交，此时可能的结果是两个，一是事务还在进行中，二是事务已回滚。我查了许多关于RocketMQ的资料，未找到有效的解决方案。搜到所有解决方案是，如果未查到结果，那么什么都不做，等待下一次回查，如果2分钟或者更久的回查，一直都是查不到的，那么认为本地事务已回滚。
+
+上述这种方案有很大的问题：
+- 两分钟还查不到gid，并不能认为本地事务已回滚，极端情况下，可能发生数据库故障（例如进程或磁盘卡住了），持续时间超过2分钟，最后数据又提交了，那么这个时候，数据就不是最终一致了，就需要人工介入处理了
+- 如果一个本地事务，已经回滚了，但是回查操作，还会在两分钟之内，按照10s左右的时间间隔，不断的进行轮询，会给服务器造成不必要的压力
+
+而DTM的二阶段消息方案，则彻底解决了这部分的问题。DTM的二阶段消息工作过程如下：
+
+1. 在处理本地事务时，会将gid插入到dtm_barrier.barrier表中，同时带上插入原因为committed。该表有一个唯一索引，主要字段为gid。
+2. 当进行回查时，二阶段消息的操作不是直接查gid是否存在，而是再insert ignore一条带有相同gid的数据，同时带上插入原因为rollbacked。此时如果表中如果已有gid的记录，那么新的插入操作就会被ignore，否则数据会被插入。
+3. 然后再用gid查询表中的记录，如果查到记录的reason为committed，那么说明本地事务已提交；如果查到记录的reason为rollbacked，那么说明本地事务已回滚。
+
+那么对比RocketMQ回查时的常见方案，二阶段消息是如何区分出进行中和已回滚呢？其中的技巧在于回查时插入的数据，如果回查时，数据库的事务还在进行中，那么插入操作就会被进行中的事务阻塞，因为插入操作会等待事务中持有的锁。如果插入操作正常返回，那么数据库中的本地事务，必定已结束，必然是已提交或已回滚。
+
+## topic原理
+
+前文提到了二阶段消息还可以按topic投递消息实现分支事务调用。DTM服务器维护了`topic -> API`的映射，存储在数据库中，服务器定时读取映射信息并载入内存。
+
+DTM处理二阶段消息请求时，如果有按topic投递的消息，会根据内存中的`topic -> API`映射信息，映射为具体的api进行处理。
+
+按topic投递消息实现了分布式事务调用方和外部服务(分支事务)解耦。外部服务API发生变更不需要修改调用方的代码，可以在管理后台动态配置API。
+
+## 普通消息
+二阶段消息不仅可以替换本地消息表方案，也能够替换普通消息方案。如果直接调用Submit，那么就与普通消息方案近似，但是提供了更灵活简单的接口。
+
+假设一个这样的应用场景，界面上有一个参加活动的按钮，如果参加活动，会赠与两本电子书的永久权限。这种情况下，可以在这个按钮的服务端中，类似这样处理：
+```go
+msg := dtmcli.NewMsg(DtmServer, gid).
+	Add(busi.Busi+"/AuthBook", &Req{UID: 1, BookID: 5}).
+	Add(busi.Busi+"/AuthBook", &Req{UID: 1, BookID: 6})
+err := msg.Submit()
+```
+
+这种方式也提供了异步接口，而不用依赖消息消息队列。在微服务的许多场景中，可以替换原有的异步消息架构。
+
+## 小结
+本文提出的二阶段消息，接口简洁优雅，带来了比本地消息表和 RocketMQ 事务消息更优雅的架构，可以帮助大家更好的解决无需回滚的这一类数据一致性问题。
+
+---
+
+# 最终成功
+
+Source: https://github.com/dtm-labs/dtm.pub/blob/main/docs/practice/must-succeed.md
+
+# 最终成功
+dtm里多种事务模式中，都出现了操作最终成功的要求，这是什么含义呢？哪些场景是最终成功的？为什么要求最终成功？应用怎么设计？
+
+最终成功并不是说要保证100%的成功，它允许暂时性失败：包括网络故障，系统宕机，系统bug；但是一旦暂时性的问题解决之后，在业务恢复之后，需要返回成功。
+
+最终成功的另一个说法是，该操作能够最终成功，即通过不断重试，最后会返回成功。
+
+## 最终成功的情况
+最终成功的情况包括以下方面
+- 二阶段消息中的分支操作
+- SAGA中的补偿操作
+- TCC的Confirm和Cancel操作
+
+您的业务需要保证以上的操作，在业务逻辑上是可以最终成功的。
+
+## 为什么要最终成功
+
+假如您的业务使用了SAGA，然后依次出现下面情况：
+- 某个操作出现失败需要回滚
+- 回滚的过程中，遇见回滚失败
+- 此时SAGA事务既无法往前执行，也无法往后回滚
+
+这是由于您的业务系统逻辑设计中的问题，分布式事务没有任何办法解决，所以您的业务需要保证回滚是可以最终成功的。
+
+## 应用如何设计
+- 二阶段消息的分支操作是最终成功的，因为二阶段消息不支持回滚。如果您需要回滚，那么请采用其他事务模式
+
+- SAGA事务如果有些正向操作是无法回滚的，那么您可以用普通非并发的SAGA，将可回滚的分支Ri放在前面，不可回滚的分支Ni放在后面。如果分支Ri正向操作失败，则会回滚Ri，一旦到了Ni，保证Ni的正向操作最终成功，这样也能够保证SAGA事务的正确运行
+
+- TCC事务的Confirm/Cancel是最终成功的，一般的设计是在TCC的Try阶段预留资源，检查约束条件，然后在Confirm阶段修改数据，在Cancel阶段释放预留的资源。经过精心的设计，能够在业务逻辑上保证Confirm/Cancel的最终成功
+
+## 注意点
+在实际的业务应用中，可能会出现某些应用bug，导致要求最终成功的操作，一直无法成功，导致数据一直无法达到最终一致。建议开发者对全局事务表进行监控，发现重试超过3次的事务，发出报警，由运维人员找开发手动处理，参见[dtm的运维](../deploy/maintain)
+
+
+---
+
+# 其他事务模式
+
+Source: https://github.com/dtm-labs/dtm.pub/blob/main/docs/practice/other.md
+
+# 其他事务模式
+
+dtm目前实现了常见的四种事务模式，TCC、SAGA、XA、事务消息，还有其他的事务模式，下面做一下简单介绍
+
+## 本地消息表
+
+
+本地消息表这个方案最初是 ebay 架构师 Dan Pritchett 在 2008 年发表给 ACM 的文章。设计核心是将需要分布式处理的任务通过消息的方式来异步确保执行。
+
+大致流程如下：
+
+![local_msg_table](../imgs/local_msg_table.jpg)
+
+写本地消息和业务操作放在一个事务里，保证了业务和发消息的原子性，要么他们全都成功，要么全都失败。
+
+容错机制：
+
+- 扣减余额事务 失败时，事务直接回滚，无后续步骤
+- 轮序生产消息失败， 增加余额事务失败都会进行重试
+
+本地消息表的特点：
+
+- 长事务仅需要分拆成多个任务，使用简单
+- 生产者需要额外的创建消息表
+- 每个本地消息表都需要进行轮询
+- 消费者的逻辑如果无法通过重试成功，那么还需要更多的机制，来回滚操作
+
+在使用上面，事务消息接口的接入比本地消息表要方便很多，因此dtm实现了事务消息，未实现本地消息表
+
+### 事务消息
+
+在上述的本地消息表方案中，生产者需要额外创建消息表，还需要对本地消息表进行轮询，业务负担较重。阿里开源的RocketMQ 4.3之后的版本正式支持事务消息，该事务消息本质上是把本地消息表放到RocketMQ上，解决生产端的消息发送与本地事务执行的原子性问题。
+
+事务消息发送及提交：
+
+- 发送消息（half消息）
+- 服务端存储消息，并响应消息的写入结果
+- 根据发送结果执行本地事务（如果写入失败，此时half消息对业务不可见，本地逻辑不执行）
+- 根据本地事务状态执行Commit或者Rollback（Commit操作发布消息，消息对消费者可见）
+
+正常发送的流程图如下：
+
+![msg_trans](../imgs/msg_trans.png)
+
+补偿流程：
+
+对没有Commit/Rollback的事务消息（pending状态的消息），从服务端发起一次“回查”
+Producer收到回查消息，返回消息对应的本地事务的状态，为Commit或者Rollback
+事务消息方案与本地消息表机制非常类似，区别主要在于原先相关的本地表操作替换成了一个反查接口
+
+事务消息特点如下：
+
+- 长事务仅需要分拆成多个任务，并提供一个反查接口，使用简单
+- 事务消息的回查没有好的方案，极端情况可能出现数据错误
+
+适用于可异步执行的业务，且后续操作无需回滚的业务
+
+## 最大努力通知
+
+发起通知方通过一定的机制最大努力将业务处理结果通知到接收方。具体包括：
+
+有一定的消息重复通知机制。因为接收通知方可能没有接收到通知，此时要有一定的机制对消息重复通知。
+消息校对机制。如果尽最大努力也没有通知到接收方，或者接收方消费消息后要再次消费，此时可由接收方主动向通知方查询消息信息来满足需求。
+前面介绍的的本地消息表和事务消息都属于可靠消息，与这里介绍的最大努力通知有什么不同？
+
+可靠消息一致性，发起通知方需要保证将消息发出去，并且将消息发到接收通知方，消息的可靠性关键由发起通知方来保证。
+
+最大努力通知，发起通知方尽最大的努力将业务处理结果通知为接收通知方，但是可能消息接收不到，此时需要接收通知方主动调用发起通知方的接口查询业务处理结果，通知的可靠性关键在接收通知方。
+
+解决方案上，最大努力通知需要：
+
+- 提供接口，让被通知方能够通过接口查询业务处理结果
+- 消息队列ACK机制，消息队列按照间隔1min、5min、10min、30min、1h、2h、5h、10h的方式，逐步拉大通知间隔 ，直到达到通知要求的时间窗口上限。之后不再通知
+
+最大努力通知适用于业务通知类型，例如微信交易的结果，就是通过最大努力通知方式通知各个商户，既有回调通知，也有交易查询接口
+
+最大努力通知更多是业务上的设计，在基础设施层，可以直接使用二阶段消息，或者事务消息、本地消息表
+
+## AT事务模式
+
+这是阿里开源项目[seata](https://github.com/seata/seata)中的一种事务模式，在蚂蚁金服也被称为FMT。
+
+- 优点是该事务模式使用方式，类似 XA 模式，业务无需编写各类补偿操作，回滚由框架自动完成
+- 缺点也类似 XA ，存在较长时间的锁，不满足高并发的场景，另外 AT 模式使用的时候，可能出现脏回滚
+
+有兴趣的同学可以参考[Seata-AT](http://seata.io/zh-cn/docs/dev/mode/xa-mode.html)
+
+DTM未实现AT，而是建议在适合AT的场景下，采用跟AT相近的XA，考虑的因素有以下几点：
+
+- 发生脏回滚需要手动处理
+- 要避免脏回滚需要访问子事务表的所有业务人员都通过统一注解访问，使用门槛高
+- 性能上面 AT 并未比 XA 更高
+
+我根据自己对AT的理解，写了一篇AT与XA对比的文章，有兴趣的同学可以阅读 [AT vs XA](./at)
+
+## 小结
+
+主要的事务模式比较多，dtm的事务模式支持了绝大多数的应用场景
+
+---
+
+# SAGA事务模式
+
+Source: https://github.com/dtm-labs/dtm.pub/blob/main/docs/practice/saga.md
+
+# SAGA事务模式
+
+SAGA事务模式是DTM中最常用的模式，主要是因为SAGA模式简单易用，工作量少，并且能够解决绝大部分业务的需求。
+
+> dtm 的SAGA模式与Seata的SAGA在设计理念上是不一样的，整体使用难度大幅度降低，非常容易上手
+
+SAGA最初出现在1987年Hector Garcaa-Molrna & Kenneth Salem发表的论文[SAGAS](https://www.cs.cornell.edu/andru/cs711/2002fa/reading/sagas.pdf)里。其核心思想是将长事务拆分为多个短事务，由Saga事务协调器协调，如果每个短事务都成功提交完成，那么全局事务就正常完成，如果某个步骤失败，则根据相反顺序一次调用补偿操作。
+
+## 拆分为子事务
+例如我们要进行一个类似于银行跨行转账的业务，将A中的30元转给B，根据Saga事务的原理，我们将整个全局事务，切分为以下服务：
+- 转出（TransOut）服务，这里转出将会进行操作A-30
+- 转出补偿（TransOutCompensate）服务，回滚上面的转出操作，即A+30
+- 转入（TransIn）服务，转入将会进行B+30
+- 转入补偿（TransInCompensate）服务，回滚上面的转入操作，即B-30
+
+整个SAGA事务的逻辑是：
+
+执行转出成功=>执行转入成功=>全局事务完成
+
+如果在中间发生错误，例如转入B发生错误，则会调用已执行分支的补偿操作，即：
+
+执行转出成功=>执行转入失败=>执行转入补偿成功=>执行转出补偿成功=>全局事务回滚完成
+
+下面我们看一个成功完成的SAGA事务典型的时序图：
+
+![saga_normal](../imgs/saga_normal.jpg)
+
+在这个图中，我们的全局事务发起人，将整个全局事务的编排信息，包括每个步骤的正向操作和反向补偿操作定义好之后，提交给服务器，服务器就会按步骤执行前面SAGA的逻辑。
+## SAGA的接入
+
+我们看看Go如何接入一个SAGA事务
+
+``` go
+req := &gin.H{"amount": 30} // 微服务的请求Body
+// DtmServer为DTM服务的地址
+saga := dtmcli.NewSaga(DtmServer, shortuuid.New()).
+  // 添加一个TransOut的子事务，正向操作为url: qsBusi+"/TransOut"， 逆向操作为url: qsBusi+"/TransOutCompensate"
+  Add(qsBusi+"/TransOut", qsBusi+"/TransOutCompensate", req).
+  // 添加一个TransIn的子事务，正向操作为url: qsBusi+"/TransIn"， 逆向操作为url: qsBusi+"/TransInCompensate"
+  Add(qsBusi+"/TransIn", qsBusi+"/TransInCompensate", req)
+// 提交saga事务，dtm会完成所有的子事务/回滚所有的子事务
+err := saga.Submit()
+```
+
+上面的代码首先创建了一个SAGA事务，然后添加了两个子事务TransOut、TransIn，每个事务分支包括action和compensate两个操作，分别为Add函数的第一第二个参数。子事务定好之后提交给dtm。dtm收到saga提交的全局事务后，会调用所有子事务的正向操作，如果所有正向操作成功完成，那么事务成功结束。
+
+详细例子代码参考[dtm-examples](https://github.com/dtm-labs/dtm-examples)
+
+我们前面的的例子，是基于HTTP协议SDK进行DTM接入，gRPC协议的接入基本一样，详细例子代码可以在[dtm-examples](https://github.com/dtm-labs/dtm-examples)
+
+## 失败回滚
+
+如果有正向操作失败，例如账户余额不足或者账户被冻结，那么dtm会调用各分支的补偿操作，进行回滚，最后事务成功回滚。
+
+我们将上述的第二个分支调用，传递参数，让他失败
+
+``` go
+  Add(qsBusi+"/TransIn", qsBusi+"/TransInCompensate", &TransReq{Amount: 30, TransInResult: "FAILURE"})
+```
+
+失败的时序图如下：
+
+![saga_rollback](../imgs/saga_rollback.jpg)
+
+::: tip 补偿执行顺序
+dtm的SAGA事务在1.10.0及之前，补偿操作是并发执行的，1.10.1之后，是根据用户指定的分支顺序，进行回滚的。
+
+如果是普通SAGA，没有打开并发选项，那么SAGA事务的补偿分支是完全按照正向分支的反向顺序进行补偿的。
+
+如果是并发SAGA，补偿分支也会并发执行，补偿分支的执行顺序与指定的正向分支顺序相反。假如并发SAGA指定A分支之后才能执行B，那么进行并发补偿时，DTM保证A的补偿操作在B的补偿操作之后执行
+:::
+
+## 如何做补偿
+当SAGA对分支A进行失败补偿时，A的正向操作可能1. 已执行；2. 未执行；3. 甚至有可能处于执行中，最终执行成功或者失败是未知的。那么对A进行补偿时，要妥善处理好这三种情况，难度很大。
+
+dtm提供了子事务屏障技术，自动处理上述三种情况，开发人员只需要编写好针对1的补偿操作情况即可，相关工作大幅简化，详细原理，参见下面的异常章节。
+
+::: tip 失败的分支是否需要补偿
+dtm 常被问到的一个问题是，TransIn返回失败，那么这个时候是否还需要调用TransIn的补偿操作？DTM 的做法是，统一进行一次调用，这种的设计考虑点如下：
+- XA, TCC 等事务模式是必须要的，SAGA 为了保持简单和统一，设计为总是调用补偿
+- DTM 支持单服务多数据源，可能出现数据源1成功，数据源2失败，这种情况下，需要确保补偿被调用，数据源1的补偿被执行
+- DTM 提供的子事务屏障，自动处理了补偿操作中的各种情况，用户只需要执行与正向操作完全相反的补偿即可
+:::
+## 异常
+
+在事务领域，异常是需要重点考虑的问题，例如宕机失败，进程crash都有可能导致不一致。当我们面对分布式事务，那么分布式中的异常出现更加频繁，对于异常的设计和处理，更是重中之重。
+
+我们将异常分为以下几类：
+- **偶发失败：** 在微服务领域，由于网络抖动、机器宕机、进程Crash会导致微小比例的请求失败。这类问题的解决方案是重试，第二次进行重试，就能够成功，因此微服务框架或者网关类的产品，都会支持重试，例如配置重试3次，每次间隔2s。DTM的设计对重试非常友好，应当支持幂等的各个接口都已支持幂等，不会发生因为重试导致事务bug的情况
+- **故障宕机：** 大量公司内部都有复杂的多项业务，这些业务中偶尔有一两个非核心业务故障也是常态。DTM也考虑了这样的情况，在重试方面做了指数退避算法，如果遇见了故障宕机情况，那么指数退避可以避免大量请求不断发往故障应用，避免雪崩。
+- **网络乱序：** 分布式系统中，网络延时是难以避免的，所以会发生一些乱序的情况，例如转账的例子中，可能发生服务器先收到撤销转账的请求，再收到转账请求。这类的问题是分布式事务中的一个重点难点问题，详情参考：[异常与子事务屏障](../practice/barrier)
+
+业务上的失败与异常是需要做严格区分的，例如前面的余额不足，是业务上的失败，必须回滚，重试毫无意义。分布式事务中，有很多模式的某些阶段，要求最终成功。例如dtm的补偿操作，是要求最终成功的，只要还没成功，就会不断进行重试，直到成功。关于这部分的更详细的论述，参见[最终成功](./must-succeed)
+
+介绍到这里，您已经具备足够的知识，开发完成一个普通的SAGA任务。下面我们将介绍SAGA更加高级的知识与用法
+## 高级用法
+
+我们以一个真实用户案例，来讲解dtm的saga部分高级功能。
+
+问题场景：一个用户出行旅游的应用，收到一个用户出行计划，需要预定去三亚的机票，三亚的酒店，返程的机票。
+
+要求：
+1. 两张机票和酒店要么都预定成功，要么都回滚（酒店和航空公司提供了相关的回滚接口）
+2. 预订机票和酒店是并发的，避免串行的情况下，因为某一个预定最后确认时间晚，导致其他的预定错过时间
+3. 预定结果的确认时间可能从1分钟到1天不等
+
+上述这些要求，正是saga事务模式擅长的领域，我们来看看dtm怎么解决。
+
+首先我们根据要求1，创建一个saga事务，这个saga包含三个分支，分别是，预定去三亚机票，预定酒店，预定返程机票
+
+``` go
+		saga := dtmcli.NewSaga(DtmServer, gid).
+			Add(Busi+"/BookTicket", Busi+"/BookTicketRevert", bookTicketInfo1).
+			Add(Busi+"/BookHotel", Busi+"/BookHotelRevert", bookHotelInfo2).
+			Add(Busi+"/BookTicket", Busi+"/BookTicketRevert", bookTicketBackInfo3)
+```
+
+然后我们根据要求2，让saga并发执行（默认是顺序执行）
+
+``` go
+  saga.EnableConcurrent()
+```
+
+最后我们处理3里面的“预定结果的确认时间”不是即时响应的问题。由于不是即时响应，所以我们不能够让预定操作等待第三方的结果，而是提交预定请求后，就立即返回状态-进行中。我们的分支事务未完成，dtm会重试我们的事务分支，我们把重试间隔指定为1分钟。
+
+``` go
+  saga.RetryInterval = 60
+  saga.Submit()
+// ........
+func bookTicket() string {
+	order := loadOrder()
+	if order == nil { // 尚未下单，进行第三方下单操作
+		order = submitTicketOrder()
+		order.save()
+	}
+	order.Query() // 查询第三方订单状态
+	return order.Status // 成功-SUCCESS 失败-FAILURE 进行中-ONGOING
+}
+```
+
+::: tip 固定间隔重试
+dtm默认情况下，重试策略是指数退避算法，可以避免出现故障时，过多的重试导致负载过高。但是这里订票结果不应当采用指数退避算法重试，否则最终用户不能及时收到通知。因此在bookTicket中，返回结果ONGOING，当dtm收到这个结果时，会采用固定间隔重试，这样能及时通知到用户。
+:::
+## 更多高级场景
+在实际应用中，还遇见过一些业务场景，需要一些额外的技巧进行处理
+
+#### 部分第三方操作无法回滚
+
+例如一个订单中的发货，一旦给出了发货指令，那么涉及线下相关操作，那么很难直接回滚。对于涉及这类情况的saga如何处理呢？
+
+我们把一个事务中的操作分为可回滚的操作，以及不可回滚的操作。那么把可回滚的操作放到前面，把不可回滚的操作放在后面执行，那么就可以解决这类问题
+
+``` go
+		saga := dtmcli.NewSaga(DtmServer, shortuuid.New()).
+			Add(Busi+"/CanRollback1", Busi+"/CanRollback1Revert", req).
+			Add(Busi+"/CanRollback2", Busi+"/CanRollback2Revert", req).
+			Add(Busi+"/UnRollback1", "", req).
+			Add(Busi+"/UnRollback2", "", req).
+			EnableConcurrent().
+			AddBranchOrder(2, []int{0, 1}). // 指定step 2，需要在0，1完成后执行
+			AddBranchOrder(3, []int{0, 1}) // 指定step 3，需要在0，1完成后执行
+```
+
+示例中的代码，指定Step 2，3 中的 UnRollback 操作，必须在Step 0，1 完成后执行。
+
+对于不可回滚的操作，DTM的设计建议是，不可回滚的操作在业务上也不允许返回失败。可以这么思考，如果发货的操作返回了失败，那么这个失败的含义是不够清晰的，调用方不知道这个失败是修改了部分数据的失败，还是修改数据前的业务校验失败，因为这个操作不可回滚，所以调用方收到这个失败，是不知道如何正确处理这个错误的。
+
+另外当你的一个全局事务中，如果出现了两个既不可回滚的又可能返回失败的操作，那么到了实际运行中，一个执行成功，一个执行失败，此时执行成功的那个事务无法回滚，那么这个事务的一致性就不可能保证了。
+
+对于发货操作，如果可能在校验数据上可能发生失败，那么将发货操作拆分为发货校验、发货两个服务则会清晰很多，发货校验可回滚，发货不可回滚同时也不会失败。
+
+#### 超时回滚
+
+saga属于长事务，因此持续的时间跨度很大，可能是100ms到1天，因此saga没有默认的超时时间。
+
+dtm支持saga事务单独指定超时时间，到了超时时间，全局事务就会回滚。
+
+``` go
+	saga.TimeoutToFail = 1800
+```
+
+在saga事务中，设置超时时间一定要注意，这类事务里不能够包含无法回滚的事务分支，因为超时回滚时，已执行的无法回滚的分支，数据就是错的。
+
+#### 其他分支的结果作为输入
+
+前面的设计环节讲了为什么dtm没有支持这样的需求，那么如果极少数的实际业务有这样的需求怎么处理？例如B分支需要A分支的执行结果
+
+dtm的建议做法是，在ServiceA再提供一个接口，让B可以获取到相关的数据。这种方案虽然效率稍低，但是易理解已维护，开发工作量也不会太大。
+
+PS：有个小细节请注意，尽量在你的事务外部进行网络请求，避免事务时间跨度变长，导致并发问题。
+
+如果您需要其他分支的结果作为输入，也可以考虑一下dtm里面的 TCC 模式，该模式有不同的适用场景，但是提供了非常便捷的获取其他分支结果的接口
+
+## SAGA 设计原则
+Seata的SAGA采用了状态机实现，而DTM的SAGA没有采用状态机，因此常常有用户会问，为什么DTM没有采用状态机，状态机可以提供更加灵活的事务自定义。
+
+我在DTM设计SAGA高级用法时，充分调研了状态机实现，经过仔细权衡之后，决定不采用状态机实现，主要原因如下：
+
+#### 易用性对比
+可能在阿里内部，需要SAGA提供类似状态机的灵活性，但是在阿里外部，看到使用Seata的Saga事务的用户特别少。我调研了Seata中SAGA的开发资料，想要上手写一个简单的SAGA事务，需要
+1. 了解状态机的原理
+2. 上手状态机的图形界面工具，生成状态机定义Json（一个简单的分布式事务任务，需要大约90多行的Json定义）
+3. 将上述Json配置到Java项目中
+4. 如果遇见问题，需要跟踪调试状态机定义的调用关系，非常复杂
+
+而对比之下，DTM的SAGA事务，则非常简单易用，开发者没有理解成本，通常五六行代码就完成了一个全局事务的编写，因此也成为DTM中，应用最为广泛的事务模式。而对于高级场景，DTM也经过实践的检验，以极简单的选项，例如EnableConcurrent、RetryInterval，解决了复杂的应用场景。目前收集到的用户需求中，暂未看到状态机能解决，而DTM的SAGA不能解决的案例。
+
+#### gRPC友好度
+gRPC 是云原生时代中应用非常广泛的协议。而Seata的状态机，对HTTP的支持度较好，而对gRPC的支持度不友好。一个gRPC服务中返回的结果，如果没有相关的pb定义文件，就无法解析出其中的字段，因此就无法采用状态机做灵活的判断，那么想用状态机的话，就必须固定结果类型，这样对应用的侵入性就比较强，适用范围就比较窄。
+
+DTM则对gRPC的支持更加友好，对结果类型无任何要求，适用范围更加广泛。
+
+## 小结
+这里详细介绍了SAGA的简单用法到高级用法，如果您熟练掌握了DTM中的SAGA事务，那么就可以解决分布式事务中的绝大部分问题了
+
+---
+
+# TCC事务模式
+
+Source: https://github.com/dtm-labs/dtm.pub/blob/main/docs/practice/tcc.md
+
+# TCC事务模式
+什么是TCC，TCC是Try、Confirm、Cancel三个词语的缩写，最早是由 Pat Helland 于 2007 年发表的一篇名为《Life beyond Distributed Transactions:an Apostate’s Opinion》的论文提出。
+
+## TCC组成
+TCC分为3个阶段
+
+- Try 阶段：尝试执行，完成所有业务检查（一致性）, 预留必须业务资源（准隔离性）
+- Confirm 阶段：如果所有分支的Try都成功了，则走到Confirm阶段。Confirm真正执行业务，不作任何业务检查，只使用 Try 阶段预留的业务资源
+- Cancel 阶段：如果所有分支的Try有一个失败了，则走到Cancel阶段。Cancel释放 Try 阶段预留的业务资源。
+
+如果我们要进行一个类似于银行跨行转账的业务，转出（TransOut）和转入（TransIn）分别在不同的微服务里，一个成功完成的TCC事务典型的时序图如下：
+
+![tcc_normal](../imgs/tcc_normal.jpg)
+
+## 简单的TCC
+
+我们来完成一个最简单的TCC：
+
+``` go
+err := dtmcli.TccGlobalTransaction(DtmServer, gid, func(tcc *dtmcli.Tcc) (*resty.Response, error) {
+  resp, err := tcc.CallBranch(&TransReq{Amount: 30}, Busi+"/TransOut", Busi+"/TransOutConfirm", Busi+"/TransOutRevert")
+  if err != nil {
+    return resp, err
+  }
+  return tcc.CallBranch(&TransReq{Amount: 30}, Busi+"/TransIn", Busi+"/TransInConfirm", Busi+"/TransInRevert")
+})
+```
+
+详细例子代码参考[dtm-examples](https://github.com/dtm-labs/dtm-examples)：
+
+调用TccGlobalTransaction会开启一个全局的tcc事务。他的声明如下：
+
+``` go
+// TccGlobalTransaction begin a tcc global transaction
+// dtm dtm服务器地址
+// gid 全局事务id
+// tccFunc tcc事务函数，里面会定义全局事务的分支
+func TccGlobalTransaction(dtm string, gid string, tccFunc TccGlobalFunc) error
+```
+
+开启成功之后，会调用第三个参数传递的函数tccFunc。我们在这个函数的内部调用了CallBranch来定义了两个子事务TransOut和TransIn。
+
+``` go
+// CallBranch call a tcc branch
+// 函数首先注册子事务的所有分支操作，成功后调用try，返回try的调用结果
+func (t *Tcc) CallBranch(body interface{}, tryURL string, confirmURL string, cancelURL string) (*resty.Response, error)
+```
+
+当tccFunc正常返回时，TccGlobalTransaction会提交全局事务，然后返回给调用者。dtm收到提交请求，则会调用所有注册事务分支的二阶段Confirm。TccGlobalTransaction返回时，一阶段的Try已经全部完成，但是二阶段的Confirm通常还未完成。
+
+## 失败回滚
+
+如果tccFunc返回错误，TccGlobalTransaction会终止全局事务，然后返回给调用者。dtm收到终止请求，则会调用所有注册子事务的二阶段Cancel。
+
+我们将上述的第二个Try调用，传递参数，让他失败
+
+``` go
+res2, rerr := tcc.CallBranch(&TransReq{Amount: 30, TransInResult: "FAILURE"}, Busi+"/TransIn", Busi+"/TransInConfirm", Busi+"/TransInRevert")
+```
+
+失败的时序图如下：
+
+![tcc_rollback](../imgs/tcc_rollback.jpg)
+
+## Confirm/Cancel操作异常
+
+假如Confirm/Cancel操作遇见失败会怎么样？按照Tcc模式的协议，Confirm/Cancel操作是要求最终成功的，遇见失败的情况，都是由于临时故障或者程序bug。dtm在Confirm/Cancel操作遇见失败时，会不断进行重试，直到成功。
+
+为了避免程序bug导致补偿操作一直无法成功，建议开发者对全局事务表进行监控，发现重试超过3次的事务，发出报警，由运维人员找开发手动处理，参见[dtm的运维](../deploy/maintain)
+
+## TCC 设计原则
+在设计上，TCC主要用于处理一致性要求较高、需要较多灵活性的短事务：
+
+#### TCC如何做到更好的一致性
+对于我们的 A 跨行转账给 B 的场景，如果采用SAGA，在正向操作中调余额，在补偿操作中，反向调整余额，那么会出现这种情况：如果A扣款成功，金额转入B失败，最后回滚，把A的余额调整为初始值。整个过程中如果A发现自己的余额被扣减了，但是收款方B迟迟没有收到资金，那么会对A造成非常大的困扰。
+
+上述需求在SAGA中无法解决，但是可以通过TCC来解决，设计技巧如下：
+- 在账户中的 balance 字段之外，再引入一个 trading_balance 字段
+- Try 阶段检查账户是否被冻结，检查账户余额是否充足，没问题后，调整 trading_balance （即业务上的冻结资金）
+- Confirm 阶段，调整 balance ，调整 trading_balance （即业务上的解冻资金）
+- Cancel 阶段，调整 trading_balance （即业务上的解冻资金）
+
+这种情况下，终端用户 A 就不会看到自己的余额扣减了，但是 B 又迟迟收不到资金的情况
+
+#### 为什么只适合短事务
+
+TCC 的事务编排放在了应用端上，就是事务一共包含多少个分支，每个分支的顺序什么样，这些信息不会像 SAGA 那样，都发送给dtm服务器之后，再去调用实际的事务分支。当应用出现 crash 或退出，编排信息丢失，那么整个全局事务，就没有办法往前重试，只能够进行回滚。如果全局事务持续时间很长，例如一分钟以上，那么当应用进行正常的发布升级时，也会导致全局事务回滚，影响业务。因此 TCC 会更适合短事务。
+
+那么是否可以把TCC的事务编排都保存到服务器，保证应用重启也不受到影响呢？理论上这种做法是可以解决这个问题的，但是存储到服务器会比在应用端更不灵活，无法获取到每个分支的中间结果，无法做嵌套等等。
+
+考虑到一致性要求较高和短事务是高度相关的（一个中间不一致状态持续很长时间的事务，自然不能算一致性较好），这两者跟“应用灵活编排”，也是有较高相关度，所以将 TCC 实现为应用端编排，而 SAGA 实现为服务端编排。
+
+## 嵌套的TCC
+
+dtm的Tcc事务模式，支持子事务嵌套，流程图如下：
+
+![nested_trans](../imgs/nested_trans.jpg)
+
+在这个流程图中，Order这个微服务，管理了订单相关的数据修改，同时还管理了一个嵌套的子事务，因此他即扮演了RM的角色，也扮演了AP的角色。
+
+#### 示例
+
+tcc支持嵌套的子事务，代码如下(具体源码参考[dtm-examples](https://github.com/dtm-labs/dtm-examples))：
+
+``` go
+err := dtmcli.TccGlobalTransaction(DtmServer, gid, func(tcc *dtmcli.Tcc) (*resty.Response, error) {
+  resp, err := tcc.CallBranch(&TransReq{Amount: 30}, Busi+"/TransOut", Busi+"/TransOutConfirm", Busi+"/TransOutRevert")
+  if err != nil {
+    return resp, err
+  }
+  return tcc.CallBranch(&TransReq{Amount: 30}, Busi+"/TransInTccParent", Busi+"/TransInConfirm", Busi+"/TransInRevert")
+})
+```
+
+这里的TransInTccParent子事务，里面会再调用TransIn子事务，代码如下：
+
+``` go
+app.POST(BusiAPI+"/TransInTccParent", common.WrapHandler2(func(c *gin.Context) interface{} {
+  tcc, err := dtmcli.TccFromReq(c)
+  if err != nil {
+    return err
+  }
+  logrus.Printf("TransInTccParent ")
+  return tcc.CallBranch(&TransReq{Amount: reqFrom(c).Amount}, Busi+"/TransIn", Busi+"/TransInConfirm", Busi+"/TransInRevert")
+}))
+```
+
+子事务嵌套时，从传入的请求中构建tcc对象，然后就能够正常使用tcc对象，进行相关的事务。
+
+## 小结
+
+在本节的教程中，我们简单介绍了TCC的理论知识，也通过几个例子，完整给出了编写一个TCC事务的过程，涵盖了正常成功完成，以及失败回滚的情况。另外还演示一个嵌套子事务。
+
+完整的一个TCC事务教程，可以参考 [TCC教程](https://segmentfault.com/a/1190000040331793)
+
+---
+
+# theory.md
+
+Source: https://github.com/dtm-labs/dtm.pub/blob/main/docs/practice/theory.md
+
+随着业务的快速发展、业务复杂度越来越高，几乎每个公司的系统都会从单体走向分布式，特别是转向微服务架构。随之而来就必然遇到分布式事务这个难题，DTM致力于提供一个简单易用、跨语言，同时具备高性能、高可用、可扩展的分布式事务解决方案。
+
+## 基础理论
+
+在讲解具体方案之前，我们先了解一下分布式事务所涉及到的基础理论知识。
+
+我们拿转账作为例子，A需要转100元给B，那么需要给A的余额-100元，给B的余额+100元，整个转账要保证，A-100和B+100同时成功，或者同时失败。看看在各种场景下，是如何解决这个问题的。
+
+## 事务
+
+把多条语句作为一个整体进行操作的功能，被称为数据库事务。数据库事务可以确保该事务范围内的所有操作都可以全部成功或者全部失败。
+
+事务具有 4 个属性：原子性、一致性、隔离性、持久性。这四个属性通常称为 ACID 特性。
+
+- Atomicity（原子性）：一个事务中的所有操作，要么全部完成，要么全部不完成，不会结束在中间某个环节。事务在执行过程中发生错误，会被恢复到事务开始前的状态，就像这个事务从来没有执行过一样。
+- Consistency（一致性）：在事务开始之前和事务结束以后，数据库的完整性没有被破坏。完整性包括外键约束、应用定义等约束不会被破坏。
+- Isolation（隔离性）：数据库允许多个并发事务同时对其数据进行读写和修改的能力，隔离性可以防止多个事务并发执行时由于交叉执行而导致数据的不一致。
+- Durability（持久性）：事务处理结束后，对数据的修改就是永久的，即便系统故障也不会丢失。
+
+主流的数据库例如MySQL、PostgreSQL等，都支持ACID事务，其内部会采用MVCC（多版本并发控制）技术，实现高性能、高并发的本地事务。MVCC技术是数据库的技术基石，非常重要，但是内容很多，这里就不再展开细说，有兴趣的同学，可以自行查找相关资料学习。
+
+## 分布式理论
+
+分布式事务涉及多个节点，是一个典型的分布式系统，与单机系统有非常大的差别。一个分布式系统最多只能同时满足一致性（Consistency）、可用性（Availability）和分区容错性（Partition tolerance）这三项中的两项，这被称为CAP理论。
+
+#### C 一致性
+
+分布式系统中，数据一般会存在不同节点的副本中，如果对第一个节点的数据成功进行了更新操作，而第二个节点上的数据却没有得到相应更新，这时候读取第二个节点的数据依然是更新前的数据，即脏数据，这就是分布式系统数据不一致的情况。
+
+在分布式系统中，如果能够做到针对一个数据项的更新操作执行成功后，所有的用户都能读取到最新的值，那么这样的系统就被认为具有强一致性（或严格的一致性）。
+
+请注意CAP中的一致性和ACID中的一致性，虽然单词相同，但实际含义不同，请注意区分
+
+#### A 可用性
+
+在集群中一部分节点故障后，集群整体是否还能响应客户端的读写请求。
+
+在现代的互联网应用中，如果因为服务器宕机等问题，导致服务长期不可用，是不可接受的
+
+#### P 分区容错性
+
+以实际效果而言，分区相当于对通信的时限要求。系统如果不能在时限内达成数据一致性，就意味着发生了分区的情况，必须就当前操作在 C 和 A 之间做出选择。
+
+提高分区容忍性的办法就是一个数据项复制到多个节点上，那么出现分区之后，这一数据项仍然能在其他区中读取，容忍性就提高了。然而，把数据复制到多个节点，就会带来一致性的问题，就是多个节点上面的数据可能是不一致的。
+
+#### 面临的问题
+
+对于多数大型互联网应用的场景，主机众多、部署分散，而且现在的集群规模越来越大，所以节点故障、网络故障是常态，而且要保证服务可用性达到N个9，即保证P和A，舍弃C。
+
+#### BASE理论
+
+BASE是Basically Available（基本可用）、Soft state（软状态）和Eventually consistent（最终一致性）三个短语的简写，BASE是对CAP中一致性和可用性权衡的结果，其来源于对大规模互联网系统分布式实践的结论，是基于CAP定理逐步演化而来的，其核心思想是即使无法做到强一致性（Strong consistency），但每个应用都可以根据自身的业务特点，采用适当的方式来使系统达到最终一致性（Eventual consistency）。接下来我们着重对BASE中的三要素进行详细讲解。
+
+- 基本可用是指分布式系统在出现不可预知故障的时候，允许损失部分可用性——但请注意，这绝不等价于系统不可用。
+- 弱状态也称为软状态，和硬状态相对，是指允许系统中的数据存在中间状态，并认为该中间状态的存在不会影响系统的整体可用性，即允许系统在不同节点的数据副本之间进行数据同步的过程存在延时。
+- 最终一致性强调的是系统中所有的数据副本，在经过一段时间的同步后，最终能够达到一个一致的状态。因此，最终一致性的本质是需要系统保证最终数据能够达到一致，而不需要实时保证系统数据的强一致性
+
+总的来说，BASE理论面向的是大型高可用可扩展的分布式系统，提出通过牺牲强一致性来获得可用性，并允许数据在一段时间内是不一致的，但最终达到一致状态。
+
+许多的NoSQL是按照BASE理论进行设计的，典型的例子包括：DynamoDB、Cassandra、CouchDB。
+
+##  分布式事务
+
+银行跨行转账业务是一个典型分布式事务场景，假设A需要跨行转账给B，那么就涉及两个银行的数据，无法通过一个数据库的本地事务保证转账的ACID，只能够通过分布式事务来解决。
+
+分布式事务就是指事务的发起者、资源及资源管理器和事务协调者分别位于分布式系统的不同节点之上。在上述转账的业务中，用户A-100操作和用户B+100操作不是位于同一个节点上。本质上来说，分布式事务就是为了保证在分布式场景下，数据操作的正确执行。
+
+分布式事务可以分为两类：
+- 第一类为：NewSQL的内部分布式事务，这类事务不是我们今天讨论的重点，仅做简单叙述
+- 第二类为：跨数据库、跨服务的分布式事务，这类事务是DTM主要研究的对象，后面会详细讲解
+
+## NewSQL的分布式事务
+
+以Spanner、TiDB为代表的NewSQL，在内部集群多节点间，实现了ACID的事务，即提供给用户的事务接口与普通本地事务无差别，但是在内部，一个事务是支持多个节点多条数据的写入，此时无法采用本地ACID的MVCC技术，而是会采用一套复杂的分布式MVCC来做到ACID。大多数的NewSQL分布式事务技术都采用这篇论文[Percolator](http://research.google.com/pubs/pub36726.html)介绍的核心技术。
+
+那么从CAP的角度看，三者不能同时兼备，那么NewSQL选择了什么，牺牲了什么呢？
+
+首先我们看C（一致性），这是数据库类的应用必须具备的。只要数据写入了，后续的读，一定能获取到最新写入的结果。你可以想象如果不是这样，那么你的应用处理关键事务如订单时，如果读到的结果不是最新的，那么你就无法确定订单的当前准确状态，就无法进行正确处理，更无从谈起ACID特性。
+
+然后我们看P（分区），只要是分布式系统，那么P就是必然有概率发生的，因此P是分布式系统必须处理，必须具备的特性。
+
+那么我们再看A（可用性），由于架构的发展，系统出现网络分区的频率可以大幅降低。另外分布式共识算法的发展，可以在较短的时间，正确的达成共识，从而从分区故障中恢复。谷歌分布式锁Chubby的公开数据显示，集群能提供99.99958％的平均可用性，一年也就130s的运行中断。这样的可用性相当高，对实际应用的影响微乎其微。
+
+也就是说随着现代工程和共识算法的发展，可以构造出满足CP的系统，同时接近于满足A，可以称之为CP+HA，这里HA代表的是非100%的A，而是很高的可用性。
+
+公开的数据显示，谷歌的Spanner支持ACID的事务特性，同时提供了高达的5个9的可用性，因此这是一个CP+HA。
+
+既然NewSQL已经达到了CP+HA，那么从CAP的角度看，前面介绍BASE中的典型DynamoDB系统等，只达到了AP，他们是否就可以退出历史舞台了呢？不会！NewSQL和BASE的系统之间，性能上差异可能是巨大的，因此在实际高性能高并发应用上，BASE也是有不少的应用场景的。
+
+## 跨服务跨库的分布式事务
+
+::: tip 分布式事务
+虽然分布式事务分为两类，一类是前面介绍的NewSQL的分布式事务，不是DTM研究的重点，另一类是DTM重点研究的跨服务跨库分布式事务，为了简化描述，本教程如果无特殊说明，关键词：**分布式事务**指的是**跨库跨服务更新数据的分布式事务**
+:::
+
+DTM主要研究跨服务，跨数据库的分布式事务，这类分布式事务只是部分遵循 ACID 规范的：
+
+- 原子性：严格遵循
+- 一致性：事务完成后的一致性严格遵循；事务中的一致性可适当放宽
+- 隔离性：并行事务间不可影响；事务中间结果可见性允许安全放宽
+- 持久性：严格遵循
+
+这里面一致性和隔离性都没有严格遵守，但是ACID这四个特性中，AID这三个特性其实是数据库实现的人非常关心，而对于使用数据库的人，最终的用户，最关心的则是C，即用户视角看，分布式事务的一致性是什么样的？
+
+对于这里面的C（一致性），我们以一个非常具体的业务例子，来进行解释。假如我们正在处理一个转账业务，假设是A转给B 30元，在本地事务的支持下，我们的用户看到A+B的总金额，在整个转账前后，以及转账过程中，都是保持不变的。那么这个时候用户认为他看到的数据是一致的，符合业务约束的。
+
+当我们业务变复杂，引入多个数据库和大量微服务时，上述本地事务的一致性，依旧是业务非常关心。假如一个业务更新操作，跨库或者跨服务时，那么此时业务关心的一致性问题，就变成了 分布式事务中的一致性问题。
+
+在单机本地事务中，A+B的总金额在任何时刻去查（以常见的ReadCommitted或ReadRepeatable隔离级别），都是不变的，也就是业务约束一直都保持的这种一致性，我们称之为强一致性。
+
+## 无法强一致
+目前在跨库、跨服务的分布式实际应用中，尚未看到有强一致性的方案。
+
+我们来看看一致性级别最高的XA事务（读者如果还不了解，可以参考[XA事务](./xa)），是否是强一致的，我们以跨行转账（在这里，我们以跨库更新AB来模拟）作为例子来说明，下面是一个XA事务的时序图：
+
+![xa-no-c](../imgs/xa-no-c.svg)
+
+在这个时序图中，我们在如图所示的时间点发起查询，就是在两个commit中间进行的查询，那么我们查到的结果数据，将是A+B+30，不等于A+B，不符合强一致的要求。
+
+> 从微服务1查到的结果为A，因为A-30这个事务未提交；从微服务2查到的结果为B+30；总和为A+B+30
+
+从理论上分析，由于是分布式系统，那么一定是无法保证两个commit同时结束，只要两个commit中间有时间差，那么无论如何我们都无法保证强一致性。
+
+## 理论上的强一致性
+我们接下来思考，普通XA事务不是强一致的，但假如完全不考虑性能因素，有没有可能在理论上做到强一致：
+
+我们先看看如果我们把XA事务涉及的数据库，隔离级别设定到Serializable，是否能到到强一致的效果呢？我们来看看前面的时序场景：
+
+![xa-serial-c](../imgs/xa-serial-c.png)
+
+这种情况下，查到结果等于A+B。
+
+> 此时从微服务1查到的结果为A-30，因为在串行化之下，查询会等到A-30这个事务提交才返回；从微服务2查到的结果为B+30；总和为A+B。
+
+但是又有另一些场景出现了问题，如下图所示：
+
+![xa-serial-c2](../imgs/xa-serial-c2.png)
+
+按照图中时序查询的结果是：A+B-30，依旧是不一致。
+
+> 此时从微服务1查到的结果为A-30，因为在串行化之下，查询会等到A-30这个事务提交才返回；从微服务2查到的结果为B，因为B+30这个事务还没有开始；总和为A+B-30.
+
+深入思考这个强一致的问题之后，有一种做法可以在普通的读已提交下做到强一致，做法如下：
+
+- 对于查询，也采用XA事务，并且查询数据时，采用select for update的方式，所有数据查完之后，再xa commit
+- 具体到当前这个时序图中，要先锁A查A，然后锁B查B，最后再分别提交，否则可能出现死锁
+
+在上述策略下，我们可以看到，在时序图任何一个时间点进行查询，获得的结果都是A+B
+
+![xa-strong-c](../imgs/xa-strong-c.png)
+
+- 在T0时间查询，那么修改一定发生在查询全部完成之后，所以查询得到结果A+B
+- 在T1，T2，T3查询，那么查询结果返回一定全部发生在修改完成之后，所以查询得到结果也是A+B
+
+很明显这种方案下的强一致，缺点非常多。互联网应用大多是读多写少，在数据库中，原先的读可以通过多版本技术，不被锁定，快速出结果，而上述这种强一致方案：
+- 一方面效率极低，所有有数据交集的数据库读读、读写、写写都必须串行执行。
+- 另一方面，开发人员进行数据库多个数据查询时，也可能发生死锁，要么让开发人员小心排好访问顺序，要么接受死锁。
+
+目前暂未看到实际应用中有哪些系统采用这种方式来进行强一致的跨库分布式事务。
+
+未来有没有可能借鉴NewSQL的这种方式，来实现跨库、跨微服务这类分布式事务的强一致性？理论上是可以的。
+
+- 实现跨服务但不跨库的分布式事务一致性，会相对简单一些，其中一种方式就是实现XA事务中的TMRESUME选项。我们从前面的分析中看到，XA事务的不一致，来源于分布式系统上的两个commit无法同时完成，现在已经在一个数据库，只是跨服务，那么TMRESUME可以允许我们将某个服务的XA事务继续往前操作，最终提交时，只有一个xa commit，因此避免了两个xa commit中间的不一致时间窗口，那么就是强一致的。
+- 实现跨数据库的分布式事务一致性，会困难很多，因为各个数据库的内部版本机制都不一样，想要协同非常困难。困难来自于两点：一是不同厂商之间的MVCC机制不一样，例如Spanner是TrueTime，TiDB是单点授时，还有一些是逻辑时钟，想要兼容多种MVCC非常困难。二是不同厂商难以有足够的商业利益驱动去做这样的协同。
+
+## 最终一致性
+从前面的分析中可以看到，在分布式事务进行的过程中，一致性是无法得到保证的，但是分布式事务完成之后，一致性是没问题的，严格遵守的。因此我们将分布式事务方案称为最终一致性方案，这个最终一致性，与CAP中的最终一致性用了同样的词语，但他们的具体含义是不一样的，在CAP中是指读取操作最终能够读取到最后一次写入的结果，在分布式事务中是指最终事务完成后，数据严格满足业务约束。
+
+既然现有的各种分布式事务方案都无法做到强一致，那么最终一致性之间是否有差别呢？我们进行了以下关于一致性强弱的分类：
+
+一致性由强到弱分别是：
+
+[XA事务](./xa)>[TCC](./tcc)>[二阶段消息](./msg)>[SAGA](./saga)
+
+他们的分类为：
+![c-classify](../imgs/c-classify.png)
+
+- **不一致窗口短**：XA和TCC在理想的情况下，可以做到不一致的窗口时间很短
+- **不一致窗口长**：SAGA和MSG则缺少控制不一致窗口时间的方法，相对来说会更长
+- **XA**：XA虽然不是强一致，但是XA的一致性是多种分布式事务中，一致性最好的，因为他处于不一致的状态时间很短，只有一部分分支开始commit，但还没有全部commit的这个时间窗口，数据是不一致的。因为数据库的commit操作耗时，通常是10ms内，因此不一致的窗口期很短。
+- **TCC**：理论上，TCC可以用XA来实现，例如Try-Prepare，Confirm-Commit，Cancel-Rollback。但绝大多数时候，TCC会在业务层自己实现Try|Confirm|Cancel，因此Confirm操作耗时，通常高于XA中的Commit，不一致的窗口时间比XA长
+- **MSG**：二阶段消息型事务在第一个操作完成后，在所有操作完成之前，这个时间窗口是不一致的，持续时长一般比前两者更久。
+- **SAGA**：SAGA的不一致窗口时长与消息接近，但是如果发生回滚，而子事务中正向操作修改的数据又会被用户看到，这部分数据就是错误数据，容易给用户带来较差的体验，因此一致性是最差的。
+
+我们这里的分类仅仅从我们关心的几个维度进行了归纳，适用于多数场景，但并不一定适用所有情况。
+
+## 小结
+
+在这里，我们介绍了分布式事务相关的理论，分析了分布式事务的最终一致性，接下来，我们将介绍DTM的架构与实践
+
+---
+
+# Workflow模式
+
+Source: https://github.com/dtm-labs/dtm.pub/blob/main/docs/practice/workflow.md
+
+# Workflow模式
+
+Workflow 模式是DTM首创推出的模式，在这个模式下，可以混合使用XA、SAGA、TCC，也可以混合使用HTTP、gRPC、本地操作，用户可以对分布式事务里面的绝大部分内容进行定制，具备极大的灵活性，下面我们以转账场景，讲述如何在Workflow下进行实现。
+
+## workflow例子
+Workflow模式下，既可以使用HTTP协议，也可以使用gRPC协议，或者是本地操作。下面以gRPC协议作为例子，一共分为以下几步：
+- 初始化 SDK
+- 注册workflow
+- 执行workflow
+
+#### 首先需要在使用workflow前对 SDK 的 Workflow 进行初始化：
+
+``` Go
+import 	"github.com/dtm-labs/dtmgrpc/workflow"
+
+// 初始化workflow SDK，三个参数分别为：
+// 第一个参数，dtm服务器地址
+// 第二个参数，业务服务器地址
+// 第三个参数，grpcServer
+// workflow的需要从"业务服务器地址"+"grpcServer"上接收dtm服务器的回调
+workflow.InitGrpc(dtmGrpcServer, busi.BusiGrpc, gsvr)
+```
+
+#### 然后需要注册workflow的处理函数
+``` Go
+wfName := "wf_saga"
+err := workflow.Register(wfName, func(wf *workflow.Workflow, data []byte) error {
+  req := MustUnmarshalReqGrpc(data)
+  wf.NewBranch().OnRollback(func(bb *dtmcli.BranchBarrier) error {
+    _, err := busi.BusiCli.TransOutRevert(wf.Context, req)
+    return err
+  })
+  _, err := busi.BusiCli.TransOut(wf.Context, req)
+  if err != nil {
+    return err
+  }
+  wf.NewBranch().OnRollback(func(bb *dtmcli.BranchBarrier) error {
+    _, err := busi.BusiCli.TransInRevert(wf.Context, req)
+    return err
+  })
+  _, err = busi.BusiCli.TransIn(wf.Context, req)
+  return err
+})
+```
+
+- 这个注册操作需要在业务服务启动之后执行，因为当进程crash，dtm会回调业务服务器，继续未完成的任务
+- 上述代码`NewBranch`会创建一个事务分支，一个分支会包括一个正向操作，以及全局事务提交/回滚时的回调
+- `OnRollback/OnCommit`会给当前事务分支指定全局事务回滚/提交时的回调，上述代码中，只指定了`OnRollback`，属于Saga模式
+- 这里面的 `busi.BusiCli` 需要添加workflow的拦截器，该拦截器会自动把rpc的请求结果记录到dtm，如下所示
+``` Go
+conn1, err := grpc.Dial(busi.BusiGrpc, grpc.WithUnaryInterceptor(workflow.Interceptor), nossl)
+busi.BusiCli = busi.NewBusiClient(conn1)
+```
+
+当然您也可以给所有的gRPC client添加`workflow.Interceptor`，这个中间件只会处理`wf.Context`和`wf.NewBranchContext()`下的请求
+
+- 当工作流函数返回nil/ErrFailure，全局事务会进入Commit/Rollback阶段，反序调用函数内部OnCommit/OnRollback注册的操作
+
+#### 最后是执行workflow
+``` Go
+req := &busi.ReqGrpc{Amount: 30}
+err = workflow.Execute(wfName, shortuuid.New(), dtmgimp.MustProtoMarshal(req))
+```
+
+- 当Execute的结果为`nil/ErrFailure`时，全局事务已成功/已回滚。
+- 当Execute的结果为其他值时，dtm服务器后续会回调这个工作流任务进行重试
+
+## workflow原理
+workflow是如何保证分布式事务的数据一致性呢？当业务进程出现crash等问题时，dtm服务器会发现这个workflow全局事务超时未完成，那么dtm会采用指数回避的策略，对workflow事务进行重试。当workflow的重试请求到达业务服务，SDK会从dtm服务器读取全局事务的进度，对于已完成的分支，会将之前保存的结果，通过gRPC/HTTP等拦截器，直接返回分支结果。最终workflow会顺利完成。
+
+工作流函数需要做到幂等，即第一次调用，或者后续重试，都应当获得同样的结果
+
+## Workflow下的Saga
+Saga模式源自于这篇论文 [SAGAS](https://www.cs.cornell.edu/andru/cs711/2002fa/reading/sagas.pdf)，其核心思想是将长事务拆分为多个短事务，由Saga事务协调器协调，如果每个短事务都成功提交完成，那么全局事务就正常完成，如果某个步骤失败，则根据相反顺序一次调用补偿操作。
+
+在Workflow模式下，您可以在函数中，直接调用正向操作的函数，然后将补偿操作写到分支的`OnRollback`，那么补偿操作就会自动被调用，达到了Saga模式的效果
+
+## Workflow下的Tcc
+Tcc模式源自于这篇论文 [Life beyond Distributed Transactions:an Apostate’s Opinion](https://www.ics.uci.edu/~cs223/papers/cidr07p15.pdf)，他将一个大事务分成多个小事务，每个小事务有三个操作：
+- Try 阶段：尝试执行，完成所有业务检查（一致性）, 预留必须业务资源（准隔离性）
+- Confirm 阶段：如果所有分支的Try都成功了，则走到Confirm阶段。Confirm真正执行业务，不作任何业务检查，只使用 Try 阶段预留的业务资源
+- Cancel 阶段：如果所有分支的Try有一个失败了，则走到Cancel阶段。Cancel释放 Try 阶段预留的业务资源。
+
+对于我们的 A 跨行转账给 B 的场景，如果采用SAGA，在正向操作中调余额，在补偿操作中，反向调整余额，那
+么会出现以下情况：
+- A扣款成功
+- A看到余额减少，并告诉B
+- 金额转入B失败，整个事务回滚
+- B一直收不到这笔资金
+
+这样给AB双方带来了极大的困扰。这种情况在SAGA中无法避免，但是可以通过TCC来解决，设计技巧如下：
+- 在账户中的 balance 字段之外，再引入一个 trading_balance 字段
+- Try 阶段检查账户是否被冻结，检查账户余额是否充足，没问题后，调整 trading_balance （即业务上的冻结资金）
+- Confirm 阶段，调整 balance ，调整 trading_balance （即业务上的解冻资金）
+- Cancel 阶段，调整 trading_balance （即业务上的解冻资金）
+
+这种情况下，一旦终端用户 A 看到自己的余额扣减了，那么 B 一定能够收到资金
+
+在Workflow模式下，您可以在函数中，直接调用`Try`操作，然后将`Confirm`操作写到分支的`OnCommit`，将`Cancel`操作写到分支的`OnRollback`，达到了`Tcc`模式的效果
+
+## Workflow下的XA
+XA是由X/Open组织提出的分布式事务的规范，XA规范主要定义了(全局)事务管理器(TM)和(局部)资源管理器(RM)之间的接口。本地的数据库如mysql在XA中扮演的是RM角色
+
+XA一共分为两阶段：
+
+第一阶段（prepare）：即所有的参与者RM准备执行事务并锁住需要的资源。参与者ready时，向TM报告已准备就绪。
+第二阶段 (commit/rollback)：当事务管理者(TM)确认所有参与者(RM)都ready后，向所有参与者发送commit命令。
+
+目前主流的数据库基本都支持XA事务，包括mysql、oracle、sqlserver、postgre
+
+在Workflow模式下，你可以在工作流函数中，调用`NewBranch().DoXa`来开启您的XA事务分支。
+
+## 多种模式混合使用
+在Workflow模式下，上述的Saga、Tcc、XA都是分支事务的模式，因此可以部分分支采用一种模式，其他分支采用另一种模式。这种混合模式带来的灵活性可以做到根据分支事务的特性选择子模式，因此建议如下：
+- XA：如果业务没有行锁争抢，那么可以采用XA，这个模式需要的额外开发量比较低，`Commit/Rollback`是数据库自动完成的。例如这个模式适合创建订单业务，不同的订单锁定的订单行不同，相互之间并发无影响；不适合扣减库存，因为涉及同一个商品的订单都会争抢这个商品的行锁，会导致并发度低。
+- Saga：不适合XA的普通业务可以采用这个模式，这个模式额外的开发量比Tcc要少，只需要开发正向操作和补偿操作
+- Tcc：适合一致性要求较高，例如前面介绍的转账，这个模式额外的开发量最多，需要开发包括`Try/Confirm/Cancel`
+
+## gRPC支持
+对gRPC的支持，包括两个方面：
+- 以gRPC协议方式与dtm服务器通信，例如上面例子中，调用上述的`workflow.InitGrpc`初始化后，dtm的SDK会走gRPC接口与dtm服务器交互
+- 以gRPC协议方式访问事务分支，例如上面例子中`reply, err = busi.BusiCli.TransIn(wf.Context, req)`，这个gRPC调用中，会通过gRPC的拦截器，自动将调用结果保存到dtm服务器，并在workflow再次执行时，自动将dtm服务器保存的结果，直接返回给调用者。
+
+## HTTP 支持
+对HTTP的支持，包括两个方面：
+- 以HTTP协议方式与dtm服务器通信，Workflow下的`workflow.InitHTTP`初始化后，dtm的SDK会走HTTP接口与dtm服务器交互
+- 以HTTP协议方式访问事务分支，例如`resp, err := wf.NewBranch().NewRequest().SetBody(req).Post(Busi + "/TransOut")`，在这个HTTP的调用中，会通过HTTP的拦截器，自动将调用结果保存到dtm服务器，并在workflow再次执行时，自动将dtm服务器保存的结果，直接返回给调用者。
+
+## 本地操作支持
+在Workflow模式下，你的事务分支，不仅可以采用HTTP/gRPC等远程分支，也可以是本地操作。下面的代码演示了一个本地事务操作：
+``` Go
+wf.Do(func(bb *dtmcli.BranchBarrier) ([]byte, error) {
+  return nil, bb.CallWithDB(dbGet(), func(tx *sql.Tx) error {
+    return busi.SagaAdjustBalance(tx, busi.TransOutUID, -req.Amount, "")
+  })
+})
+```
+
+您可以进行本地事务操作，也可以进行其他操作，灵活使用
+
+## gRPC/HTTP/本地 混合使用
+在一个分布式事务中，您也可以混合使用gRPC/HTTP/本地 这些方式去处理你的事务分支，可以给您极大的灵活性。对于多技术栈，对于多协议并存，以及将已有的遗留系统接入分布式事务等各种场景，提供了非常好的解决方案。
+
+## 幂等要求
+在Workflow模式下，当crash发生时，会进行重试，因此要求各个操作支持幂等，即多次调用和一次调用的结果是一样的，返回相同的结果。业务中，通常采用数据库的`unique key`来实现幂等，具体为`insert ignore "unique-key"`，如果插入失败，说明这个操作已完成，此次直接忽略返回；如果插入成功，说明这是首次操作，继续后续的业务操作。
+
+如果您的业务本身就是幂等的，那么您直接操作您的业务即可；如果您的业务未提供幂等功能，那么dtm提供了`BranchBarrier`辅助类，基于上述unique-key原理，可以方便的帮助开发者实现在`Mysql/Mongo/Redis`中实现幂等操作。
+
+以下两个是典型的非幂等操作，请注意：
+- 超时回滚：假如您的业务中有一个操作可能耗时长，并且您想要让您的全局事务在等待超时后，返回失败，进行回滚。那么这个就不是幂等操作，因为在极端情况下，两个进程同时调用了该操作，一个返回了超时失败，而另一个返回了成功，导致结果不同
+- 达到重试上限后回滚：分析过程同上。
+
+Workflow模式暂未支持上述的超时回滚及重试达到上限后回滚，如果您有相关的场景需求，欢迎把具体场景给我们，我们将积极考虑是否添加这种的支持
+
+## 分支操作结果
+分支操作会返回以下几种结果：
+- 成功：分支操作返回`HTTP-200/gRPC-nil`
+- 业务失败：分支操作返回`HTTP-409/gRPC-Aborted`，不再重试，全局事务需要进行回滚
+- 进行中：分支操作返回`HTTP-425/gRPC-FailPrecondition`，这个结果表示事务正在正常进行中，要求dtm重试时，不要采用指数退避算法，而是采用固定间隔重试
+- 未知错误 ：分支操作返回其他结果，表示未知错误，dtm会重试这个工作流，采用指数退避算法
+
+如果您的现有服务与上述的结果不同，那么您可以通过`workflow.Options.HTTPResp2DtmError/GRPCError2DtmError`来定制这部分结果
+
+Saga的补偿操作、Tcc的Confirm/Cancel操作，按照Saga和Tcc的协议，是不允许返回业务上的失败，因为到了工作流的第二阶段Commit/Rollback，此时既不成功，也不让重试，那么全局事务无法完成，这点请开发者在设计时就要注意避免
+
+## 事务完成通知
+部分业务场景，想要获得事务完成的通知，这个功能可以通过在第一个事务分支上设置`OnFinish`回调来实现。当回调函数被调用时，所有的业务操作已经执行完毕，因此全局事务在实质上已经完成。回调函数可以依据传入的`isCommit`来判断全局事务最终提交了还是回滚了。
+
+有一个地方需要注意，收到`OnFinish`回调时，dtm服务器上，这个事务的状态还未修改为最终状态，因此如果混合使用事务完成通知和查询全局事务结果，那么两者的结果可能不一致，建议用户只使用其中一种方式，而不要混合使用。
+
+## 性能
+在DTM里，正常完成一个Workflow事务，需要两个分开的全局事务写（一个是Prepare时保存，另一个是将状态改为成功），需要保存中间事务进度（这部分批量化后，开销很小）。对比DTM的Saga模式，少了一个单独的分支事务保存，另外分支事务的写入量变小（成功的事务不需要额外保存补偿分支），因此性能会比Saga的性能更好，详细的测试报告，未来会出。
+
+## 下一步工作
+- 逐步完善workflow的例子以及文档
+- 支持分支事务并发
+
+---
+
+# XA事务模式
+
+Source: https://github.com/dtm-labs/dtm.pub/blob/main/docs/practice/xa.md
+
+# XA事务模式
+
+## XA是什么
+
+XA是由X/Open组织提出的分布式事务的规范，XA规范主要定义了(全局)事务管理器(TM)和(局部)资源管理器(RM)之间的接口。本地的数据库如mysql在XA中扮演的是RM角色
+
+XA一共分为两阶段：
+
+第一阶段（prepare）：即所有的参与者RM准备执行事务并锁住需要的资源。参与者ready时，向TM报告已准备就绪。
+第二阶段 (commit/rollback)：当事务管理者(TM)确认所有参与者(RM)都ready后，向所有参与者发送commit命令。
+
+目前主流的数据库基本都支持XA事务，包括mysql、oracle、sqlserver、postgre
+
+我们看看本地数据库是如何支持XA的：
+
+第一阶段 准备
+
+``` sql
+XA start '4fPqCNTYeSG' -- 开启一个 xa 事务
+UPDATE `user_account` SET `balance`=balance + 30,`update_time`='2021-06-09 11:50:42.438' WHERE user_id = '1'
+XA end '4fPqCNTYeSG'
+XA prepare '4fPqCNTYeSG' -- 此调用之前，连接断开，那么事务会自动回滚
+-- 当所有的参与者完成了prepare，就进入第二阶段 提交
+xa commit '4fPqCNTYeSG'
+```
+
+## XA实战
+
+我们来完成一个完整的XA，我们先看一个成功的XA时序图：
+
+![xa_normal](../imgs/xa_normal.jpg)
+
+### HTTP接入
+我们来看看如何用使用HTTP接入一个基于[dtm-labs/dtm](https://github.com/dtm-labs/dtm)的XA事务
+``` go
+	gid := dtmcli.MustGenGid(dtmutil.DefaultHTTPServer)
+	err := dtmcli.XaGlobalTransaction(dtmutil.DefaultHTTPServer, gid, func(xa *dtmcli.Xa) (*resty.Response, error) {
+		resp, err := xa.CallBranch(&busi.TransReq{Amount: 30}, busi.Busi+"/TransOutXa")
+		if err != nil {
+			return resp, err
+		}
+		return xa.CallBranch(&busi.TransReq{Amount: 30}, busi.Busi+"/TransInXa")
+	})
+
+app.POST(BusiAPI+"/TransInXa", dtmutil.WrapHandler2(func(c *gin.Context) interface{} {
+	return dtmcli.XaLocalTransaction(c.Request.URL.Query(), BusiConf, func(db *sql.DB, xa *dtmcli.Xa) error {
+		return AdjustBalance(db, TransInUID, reqFrom(c).Amount, reqFrom(c).TransInResult)
+	})
+}))
+app.POST(BusiAPI+"/TransOutXa", dtmutil.WrapHandler2(func(c *gin.Context) interface{} {
+	return dtmcli.XaLocalTransaction(c.Request.URL.Query(), BusiConf, func(db *sql.DB, xa *dtmcli.Xa) error {
+		return AdjustBalance(db, TransOutUID, reqFrom(c).Amount, reqFrom(c).TransOutResult)
+	})
+}))
+```
+
+详细例子代码参考[dtm-examples](https://github.com/dtm-labs/dtm-examples)：可以通过以下命令运行这个示例：
+```
+go run main.go http_xa
+```
+
+上面的代码首先注册了一个全局XA事务，然后添加了两个子事务TransOut、TransIn。子事务全部执行成功之后，提交给dtm。dtm收到提交的xa全局事务后，会调用所有子事务的xa commit，完成整个xa事务。
+
+### 失败回滚
+
+如果有一阶段prepare操作失败，那么dtm会调用各子事务的xa rollback，进行回滚，最后事务成功回滚。
+
+我们在上述XaFireRequest的请求负荷中，传递TransInResult=FAILURE，让他失败
+
+``` go
+req := &busi.TransReq{Amount: 30, TransInResult: "FAILURE"}
+```
+
+失败的时序图如下：
+
+![xa_rollback](../imgs/xa_rollback.jpg)
+
+### 注意点
+- dtm的XA事务接口在 v1.13.0 做了一次变更，大幅简化了XA事务的使用，整体上与TCC的接口保持一致，更易于上手。
+- XA事务的第二阶段处理，即分支的最终提交或回滚，也会发往 API `BusiAPI+"/TransOutXa"`，在这个服务的内部，`dtmcli.XaLocalTransaction`会自动做`xa commit | xa rollback`， 此时请求的body为nil，因此解析body之类的操作，如前面的`reqFrom`需要放在`XaLocalTransaction`内部，否则会解析body出错.
+
+### 小结
+XA事务的特点是：
+- 简单易理解
+- 开发较容易，回滚之类的操作，由底层数据库自动完成
+- 对资源进行了长时间的锁定，并发度低，不适合高并发的业务
+
+---
+
+# 更多功能特性
+
+Source: https://github.com/dtm-labs/dtm.pub/blob/main/docs/ref/feature.md
+
+# 更多功能特性
+大部分的功能特性，已经在相关的文档里详细介绍，下面将介绍额外的功能特性
+
+## 鉴权
+对于许多公司的api，通常需要鉴权，大部分鉴权系统是通过http/grpc的header携带token，dtm支持全局事务范围的header自定义，详细的使用，可以参考 [事务选项](./options)中自定义header部分
+
+## 单服务多数据源
+部分应用服务，会访问多个数据源，当他们组成全局事务时，需要做到多个数据源的事务，要么都成功，要么都回滚。大多数分布式事务框架，未提供这种支持，而 dtm 可以通过简单的技巧支持
+
+假定现在跨行转账时，不需要跨服务，只需要跨数据库修改数据，那么可以将两个事务分支，合并为一个事务分支，然后在一个服务内，跨数据源操作数据。
+
+``` go
+app.POST(BusiAPI+"/SagaMultiSource", dtmutil.WrapHandler2(func(c *gin.Context) interface{} {
+  barrier := MustBarrierFromGin(c)
+  transOutSource := pdbGet() // 数据源1
+  err := barrier.CallWithDB(transOutSource, func(tx *sql.Tx) error {
+    return SagaAdjustBalance(tx, TransOutUID, -reqFrom(c).Amount, reqFrom(c).TransOutResult)
+  })
+  if err != nil {
+    return err
+  }
+  transInSource := pdbGet() // 数据源2
+  return MustBarrierFromGin(c).CallWithDB(transInSource, func(tx *sql.Tx) error {
+    return SagaAdjustBalance(tx, TransInUID, reqFrom(c).Amount, reqFrom(c).TransInResult)
+  })
+}))
+app.POST(BusiAPI+"/SagaMultiSourceRevert", dtmutil.WrapHandler2(func(c *gin.Context) interface{} {
+  barrier := MustBarrierFromGin(c)
+  transInSource := pdbGet() // 数据源2
+  err := MustBarrierFromGin(c).CallWithDB(transInSource, func(tx *sql.Tx) error {
+    return SagaAdjustBalance(tx, TransInUID, -reqFrom(c).Amount, "")
+  })
+  if err != nil {
+    return err
+  }
+  transOutSource := pdbGet() // 数据源1
+  return barrier.CallWithDB(transOutSource, func(tx *sql.Tx) error {
+    return SagaAdjustBalance(tx, TransOutUID, +reqFrom(c).Amount, "")
+  })
+}))
+
+saga := dtmcli.NewSaga(dtmutil.DefaultHTTPServer, dtmcli.MustGenGid(dtmutil.DefaultHTTPServer)).
+  Add(busi.Busi+"/SagaMultiSource", busi.Busi+"/SagaMultiSourceRevert", req)
+
+```
+
+上述的代码能够保证，在各种异常情况下，数据源1和数据源2的数据修改，要么同时成功，要么同时回滚。
+
+可运行的示例，参见[dtm-examples](https://github.com/dtm-labs/dtm-examples)中的 `multiSource`
+
+---
+
+# go-zero支持
+
+Source: https://github.com/dtm-labs/dtm.pub/blob/main/docs/ref/gozero.md
+
+# go-zero支持
+dtm与go-zero进行了深度合作，打造了go-zero原生支持分布式事务的解决方案，提供了极简的用户体验。感谢go-zero作者[kevwan](https://github.com/kevwan)的大力支持
+
+dtm从v1.6.0开始原生支持go-zero微服务框架，go-zero的版本需要v1.2.4以上
+
+## 运行一个已有的示例
+我们以etcd作为注册服务中心为例，按照如下步骤运行一个go-zero的示例：
+
+- 启动etcd
+```
+# 前提：已安装etcd
+etcd
+```
+- 配置dtm
+```
+MicroService:
+  Driver: 'dtm-driver-gozero' # 配置dtm使用go-zero的微服务协议
+  Target: 'etcd://localhost:2379/dtmservice' # 把dtm注册到etcd的这个地址
+  EndPoint: 'localhost:36790' # dtm的本地地址
+```
+- 启动dtm
+```
+# 前提：配置好conf.yml
+go run app/main.go -c conf.yml
+```
+- 运行一个go-zero的服务
+```
+git clone https://github.com/dtm-labs/dtmdriver-clients && cd dtmdriver-clients
+cd gozero/trans && go run trans.go
+```
+- 发起一个go-zero使用dtm的事务
+```
+# 在dtmdriver-clients的目录下
+cd gozero/app && go run main.go
+```
+
+当您在trans的日志中看到
+```
+2021/12/03 15:44:05 transfer out 30 cents from 1
+2021/12/03 15:44:05 transfer in 30 cents to 2
+2021/12/03 15:44:05 transfer out 30 cents from 1
+2021/12/03 15:44:05 transfer out 30 cents from 1
+```
+那就是事务正常完成了
+
+## 开发接入
+参考[dtm-labs/dtmdriver-clients](https://github.com/dtm-labs/dtmdriver-clients/blob/main/gozero/app/main.go)的代码
+
+``` go
+// 下面这行导入gozero的dtm驱动
+import _ "github.com/dtm-labs/driver-gozero"
+
+// dtm已经通过前面的配置，注册到下面这个地址，因此在dtmgrpc中使用该地址
+var dtmServer = "etcd://localhost:2379/dtmservice"
+
+// 下面从配置文件中Load配置，然后通过BuildTarget获得业务服务的地址
+var c zrpc.RpcClientConf
+conf.MustLoad(*configFile, &c)
+busiServer, err := c.BuildTarget()
+
+  // 使用dtmgrpc生成一个消息型分布式事务并提交
+	gid := dtmgrpc.MustGenGid(dtmServer)
+	msg := dtmgrpc.NewMsgGrpc(dtmServer, gid).
+    // 事务的第一步为调用trans.TransSvcClient.TransOut
+    // 可以从trans.pb.go中找到上述方法对应的Method名称为"/trans.TransSvc/TransOut"
+    // dtm需要从dtm服务器调用该方法，所以不走强类型
+    // 而是走动态的url: busiServer+"/trans.TransSvc/TransOut"
+		Add(busiServer+"/trans.TransSvc/TransOut", &busi.BusiReq{Amount: 30, UserId: 1}).
+		Add(busiServer+"/trans.TransSvc/TransIn", &busi.BusiReq{Amount: 30, UserId: 2})
+	err := msg.Submit()
+
+```
+
+整个开发接入的过程很少，前面的注释已经很清晰，就不再赘述了
+
+
+#### 注意事项
+在去找*.pb.go的文件中的grpc访问的方法路径时候，一定要找invoke的路径
+
+![pb_url_right](../imgs/pb_url_right.png)
+
+<img src="../imgs/pb_url_wrong.png" height=200/>
+
+## 深入理解动态调用
+在go-zero使用dtm的分布式事务时，许多的调用是从dtm服务器发起的，例如TCC的Confirm/Cancel，SAGA/MSG的所有调用。
+
+dtm无需知道组成分布式事务的相关业务api的强类型，它是动态的调用这些api。
+
+grpc的调用，可以类比于HTTP的POST，其中：
+
+- c.BuildTarget() 产生的target类似于URL中的Host
+- "/trans.TransSvc/TransOut" 相当于URL中的Path
+- &busi.BusiReq{Amount: 30, UserId: 1} 相当于Post中Body
+- pb.Response 相当于HTTP请求的响应
+
+通过下面这部分代码，dtm就拿到了完整信息，就能够发起完整的调用了
+
+`Add(busiServer+"/trans.TransSvc/TransOut", &busi.BusiReq{Amount: 30, UserId: 1})`
+
+## 更加完整的例子
+热心的社区同学Mikael帮忙写了一个内容更加丰富的例子，结合实际应用和子事务屏障，完整的演示了一个线上实际运行的分布式事务，有兴趣的同学可以参考：
+
+- [https://github.com/Mikaelemmmm/gozerodtm](https://github.com/Mikaelemmmm/gozerodtm)
+- [https://github.com/nivin-studio/go-zero-mall](https://github.com/nivin-studio/go-zero-mall)
+
+::: tip docker 中部署
+接入过程中，如果你使用了docker部署，那么请参照上述两个完整例子中，关于docker的地址配置，避免因为localhost/127.0.0.1在docker中无法互通导致问题
+:::
+## 其他方式接入
+go-zero的微服务还有非etcd的其他方式，我们依次说明他们的接入方式
+
+#### consul接入
+dtm也支持go-zero的consul接入，需要版本1.13.2+，配置示例如下：
+
+```
+MicroService:
+  Driver: 'dtm-driver-gozero' # 配置dtm使用go-zero的微服务协议
+  Target: 'consul://localhost:2379/dtmservice' # 把dtm注册到consul的这个地址
+  EndPoint: 'localhost:36790' # dtm的本地地址
+```
+
+完整的示例，可以从[https://github.com/Mikaelemmmm/gozerodtm](https://github.com/Mikaelemmmm/gozerodtm)找到
+
+#### 直连
+对于直连这种方式，您只需要在上面dtm的etcd配置基础上，将Target设置为空字符串即可。
+
+直连的情况，不需要将dtm注册到注册中心
+
+#### K8S
+对于K8S这种方式，您只需要在上面dtm的etcd配置基础上，将Target设置为空字符串即可。
+
+在K8S中，将服务注册到K8S中，是有deployment.yaml完成的，应用内部，不需要进行注册
+
+## 小结
+
+欢迎使用[dtm](https://github.com/dtm-labs/dtm)，并star支持我们，一起共建golang的微服务生态
+
+---
+
+# HTTP 参考
+
+Source: https://github.com/dtm-labs/dtm.pub/blob/main/docs/ref/http.md
+
+# HTTP 参考
+
+## 概述
+DTM 可以通过HTTP协议交互。因为事务本身具有特殊性，它和普通的api调用只区分成功和失败不同，DTM的结果状态详情，请参考[接口协议](../practice/arch#proto)
+
+接口主要分为三类： AP调用TM的接口、AP调用RM的接口、TM调用RM的接口。本文主要讲解AP调用TM的接口，其他两类接口参见[dtm 架构](../practice/arch)
+
+## AP调用TM的接口
+
+这部分接口的路径前缀为/api/dtmsvr。例如后面介绍的prepare，实际路径为/api/dtmsvr/prepare
+
+这部分接口如果对事务状态进行变更，则dtm会对事务状态做相关的校验，有可能校验失败，而返回错误。以一个实际的例子说明：
+
+如果调用prepare时，这个事务状态已经是failed，那么dtm将返回错误码409，错误内容：
+``` JSON
+{
+    "dtm_result":"FAILURE",
+    "message":"current status 'failed', cannot prepare"
+}
+```
+
+每个接口的详细说明如下：
+
+## newGid 获取Gid
+
+此接口用于获取gid。dtm的gid生成采用ip+snowflake。如果发生短时间内ip重用的情况，有极低概率发生gid重复情况。
+
+因为几乎每个公司都会有自己的唯一id生成基础设置，建议在dtm中使用的gid，采用自己公司内部的唯一id生成算法。
+
+| 接口名称 | 请求方法 | 请求格式 | 适用事务 |
+|:----:|:-----:|:----:|:-----:|
+| newGid | GET | - | - |
+
+请求示例
+``` bash
+curl 'localhost:36789/api/dtmsvr/newGid'
+```
+
+响应示例
+``` JSON
+{
+    "dtm_result":"SUCCESS",
+    "gid":"c0a8038b_4nxAcyxSX8N"
+}
+```
+
+## prepare 准备事务
+
+此接口用于准备事务，正常情况下，后续将提交事务。
+
+| 接口名称 | 请求方法 | 请求格式 | 适用事务 |
+|:----:|:-----:|:----:|:-----:|
+| prepare | POST | JSON | [MSG][], [TCC][], [XA][] |
+
+请求示例
+``` bash
+curl --location --request POST 'localhost:36789/api/dtmsvr/prepare' \
+--header 'Content-Type: application/json' \
+--data-raw '{
+    "gid": "xxx",
+    "trans_type": "tcc"
+}'
+```
+
+响应示例
+``` JSON
+{
+    "dtm_result":"SUCCESS"
+}
+```
+
+MSG 的prepare请求还会携带分支信息
+##  MSG的prepare示例
+请求示例
+``` bash
+curl --location --request POST 'localhost:36789/api/dtmsvr/prepare' \
+--header 'Content-Type: application/json' \
+--data-raw '{
+    "gid":"TestMsgTimeoutSuccess",
+    "trans_type":"msg",
+    "steps":[
+        {
+            "action":"http://localhost:8081/api/busi/TransOut"
+        },
+        {
+            "action":"http://localhost:8081/api/busi/TransIn"
+        }
+    ],
+    "payloads":[
+        "{\"amount\":30,\"transInResult\":\"SUCCESS\",\"transOutResult\":\"SUCCESS\"}",
+        "{\"amount\":30,\"transInResult\":\"SUCCESS\",\"transOutResult\":\"SUCCESS\"}"
+    ],
+    "query_prepared":"http://localhost:8081/api/busi/CanSubmit"
+}'
+```
+- steps 指定整个事务会分成多个步骤，每个步骤的正向操作url为action
+- payloads 表示每个步骤中进行http请求时的body
+- query_prepared 指定事务消息超时后进行查询的url
+
+## submit 提交事务
+
+此接口用于提交全局事务
+
+| 接口名称 | 请求方法 | 请求格式 | 适用事务 |
+|:----:|:-----:|:----:|:-----:|
+| submit | POST | JSON | [MSG][], [SAGA][], [TCC][], [XA][] |
+
+请求示例
+``` bash
+curl --location --request POST 'localhost:36789/api/dtmsvr/submit' \
+--header 'Content-Type: application/json' \
+--data-raw '{
+    "gid": "xxx",
+    "trans_type": "tcc"
+}'
+```
+
+响应示例
+``` JSON
+{
+    "dtm_result":"SUCCESS"
+}
+```
+
+其中MSG和SAGA的submit还会携带分支信息
+
+## MSG的submit示例
+请求示例
+``` bash
+curl --location --request POST 'localhost:36789/api/dtmsvr/submit' \
+--header 'Content-Type: application/json' \
+--data-raw '{
+    "gid":"TestMsgNormal",
+    "trans_type":"msg",
+    "steps":[
+        {
+            "action":"http://localhost:8081/api/busi/TransOut"
+        },
+        {
+            "action":"http://localhost:8081/api/busi/TransIn"
+        }
+    ],
+    "payloads":[
+        "{\"amount\":30,\"transInResult\":\"SUCCESS\",\"transOutResult\":\"SUCCESS\"}",
+        "{\"amount\":30,\"transInResult\":\"SUCCESS\",\"transOutResult\":\"SUCCESS\"}"
+    ]
+}'
+```
+详细字段含义见上述MSG的prepare示例
+
+## SAGA的submit示例
+请求示例
+``` bash
+curl --location --request POST 'localhost:36789/api/dtmsvr/submit' \
+--header 'Content-Type: application/json' \
+--data-raw '{
+    "gid":"TestSagaNormal",
+    "trans_type":"saga",
+    "steps":[
+        {
+            "action":"http://localhost:8081/api/busi/TransOut",
+            "compensate":"http://localhost:8081/api/busi/TransOutRevert"
+        },
+        {
+            "action":"http://localhost:8081/api/busi/TransIn",
+            "compensate":"http://localhost:8081/api/busi/TransInRevert"
+        }
+    ],
+    "payloads":[
+        "{\"amount\":30,\"transInResult\":\"SUCCESS\",\"transOutResult\":\"SUCCESS\"}",
+        "{\"amount\":30,\"transInResult\":\"SUCCESS\",\"transOutResult\":\"SUCCESS\"}"
+    ]
+}'
+```
+
+- steps 指定整个事务会分成多个步骤，每个步骤的正向操作url为action，补偿操作url为compensate
+- payloads 每个步骤http请求的body
+
+## abort 回滚事务
+
+此接口用于回滚全局事务
+
+| 接口名称 | 请求方法 | 请求格式 | 适用事务 |
+|:----:|:-----:|:----:|:-----:|
+| abort | POST | JSON | [TCC][], [XA][] |
+
+请求示例
+``` bash
+curl --location --request POST 'localhost:36789/api/dtmsvr/abort' \
+--header 'Content-Type: application/json' \
+--data-raw '{
+    "gid": "xxx",
+    "trans_type": "tcc"
+}'
+```
+
+响应示例
+``` JSON
+{
+    "dtm_result":"SUCCESS"
+}
+```
+
+## registerBranch
+
+此接口用于TCC, XA事务模式中，注册事务分支
+
+| 接口名称 | 请求方法 | 请求格式 | 适用事务 |
+|:----:|:-----:|:----:|:-----:|
+| registerBranch | POST | JSON | [XA][] [TCC][] |
+
+#### 注册XA分支请求示例
+``` bash
+curl --location --request POST 'localhost:36789/api/dtmsvr/registerBranch' \
+--header 'Content-Type: application/json' \
+--data-raw '{
+    "branch_id":"0101",
+    "gid":"c0a8038b_4nxEEB1M7K3",
+    "trans_type":"xa",
+    "url":"http://localhost:8081/api/busi/xa"
+}'
+```
+- url: xa事务模式最后进行commit/rollback的服务地址
+
+## 注册TCC分支请求示例
+
+``` bash
+curl --location --request POST 'localhost:36789/api/dtmsvr/registerTccBranch' \
+--header 'Content-Type: application/json' \
+--data-raw '{
+    "branch_id":"01",
+    "cancel":"http://localhost:8081/api/busi/TransOutRevert",
+    "confirm":"http://localhost:8081/api/busi/TransOutConfirm",
+    "data":"{\"amount\":30,\"transInResult\":\"\",\"transOutResult\":\"\"}",
+    "gid":"c0a8038b_4nxEEGy7W5h",
+    "trans_type":"tcc"
+}'
+```
+
+- cancel：指定cancel操作的url
+- confirm：指定confirm操作的url
+- data：调用cancel/confirm时需要传递的body
+
+响应示例
+``` JSON
+{
+    "dtm_result":"SUCCESS"
+}
+```
+
+## query 查询事务
+
+此接口用于查询指定gid的事务。
+
+| 接口名称 | 请求方法 | 请求格式 | 适用事务 |
+|:----:|:-----:|:----:|:-----:|
+| query | GET | - | - |
+
+请求示例
+``` bash
+curl 'localhost:36789/api/dtmsvr/query?gid=xxx'
+```
+
+成功响应示例
+``` JSON
+{
+    "branches":[
+    ],
+    "transaction":{
+        "ID":69,
+        "CreateTime":"2021-10-25T08:51:27+08:00",
+        "UpdateTime":"2021-10-25T08:51:39+08:00",
+        "gid":"xxx",
+        "trans_type":"tcc",
+        "data":"",
+        "status":"failed",
+        "query_prepared":"",
+        "protocol":"http",
+        "CommitTime":null,
+        "FinishTime":null,
+        "RollbackTime":"2021-10-25T08:51:39+08:00",
+        "Options":"{}",
+        "NextCronInterval":10,
+        "NextCronTime":"2021-10-25T08:51:49+08:00"
+    }
+}
+```
+
+未找到gid的响应示例
+``` JSON
+{
+    "branches":[
+    ],
+    "transaction":null
+}
+```
+
+## all 批量查询事务
+
+此接口用于批量查询事务。dtm将返回id小于last_id，按照id从大到小排序的100条数据
+
+| 接口名称 | 请求方法 | 请求格式 | 适用事务 |
+|:----:|:-----:|:----:|:-----:|
+| all | GET | - | - |
+
+请求示例
+``` bash
+curl 'localhost:36789/api/dtmsvr/all?last_id='
+```
+
+参数last_id: 上一次请求返回数据的最小id。
+
+成功响应示例
+``` JSON
+{
+    "transactions":[
+        {
+            "ID":69,
+            "CreateTime":"2021-10-25T08:51:27+08:00",
+            "UpdateTime":"2021-10-25T08:51:39+08:00",
+            "gid":"xxx",
+            "trans_type":"tcc",
+            "data":"",
+            "status":"failed",
+            "query_prepared":"",
+            "protocol":"http",
+            "CommitTime":null,
+            "FinishTime":null,
+            "RollbackTime":"2021-10-25T08:51:39+08:00",
+            "Options":"{}",
+            "NextCronInterval":10,
+            "NextCronTime":"2021-10-25T08:51:49+08:00"
+        }
+    ]
+}
+```
+
+空响应示例
+``` JSON
+{
+    "transactions":[
+    ]
+}
+```
+
+## 事务选项
+
+事务支持以下选项，具体含义参加[事务选项文档](./options)：
+- wait_result: 等待事务结果
+- retry_interval: 重试间隔
+- timeout_to_fail: 超时失败时间
+- branch_headers: 自定义header
+
+这些事务选项可以在prepare/submit请求中，发送给TM，请求示例
+
+``` bash
+curl --location --request POST 'localhost:36789/api/dtmsvr/prepare' \
+--header 'Content-Type: application/json' \
+--data-raw '{
+    "gid": "xxx",
+    "trans_type": "tcc",
+    "wait_result": true,
+    "retry_interval": 15,
+    "branch_headers":{"test_header":"test"},
+    "timeout_to_fail": 60
+}'
+```
+
+响应示例
+``` JSON
+{
+    "dtm_result":"SUCCESS"
+}
+```
+
+
+
+[MSG]: ../practice/msg "MSG"
+[TCC]: ../practice/tcc "TCC"
+[XA]: ../practice/xa "XA"
+[SAGA]: ../practice/saga "SAGA"
+
+---
+
+# Kratos支持
+
+Source: https://github.com/dtm-labs/dtm.pub/blob/main/docs/ref/kratos.md
+
+# Kratos支持
+
+## 运行一个已有的示例
+
+我们以 etcd 作为注册服务中心为例，按照如下步骤运行一个 kratos 的示例：
+
+- 启动 etcd
+
+```shell
+# 请先确保已经安装 etcd
+etcd
+```
+
+- 配置 dtm
+
+```yaml
+MicroService:
+ Driver: 'dtm-driver-kratos' # name of the driver to handle register/discover
+ Target: 'etcd://127.0.0.1:2379/dtmservice' # register dtm server to this url
+ EndPoint: 'grpc://localhost:36790'
+```
+
+- 启动 dtm
+
+```shell
+# 请先配置好dtm的数据库
+go run app/main.go -c conf.yml # conf.yml 为你对应的 dtm 配置文件
+```
+
+- 运行一个 kratos 的服务
+
+```shell
+git clone https://github.com/dtm-labs/dtmdriver-clients && cd dtmdriver-clients
+cd kratos/trans
+make build && ./bin/trans -conf configs/config.yaml
+```
+
+- 发起一个 kratos 使用 dtm 的事务
+
+```
+# 在 dtmdriver-clients 的目录下
+
+cd kratos/app && go run main.go
+```
+
+当您在 trans 的日志中看到
+
+```
+INFO msg=config loaded: config.yaml format: yaml
+INFO msg=[gRPC] server listening on: [::]:9000
+2022/03/30 09:35:36 transfer out 30 cents from 1
+2022/03/30 09:35:36 transfer in 30 cents to 2
+```
+
+那就是事务正常完成了
+
+
+
+## 开发接入
+
+参考 [dtm-labs/dtmdriver-clients](https://github.com/dtm-labs/dtmdriver-clients/blob/main/kratos/app/main.go) 的代码
+
+```go
+
+import (
+	"github.com/dtm-labs/client/dtmcli/logger"
+	"github.com/dtm-labs/client/dtmgrpc"
+  // 导入 kratos 的 dtm 驱动
+	_ "github.com/dtm-labs/driver-kratos"
+	"github.com/dtm-labs/dtmdriver-clients/busi"
+	"github.com/go-kratos/kratos/contrib/registry/etcd/v2"
+	"github.com/go-kratos/kratos/v2/transport/grpc/resolver/discovery"
+	etcdAPI "go.etcd.io/etcd/client/v3"
+	"google.golang.org/grpc/resolver"
+	"strings"
+)
+
+var etcdServer = "localhost:2379"
+//采用Kratos的方法创建registry, https://go-kratos.dev/docs/component/registry/
+client, err := etcdAPI.New(etcdAPI.Config{
+  Endpoints: strings.Split(etcdServer, ","),
+})
+if err != nil {
+  panic(err)
+}
+registry := etcd.New(client)
+
+//注册全局的resolver,  现在business server可以使用 discovery:///dtmservice 来访问dtm
+resolver.Register(discovery.NewBuilder(registry, discovery.WithInsecure(true)))
+
+
+var dtmServer = "discovery:///dtmservice"
+
+// 业务地址，下面的 busi 换成实际在 server 初始化设置的名字, dtm将采用registry来访问busi
+var busiServer = "discovery:///busi"
+
+// 发起一个msg事务，保证TransOut和TransIn都会完成
+gid := dtmgrpc.MustGenGid(dtmServer)
+m := dtmgrpc.NewMsgGrpc(dtmServer, gid).
+  Add(busiServer+"/api.trans.v1.Trans/TransOut", &busi.BusiReq{Amount: 30, UserId: 1}).
+  Add(busiServer+"/api.trans.v1.Trans/TransIn", &busi.BusiReq{Amount: 30, UserId: 2})
+m.WaitResult = true
+err := m.Submit()
+logger.FatalIfError(err)
+```
+
+## 深入理解动态调用
+
+在 kratos 使用 dtm 的分布式事务时，许多的调用是从 dtm 服务器发起的，例如 TCC 的Confirm/Cancel，SAGA/MSG 的所有调用。
+
+dtm 无需知道组成分布式事务的相关业务 api 的强类型，它是动态的调用这些api。
+
+grpc 的调用，可以类比于 HTTP 的 POST，其中：
+
+- "/api.trans.v1.Trans/TransIn" 相当于 URL 中的 Path。请注意这个Path一定是要从TransIn的Invoke函数实现里面找
+- &busi.BusiReq{Amount: 30, UserId: 1} 相当于 Post 中 Body
+- v1.Response 相当于HTTP请求的响应
+
+通过下面这部分代码，dtm就拿到了完整信息，就能够发起完整的调用了
+
+`Add(busiServer+"/api.trans.v1.Trans/TransIn", &busi.BusiReq{Amount: 30, UserId: 1})`
+
+## 其他方式接入
+
+kratos 的微服务还有非 etcd 的其他方式，下面列出它们的接入方式
+
+
+#### Consul
+
+对于 Consul 这种方式，需要将对于是 etcd 相关换成 `consul` 即可，如下
+
+```yaml
+#  dtm: conf.yml
+MicroService:
+ Driver: 'dtm-driver-kratos' # name of the driver to handle register/discover
+ Target: 'consul://127.0.0.1:8500/dtmservice' # register dtm server to this url
+ EndPoint: 'grpc://localhost:36790'
+```
+
+```go
+// client:
+import(
+  consulAPI "github.com/hashicorp/consul/api"
+  consul "github.com/go-kratos/kratos/contrib/registry/consul/v2"
+  ...
+)
+var consulServer = "localhost:2379"
+//采用Kratos的方法创建registry, https://go-kratos.dev/docs/component/registry/
+client, err := consulAPI.New(consulAPI.Config{
+  Endpoints: strings.Split(consulServer, ","),
+})
+if err != nil {
+  panic(err)
+}
+registry := consul.New(client)
+
+//注册全局的resolver,  现在business server可以使用 discovery:///dtmservice 来访问dtm
+resolver.Register(discovery.NewBuilder(registry, discovery.WithInsecure(true)))
+
+
+// 实际的调用逻辑
+var dtmServer = "discovery:///dtmservice"
+
+// 业务地址，下面的 busi 换成实际在 server 初始化设置的名字
+var busiServer = "discovery:///busi"
+
+...
+```
+
+## 小结
+
+欢迎使用 [dtm](https://github.com/dtm-labs/dtm)，并 star 支持我们，一起共建 golang 的微服务生态
+
+---
+
+# 事务选项
+
+Source: https://github.com/dtm-labs/dtm.pub/blob/main/docs/ref/options.md
+
+# 事务选项
+
+## 概况
+dtm的事务可以设定以下的选项:
+``` Go
+type TransOptions struct {
+	WaitResult         bool              `json:"wait_result,omitempty" gorm:"-"`
+	TimeoutToFail      int64             `json:"timeout_to_fail,omitempty" gorm:"-"` // for trans type: saga xa tcc
+	RetryInterval      int64             `json:"retry_interval,omitempty" gorm:"-"`  // for trans type: msg saga xa tcc
+	BranchHeaders      map[string]string `json:"branch_headers,omitempty" gorm:"-"`
+}
+```
+
+在 Saga、Msg事务模式中，可以在事务对象生成之后，设定这些选项
+
+XA 则需要在 XaGlobalTransaction2 的第二个参数回调函数中设定
+
+TCC 则需要在 TccGlobalTransaction2 的第三个参数回调函数中设定
+## 等待事务结果
+
+上面介绍了各种模式，每种模式将事务提交之后，立即返回，不等待事务结束。但某些实际应用的场景，很多时候希望在整个全局事务完成之后，返回给用户最终结果，dtm对此进行了支持。
+
+dtm 是通过事务中的 WaitResult 选项，对此进行了支持。该标记为true的情况下，Submit提交给dtm后，dtm会同步对事务进行一轮分支事务操作的调用，如果一切正常，所有的分支事务操作全部成功结束，全局事务成功，那么返回SUCCESS。如果全局事务的某个分支操作，出现异常，那么返回错误，后续会超时重试相关的分支操作。
+
+客户端检查Submit返回的错误，如果为nil，则表示整个全局事务已经正常完成。如果不是nil，不意味全局事务已回滚，可能的情况有很多，客户端最好通过 dtm 的 query 接口查询全局事务的状态。
+
+WaitResult 选项适用于：Saga/Xa/Tcc/Msg。
+
+可以在示例项目中搜索 WaitResult，查看相关的例子
+
+## 超时
+dtm 服务器有一个配置项 TimeoutToFail：他指定了全局事务默认的超时失败时长（系统默认为33秒）。
+
+当一个TCC、XA事务超过TimeoutToFail之后，会超时失败，进行回滚。您可以修改系统的默认值，也可以单独指定事务的TimeoutToFail
+
+MSG 事务模式对 TimeoutToFail 的解读与其他事务模式不同，它是指在这个时间之后，会对只调用了Prepare，但是没有调用Submit的全局事务进行反查。MSG 事务模式在Submit之后，是不会回滚的。
+
+SAGA 事务可能为短事务，也可能为长事务，超时时间跨度非常大，因此不采用系统设定的值，但是可以单独指定事务的TimeoutToFail
+
+可以在示例项目中搜索 TimeoutToFail，查看相关的例子
+
+## 重试时间
+
+DTM 会对许多事务分支操作进行重试，重试的间隔时间为 RetryInterval （系统默认为10秒），您可以修改系统的默认值，也可以单独指定事务的RetryInterval
+
+DTM重试时采用退避算法，如果重试失败，则会加倍重试间隔时间后重试；如果某一次重试成功，那么会重置间隔时间，避免后续的正常操作采用过大的间隔时间
+
+如果您不想要退避算法，而是希望间隔固定的时间，例如您预定了机票，需要定时查询结果，那么您可以在您的服务中，返回ONGOING，当DTM收到这个返回值，会不走退避算法，而是按照设定的间隔时间进行重试
+
+可以在示例项目中搜索 RetryInterval ，查看相关的例子
+
+## 自定义header
+
+有一部分的业务中的子事务，需要自定义header。dtm支持全局事务粒度的header定制，即您可以给不同的全局事务指定不同的自定义header，dtm调用您的子事务服务时，将会添加您指定的header
+
+HTTP和gRPC都支持自定义header，详情可以参考[dtm-examples](https://github.com/dtm-labs/dtm-examples)名字中带有Header的例子
+
+可以在示例项目中搜索 BranchHeaders ，查看相关的例子
+
+---
+
+# 项目概况
+
+Source: https://github.com/dtm-labs/dtm.pub/blob/main/docs/ref/projects.md
+
+# 项目概况
+
+## dtm-labs 组织
+[dtm-labs](https://github.com/dtm-labs)的主要的目标是让分布式事务变得更加简单，包含了dtm相关的各个项目
+- 主项目dtm，主要功能是dtm服务器，涵盖dtm的源代码、单元测试，http客户端，gRPC客户端
+- dtm的大量示例dtm-examples，该项目包含了各种dtm事务模式的使用示例，各种选项的使用
+- dtm的文档，包括中文文档dtm.pub，英文文档en.dtm.pub
+- dtm的go客户端，包括dtmcli，dtmgrpc，这两个项目的代码同步自dtm项目中的dtmcli和dtmgrpc两个目录
+- dtm的go简单示例，包括dtmcli-go-sample，dtmgrpc-go-sample，这两个示例主要演示了dtmcli和dtmgrpc的最简例子
+- dtm的其他语言客户端，包括dtmcli-xxx
+- dtm的其他语言示例，包括dtmcli-xxx-sample
+
+## 主项目dtm
+
+dtm项目主要有以下几个目录
+
+- admin: 管理后台，技术栈为 vue3 + typescript + vite + pinia
+- bench: 性能测试的服务器代码，以及相关的测试脚本
+- client: dtm的客户端，里面包含了dtmcli/dtmgrpc/workflow，发布时同步到dtm-labs/client
+- dtmsvr: dtm的服务端，包含http、grpc的服务
+- dtmutil: dtm使用的工具类，会在 dtmsvr 和 test 中共用，也会在dtm-labs/dtm-examples中使用
+- helper: 各类辅助文件
+- qs: quick-start 例子
+- sqls: 包含了dtm使用的sql
+- test: 包含各种测试用例
+
+#### 代码说明
+Go 语言推荐的错误处理方式是error is a value，而不是异常的方式，因此dtmcli中提供给用户使用的接口都是符合这个标准的。
+
+但是给出的示例，使用了函数E2P，这是一个自定义的函数，将error转成了panic，虽然不符合go的规范，但是减少了错误处理的代码量，让贴出来的代码更简短，能让用户聚焦在核心演示的内容上面
+
+Go 的错误处理，大量 if err != nil { return err }，导致代码变多，很不优雅，因此 dtm 暂时将 panic/cover 作为不常见错误的处理方式。Go 未来版本的 error-handling 则会引入优雅的 check/handle ，彻底解决这个问题。届时 dtm 会根据新的 error-handling 方式，将错误处理的部分重构，
+
+## 如何阅读dtm源码
+如果您需要阅读研究 DTM 的源码，建议方式为
+- dtm 首页README，运行一个quick-start，理解dtm的一个分布式事务过程
+- 阅读dtm.pub中的文档，了解相关的理论与事务，并结合dtm-labs/dtm-examples 运行相关的例子
+- 到 dtm 项目的test，运行感兴趣的测试用例，结合测试用例，跟踪调试dtm的SDK和服务器代码
+
+---
+
+# 概述
+
+Source: https://github.com/dtm-labs/dtm.pub/blob/main/docs/ref/proto.md
+
+# 概述
+
+dtm支持多种协议，包括通用类协议HTTP，gRPC，和微服务协议，如go-zero：
+
+## HTTP
+
+HTTP作为前端与后端交互中最通用的协议，通常也用于后端内部的通讯协议。
+
+dtm服务器启动时，默认监听36789端口，提供http服务。您可以使用[dtm-labs/client/dtmcli](https://github.com/dtm-labs/client/dtmcli)这个SDK，使用HTTP的最简示例，可以参考[dtmcli-qs](https://github.com/dtm-labs/quick-start-sample/dtmcli-qs)
+
+更多高级的HTTP使用示例，可以参考[dtm-examples](https://github.com/dtm-labs/dtm-examples)下的带有http的文件内容
+
+如果您接入的是HTTP之上的微服务协议，目前您可能需要自己将相关的微服务以独立的HTTP服务提供出来，dtm后续可能会接入类似SpringCloud这样的微服务协议
+
+
+## gRPC
+
+gRPC广泛应用于后端微服务中，大量云原生应用，大量微服务框架，构建在此协议之上，应用非常广泛
+
+dtm服务器启动时，默认监听36790端口，提供gRPC服务。对于通过gRPC协议使用dtm的用户，您可以使用[dtm-labs/clientdtmgrpc](https://github.com/dtm-labs/client/dtmgrpc)这个SDK，使用gRPC的最简示例，可以参考[dtmgrpc-qs](https://github.com/dtm-labs/quick-start-sample/dtmgrpc-qs)
+
+更多高级的gRPC使用示例，可以参考[dtm-examples](https://github.com/dtm-labs/dtm-examples)下的带有grpc的文件内容
+
+## 微服务协议
+
+当前已有许多微服务框架被广泛应用，为了方便用户能够在自己的微服务框架中直接使用dtm，dtm采用插件的方式，支持了多个微服务框架。
+
+## go-zero
+dtm首先接入了go-zero，这是一个一开源就很火爆的微服务框架，在对接的过程中，获得了框架作者的大量支持，相关的代码主要由框架作者完成，我们只是做了最后的代码整理，以及相关的文档编写。
+
+接入详情参见 [go-zero](./gozero)
+
+## kratos
+dtm已接入了bilibili开源的kratos，该功能主要由[lei liu](https://github.com/Leizhengzi)完成，非常感谢[lei liu](https://github.com/Leizhengzi)的杰出贡献
+
+接入详情参见 [kratos](./kratos)
+
+## springcloud
+dtm已经支持了springcloud协议，包括springcloud-alibaba，springcloud-netflix。该功能主要由[Kui Liao](https://github.com/horseLk)完成，非常感谢[Kui Liao](https://github.com/horseLk)的杰出贡献
+
+接入详情参见[dtmcli-java](https://github.com/dtm-labs/dtmcli-java)
+
+## polaris
+dtm接入了腾讯开源的polaris，以及polaris之上的微服务框架，对接过程中，获得了腾讯同学的大力支持，由腾讯的同学[ychensha](https://github.com/ychensha)提供了PR。
+
+dtm从v1.6.3开始原生支持grpc-polaris微服务框架
+
+具体的接入指南待完善
+
+## ego
+[EGO](https://github.com/gotomicro/ego)是一个集成了各种工程实践的框架。通过组件化的设计模式，保证了业务方能够统一的调用方式启动各种组件。
+
+dtm从v1.16.3开始原生支持ego，该微服务驱动由[vicnoah](https://github.com/vicnoah)完成，非常感谢[vicnoah](https://github.com/vicnoah)的接触贡献
+
+详细使用方式参考 [https://github.com/dtm-labs/dtmdriver-clients/tree/main/ego](https://github.com/dtm-labs/dtmdriver-clients/tree/main/ego)
+
+#### 其他
+其他gRPC之上的微服务框架协议，正在快速接入中，如果您有相关的需求或者您是框架维护者，欢迎联系我(微信yedf2008)，我们将非常乐意接入您的微服务框架
+
+具体如何让您的微服务框架接入dtm，参考下面的 微服务接入指南
+
+## 微服务对接指南
+
+此文档主要针对框架维护者，普通用户无需关注
+
+dtm支持gRPC协议之上的微服务框架接入，即采用gRPC Resolver机制的微服务框架，下面先看一个如何使用一个自定义的协议
+
+#### 运行一个接入示例
+dtm做了一个最简协议示例：protocol1，方便框架维护者接入，按照如下步骤能够运行这个协议的应用：
+
+- 配置dtm服务器，并运行
+```
+MicroService:
+  Driver: 'dtm-driver-protocol1'
+```
+- 运行一个使用dtm的APP
+```
+# dtm-labs/dtmdriver-clients
+go run protocol1/main.go
+```
+
+至此您可以看到类似这样的日志，这个简单的协议已经运行起来了：
+```
+2021/12/03 15:27:13.65 types.go:43 grpc client called: protocol1://localhost:36790/dtmgimp.Dtm/NewGid  result: Gid:"c0a803b8_4psHCRxQ1kA" err: <nil>
+2021/12/03 15:27:13 TransOut 30 from user 1
+2021/12/03 15:27:13 TransIn 30 to user 2
+```
+
+更加完整的运行示例可以参考[go-zero](./gozero)
+
+#### 接入步骤
+
+接入步骤如下：
+- 实现dtm-labs/dtmdriver里面的接口
+- 提一个PR给dtm，在dtm导入您实现了dtmdriver的包
+- 配置dtm服务器，使用您的驱动
+- 执行dtmdriver.Use，注册您的驱动，之后就可以使用dtmgrpc
+
+#### 步骤1：dtmdriver接口
+此接口定义如下
+``` go
+// Driver interface to do service register and discover
+type Driver interface {
+	// GetName return the name of the driver
+	GetName() string
+	// RegisterGrpcResolver register the grpc resolver to handle custom scheme
+	RegisterGrpcResolver()
+	// RegisterGrpcService register dtm endpoint to target
+	RegisterGrpcService(target string, endpoint string) error
+	// ParseServerMethod parse the uri to server and method.
+	// server will be passed to grpc.Dial, and method to grpc.ClientConn.invoke
+	ParseServerMethod(uri string) (server string, method string, err error)
+}
+```
+
+##### GetName
+返回微服务框架的驱动名称，一般以"dtm-driver-"作为前缀，例如"dtm-driver-gozero"。
+
+它会被dtm服务器和dtm客户端用到
+
+##### RegisterGrpcResolver
+您需要在这个函数里，注册您的grpc的resolver，这样grpc调用时，会使用您的服务发现
+
+##### RegisterGrpcService
+在您的微服务框架中，您可能需要将dtm服务，注册到您的服务发现组件里。dtm服务启动之后，会调用您的这个函数，并传递dtm配置中的Target和Endpoint
+
+##### ParseServerMethod
+由于各个微服务框架，对于协议中的URL，dtm需要将它拆分成server和method两部分，然后创建连接并调用。但是不同微服务协议，通常有不同的拆解方式，因此dtm服务器和SDK将调用这个接口完成拆分
+
+##### init
+您实现了Driver之后，请将您的Driver注册到dtmdriver中，如下所示:
+``` go
+func init() {
+	dtmdriver.Register(&protocol1Driver{})
+}
+```
+
+#### 步骤2：提PR给DTM
+如果您完成了驱动的编写，您可以提PR给dtm，dtm团队将及时给您反馈，评估您的需求。您的PR内容类似于：
+``` go
+import _ "github.com/dtm-labs/dtmdriver-gozero"
+```
+
+#### 步骤3：配置运行dtm
+配置dtm支持您的自定义协议，示例如下：
+```
+MicroService:
+  Driver: 'dtm-driver-gozero' # 填写您的驱动名称
+  Target: 'etcd://localhost:2379/dtmservice' # dtm服务将注册到这个url
+  EndPoint: 'localhost:36790' # dtm服务的ip端口
+```
+
+#### 步骤4：使用dtm SDK
+dtm的grpc协议SDK为dtmgrpc，您先调用dtmdriver.Use("dtm-driver-gozero")，告知dtmgrpc使用这个驱动来解析url。
+
+然后您就可以正常使用dtmgrpc来访问dtm了
+
+---
+
+# SDK
+
+Source: https://github.com/dtm-labs/dtm.pub/blob/main/docs/ref/sdk.md
+
+# SDK
+
+## 支持的语言
+
+#### go
+
+这里的client都是dtm/client里面内容的同步复制。采用这里的包，而不是dtm，会让你的应用程序依赖更少，包体更小
+
+client: [https://github.com/dtm-labs/client](https://github.com/dtm-labs/client)
+
+最简示例: [https://github.com/dtm-labs/quick-start-sample](https://github.com/dtm-labs/quick-start-sample)
+
+关于SDK使用的最全的示例，包括了grpc/http/xa/msg/saga/tcc/barrier 等等，都合并在下面这个项目
+
+[https://github.com/dtm-labs/dtm-examples](https://github.com/dtm-labs/dtm-examples)
+
+[相关博客](../resource/blogs-go)
+
+#### php
+客户端sdk 协程版（支持Hyperf、SAGA、TCC、MSG、XA、子事务屏障）[https://github.com/dtm-php/dtm-client](https://github.com/dtm-php/dtm-client)
+
+示例：[https://github.com/dtm-php/dtm-sample](https://github.com/dtm-php/dtm-sample)
+
+上述SDK由PHP界大佬[黄朝晖](https://github.com/huangzhhui)发起，并亲自操刀设计，主要代码由[PandaLIU-1111](https://github.com/PandaLIU-1111)贡献，并获得Swoole创始人推荐，代码质量高，社区活跃
+
+普通版客户端sdk（当前只支持TCC）: [https://github.com/dtm-labs/dtmcli-php](https://github.com/dtm-labs/dtmcli-php)
+
+示例: [https://github.com/dtm-labs/dtmcli-php-sample](https://github.com/dtm-labs/dtmcli-php-sample)
+
+感谢 [onlyshow](https://github.com/onlyshow) 的帮助，php的sdk和示例，主要由他完成
+
+[相关博客](../resource/blogs-php)
+
+#### dotnet
+
+客户端sdk http版本（支持TCC、SAGA、MSG、子事务屏障）: [https://github.com/dtm-labs/dtmcli-csharp](https://github.com/dtm-labs/dtmcli-csharp)
+
+示例: [https://github.com/dtm-labs/dtmcli-csharp-sample](https://github.com/dtm-labs/dtmcli-csharp-sample)
+
+感谢 [catcherwong](https://github.com/catcherwong)、[geffzhang](https://github.com/geffzhang)的帮助，C#的sdk和示例，主要由他们贡献
+
+客户端sdk grpc版本：[https://github.com/catcherwong/dtmgrpc-csharp](https://github.com/catcherwong/dtmgrpc-csharp)
+
+[相关博客](../resource/blogs-donet)
+
+#### python
+
+客户端sdk（当前支持TCC、SAGA、子事务屏障）: [https://github.com/dtm-labs/dtmcli-py](https://github.com/dtm-labs/dtmcli-py)
+
+示例: [https://github.com/dtm-labs/dtmcli-py-sample](https://github.com/dtm-labs/dtmcli-py-sample)
+
+[相关博客](../resource/blogs-py)
+
+
+#### Java
+
+客户端sdk（SAGA、TCC、子事务屏障）: [https://github.com/dtm-labs/dtmcli-java](https://github.com/dtm-labs/dtmcli-java)
+
+示例: [https://github.com/dtm-labs/dtmcli-java-sample](https://github.com/dtm-labs/dtmcli-java-sample)
+
+感谢 [li-xiao-shuang](https://github.com/li-xiao-shuang)，[viticis](https://github.com/viticis) [Kui Liao](https://github.com/horseLk)的帮助，Java的sdk和示例，主要由他们贡献
+
+[相关博客](../resource/blogs-java)
+
+#### node
+
+客户端sdk（当前只支持TCC）: [https://github.com/dtm-labs/dtmcli-node](https://github.com/dtm-labs/dtmcli-node)
+
+示例: [https://github.com/dtm-labs/dtmcli-node-sample](https://github.com/dtm-labs/dtmcli-node-sample)
+
+[相关博客](../resource/blogs-node)
+
+#### 其他
+
+如果这里没有找到您熟悉的语言，同时您又想运行dtm，看看一个分布式事务什么样，您可以参考这里：
+
+[DTM安装运行](../guide/install)
+
+如果你是通过brew 安装，那么您可以直接运行
+
+```
+dtm-qs
+```
+
+上述dtm-qs命令，会运行一个简单的quick start例子，这是一个saga事务，您可以对照saga的时序图与日志，更深入的了解dtm
+
+## 支持的数据库
+dtm的SDK中，提供了子事务屏障功能，也提供了XA相关的支持，这部分的支持是与具体的数据库相关的。目前已支持了常见的几种数据库事务，包括Mysql系列、Postgres，Redis、Mongo。未来将考虑接入更多的数据库事务
+#### Mysql 系列
+
+包括Mysql，MariaDB，TiDB，TDSQL
+
+#### Postgres
+
+已完整支持Postgres，如果您使用Postgres，需要在使用SDK前，进行如下调用
+
+``` go
+dtmcli.SetCurrentDBType("postgres")
+```
+
+详细例子，可以参考dtm/app/main.go中的代码
+
+#### Redis
+DTM 已支持 Redis 事务，这样用户可以在一个分布式事务里，组合使用 Redis 及 Mysql ，可以将扣库存放在 Redis 中，提供准确扣库存的架构，让订单系统可以轻松应对秒杀场景
+
+#### Mongo
+DTM已支持Mongo
+
+## ORM 对接 {#orm}
+
+#### 概述
+
+dtm中的子事务屏障，需要与数据库交互，xa事务模式，也需要与数据库交互。目前dtm定义的交互接口，采用了与标准库sql兼容的方式，使用中，直接传递sql.DB/sql.Tx即可。
+
+因为barrier需要在事务内部操作barrier相关的表，所以它的接口需要传入一个 *sql.Tx或 *sql.DB
+
+``` go
+func (bb *BranchBarrier) Call(tx *sql.Tx, busiCall BusiFunc) error
+func (bb *BranchBarrier) CallWithDB(db *sql.DB, busiCall BusiFunc) error
+
+```
+
+Xa事务模式中，本地数据库连接是由dtmcli创建和管理的，因此调用回调函数的参数类型是 *sql.DB 。如果您使用其他的库，例如gorm等，那么您根据 *sql.DB 构建相关的orm对象即可。
+
+``` go
+type XaLocalFunc func(db *sql.DB, xa *Xa) (interface{}, error)
+```
+
+目前 dtm 的示例，只给出了gorm的，其他orm，暂时在此说明文档中说明用法
+
+#### GORM
+
+示例在 [dtm-examples](https://github.com/dtm-labs/dtm-examples)
+
+barrier示例：
+``` go
+  barrier := MustBarrierFromGin(c)
+  // gdb is a *gorm.DB
+  tx := gdb.Begin()
+	return dtmcli.ResultSuccess, barrier.Call(tx.Statement.ConnPool.(*sql.Tx), func(tx1 *sql.Tx) error {
+		return tx.Exec("update dtm_busi.user_account set balance = balance + ? where user_id = ?", -req.Amount, 2).Error
+	})
+```
+
+xa示例：
+
+``` go
+  return dtmcli.XaLocalTransaction(c.Request.URL.Query(), BusiConf, func(db *sql.DB, xa *dtmcli.Xa) error {
+    // gorm提供接口，可以从标准的sql.DB对象，构造gorm.DB
+    gdb, err := gorm.Open(mysql.New(mysql.Config{
+      Conn: db,
+    }), &gorm.Config{})
+    if err != nil {
+      return nil, err
+    }
+    dbr := gdb.Exec("update dtm_busi.user_account set balance=balance-? where user_id=?", reqFrom(c).Amount, 1)
+    return dbr.Error
+	})
+```
+
+#### GOQU
+
+barrier示例：
+``` go
+	dialect := goqu.Dialect("mysql")
+	sdb, err := dbGet().DB.DB()
+	if err != nil {
+		return nil, err
+  }
+  gdb := dialect.DB(sdb)
+  // gdb is a goqu dialect.DB, the following code shows how to obtain tx
+	tx, err := gdb.Begin()
+	return dtmcli.ResultSuccess, barrier.Call(tx, func(tx1 *sql.Tx) error {
+		_, err := tx.Exec("update dtm_busi.user_account set balance = balance + ? where user_id = ?", -req.Amount, 2)
+		return err
+	})
+```
+
+xa示例
+
+``` go
+  return dtmcli.XaLocalTransaction(c.Request.URL.Query(), BusiConf, func(db *sql.DB, xa *dtmcli.Xa) error {
+    dialect := goqu.Dialect("mysql")
+    godb := dialect.DB(db)
+    _, err := godb.Exec("update dtm_busi.user_account set balance=balance-? where user_id=?", reqFrom(c).Amount, 1)
+    return err
+  })
+```
+
+#### XORM
+
+请注意，2021-08-21刚给xorm提了pr，暴露了sql.Tx，虽然已合并，但是还未发布版本，因此需要安装最新版本
+
+``` bash
+go get -u xorm.io/xorm@7cd6a74c9f
+```
+
+barrier示例：
+
+``` go
+	x, _ := xorm.NewEngineWithDB("mysql", "dtm", core.FromDB(sdbGet()))
+	se := x.NewSession()
+	defer se.Close()
+	err := se.Begin()
+	if err != nil {
+		return nil, err
+	}
+  // se is a xorm session, the following code shows how to obtain tx
+	return dtmcli.ResultSuccess, barrier.Call(se.Tx().Tx, func(tx1 *sql.Tx) error {
+		_, err := se.Exec("update dtm_busi.user_account set balance = balance + ? where user_id = ?", -req.Amount, 2)
+		return err
+	})
+```
+
+xa示例
+
+``` go
+  return dtmcli.XaLocalTransaction(c.Request.URL.Query(), BusiConf, func(db *sql.DB, xa *dtmcli.Xa) error {
+    xdb, _ := xorm.NewEngineWithDB("mysql", "dtm", core.FromDB(db))
+    _, err := xdb.Exec("update dtm_busi.user_account set balance=balance-? where user_id=?", reqFrom(c).Amount, 1)
+    return err
+  })
+
+```
+
+#### Go-zero
+
+需要go-zero >= v1.2.0
+
+barrier示例：
+
+``` go
+  // 假设conn为go-zero里面的 sqlx.SqlConn
+  db, err := conn.RawDB()
+  if err != nil {
+    return err
+  }
+	return dtmcli.ResultSuccess, barrier.CallWithDB(db, func(tx *sql.Tx) error {
+		_, err := tx.Exec("update dtm_busi.user_account set balance = balance + ? where user_id = ?", -req.Amount, 2)
+		return err
+	})
+```
+
+xa示例
+
+``` go
+  return dtmcli.XaLocalTransaction(c.Request.URL.Query(), BusiConf, func(db *sql.DB, xa *dtmcli.Xa) error {
+    conn := NewSqlConnFromDB(db)
+    _, err := conn.Exec("update dtm_busi.user_account set balance=balance-? where user_id=?", reqFrom(c).Amount, 1)
+    return err
+  })
+
+```
+
+#### ent
+可以支持，代码示例待补充
+
+---
+
+# 存储引擎
+
+Source: https://github.com/dtm-labs/dtm.pub/blob/main/docs/ref/store.md
+
+# 存储引擎
+
+dtm支持将全局事务的状态与进度保存到三类存储：关系数据库（mysql/postgres）、Redis、boltdb，这三种存储分别适合不同的场景，下面分别介绍如下
+
+## 关系数据库
+互联网里的几乎每个公司，都会将数据存储在关系数据库，因此dtm最早支持了关系型数据库的存储，包括：
+- Mysql系列：Mysql，MariaDB，TiDB
+- Postgress
+详细配置参考[conf.sample.yml](https://github.com/dtm-labs/dtm/blob/main/conf.sample.yml)中Store.Driver:"mysql"部分
+
+采用关系数据库进行存储，[性能测试报告](../other/performance)显示：2.6wIOPS磁盘上的的Mysql数据库，能够提供900+事务每秒，能够满足绝大部分公司的分布式事务需求。
+
+如果上述性能不够，建议您考虑下面Redis存储方案
+## Redis
+Redis是应用非常广泛的缓存系统，几乎每个云厂商都会提供，几乎每个公司都有部署。dtm支持将全局事务进度存储到Redis，提供超高性能的分布式事务服务。
+
+由于dtm需要按照时间顺序查询过期的全局事务，所以dtm的Redis存储不支持将负载分片到不同的slot上(PS: seata等分布式事务框架，同样不支持)。
+
+各个公司可能已经购买了集群版的Redis服务，能否让dtm将数据存储到集群版Redis？答：可以，dtm默认会指定前缀，将所有的数据存储到一个slot。
+
+详细配置参考[conf.sample.yml](https://github.com/dtm-labs/dtm/blob/main/conf.sample.yml)中Store.Driver:"redis"部分
+
+采用Redis进行存储，可以达到非常高的性能，预计提供1w+事务每秒。相关的性能测试报告正在进行中，不久之后将更新。
+
+如果您非常关注性能，可以接受机房断电的这种故障能够丢失短时间（1s左右)的数据，那么您可以考虑这种存储方案
+
+## boltdb
+boltdb是一种内嵌的kv存储，被etcd用作存储引擎，支持ACID。
+
+dtm也支持您使用boltdb进行存储，这种存储方式适用于您想要快速体验dtm，省去安装mysql/redis的麻烦。
+
+详细配置参考[conf.sample.yml](https://github.com/dtm-labs/dtm/blob/main/conf.sample.yml)中Store.Driver:"boltdb"部分
+
+当您没有配置任何内容，默认情况下，dtm启动时，会采用boltdb
+
+因为boltdb是内嵌的存储，未支持多机部署，因此不适合线上应用，只适合快速体验dtm。
+
+---
+
+# 博客 深入系列
+
+Source: https://github.com/dtm-labs/dtm.pub/blob/main/docs/resource/blogs-deep.md
+
+# 博客 深入系列
+
+[深度剖析saga分布式事务](https://segmentfault.com/a/1190000041001954)
+
+[深度剖析分布式事务性能](https://segmentfault.com/a/1190000040791009)
+
+
+---
+
+# 博客 donet
+
+Source: https://github.com/dtm-labs/dtm.pub/blob/main/docs/resource/blogs-donet.md
+
+# 博客 donet
+
+[聊一聊如何用C#轻松完成一个SAGA分布式事务](https://mp.weixin.qq.com/s/dj7ZOX-EDKOtKsCa1GV3MQ)
+
+[聊一聊如何用C#轻松完成一个TCC分布式事务](https://mp.weixin.qq.com/s/GkPlimEbS0Ze0Y5PcgDFog)
+
+[聊一聊DTM子事务屏障功能之SQL Server版](https://mp.weixin.qq.com/s/Wf2C9qoua1JpWTP9P48oGw)
+
+[（C#版）使用TCC分布式事务改造现有下单流程（一）](https://www.cnblogs.com/moonfeeling/p/15483543.html)
+
+[（C#版）使用TCC分布式事务改造现有下单流程（二）](https://www.cnblogs.com/moonfeeling/p/15484198.html)
+
+---
+
+# 博客Go
+
+Source: https://github.com/dtm-labs/dtm.pub/blob/main/docs/resource/blogs-go.md
+
+# 博客Go
+
+[用Go轻松完成一个TCC分布式事务，保姆级教程](https://segmentfault.com/a/1190000040331793)
+
+[用Go轻松完成一个SAGA分布式事务，保姆级教程](https://segmentfault.com/a/1190000040294095)
+
+[分布式事务实战--一个完整的XA是什么样的？](https://segmentfault.com/a/1190000040338887)
+
+---
+
+# 博客 Java
+
+Source: https://github.com/dtm-labs/dtm.pub/blob/main/docs/resource/blogs-java.md
+
+# 博客 Java
+
+[用Java轻松完成一个分布式事务TCC，自动处理空补偿、悬挂、幂等](https://segmentfault.com/a/1190000041030430)
+
+
+---
+
+# 博客 Node
+
+Source: https://github.com/dtm-labs/dtm.pub/blob/main/docs/resource/blogs-node.md
+
+# 博客 Node
+
+[用Node轻松完成一个分布式事务TCC，保姆级教程](https://segmentfault.com/a/1190000040592773)
+
+
+---
+
+# 博客 PHP
+
+Source: https://github.com/dtm-labs/dtm.pub/blob/main/docs/resource/blogs-php.md
+
+# 博客 PHP
+
+[用PHP轻松完成一个分布式事务TCC，保姆级教程](https://segmentfault.com/a/1190000040714880)
+
+
+---
+
+# 博客 python
+
+Source: https://github.com/dtm-labs/dtm.pub/blob/main/docs/resource/blogs-py.md
+
+# 博客 python
+
+[用python轻松完成一个分布式事务TCC，保姆级教程](https://segmentfault.com/a/1190000040396649)
+
+[线上的分布式事务是什么样的？以python的saga为例](https://segmentfault.com/a/1190000040515787)
+
+
+---
+
+# 博客 理论
+
+Source: https://github.com/dtm-labs/dtm.pub/blob/main/docs/resource/blogs-theory.md
+
+# 博客 理论
+
+[分布式事务最经典的七种解决方案](https://segmentfault.com/a/1190000040321750)
+
+[如何选择最适合你的分布式事务方案](https://segmentfault.com/a/1190000040468762)
+
+[Go开源说第十七期 分布式事务DTM](https://mp.weixin.qq.com/s/5jAIHaIpO-Dk4F2kJzWQAQ)
+
+
+---
+
+# 视频链接
+
+Source: https://github.com/dtm-labs/dtm.pub/blob/main/docs/resource/videos.md
+
+# 视频链接
+
+本页面收集在各个地方分享的视频
+
+[TalkGo #127 消息最终一致性的架构革命](https://www.bilibili.com/video/BV17S4y1C7CP)
+
+[TalkGo #124 go-zero 分布式事务实践](https://www.bilibili.com/video/BV1wi4y1R73Z)
+
+[Go开源说第十七期](https://www.bilibili.com/video/BV1134y1D7Pw)
+
+[TalkGo #121 微服务的数据一致性问题及解决方案 DTM](https://www.bilibili.com/video/BV1Fu411Z7LS)
+
+---
