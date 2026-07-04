@@ -1,0 +1,2120 @@
+# infino
+
+Source: https://github.com/infino-ai/infino/blob/main/README.md
+
+# infino
+
+
+**infino is a fast retrieval engine that runs SQL, full-text search, and vector search over a single copy of your data on object storage.** Data stays in Parquet on S3 (or Azure, GCS, or local disk) and you can query it at scale.
+
+**Why infino**
+
+- **Speed per dollar** — infino optimizes for speed per dollar, making tradeoffs to achieve object-storage economics at search engine speeds. On a 1-million-document index, warm BM25 queries return in the microsecond range — see [benchmarks](benches/README.md).
+- **Multi-modal queries** — keyword (BM25), vector, and SQL queries over the same rows, offering flexible query paths for agents.
+- **Object-storage-native** — data lives on S3, Azure, GCS, or local disk, with snapshot-isolated reads and atomic commits.
+- **Open format, no lock in** — text and numeric data is stored as spec-compliant Parquet, so anything that reads Parquet can read your data.
+
+## Contents
+
+- [Install](#install)
+- [Quickstart](#quickstart)
+- [Cloud storage](#cloud-storage)
+- [Architecture](#architecture)
+- [SQL joins across tables](#sql-joins-across-tables)
+- [Hybrid search](#hybrid-search)
+- [Stability](#stability)
+- [Development](#development)
+- [Performance](#performance)
+- [Tests](#tests)
+
+## Install
+
+**Python**
+
+```sh
+pip install infino
+
+# Or with uv (https://docs.astral.sh/uv/):
+uv pip install infino
+```
+
+**Node.js**
+
+```sh
+npm install @infino-ai/infino
+```
+
+**Rust**
+
+```sh
+cargo add infino
+```
+
+or in `Cargo.toml`:
+
+```toml
+[dependencies]
+infino = "0.1"
+```
+
+The full Rust API reference is on [docs.rs/infino](https://docs.rs/infino).
+
+infino installs the [mimalloc](https://github.com/microsoft/mimalloc)
+global allocator by default. If you embed infino in a process that already
+sets a global allocator, turn it off to avoid a second one:
+`infino = { version = "0.1", default-features = false }`.
+
+## Quickstart
+
+**Python**
+
+```python
+import infino
+import pyarrow as pa
+
+# A knowledge base your agent retrieves over. "memory://" is in-process;
+# use "./data" or "s3://bucket/prefix" to persist.
+db = infino.connect("memory://")
+
+# Tiny stand-in for your embedding model so this runs as-is — a 16-dim
+# one-hot by topic. Real embeddings are dense and higher-dimensional.
+def embed(topic):                       # 0 = billing, 1 = appearance
+    v = [0.0] * 16
+    v[topic] = 1.0
+    return v
+
+schema = pa.schema([
+    pa.field("source", pa.large_utf8(), nullable=False),
+    pa.field("body", pa.large_utf8(), nullable=False),
+    pa.field("embedding", pa.list_(pa.float32(), 16), nullable=False),
+])
+docs = db.create_table(
+    "docs", schema,
+    infino.IndexSpec().fts("body").vector("embedding", 16, 1, "cosine"),
+)
+
+docs.append([
+    {"source": "help-center", "body": "To cancel a subscription, open Settings then Billing.", "embedding": embed(0)},
+    {"source": "help-center", "body": "Refunds return to the original payment method.",         "embedding": embed(0)},
+    {"source": "blog",        "body": "Enable dark mode under Settings then Appearance.",        "embedding": embed(1)},
+])
+
+# Retrieve context to ground the agent's next answer:
+keyword  = docs.bm25_search("body", "cancel subscription", 5)               # BM25
+semantic = docs.vector_search("embedding", embed(0), 5)                     # vector kNN
+# vector kNN, restricted to rows whose body matches a keyword (pushdown filter):
+filtered = docs.vector_search("embedding", embed(0), 5, filter_column="body", filter_query="billing")
+billing  = db.query_sql("SELECT body FROM docs WHERE source = 'help-center'")  # SQL filter
+```
+
+**Node.js**
+
+```javascript
+import { connect, IndexSpec } from "@infino-ai/infino";
+
+// A knowledge base your agent retrieves over. "memory://" is in-process;
+// use "./data" or "s3://bucket/prefix" to persist.
+const db = connect("memory://");
+
+// Tiny stand-in for your embedding model so this runs as-is — a 16-dim
+// one-hot by topic. Real embeddings are dense and higher-dimensional.
+const embed = (topic) => { const v = Array(16).fill(0.0); v[topic] = 1.0; return v; };
+
+const docs = db.createTable(
+  "docs",
+  { source: "large_utf8", body: "large_utf8", embedding: { vector: 16 } },
+  new IndexSpec().fts("body").vector("embedding", 16, 1, "cosine"),
+);
+
+docs.append([
+  { source: "help-center", body: "To cancel a subscription, open Settings then Billing.", embedding: embed(0) },
+  { source: "help-center", body: "Refunds return to the original payment method.",         embedding: embed(0) },
+  { source: "blog",        body: "Enable dark mode under Settings then Appearance.",        embedding: embed(1) },
+]);
+
+// Retrieve context to ground the agent's next answer:
+const keyword  = docs.bm25Search("body", "cancel subscription", 5);            // BM25
+const semantic = docs.vectorSearch("embedding", embed(0), 5);                  // vector kNN
+// vector kNN, restricted to rows whose body matches a keyword (pushdown filter):
+const filtered = docs.vectorSearch("embedding", embed(0), 5, { filter: { column: "body", query: "billing" } });
+const billing  = db.querySql("SELECT body FROM docs WHERE source = 'help-center'");  // SQL filter
+```
+
+**Rust**
+
+```rust
+use std::sync::Arc;
+
+use arrow_array::{FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch};
+use arrow_schema::{DataType, Field, Schema};
+use infino::{connect, BoolMode, IndexSpec, Metric, VectorFilter, VectorSearchOptions};
+
+// Tiny stand-in for your embedding model so this runs as-is — a 16-dim
+// one-hot by topic. Real embeddings are dense and higher-dimensional.
+fn embed(topic: usize) -> Vec<f32> {
+    let mut v = vec![0.0_f32; 16];
+    v[topic] = 1.0;
+    v
+}
+
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+// A knowledge base your agent retrieves over. "memory://" is in-process;
+// use "./data" or "s3://bucket/prefix" to persist.
+let db = connect("memory://")?;
+
+let item = Arc::new(Field::new("item", DataType::Float32, true));
+let schema = Arc::new(Schema::new(vec![
+    Field::new("source", DataType::LargeUtf8, false),
+    Field::new("body", DataType::LargeUtf8, false),
+    Field::new("embedding", DataType::FixedSizeList(item.clone(), 16), false),
+]));
+let docs = db.create_table(
+    "docs",
+    schema.clone(),
+    IndexSpec::new().fts("body").vector("embedding", 16, 1, Metric::Cosine),
+)?;
+
+let flat: Vec<f32> = [0usize, 0, 1].iter().flat_map(|&t| embed(t)).collect();
+docs.append(&RecordBatch::try_new(
+    schema,
+    vec![
+        Arc::new(LargeStringArray::from(vec!["help-center", "help-center", "blog"])),
+        Arc::new(LargeStringArray::from(vec![
+            "To cancel a subscription, open Settings then Billing.",
+            "Refunds return to the original payment method.",
+            "Enable dark mode under Settings then Appearance.",
+        ])),
+        Arc::new(FixedSizeListArray::new(item, 16, Arc::new(Float32Array::from(flat)), None)),
+    ],
+)?)?;
+
+// Retrieve context to ground the agent's next answer:
+let keyword = docs.bm25_search("body", "cancel subscription", 5, BoolMode::Or, None)?;
+let semantic = docs.vector_search("embedding", &embed(0), 5, VectorSearchOptions::new(), None, None)?;
+// vector kNN, restricted to rows whose body matches a keyword (pushdown filter):
+let filtered = docs.vector_search(
+    "embedding", &embed(0), 5, VectorSearchOptions::new(),
+    Some(VectorFilter { column: "body", query: "billing", mode: BoolMode::Or }), None,
+)?;
+let billing = db.query_sql("SELECT body FROM docs WHERE source = 'help-center'")?;
+assert_eq!(keyword.iter().map(|b| b.num_rows()).sum::<usize>(), 1);   // BM25
+assert!(semantic.iter().map(|b| b.num_rows()).sum::<usize>() >= 1);   // vector kNN
+assert_eq!(filtered.iter().map(|b| b.num_rows()).sum::<usize>(), 1);  // vector + keyword filter
+assert_eq!(billing.iter().map(|b| b.num_rows()).sum::<usize>(), 2);   // SQL filter
+# Ok(())
+# }
+```
+
+Bindings live in [`infino-python/`](infino-python/) (PyO3 + maturin) and
+[`infino-node/`](infino-node/); see their READMEs to build from source.
+The Node API is synchronous — objects in, plain records out, with `_id`
+returned as a JavaScript `bigint`.
+
+### Open format: read it as Parquet
+
+A superfile *is* a spec-compliant Parquet file. The embedded BM25 and
+vector index regions are spliced in ahead of a standard Parquet footer
+and pointed at by `inf.*` key/value metadata keys, which any conformant
+Parquet reader ignores. So the columnar body opens in DuckDB, pandas,
+pyarrow, or DataFusion with **no infino in the read path** and no export
+step:
+
+```python
+import infino, pyarrow as pa, glob, duckdb
+
+db = infino.connect("./data")          # persist to disk (not "memory://")
+docs = db.create_table(
+    "docs",
+    pa.schema([
+        pa.field("source", pa.large_utf8(), nullable=False),
+        pa.field("body", pa.large_utf8(), nullable=False),
+    ]),
+    infino.IndexSpec().fts("body"),
+)
+docs.append([
+    {"source": "help-center", "body": "To cancel a subscription, open Settings then Billing."},
+    {"source": "help-center", "body": "Refunds return to the original payment method."},
+    {"source": "blog",        "body": "Enable dark mode under Settings then Appearance."},
+])
+
+# The superfiles are ordinary files on disk (one write can shard into
+# several, so read them as a set):
+files = glob.glob("data/**/*.sf.parquet", recursive=True)
+print(files[0])   # e.g. data/docs-18bc4051eb6a9468-0/data/seg-....sf.parquet
+
+# Read them with a third-party engine, no infino in this line:
+duckdb.sql("SELECT source, count(*) FROM read_parquet('data/**/*.sf.parquet') GROUP BY source").show()
+# ┌─────────────┬──────────────┐
+# │   source    │ count_star() │
+# ├─────────────┼──────────────┤
+# │ help-center │            2 │
+# │ blog        │            1 │
+# └─────────────┴──────────────┘
+```
+
+**Read-only openness.** Standard tools *read* a superfile's columns with
+no export step. Rewriting it through a generic Parquet writer (e.g.
+`pyarrow.parquet.write_table`) produces valid Parquet that has silently
+dropped the embedded BM25/vector indexes, so it's no longer a superfile.
+The compatibility is one-directional.
+
+The shortest end-to-end demo (write a corpus, run BM25 + vector +
+SQL/hybrid retrieval against it, then read the very same file back with
+DuckDB *and* pyarrow) is
+[`infino-python/examples/parquet_interop.py`](infino-python/examples/parquet_interop.py).
+
+## Cloud storage
+
+The backend is chosen by the URI scheme — `s3://bucket/prefix`,
+`az://container/prefix`, `gs://bucket/prefix`, `file://path`, a bare path,
+or `memory://`. Credentials go through `ConnectOptions`, keyed by
+`object_store`'s config strings (`aws_*` / `azure_*` / `google_*` — the
+names the AWS/Azure/GCS SDKs use). Infino reads no credentials from the
+environment; omit them to use ambient cloud identity (IAM instance role /
+managed identity / workload-identity ADC).
+
+```rust
+use infino::{connect_with, ConnectOptions};
+
+// S3
+let db = connect_with("s3://bucket/prefix", ConnectOptions::new()
+    .with_storage_option("aws_access_key_id", "…")
+    .with_storage_option("aws_secret_access_key", "…")
+    .with_storage_option("aws_region", "us-east-1"))?;
+
+// Azure
+let db = connect_with("az://container/prefix", ConnectOptions::new()
+    .with_storage_option("azure_storage_account_name", "…")
+    .with_storage_option("azure_storage_account_key", "…"))?;
+
+// GCS
+let db = connect_with("gs://bucket/prefix", ConnectOptions::new()
+    .with_storage_option("google_service_account_key", "…"))?;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+Common keys:
+
+| Backend | Keys |
+| ------- | ---- |
+| S3      | `aws_access_key_id`, `aws_secret_access_key`, `aws_region`, `aws_session_token`, `aws_endpoint` |
+| Azure   | `azure_storage_account_name`, `azure_storage_account_key`, `azure_storage_sas_key`, `azure_storage_client_id`, `azure_storage_client_secret`, `azure_storage_tenant_id` |
+| GCS     | `google_service_account` (path), `google_service_account_key` (inline JSON), `google_application_credentials`, `google_skip_signature` |
+
+The full set is whatever `object_store` accepts for the backend; an unknown
+or cross-backend key is rejected at connect. `with_validate(true)` opts into
+a connect-time reachability probe, so bad credentials fail at `connect`
+rather than on the first query. The same options exist in the config file
+(`storage.storage_options`) and both bindings (`storage_options` +
+`validate`).
+
+## Architecture
+
+Three docs cover the design, from the high-level tour down to the
+on-disk bytes:
+
+- **[Overview →](docs/architecture/overview.md)** — the plain-language
+  tour: what infino is, the mental model, and how it compares to other
+  systems.
+- **[Superfile format →](docs/architecture/superfile.md)** — the
+  single-file superfile format: a valid Parquet file with embedded
+  full-text and vector indexes. Covers the layout, Parquet
+  compatibility, and the full-text and vector index design.
+- **[Supertable layer →](docs/architecture/supertable.md)** — the table
+  layer over many superfiles: manifest snapshots, the commit/publish
+  path, pluggable storage, query fan-out with manifest-only skip
+  pruning, and reader/writer concurrency.
+
+For concepts, quickstart, guides, and examples (Python, Node.js, and Rust), see
+the full documentation at **[docs.infino.ai](https://docs.infino.ai)**.
+
+## SQL joins across tables
+
+`query_sql` resolves every table the query names through the catalog into
+one engine, and the `bm25_search` / `vector_search` / `hybrid_search`
+table functions are relations too — so a single query can fuse keyword
+and vector retrieval and join the result to an ordinary table. This is
+the canonical agent retrieval, end to end: hybrid-search a knowledge
+base, fuse the two rankings (reciprocal-rank fusion), and join provenance
+— one snapshot, no client-side stitching.
+
+```rust
+use std::sync::Arc;
+
+use arrow_array::{FixedSizeListArray, Float32Array, Int64Array, LargeStringArray, RecordBatch};
+use arrow_schema::{DataType, Field, Schema};
+use infino::{connect, IndexSpec, Metric};
+
+// Tiny stand-in for your embedding model so this runs as-is; real
+// embeddings are dense and higher-dimensional (e.g. 1536).
+fn embed(topic: usize) -> Vec<f32> {
+    let mut v = vec![0.0_f32; 16];
+    v[topic] = 1.0;
+    v
+}
+
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+let db = connect("memory://")?;
+
+// `docs`: text (BM25) + embedding (vector) + the source it came from.
+let item = Arc::new(Field::new("item", DataType::Float32, true));
+let docs_schema = Arc::new(Schema::new(vec![
+    Field::new("source", DataType::LargeUtf8, false),
+    Field::new("body", DataType::LargeUtf8, false),
+    Field::new("embedding", DataType::FixedSizeList(item.clone(), 16), false),
+]));
+let docs = db.create_table(
+    "docs",
+    docs_schema.clone(),
+    IndexSpec::new().fts("body").vector("embedding", 16, 1, Metric::Cosine),
+)?;
+let flat: Vec<f32> = [0usize, 0, 1].iter().flat_map(|&t| embed(t)).collect();
+docs.append(&RecordBatch::try_new(
+    docs_schema,
+    vec![
+        Arc::new(LargeStringArray::from(vec!["help-center", "help-center", "blog"])),
+        Arc::new(LargeStringArray::from(vec![
+            "To cancel a subscription, open Settings then Billing.",
+            "Refunds return to the original payment method.",
+            "Enable dark mode under Settings then Appearance.",
+        ])),
+        Arc::new(FixedSizeListArray::new(item, 16, Arc::new(Float32Array::from(flat)), None)),
+    ],
+)?)?;
+
+// `sources`: a plain table — where each source came from, and its trust.
+let sources_schema = Arc::new(Schema::new(vec![
+    Field::new("source", DataType::LargeUtf8, false),
+    Field::new("url", DataType::LargeUtf8, false),
+    Field::new("trust", DataType::Int64, false),
+]));
+let sources = db.create_table("sources", sources_schema.clone(), IndexSpec::new())?;
+sources.append(&RecordBatch::try_new(
+    sources_schema,
+    vec![
+        Arc::new(LargeStringArray::from(vec!["help-center", "blog"])),
+        Arc::new(LargeStringArray::from(vec![
+            "https://help.example.com",
+            "https://blog.example.com",
+        ])),
+        Arc::new(Int64Array::from(vec![2, 1])),
+    ],
+)?)?;
+
+// The agent's question, embedded like the corpus. The vector TVF takes
+// the query vector as a comma-separated string, so build the SQL with it.
+let qvec = embed(0).iter().map(|x| x.to_string()).collect::<Vec<_>>().join(",");
+let sql = format!(
+    "WITH lexical AS (                       -- BM25 candidates, ranked
+         SELECT _id, source, body, ROW_NUMBER() OVER (ORDER BY score DESC) AS rank
+         FROM bm25_search('docs', 'body', 'how do I cancel my subscription?', 50)
+     ),
+     semantic AS (                           -- vector candidates (nearer = lower score)
+         SELECT _id, source, body, ROW_NUMBER() OVER (ORDER BY score ASC) AS rank
+         FROM vector_search('docs', 'embedding', '{qvec}', 50)
+     )
+     SELECT s.url,
+            COALESCE(l.body, v.body) AS chunk,
+            COALESCE(1.0/(60+l.rank), 0.0) + COALESCE(1.0/(60+v.rank), 0.0) AS relevance
+     FROM lexical l
+     FULL OUTER JOIN semantic v ON l._id = v._id      -- fuse lexical + semantic
+     JOIN sources s ON s.source = COALESCE(l.source, v.source)   -- + provenance
+     WHERE s.trust >= 1
+     ORDER BY relevance DESC
+     LIMIT 5"
+);
+let context = db.query_sql(&sql)?;
+assert!(context.iter().map(|b| b.num_rows()).sum::<usize>() >= 1);
+# Ok(())
+# }
+```
+
+**Making it real.** `embed()` here is a 16-dim toy so the example runs as
+written; swap in your embedding model and raise `dim` / `n_cent` to match
+(e.g. 1536 / 256). The vector TVF takes the query vector as a
+comma-separated string — that's the only reason the query is built with
+`format!`. The SQL itself is identical from Python and Node; only table
+creation and embedding differ.
+
+## Hybrid Search
+
+Infino also wires indexes into SQL execution as **physical
+access paths**:
+
+```sql
+-- The text predicate is answered from the FTS index — inverted index →
+-- candidate rows → decode only those rows — never a full column scan.
+SELECT category, AVG(rating)
+FROM reviews
+WHERE title = 'battery life'
+GROUP BY category;
+```
+
+Equality, `IN`, and boolean combinations on an indexed text column
+resolve through the index to an exact candidate row set before any
+column data is read. Superfiles that can't match are never opened at all:
+term blooms, value ranges, and vector centroids live side by side in the
+manifest, so scalar, keyword, and vector signals prune through one
+shared layer.
+
+Retrieval composes the same way. The ranked `bm25_search` /
+`vector_search` / `hybrid_search` and the unranked `token_match` /
+`exact_match` are table functions so a candidate set is the
+*first stage of a plan* rather than its result:
+
+```sql
+-- Rank first; join and aggregate over just the candidates.
+SELECT a.name, COUNT(*) AS hits
+FROM bm25_search('posts', 'body', 'rust async', 100) p
+JOIN authors a ON a.author_id = p.author_id
+GROUP BY a.name
+ORDER BY hits DESC;
+
+-- Set algebra over index-bounded candidate sets: "rust but not compiler".
+SELECT _id FROM token_match('posts', 'body', 'rust')
+EXCEPT
+SELECT _id FROM token_match('posts', 'body', 'compiler');
+```
+
+One snapshot, one copy of the data: sparse (BM25), dense (vector), and
+structured (scalar) predicates compose inside the engine — no second
+system to sync, no client-side result stitching.
+
+## Stability
+
+The public API is what's re-exported from the crate root — `connect` /
+`connect_with`, `Connection`, `Supertable`, `IndexSpec`, `InfinoError`,
+and the value types their signatures name. It is pinned by a
+`cargo-public-api` snapshot (`public-api.txt`); any change to it is
+reviewed as a contract change in the same pull request.
+
+- **Versioning.** 0.x while the surface soaks; 1.0 once it has shipped
+  without churn for a release or two. Pre-1.0 may break, but every break
+  shows in the snapshot diff and is called out in the release notes.
+- **`#[non_exhaustive]`** on growable public enums/structs (e.g.
+  `InfinoError`, `MutationStats`), so adding a variant or field is not a
+  breaking change.
+- **Arrow / DataFusion are part of the contract.** The API is
+  Arrow-native (`RecordBatch`, `SchemaRef`, `Expr`); a major bump of
+  arrow / datafusion that changes an exposed type is a breaking change to
+  infino. The supported version range is documented and CI-tested.
+- **MSRV.** The minimum supported Rust version is **1.95** (enforced by
+  `rust-version` in `Cargo.toml`). Raising it is a minor bump, never a
+  patch.
+- **Deprecation.** Post-1.0, removals go through `#[deprecated]` for at
+  least one minor release first.
+- **Bindings version independently.** The Python (`pip install infino`)
+  and Node (`npm install @infino-ai/infino`) packages are versioned on their own
+  SemVer lines — each embeds its own copy of the engine, so a binding
+  version need not match this crate's. See
+  [`docs/versioning.md`](https://github.com/infino-ai/infino/blob/main/docs/versioning.md).
+
+## Development
+
+```bash
+git clone git@github.com:infino-ai/infino.git
+cd infino
+cargo build
+cargo run --example demo   # end-to-end tour: build, BM25 + vector search, read back as Parquet
+```
+
+The toolchain is pinned by `rust-toolchain.toml`, so `rustup` installs
+the right stable Rust on first build. Run `cargo test --features test-helpers`
+for the suite (integration tests use `infino::test_helpers`) and `make ci`
+before opening a pull request. Browse the full API locally with `make doc`
+(`cargo doc --no-deps --open` — the same docs [docs.rs](https://docs.rs/infino) renders).
+
+For an enhanced local development experience, install and configure
+[pre-commit](https://pre-commit.com/#install) hooks with `pre-commit install`
+to catch formatting and lint issues before committing.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the full development guide.
+
+## Performance
+
+Benchmarks live under [`benches/`](benches/) and use Infino's custom
+benchmark harness so build, correctness, hot reads, cold object-store
+reads, RSS, and markdown output all share one measured lifecycle. Run
+`cargo bench` to reproduce them on your hardware.
+
+## Tests
+
+Run `cargo test --workspace` for the full suite. It covers the
+end-to-end full-text, vector, and superfile pipelines, ingestion and
+commit, and open-format compatibility — DataFusion reads superfiles as
+plain Parquet, with column projection, GROUP BY, and predicate
+pushdown all matching the columnar data.
+
+**Memory safety.** The full-text surface runs clean under
+[miri](https://github.com/rust-lang/miri) (Stacked Borrows + UB
+detection) and
+[AddressSanitizer](https://clang.llvm.org/docs/AddressSanitizer.html);
+run `make miri` and `make asan`.
+
+---
+
+# Infino — notes for AI agents
+
+Source: https://github.com/infino-ai/infino/blob/main/AGENTS.md
+
+# Infino — notes for AI agents
+
+Read `[CONTRIBUTING.md](CONTRIBUTING.md)` first — it covers prerequisites, build, the demo, test commands, the `make ci` gates, code conventions, and the fork → branch → PR workflow. This file only covers what isn't in there: the repository map, hard boundaries, and traps that aren't obvious from the code.
+
+## Project overview
+
+**Infino is a fast retrieval engine that stores your data on object storage (like Amazon S3) and runs SQL, full-text search, and vector search over it from a single system**. One file (a "superfile") is a valid Apache Parquet file with embedded BM25 + vector indexes spliced into it. The `supertable` layer composes many superfiles into a queryable table with snapshot-isolated reads, append-only writes, and atomic-commit manifest. Object-storage-native; no daemon, no managed service.
+
+For the plain-language tour — what Infino is, the mental model, and how it compares to other systems — see `docs/architecture/overview.md`. For design references, read `docs/architecture/superfile.md` and `docs/architecture/supertable.md` before touching format or manifest code.
+
+## Golden rule
+
+**Correctness > complexity > performance — in that order, always.** A correct, simple solution beats a clever or faster one. Reach for performance only after the code is correct and no more complex than it needs to be. When a change forces a trade-off between these three, the higher priority wins; if you're optimizing at the cost of correctness or simplicity, stop and reconsider.
+
+## Rule precedence
+
+When guidance disagrees, resolve in this order (closest wins):
+
+1. **Explicit user / task instructions** in the current session trump everything below.
+2. **Subdirectory `AGENTS.md`** files (when present) take precedence over this file for the scope they cover.
+3. **This file** carries the traps and boundaries; `[CONTRIBUTING.md](CONTRIBUTING.md)` carries the general contributor workflow.
+4. **Configuration files** (`Cargo.toml`, `Makefile`, `rust-toolchain.toml`, `.github/workflows/`) are the source of truth where they overlap with anything written here — see "Sources of truth" near the end.
+
+## Running a focused test subset
+
+Test binaries are bundled by layer in `Cargo.toml` (`[[test]]` stanzas) to keep link time down — `--test <binary>` picks the layer, the filter narrows within it. Benches are one further step consolidated: a single `[[bench]]` target named `bench`, selected by positional tokens.
+
+```sh
+# Run one integration test crate (each binary covers a top-level layer)
+cargo test --test superfile fts::
+cargo test --test supertable commit::
+cargo test --test superfile format::crc_corruption
+
+# Run unit tests in one module
+cargo test --lib superfile::vector::
+
+# All benches share one `bench` target; select cells with positional
+# tokens after `--`: [tier] [modality] [phase ...] (space-separated)
+cargo bench --bench bench -- superfile fts
+cargo bench --bench bench -- supertable vector build warm
+# Diagnostics are tokens on the same binary:
+#   scale | tombstone | update | sql-diag | object-store
+cargo bench --bench bench -- tombstone
+```
+
+## Code style beyond CONTRIBUTING.md
+
+- **Rayon for CPU, tokio for I/O.** In general this split is the standing concurrency contract for the query and build paths:
+  - **tokio owns the I/O waves**: superfile opens, object-store range GETs, sidecar prefetches — `tokio::spawn` / `try_join_all` on the shared multi-thread query runtime so connections pool and fetches overlap. Never build a throwaway per-call runtime on a worker thread (that exact anti-pattern once regressed cold vector search from ~1.1 s to ~3.7–11 s).
+  - **rayon owns the CPU waves**: Parquet page decode, BM25 / vector scoring, rerank, encode. Run them on `options.reader_pool` (the configurable pool — not the global rayon pool) via `pool.install(|| … par_iter …)`.
+  - **Bridge with a oneshot**: when an async task needs a CPU wave, hand the work to the rayon pool and `await` a `tokio::sync::oneshot` for the result, so tokio workers keep driving I/O instead of blocking under the compute. Don't call `par_iter` (or any long compute) inline in an async fn.
+  - If you change where work runs, benchmark before and after (`cargo bench --bench bench -- supertable search` plus the `INFINO_DIAG_QUERY_SQL_OVERHEAD` diagnostic for the SQL resolve path) — a prior change silently moved warm decodes back onto tokio and cost ~5× on `resolve_hits`.
+- **No magic numbers.** Numeric (and other opaque) literals that carry semantic meaning must be named `const`s with a short doc-comment, never inlined mid-expression. Declare them at the **top of the file** for runtime code; for test code, at the top of the file or at the top of the relevant test section / module. Trivial values in obvious arithmetic and indexing (`i + 1`, `len - 1`, `x / 2`, index `0`) are exempt.
+- **Imports at the top of the file.** All `use` statements live at the top of the file (or, for an inline `#[cfg(test)]` module, at the top of that module) — never function-local, block-scoped, or otherwise inline. A file's full dependency surface should be readable in one place. If you find yourself reaching for a fully-qualified path mid-expression only to avoid an import, add the `use` at the top instead.
+- **No inline fully-qualified paths.** Don't name an item by its full module path mid-expression — not crate-internal (`crate::…`, `self::…`, `super::…`) and not external/std (`std::…`, `core::…`, `alloc::…`, `arrow::…`, `datafusion::…`, …). Import the item at the top (`use …::foo;`) and call the short name (`foo(…)`). Applies to functions, types, consts, struct/enum literals, and trait paths alike. Four exceptions only: (1) **disambiguation** of two same-named items used in one file — import both *parent modules* and qualify by the last segment (`vector::reader::OpenOptions` vs `fts::reader::OpenOptions`), never deep-path either; (2) **UFCS / trait disambiguation** (`<T as Trait>::method`, `<Self as …>`) where no import can remove the qualification; (3) `#[from]` and other **attribute paths** inside `#[derive(Error)]` enums (idiomatic thiserror, collision-prone — leave fully-qualified); (4) `Self::` associated items (not a module path). When two imports would collide outside an error enum, alias with `as` rather than fall back to an inline path.
+- **No code duplication.** Read the surrounding modules *before* writing new code — there is usually an existing helper that already does what you need. Refactor shared logic into one helper rather than copy-pasting; duplicated logic drifts out of sync and is a correctness hazard.
+- **No `unsafe` outside the documented surface.** `unsafe` in `src/` is concentrated in four areas: SIMD intrinsic kernels (`superfile/vector/distance.rs`, `vector/sq8_simd.rs`, `vector/quant.rs`, `superfile/fts/tokenize.rs`); memory-mapped / page-advise I/O (`supertable/reader_cache/disk.rs`, `config/`, and the spilled-partition `Mmap` reads in `superfile/fts/builder.rs` + `superfile/vector/spill.rs`); the FTS builder's `bumpalo` lifetime extensions (`FtsBuilder::add_doc` and `intern_term_id_arena`); and bounds-check elisions in the FTS builder's hottest loops (the radix-sort scatter and the `add_doc` dense-tf/partition updates in `superfile/fts/builder.rs`), each guarded by a `SAFETY:` comment proving the index invariant. (Note: `superfile/format/` is *safe* byte parsing — no `unsafe` there.) New `unsafe` requires both `make miri` and `make asan` green plus a clear safety argument in a doc-comment above the block.
+- **Visibility hygiene.** Items used only inside the crate are `pub(crate)`, not `pub`. Test-only methods go behind `#[cfg(test)]`, not `#[allow(dead_code)]`. The public API surface is what's re-exported at the crate root (`src/lib.rs`) — see the "Public API surface" section below.
+- **State rationale inline in comments.** Don't cite external documents or trackers a reader may not have access to; explain the reasoning directly.
+- **Use plain language in source, comments, and commit messages.** Avoid cryptic internal shorthand or tracking tags; describe the change directly.
+- **Performance numbers live in `benches/README.md`.** Keep benchmark results there rather than scattered through the codebase.
+
+## Testing instructions
+
+Three lanes beyond `cargo test`:
+
+- **Brute-force oracles** under `tests/` — BM25 top-K is compared against the textbook BM25 formula on planted corpora; full-nprobe IVF is compared against brute-force exact-nearest for L2Sq / Cosine / NegDot. These are the correctness gates; if you touch scoring math or vector distance kernels, the oracles run first.
+- **Recall measurement — the acceptance bar is recall@10 ≥ 0.99, full stop.** No change is accepted that drops vector recall@10 below 0.99 on the standard vector bench (10M-row supertable, default config); demonstrate it and report the number in the PR body. The lower floors currently hard-coded in the bench suite (recall@10 ≥ 0.90 / 0.95 in `benches/utils/scale.rs`, and the 0.80 / 0.85 correctness floors) are loose regression tripwires only — **passing them is necessary but not sufficient.** The bar is 0.99.
+- `**make miri` + `make asan`** — the memory-safety oracles. Run them. Cost: miri ~100-1000× slower than native; asan 2-3×.
+- **Property tests** — `proptest` is in dev-deps; used for round-trip invariants like PFOR encode/decode.
+
+Test deletions require explicit justification.
+
+## Performance
+
+Performance *and* cost are first-class acceptance criteria for every change. A PR that regresses query latency, ingest throughput, or the cost profile (bytes fetched, object-store request count, memory / cache footprint) is rejected unless it buys a correctness fix or a deliberate, documented trade-off. The golden rule still holds — correctness and simplicity come first — but among otherwise-acceptable changes, the one that preserves or improves speed-per-dollar wins.
+
+### What `benches/` covers
+
+One bench target (`[[bench]] name = "bench"`, `harness = false`, custom `main`) drives the whole suite; all measurement logic lives in the `infino-bench-utils` crate under `benches/utils/`. Selection is positional: `cargo bench --bench bench -- [tier] [modality] [phase ...]` with tier `superfile` | `supertable`, modality `fts` | `vector` | `sql`, phase `build` | `warm` | `cold` (omitted ⇒ all). A bare `cargo bench` runs every tier × modality. See `benches/README.md` for the full invocation guide and recorded result tables.
+
+- `**superfile` tier** — single-superfile, in-memory scale (default 1M docs): BM25, IVF + RaBitQ vector, and SQL over one superfile.
+- `**supertable` tier** — multi-superfile table over object storage (default 10M docs; backend chosen by `INFINO_BENCH_STORE`, in-process `s3s-fs` emulator by default): the warm/cold table paths for FTS, vector, and SQL.
+
+Diagnostics are standalone programs sharing the same binary (tokens, not separate targets): `scale` (release-profile recall gates), `tombstone`, `update`, `sql-diag`, `object-store`. Scale knobs: `INFINO_BENCH_SUPERFILE_DOCS` / `INFINO_BENCH_SUPERTABLE_DOCS` (plain integers, per tier) and `INFINO_BENCH_WRITERS`.
+
+Recorded numbers live in `benches/README.md`; the structured source of truth is `target/infino-bench/<bench>.json`, written by the report layer after each run (the previous run's file is the delta baseline).
+
+### Running the suite
+
+- **Before any material change to the codebase, run the full bench suite** (`make bench`, i.e. `cargo bench`) and keep the baseline. After your change, re-run and diff against `main` — confirm there is no latency, throughput, *or* cost (bytes / requests / memory) regression. `make bench-quick` (a 100K-doc `superfile fts warm` run) is for fast inner-loop iteration only, never for the final gate.
+- This is the same bar the PR checklist enforces: the comparison against `main`, and any intentional trade-off, goes in the PR body.
+- Treat a bench run as mandatory — not optional — when you touch scoring math, distance / SIMD kernels, the quantization codecs, the commit / manifest path, or the reader cache.
+
+## Security considerations
+
+- **Crash safety contract.** Committed superfiles must survive `SIGABRT` mid-flight. Verified by tests in `tests/supertable_commit_crash_localfs.rs` (parent spawns aborting child; assertions check superfiles persist). Don't break this contract; if your change touches the commit path, run that test specifically.
+- **Don't add new dependencies casually.** Supply-chain surface is part of the public crate's risk profile. New deps require justification in the PR body — what they enable, why no existing dep covers it, and the maintainer / license picture.
+- **No secrets in commits.** Agents have committed `.env` files before; the rule applies to them too.
+- **Object-store credentials** in tests use mock servers (`s3s` + `s3s-fs`); don't introduce tests that require live cloud credentials.
+
+## Commit message guidelines
+
+- **No `Co-Authored-By: Claude ...` trailer (or any other AI-attribution trailer).** Commit metadata reflects the human author only, even when an agent drafts the message or runs `git commit`.
+- **Subject line under ~70 characters.** Body explains *what and why*, not *how* (the diff already shows how).
+- **Reference the layer or subsystem in the subject** when reasonable. The recent history is good reference: `fts: leapfrog AND intersection over the skip table`, `superfile/vector: gate scalar/fake test helpers behind target_arch="x86_64"`, `WAL-driven updates + deletes`.
+- **No `--no-verify`, no `--no-gpg-sign`, no `-c commit.gpgsign=false`** unless the human author has explicitly requested it. If a pre-commit hook fails, fix the cause; don't bypass.
+- **Prefer new commits over amending.** If a hook fails or a review change is needed, create a new commit; do not `git commit --amend` unless explicitly requested.
+
+## Pull request guidelines
+
+- **For non-trivial changes, open an issue first.** Describe the problem and proposed approach so the design can be discussed before code review starts.
+- **Bug fixes need a regression test** that fails before the fix and passes after. New features need coverage proportional to the surface added.
+- **Run `benches/` against current `main` before submitting.** Every PR must run the benchmark suite against `main` and confirm there are no performance *or* cost regressions. Report the comparison in the PR body, and call out any intentional trade-off explicitly (see `benches/README.md` for where results live).
+- **Recall@10 ≥ 0.99 is non-negotiable.** A PR that drops vector recall@10 below 0.99 on the standard bench is rejected regardless of any other merit. The sanity checks baked into the bench code are not the acceptance bar — 0.99 is.
+- **Don't force-push to `main` or shared branches.** Force-push your own feature branches if you need to clean up history, but never to `main`.
+- **Don't merge with red CI** or with unanswered review comments.
+- **PR title and body follow the commit-message conventions above.** No AI-attribution trailers.
+
+## Repository layout
+
+Three core layers (`storage`, `superfile`, `supertable`), the public
+`catalog` layer on top, plus a few small support modules:
+
+```
+src/
+├── lib.rs                 ← crate root (small; declares modules + curated re-exports)
+├── catalog/               ← public entry point (connect → Connection → tables, search TVFs)
+├── error.rs               ← the single public InfinoError (coarse, #[non_exhaustive])
+├── storage/               ← byte-level I/O (StorageProvider trait, LocalFs, S3, Azure, GCS)
+├── superfile/             ← single-file format (immutable superfiles)
+│   ├── builder.rs         ← write path
+│   ├── reader.rs          ← read path
+│   ├── format/            ← binary layout (footer, CRC)
+│   ├── fts/               ← BM25 + posting lists + tokenizer
+│   ├── vector/            ← IVF + rotation + quantization codecs
+│   └── lazy_source.rs     ← byte-source abstraction for object-store reads
+├── supertable/            ← table layer (composes many superfiles)
+│   ├── handle.rs          ← Supertable, ArcSwap<Manifest>, single-writer slot
+│   ├── writer.rs          ← append + commit
+│   ├── manifest/          ← superfile list + Bloom + min/max + partition strategies
+│   ├── query/             ← cross-superfile fanout (fts, vector, sql)
+│   ├── tombstones/        ← runtime tombstone cache (filtering deleted rows)
+│   ├── wal/               ← write-ahead log for update/delete pipeline
+│   └── reader_cache/      ← per-process superfile cache
+├── config/                ← runtime tuning knobs (StorageSettings + defaults)
+├── runtime_bridge.rs      ← sync ↔ async runtime glue
+└── test_helpers/          ← shared test fixtures (pub for integration tests)
+
+tests/                     ← integration tests; the two main binaries
+                             (superfile, supertable) are bundled by layer
+                             in [[test]] stanzas, plus a few standalone
+                             top-level test files (e.g. the crash /
+                             concurrent-process tests)
+benches/                   ← one custom-harness [[bench]] target (`bench`); all
+                             measurement logic in benches/utils (infino-bench-utils)
+docs/architecture/         ← canonical design references
+examples/                  ← runnable examples (start with `cargo run --example demo`)
+```
+
+Rule of thumb for landing a change in the right place:
+
+
+| If the change is about…                     | Edit here                                                             |
+| ------------------------------------------- | --------------------------------------------------------------------- |
+| BM25 scoring                                | `src/superfile/fts/bm25.rs`                                           |
+| Posting list iteration / skip table         | `src/superfile/fts/posting.rs`                                        |
+| Vector quantization codec                   | `src/superfile/vector/quant.rs`                                       |
+| Vector distance kernel (incl. SIMD)         | `src/superfile/vector/distance.rs`                                    |
+| Tokenizer                                   | `src/superfile/fts/tokenize.rs`                                       |
+| Partition strategy                          | `src/supertable/manifest/partition.rs`                                |
+| Skip pruning (Bloom / min-max / term range) | `src/supertable/manifest/{bloom,aggregates,term_range,list_prune}.rs` |
+| Commit / writer slot / handle               | `src/supertable/writer.rs` + `src/supertable/handle.rs`               |
+| Tombstones (delete-path / query-filter)     | `src/supertable/{wal,tombstones}/`                                    |
+| New storage backend                         | `src/storage/`                                                        |
+| File-format byte layout                     | `src/superfile/format/`                                               |
+| Catalog / `connect` / `Connection`          | `src/catalog/`                                                        |
+| Public error mapping                        | `src/error.rs`                                                        |
+
+
+## Boundaries
+
+### ✅ Safe to propose and PR (with tests)
+
+- Bug fixes with regression tests
+- Documentation, error-message, and example improvements
+- Performance optimizations localized to one subsystem
+- New implementations of an existing public trait — the trait is the extension contract
+- Test additions and refactors confined to one module
+
+### ⚠️ Ask first (open an issue before writing code)
+
+- Changes to the public API surface (anything re-exported at the crate root / tracked in `public-api.txt`)
+- Adding a new top-level module under `src/`
+- Adding a new direct dependency to `Cargo.toml`
+- Changes to the on-disk format (`superfile/format/`, footer layout, blob layout, CRC discipline)
+- Changes to commit / manifest semantics (`supertable/manifest/commit.rs`, `supertable/handle.rs`, `supertable/writer.rs`)
+- Anything adding `unsafe` outside the existing documented areas (SIMD kernels, mmap/page-advise, the `bumpalo` extension)
+
+### 🚫 Never propose (measured and rejected; don't bring back without genuinely new evidence)
+
+- **Non-Parquet file format** (e.g. a proprietary columnar layout like Lance). Search-on-Parquet is the thesis; ecosystem reuse outweighs a 30-50% storage win.
+- **WAL-based ingest** (per-row durability before commit). Rejected as a different architectural model; commit-as-durability-boundary is deliberate. Note: a WAL *does* exist in `src/supertable/wal/` for the **updates/deletes** pipeline — that's orchestration state, not ingest durability. Don't conflate.
+- **HNSW graph inside each IVF partition.** Memory cost is 80 MB / 1M docs for an 18% warm-search win; not worth it given our high-`n_cent` + 1-bit-code shape.
+- **SPFresh-style in-place IVF rebalance.** Superfiles are immutable by design. Updates = delete + insert via tombstones.
+- **Multi-vector / ColBERT-style per-token vectors.** Niche; better as a sidecar pattern than a format primitive.
+- `**range_concurrent(&[Range])` storage API.** `LazyByteSource::range` is already `async fn`; callers parallelize with `try_join_all` or `FuturesUnordered`.
+
+If you have a strong reason to revisit any 🚫 item, open an issue with new evidence first; don't open a PR cold.
+
+## Public API surface
+
+The stability boundary is the set of items re-exported at the **crate
+root** (`src/lib.rs`) — everything a user reaches as `infino::*`. The
+surface is deliberately small: a connection-and-table API over the
+storage/superfile/supertable layers, which are themselves internal.
+
+- **Entry points** — `connect(uri)` and `connect_with(uri, ConnectOptions)`, returning a `Connection`.
+- `**Connection`** — `create_table`, `open_table`, `drop_table` (logical by default; `purge = true` also deletes the table's storage subtree), `list_tables`, `query_sql`.
+- `**Supertable`** (the table handle) — `append`, `update`, `delete`, `schema`, plus the sync search surface. All five search methods (`bm25_search`, `vector_search`, `hybrid_search`, and the unranked `token_match` / `exact_match`) return Arrow rows (`Vec<RecordBatch>`) and take a `projection: Option<&[&str]>` naming the output columns (`_id`, any visible scalar column, or the trailing `score`); `None` returns the engine-native `_id` + `score` pair (no scalar decode — `_id` reads from its dedicated id pages), and materializing row data is an explicit opt-in by naming the columns to decode. The async kernels and the superfile-local hit representation stay on the internal `SupertableReader`; the public methods resolve to the stable `_id` before returning.
+- **Supporting types** — `ConnectOptions`, `ColdFetchMode`, `IndexSpec`, `Metric`, `BoolMode`, `VectorSearchOptions`, `MutationStats`, the `InfinoError` enum, and `BUILDER_ID`.
+
+Everything else — `SupertableReader`/`SupertableWriter`, the manifest
+and summary types, the storage providers and `StorageProvider` trait,
+the whole `SuperfileReader`/builder/byte-source surface — is
+`pub(crate)` or test-only and **not** part of the public API. Default
+new items to `pub(crate)`; if you add a crate-root `pub` re-export,
+justify why it needs to be reachable outside the crate.
+
+The surface is **machine-guarded**: `public-api.txt` is a checked-in
+`cargo-public-api` snapshot. `make public-api` fails if the live
+surface drifts from it; run `make public-api-update` to regenerate the
+snapshot intentionally and review the diff in the PR. Test-only
+visibility is handled by the `test_visible!` macro (flips an item
+between `pub(crate)` and `pub` under the `test-helpers` feature) so
+integration tests can reach internals without widening the shipped
+surface.
+
+## Sources of truth
+
+When this file and a config file disagree, the config file wins. Authoritative sources:
+
+- `**Cargo.toml`** — dependencies, lint config (`#![deny(clippy::unwrap_used)]` lives in `lib.rs`), test/bench target declarations (`[[test]]` / `[[bench]]` stanzas), feature flags.
+- `**Makefile`** — canonical command set (`check`, `test`, `ci`, `coverage`, `miri`, `asan`, `bench`, `bench-quick`, `clean`).
+- `**rust-toolchain.toml`** — the exact stable Rust version pinned for this crate.
+- `**.github/workflows/**` — what CI actually runs and fails on.
+- `**docs/architecture/superfile.md**` + `**docs/architecture/supertable.md**` — design-level invariants and the rationale behind major choices.
+
+If a section here drifts out of sync with one of those, the config wins and this file is wrong.
+
+## When something doesn't fit any of these notes
+
+Ask. Filing an issue describing the problem before writing code is always welcome — a short written proposal to react to beats a surprise PR.
+
+For project overview and quick-start, see `[README.md](README.md)`.
+
+---
+
+# CLAUDE.md
+
+Source: https://github.com/infino-ai/infino/blob/main/CLAUDE.md
+
+AGENTS.md
+
+---
+
+# Contributing to infino
+
+Source: https://github.com/infino-ai/infino/blob/main/CONTRIBUTING.md
+
+# Contributing to infino
+
+Thanks for your interest in infino. This guide gets you from a fresh
+clone to a green pull request.
+
+## Prerequisites
+
+- **Rust** — install via [rustup](https://www.rust-lang.org/tools/install).
+  You do not need to pick a version: `rust-toolchain.toml` pins the
+  exact stable toolchain and `rustup` installs it automatically the
+  first time you build.
+- **Nightly Rust** — only required for the memory-safety lanes
+  (`make miri`, `make asan`). Install with
+  `rustup toolchain install nightly` and, for miri,
+  `rustup +nightly component add miri`.
+- **cargo-llvm-cov** — only required to run the coverage gate locally:
+  `cargo install cargo-llvm-cov --locked`.
+- **pre-commit** — optional but recommended for local development. Install via
+  [pre-commit.com](https://pre-commit.com/#install) and run `pre-commit install`
+  in the repository root. This sets up git hooks to catch style and lint issues
+  before they reach CI.
+
+## Build
+
+```bash
+git clone git@github.com:infino-ai/infino.git
+cd infino
+cargo build
+```
+
+## Run the demo
+
+The fastest way to see the whole stack work end to end — a superfile
+built in memory, queried by BM25 and vector kNN, then read back as a
+plain Parquet table:
+
+```bash
+cargo run --example demo
+```
+
+## Test
+
+```bash
+cargo test --features test-helpers          # full suite (integration tests need this feature)
+cargo test --features test-helpers <name_substring>   # a single test or module
+cargo test --features test-helpers bm25_oracle -- --nocapture   # ...with stdout
+```
+
+## Node.js bindings
+
+The Node.js bindings live in [`infino-node/`](infino-node/). They build
+`infino` as an ordinary dependency and are kept out of the Cargo
+workspace, so the core crate never needs a Node toolchain. Working on
+them additionally requires **Node.js >= 18** and **npm**.
+
+| Target | What it does |
+|---|---|
+| `make node-test` | build the addon (debug) and run the smoke tests |
+| `make node-build` | build a release addon for the current platform |
+| `make node-verify` | pack the package as it ships, install it into a throwaway project, and run a roundtrip — proving an installed package resolves its prebuilt binary |
+
+The smoke tests under `infino-node/__test__/` exercise the same surface
+the Rust API guarantees — create a table, append, search, read records
+back. Run `make node-test` before opening a PR that touches the
+bindings; `make node-verify` reuses the last build by default (set
+`REBUILD=1` to force a fresh one).
+
+## Pre-commit hooks (optional but recommended)
+
+After running `pre-commit install`, git hooks will automatically run before each commit to catch:
+- Code formatting issues (`rustfmt`)
+- Compiler errors (`cargo check`)
+- Lint warnings (`clippy`)
+- File hygiene (trailing whitespace, line endings, merge conflicts, YAML syntax)
+
+To run them manually without committing:
+
+```bash
+pre-commit run --all-files        # check all files
+pre-commit run --files <file>     # check specific file(s)
+```
+
+## Before you open a pull request
+
+Run the same gates CI runs:
+
+```bash
+make ci
+```
+
+`make ci` is `make check` + `make coverage`; it must pass before a PR
+is merged. The individual targets:
+
+| Target | What it does |
+|---|---|
+| `make check` | `cargo fmt --check` + `cargo clippy --all-targets -- -D warnings` |
+| `make test` | `cargo test` (full suite) |
+| `make ci` | `check` + `coverage` — the pre-PR gate |
+| `make coverage` | `cargo llvm-cov --summary-only` (≥90% overall) |
+| `make bench` / `make bench-quick` | custom harness benches (`bench-quick` for a fast pass) |
+| `make miri` | language-level UB detection on the FTS surface (nightly) |
+| `make asan` | LLVM AddressSanitizer on the FTS surface (nightly) |
+
+If your change touches any `unsafe` code, also run `make miri` and
+`make asan`.
+
+## Code conventions
+
+- **No `.unwrap()`.** The crate is `#![deny(clippy::unwrap_used)]`
+  crate-wide (reasserted in `tests/` and `benches/`). Use `?` to
+  propagate, or `.expect("invariant: ...")` on paths that are
+  infallible by construction. Tests and benches use
+  `.expect("description")`.
+- **Match the surrounding code** — naming, comment density, and idiom.
+- Source comments document the *what*; keep them focused and accurate.
+
+## Workflow
+
+1. Fork the repository and create a branch off `main`.
+2. Make your change with tests — we do not merge code without tests.
+3. Run `make ci` until it is green.
+4. Open a pull request against `main`; CI runs the same gates.
+
+For the design rationale behind a subsystem, read the architecture
+references in [`docs/architecture/`](docs/architecture/) —
+[`superfile.md`](docs/architecture/superfile.md) (the on-disk format
+and single-file reader/builder) and
+[`supertable.md`](docs/architecture/supertable.md) (the in-memory
+cross-superfile query and manifest layer).
+
+For how the Rust crate, Node, and Python package versions relate (the
+`major.minor` lockstep, independent patches, pre-1.0 policy), see
+[`docs/versioning.md`](docs/versioning.md).
+
+---
+
+# infino
+
+Source: https://github.com/infino-ai/infino/blob/main/crate-docs.md
+
+# infino
+
+
+**infino is a fast retrieval engine that runs SQL, full-text (BM25), and vector
+search over a single copy of your data on object storage.** Data stays in Parquet
+on S3 (or Azure, GCS, or local disk) and you query it at scale — embedded in your
+process, with no separate search server or vector database to run.
+
+- **Speed per dollar** — object-storage economics at search-engine speeds; on a
+  1-million-document index, warm BM25 queries return in the microsecond range.
+- **Multi-modal queries** — keyword (BM25), vector, and SQL over the same rows.
+- **Object-storage-native** — snapshot-isolated reads and atomic commits over S3,
+  Azure, GCS, or local disk.
+- **Open format, no lock-in** — spec-compliant Parquet, so anything that reads
+  Parquet can read your data.
+
+## Install
+
+```sh
+cargo add infino
+```
+
+infino installs the [mimalloc](https://github.com/microsoft/mimalloc) global
+allocator by default. If you embed infino in a process that already sets a global
+allocator, turn it off to avoid a second one:
+`infino = { version = "0.1", default-features = false }`.
+
+## Quickstart
+
+```rust
+use std::sync::Arc;
+
+use arrow_array::{FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch};
+use arrow_schema::{DataType, Field, Schema};
+use infino::{connect, BoolMode, IndexSpec, Metric, VectorFilter, VectorSearchOptions};
+
+// Tiny stand-in for your embedding model so this runs as-is — a 16-dim
+// one-hot by topic. Real embeddings are dense and higher-dimensional.
+fn embed(topic: usize) -> Vec<f32> {
+    let mut v = vec![0.0_f32; 16];
+    v[topic] = 1.0;
+    v
+}
+
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+// A knowledge base your agent retrieves over. "memory://" is in-process;
+// use "./data" or "s3://bucket/prefix" to persist.
+let db = connect("memory://")?;
+
+let item = Arc::new(Field::new("item", DataType::Float32, true));
+let schema = Arc::new(Schema::new(vec![
+    Field::new("source", DataType::LargeUtf8, false),
+    Field::new("body", DataType::LargeUtf8, false),
+    Field::new("embedding", DataType::FixedSizeList(item.clone(), 16), false),
+]));
+let docs = db.create_table(
+    "docs",
+    schema.clone(),
+    IndexSpec::new().fts("body").vector("embedding", 16, 1, Metric::Cosine),
+)?;
+
+let flat: Vec<f32> = [0usize, 0, 1].iter().flat_map(|&t| embed(t)).collect();
+docs.append(&RecordBatch::try_new(
+    schema,
+    vec![
+        Arc::new(LargeStringArray::from(vec!["help-center", "help-center", "blog"])),
+        Arc::new(LargeStringArray::from(vec![
+            "To cancel a subscription, open Settings then Billing.",
+            "Refunds return to the original payment method.",
+            "Enable dark mode under Settings then Appearance.",
+        ])),
+        Arc::new(FixedSizeListArray::new(item, 16, Arc::new(Float32Array::from(flat)), None)),
+    ],
+)?)?;
+
+// Retrieve context to ground the agent's next answer:
+let keyword = docs.bm25_search("body", "cancel subscription", 5, BoolMode::Or, None)?;
+let semantic = docs.vector_search("embedding", &embed(0), 5, VectorSearchOptions::new(), None, None)?;
+// vector kNN, restricted to rows whose body matches a keyword (pushdown filter):
+let filtered = docs.vector_search(
+    "embedding", &embed(0), 5, VectorSearchOptions::new(),
+    Some(VectorFilter { column: "body", query: "billing", mode: BoolMode::Or }), None,
+)?;
+let billing = db.query_sql("SELECT body FROM docs WHERE source = 'help-center'")?;
+assert_eq!(keyword.iter().map(|b| b.num_rows()).sum::<usize>(), 1);   // BM25
+assert!(semantic.iter().map(|b| b.num_rows()).sum::<usize>() >= 1);   // vector kNN
+assert_eq!(filtered.iter().map(|b| b.num_rows()).sum::<usize>(), 1);  // vector + keyword filter
+assert_eq!(billing.iter().map(|b| b.num_rows()).sum::<usize>(), 2);   // SQL filter
+# Ok(())
+# }
+```
+
+## API overview
+
+The public surface is a small connection-and-table API:
+
+- `connect` / `connect_with` open a `Connection`. The backend follows the URI
+  scheme (`s3://`, `az://`, `gs://`, `file://`, bare path, `memory://`);
+  credentials are passed via `ConnectOptions::with_storage_option`
+  (object_store's `aws_*` / `azure_*` / `google_*` keys), never read from the
+  environment.
+- `Connection` — `create_table`, `open_table`, `drop_table`, `list_tables`, `query_sql`.
+- `Supertable` (the table handle) — `append`, `update`, `delete`, `schema`, and the
+  search methods `bm25_search`, `vector_search`, `hybrid_search`, `token_match`,
+  and `exact_match` (each returns Arrow rows as `Vec<RecordBatch>`).
+- Supporting types — `IndexSpec`, `Metric`, `BoolMode`, `VectorSearchOptions`,
+  `ConnectOptions`, `MutationStats`, and the `InfinoError` enum.
+
+## Other languages
+
+infino also ships **Python** (`pip install infino`) and **Node.js**
+(`npm install @infino-ai/infino`) bindings. For multi-language guides and
+examples, see the [project repository](https://github.com/infino-ai/infino).
+
+---
+
+# Infino Architecture Overview
+
+Source: https://github.com/infino-ai/infino/blob/main/docs/architecture/overview.md
+
+# Infino Architecture Overview
+
+A plain-language tour of what Infino is, how it's built, and how it
+differs from the database, search engine, and vector database alternatives. 
+For more technical detail, see [superfile](./superfile.md) (the superfile format) and
+[supertable](./supertable.md) (the table layer).
+
+## What is Infino?
+
+**Infino is a fast retrieval engine that keeps your data on cheap object storage (like Amazon S3) and runs SQL, full-text search, and vector search over it from a single system.**
+
+For most retrieval and RAG workloads, hybrid queries are useful for improving the cost, latency, and accuracy of results. In Infino, SQL, keyword, and vector run over **one copy of the data** through **one query path**, making **hybrid search** a first-class, single-pass operation.
+
+ The data lives in object storage at object-storage prices, and  
+compute pulls in only what a query actually touches, caching the hot  
+parts locally for speed. You do not need to maintain a separate cluster.
+
+## The mental model
+
+Think of three ideas:
+
+1. **The data is just files.** Every chunk of the table is one
+  self-contained file — a *superfile* — that holds the raw columns
+   *and* the search indexes (keyword + vector) together. There are no
+   sidecar index files to keep in sync, and the file is also a valid
+   Apache Parquet file, so standard analytics tools (DuckDB,
+   DataFusion, pandas/pyarrow) can read it directly.
+2. **Files are never edited, only added.** A *supertable* is described
+  by its *manifest* — the list of which files currently make up the
+   table. Writes create new files and publish a new manifest; they never
+   modify existing files. This makes consistency simple and snapshots
+   essentially free.
+3. **Storage and compute are separate.** The source of truth is object
+  storage. Compute nodes are stateless readers that fetch byte ranges
+   on demand and keep a local cache of hot data. You scale storage and
+   compute independently and pay for each separately.
+
+```text
+        Application
+            │  connect(uri) → Connection
+            ▼
+        Connection  ── catalog of tables (name → supertable) ──┐
+            │  create / open / list / drop · cross-table SQL    │
+            ▼                                                    │
+        Supertable  ── manifest (the file list) ──┐             │
+            │                                      │             │
+   stateless compute                       immutable files      │
+   + local cache (hot)                     (superfiles)          │
+            │                                      │             │
+            └──────────── byte-range reads ────────┴─────────────┘
+                                 ▼
+                      Object storage (S3) — cheap, durable,
+                              the source of truth
+```
+
+## Opening Infino
+
+Infino is an **embedded engine, not a server** — it runs inside your
+process, the way SQLite or DuckDB do. You install it as a library (the
+Rust crate via `cargo add infino`, or the Python wheel via
+`pip install infino`) and open a **connection** to a root location on
+storage from your own code; the engine, including its SQL (DataFusion
+under the hood), executes in-process. There is no wire protocol yet, so
+external SQL clients can't attach — SQL is reached through the
+connection's `query_sql`. From that connection you work with tables:
+
+- `connect("s3://bucket/prefix")` (or `az://container/prefix`,
+  `gs://bucket/prefix`, a local path, or `memory://`) returns a
+  **`Connection`** — a *catalog of tables* persisted at that root.
+  (Distinct from a supertable's *manifest*, which lists the files within
+  one table.) Credentials are passed as `storage_options` keyed by
+  `object_store`'s `aws_*` / `azure_*` / `google_*` config strings — never
+  read from the environment.
+- From the connection you **create**, **open**, **list**, and **drop**
+  tables, and run **SQL across them** (`query_sql`) — joins and
+  aggregations span tables in the catalog in one engine.
+- Each table is a **`Supertable`** handle: `append` rows, `update` /
+  `delete`, and search it — `bm25_search` / `vector_search` /
+  `hybrid_search` (full-text, vector kNN, and RRF-fused, returning Arrow
+  rows), the unranked `token_match` / `exact_match`, and `schema`. The
+  same retrievers are also SQL table-valued functions, so search composes
+  with the rest of a query.
+
+The connection is the only entry point; everything below it (manifest,
+storage, cache, query fan-out) is internal.
+
+## How a query runs
+
+To minimize latency and cost, infino tries to optimize data layout and data accesses so that a query rarely needs to download the whole dataset. It:
+
+1. Starts from a **pinned snapshot** of the manifest (so concurrent
+  writes never change the answer mid-query).
+2. **Prunes** — uses small per-file summaries in the manifest
+  (value ranges, a keyword "is this term present?" filter, vector
+   centroids) to skip files that can't possibly match. This reads only
+   the catalog, never file contents. The same summaries back every
+   modality through one shared pruning layer, so a hybrid query prunes
+   on scalar, keyword, *and* vector signals together before touching a
+   single byte of a superfile.
+3. **Fetches only what it needs** — for surviving files it pulls just
+  the relevant byte ranges from object storage (a posting list, a
+   handful of vector clusters), not the whole file. This holds for SQL
+   too: a keyword filter on an indexed text column is answered from the
+   index and decodes only the matching rows, rather than scanning the
+   whole column. The same index answers unranked retrieval directly —
+   boolean token matching and exact raw-value matching — so an
+   equality or `IN` predicate on an indexed column resolves to a small
+   candidate row set before any column data is read.
+4. **Merges** the per-file results into one ranked answer.
+
+The cost model that falls out of this is the headline: **you pay for
+what you query, not for keeping everything in memory.**
+
+## Caching: cold, warm, hot
+
+Object storage is cheap and durable but relatively slow per request, so
+infino layers a cache between compute and storage:
+
+- **Cold** — data only in object storage. The first query is served
+from ranged reads while the full file is fetched into the local cache
+in the background.
+- **Warm/Hot** — once a file is resident locally it's served from a
+memory-mapped file, at local-disk/RAM speed.
+- **Bounded & elastic** — the cache has a size budget and evicts cold
+files when full. A separate memory budget can push pages out of RAM
+while leaving the file on local disk, so it re-faults without a
+re-download. Eviction is always safe: in-flight queries keep their
+data alive.
+
+The point: the **hot working set** lives close to compute for speed,
+while the **long tail** lives in cheap storage — without you having to
+decide up front which is which.
+
+## How this differs from what's out there
+
+Databases, search engines, and vector databases increasingly offer multiple
+modalities — scalar, full-text, and vector — and several have moved at
+least partway toward object storage. So the interesting question is
+rarely "can system X do vectors / keyword / SQL?" (usually: yes, in some
+form). It's about each system's **design center** — what it was built
+around from day one — and the **tradeoffs in cost and complexity
+for a given use case** that follow at scale. The categories below are
+points on a spectrum, not walls.
+
+### Traditional databases (Postgres, MySQL, …)
+
+- Built for transactional workloads: row-oriented, tuned for
+point reads/writes of individual records with strong consistency.
+- The ecosystem has added real search capability — `pgvector` for
+embeddings, built-in full-text — and for many teams that's the right
+answer: one system you already run, no extra moving parts, perfectly
+good at moderate scale.
+- The tradeoff is architectural: storage and compute are **coupled**,
+so as the dataset (and especially the vector count) grows, you scale
+by buying a bigger box or sharding it yourself, and the cost curve
+rises with total data rather than with what you query.
+- **Sweet spot**: transactions and mixed small-record read/write, plus
+search that piggybacks on data you already keep there. **Less ideal**:
+very large search corpora where most data is cold.
+
+### Search engines (Elasticsearch / OpenSearch / Lucene-based)
+
+- The mature standard for full-text relevance, with a deep feature set
+(analyzers, aggregations, highlighting) and increasingly capable
+dense-vector support.
+- They've also evolved toward tiered storage — **searchable snapshots /
+frozen tiers** can back colder data with object storage — so the
+"everything on local disk" picture is no longer the whole story.
+- That said, the **design center is still the node-and-shard cluster**:
+object-storage tiers are an addition to that model rather than the
+default, and operational weight (sizing, shard rebalancing, JVM/heap
+tuning, tier management) remains real. Keeping large indexes hot is
+powerful but costly.
+- **Sweet spot**: rich, mature full-text relevance and analytics on
+data you actively query. **Cost/ops consideration**: scale and
+always-hot footprint.
+
+### Vector databases (Pinecone, Weaviate, Milvus, Qdrant, …)
+
+- Purpose-built, often best-in-class approximate-nearest-neighbor over
+embeddings, with strong recall/latency tuning.
+- The category has matured well past "vectors only": most now offer
+**metadata filtering and hybrid (keyword + vector) search**, and some
+are themselves moving to object-storage-backed, separated-compute
+architectures.
+- The common tradeoff is **system count and role**: a vector DB is
+frequently run *alongside* your system of record and your search
+engine, so you keep multiple copies of data in sync; and full-text /
+SQL maturity varies by vendor. Latency-first deployments that pin
+vectors in RAM/SSD can get expensive as the corpus grows.
+- **Sweet spot**: vector-first / AI-retrieval workloads. **Consideration**:
+where it sits relative to your other systems, and breadth beyond
+vectors.
+
+### Object-storage-native search (Infino, TurboPuffer, LanceDB)
+
+This camp's distinction isn't "the only ones who *can*" do these things
+— it's that the architecture is **built around object storage and
+multi-modal retrieval from the start**, rather than retrofitting either:
+
+- **Object storage as the primary tier by default.** The full dataset
+lives in S3 at S3 prices; compute is stateless and cached. Cold data
+is cheap to *keep*, and you largely pay compute for what you *query*.
+- **Separation of storage and compute** as the baseline — scale and
+bill each independently; spin compute down without losing data.
+- **Multi-modal as a first-class assumption**, not a later addition.
+
+Where **Infino is distinctive even within this camp**:
+
+- **The superfile is a valid Parquet file.** Data isn't trapped in a
+proprietary index format — the *same bytes* are readable by the open
+analytics ecosystem (DuckDB, DataFusion, pyarrow) with no export step,
+while infino uses embedded index regions for search. Lower lock-in,
+easy interop with existing data tooling.
+- **Scalar + full-text + vector together in one immutable superfile** —
+SQL, BM25, and IVF + RaBitQ vectors share one copy of the data and
+one consistency model, instead of syncing a DB + a search engine + a
+vector DB.
+- **Hybrid search is a first-class citizen — and an access path, not just an API.** In most systems, hybrid search ends at top-k: two retrievals (BM25, ANN) plus rank fusion. Here every modality shares one copy and one query path, so you fuse keyword and vector relevance — with SQL filters — in a single query against a single snapshot, with no second system to keep in sync and no client-side result stitching. And because the retrievers are *relations* (table functions) and indexed text predicates resolve to candidate row sets inside the engine, search can be the first stage of a larger SQL plan — feeding joins, filters, and aggregates — rather than its result. The same index machinery prunes superfiles across SQL, full-text, and vector together, so the hybrid query is also the well-pruned, cheap one.
+
+### At a glance
+
+Read these as **design center and typical tradeoff**, not hard limits —
+most systems are extending across the row over time.
+
+
+|                          | Built around                             | Modalities (today)                                           | Cold-data cost curve                         | Format                                     |
+| ------------------------ | ---------------------------------------- | ------------------------------------------------------------ | -------------------------------------------- | ------------------------------------------ |
+| **Traditional DB**       | Transactions, single node                | Scalar core; full-text + vectors added (e.g. pgvector)       | Rises with total data (coupled)              | Some prorietary, many support **Parquet**. |
+| **Search engine**        | Node/shard cluster                       | Full-text core; vectors maturing; object-storage tiers added | Lower with frozen tiers, but cluster-centric | Proprietary                                |
+| **Vector DB**            | ANN over embeddings                      | Vector core; hybrid + filtering increasingly common          | Varies; RAM/SSD-heavy if latency-pinned      | Proprietary                                |
+| **Object Store Engines** | Object storage + multi-modal, by default | Scalar + full-text + vector + hybrid as a baseline           | Low; pay for what you query                  | Infino: **Parquet**                        |
+
+
+## What Infino optimizes for
+
+- **Cost at scale.** Object storage as the source of truth means
+storing a lot of data is cheap; you pay compute only for the queries
+you run and the hot set you cache.
+- **One system, multiple query types — including hybrid.** SQL filters,
+keyword relevance, and semantic similarity over the same data, fused
+into a single hybrid query when you want both signals at once — no
+multi-system sync, no duplicated copies, no client-side result merging.
+- **Predictable performance tiers.** Bounded ranged reads on cold data,
+local memory-mapped speed when hot, with the cache managing the
+transition automatically.
+- **Operational simplicity.** Immutable files + an atomic manifest swap
+give clean snapshots, safe concurrent writers, and stateless,
+disposable compute.
+- **Openness / no lock-in.** Superfiles are Parquet; data stays usable by
+the broader ecosystem.
+
+## Where it fits best
+
+Infino is best for:
+
+- Large corpora where **most data is cold** but must stay searchable —
+logs, documents, product catalogs, knowledge bases, chat/email
+history — and where keeping it all hot is the cost pain.
+- **RAG and AI retrieval** that needs **hybrid** relevance — semantic
+(vector) fused with keyword and metadata/SQL filtering over the same
+store — where consolidating onto one multi-modal system beats running
+and syncing another.
+- Teams feeling the **always-hot cost or operational weight** of their
+current setup (e.g. a large search cluster, or a separate vector DB
+kept in sync with a database) and open to a separated-compute,
+object-storage-native model.
+- Workloads with **bursty or elastic query volume**, where decoupled
+compute can scale up and down against a stable storage tier.
+- **Existing warehouse / lakehouse data** you want to search in place.
+Because a superfile *is* a valid Parquet file, you add keyword, vector,
+and hybrid retrieval over data already in your lakehouse's open format —
+cutting the number of tools you operate and the cost of keeping
+duplicate copies and separate systems in sync.
+
+Equally fair to say where it's *not* the obvious choice: heavy transactional workloads belong in an OLTP database, and if you already
+run one system that comfortably handles your scale and modalities, then where Infino helps is to consolidate to save cost/ops.
+
+## A few terms you'll see through the repo
+
+- **Connection** — the entry point: a catalog of tables rooted at a URI,
+opened with `connect(uri)`. Create / open / list / drop tables and run
+SQL across them. (The table catalog; not to be confused with a single
+table's manifest.)
+- **Superfile** — one immutable superfile file (columns + keyword index +
+vector index), also a valid Parquet file.
+- **Supertable** — the table: a manifest over many superfiles,
+presenting them as one queryable table. Obtained from a `Connection`.
+- **Manifest** — the immutable list of which files make up one table
+right now; each commit publishes a new one atomically.
+- **Snapshot read** — a query pinned to one manifest, so concurrent
+writes never change its answer.
+- **Pruning** — skipping files that can't match using small per-file
+summaries, before touching any file contents.
+- **BM25** — the standard keyword-relevance ranking for full-text
+search.
+- **Hybrid search** — a single query that fuses keyword (BM25) and
+vector relevance (e.g. via reciprocal-rank fusion), optionally with
+SQL filters, over one copy of the data and one snapshot.
+- **IVF + RaBitQ** — the clustering + compact-binary-code technique
+behind fast approximate vector search.
+- **Object storage / S3** — cheap, durable, near-infinite remote
+storage used as the source of truth.
+
+
+---
+
+# Superfile
+
+Source: https://github.com/infino-ai/infino/blob/main/docs/architecture/superfile.md
+
+# Superfile
+
+A superfile is infino's superfile format. Each superfile is a single,
+self-contained file that is also a valid
+[Apache Parquet](https://parquet.apache.org/docs/) file. Standard
+Parquet tools read it as an ordinary columnar table; infino reads the
+same file as a search superfile, with full-text and vector indexes
+available alongside the columnar data.
+
+This document describes the format and its guarantees. The table layer
+that composes many superfiles into one queryable table is described in
+[supertable](./supertable.md).
+
+## Design
+
+- **Single file.** One superfile is one superfile: the columnar data and
+  its search indexes live in the same file, with no sidecars to keep
+  in sync.
+- **Parquet-compatible.** A superfile is a standards-compliant Parquet
+  file. Any Parquet reader can open it and read the columnar data with
+  no infino-specific support.
+- **Immutable.** A superfile is written once and never modified in
+  place. Changes are expressed by writing new superfiles.
+- **Search-native.** Full-text and vector search indexes are part of
+  the superfile, not a separate system layered on top of it.
+
+## Layout
+
+A superfile is a Parquet file with index regions placed between the
+Parquet row groups and the Parquet footer:
+
+```text
+[ Parquet row groups          ]   columnar data
+[ Full-text index  (optional) ]
+[ Vector index     (optional) ]
+[ Parquet footer              ]
+```
+
+The footer is a standard Parquet footer. infino records the location
+and configuration of its index regions in the footer's key-value
+metadata, under a reserved namespace. Parquet readers ignore metadata
+keys they do not recognize, so the presence of the indexes does not
+affect Parquet compatibility.
+
+## Parquet compatibility
+
+Compatibility is a property of the bytes, not a conversion step:
+
+- The file begins with Parquet data and ends with a standard Parquet
+  footer and trailer.
+- The schema, row groups, and column data are written by a standard
+  Parquet writer.
+- The index regions are opaque to Parquet readers and lie outside the
+  row-group ranges described by the footer.
+- Index metadata is namespaced in the footer's key-value metadata and
+  is ignored by readers that do not use it.
+
+As a result, tools such as
+[DataFusion](https://datafusion.apache.org/),
+[DuckDB](https://duckdb.org/), and
+[pyarrow](https://arrow.apache.org/docs/python/) can read a superfile
+as a normal table — projecting columns, filtering rows, and running
+SQL over the columnar data — without any infino-specific support.
+infino uses the same footer to locate the embedded indexes when
+full-text or vector search is requested.
+
+```mermaid
+flowchart TD
+    bytes["Superfile bytes<br/>(one valid Parquet file)"]
+    bytes --> pq["Standard Parquet tools<br/>(DataFusion / DuckDB / pyarrow)"]
+    bytes --> inf["infino reader"]
+    pq --> pqout["Columnar table:<br/>project, filter, SQL"]
+    inf --> infout["Columnar data + embedded<br/>full-text and vector search"]
+```
+
+## Full-text index
+
+The full-text index is an inverted index supporting
+[BM25](https://en.wikipedia.org/wiki/Okapi_BM25) ranking over one or
+more text columns. It is built in the following stages:
+
+- **Tokenization.** Each indexed text value is tokenized into terms,
+  and the per-document term frequencies and document lengths that BM25
+  needs are accumulated as documents are added.
+- **Term dictionary.** Indexed terms are stored in a
+  [finite-state transducer](https://blog.burntsushi.net/transducers/),
+  a compact, ordered dictionary that maps each term to its postings and
+  supports prefix lookups.
+- **Posting lists.** For each term, the documents that contain it are
+  stored as a delta- and bit-packed posting list together with the
+  per-document term frequencies, kept in document order.
+- **Block metadata.** Posting lists are divided into fixed-size blocks,
+  and each block carries the maximum BM25 contribution any document in
+  it can produce. This upper bound lets search skip whole blocks that
+  cannot enter the top results.
+
+A query runs in two stages:
+
+1. Resolve each query term through the term dictionary to its posting
+   list.
+2. Walk the posting lists in document order, using the per-block upper
+   bounds to skip blocks that cannot improve the current top results,
+   and rank the surviving documents with BM25.
+
+The same inverted index also answers **unranked token matching**:
+resolve the query tokens to their posting lists and intersect them (all
+tokens present) or union them (any token present) to get the matching
+document set, with no BM25 scoring. This is the boolean retrieval the
+table layer's SQL `WHERE` pushdown builds on; ranking and matching share
+one set of posting lists.
+
+Document identifiers in the index are local to the superfile.
+
+## Vector index
+
+The vector index supports approximate nearest-neighbor search over one
+or more vector columns, under L2, cosine, or inner-product metrics. It
+is built in the following stages:
+
+- **Rotation.** A deterministic random rotation is applied to every
+  vector, spreading information evenly across dimensions so that the
+  binary codes below are uniformly informative.
+- **Clustering (IVF).** Rotated vectors are partitioned into clusters
+  with k-means, forming an inverted-file index. A query scans only the
+  clusters nearest the query rather than the entire column.
+- **Binary codes.** Each vector is encoded as a compact binary
+  (one bit per dimension) code derived from its rotated form, using
+  [RaBitQ](https://arxiv.org/abs/2405.12497). These codes drive a fast,
+  approximate first-pass scan.
+- **Rerank payload.** Each vector also carries a rerank representation
+  used to order candidates precisely. It is configurable per column:
+  full-precision floats, a compact quantized code with a residual
+  correction (the default), or none (binary codes only).
+- **Cluster-contiguous storage.** A cluster's centroid metadata, binary
+  codes, document identifiers, and rerank payloads are laid out
+  together, so evaluating a cluster is a contiguous read.
+
+A query runs in two stages:
+
+1. Score the query against the cluster centroids and select the nearest
+   clusters to probe.
+2. Scan the binary codes of the probed clusters to build a candidate
+   shortlist, then rerank the shortlist with the per-column rerank
+   representation and return the top results.
+
+Document identifiers in the index are local to the superfile.
+
+## Integrity
+
+Index regions are checksummed. The default read path verifies the
+checksums when a superfile is opened, so corruption is detected before
+any query runs against it.
+
+## Reading from a byte source
+
+A superfile can be opened against a *byte source* instead of a fully
+materialized buffer. Because the footer records the exact location of
+every region, a reader can address the Parquet row groups and each
+index region by range rather than needing the whole file in hand.
+
+A byte source abstracts where those bytes come from — an in-memory
+buffer, a memory-mapped local file, or an object store served by
+ranged reads. It offers a zero-copy fast path for ranges already
+resident in memory and an asynchronous fetch for ranges that are not,
+can present a sub-region of a larger object as its own source, and can
+overlay a handful of pre-fetched ranges so that the several small
+reads issued while opening a superfile are satisfied from one fetch
+rather than many round-trips.
+
+Opening this way reads only the metadata ranges the reader needs, not
+the whole superfile: the Parquet footer, then the full-text and vector
+section headers and directories. The reader does not retain the full
+superfile bytes — a source-opened reader cannot hand back the original
+Parquet file for a pass-through tool, and a caller that needs that uses
+the eager open path instead.
+
+Queries then fetch only the regions they touch. A full-text query
+resolves its terms through the dictionary and fetches each term's
+posting list on demand; the postings region is never read in full. A
+vector query fetches the centroids and then only the blocks of the
+clusters it probes. So a superfile on object storage answers a query by
+pulling a bounded set of ranges rather than downloading the file
+first.
+
+## Scope
+
+- A superfile is a single superfile. Querying across many superfiles is the
+  table layer's responsibility (see [supertable](./supertable.md)).
+- A superfile is immutable and is queryable only once it is fully
+  written.
+- Full-text search is bag-of-words: BM25 ranking and unranked token
+  matching (AND/OR) both run over the same posting lists. The format
+  stores **no token positions**, so there is no positional/phrase index.
+  Exact-string matching is therefore done as a two-pass operation — a
+  token-AND prune on the index to gather candidate rows, then a
+  raw-value verification against the stored column — not by storing
+  positions.
+
+---
+
+# Supertable
+
+Source: https://github.com/infino-ai/infino/blob/main/docs/architecture/supertable.md
+
+# Supertable
+
+A supertable is infino's table layer over [superfile](./superfile.md)
+superfiles. It presents many immutable superfiles as a single table that
+supports SQL, full-text, and vector search, while keeping readers
+consistent under concurrent writes.
+
+This document describes the table model and its guarantees. The superfile
+format is described in [superfile](./superfile.md).
+
+## Design
+
+- **Table over superfiles.** A supertable is a set of immutable superfile
+superfiles plus a manifest that defines the current contents of the
+table.
+- **Snapshot reads.** A reader observes a single, consistent snapshot
+of the table for its entire lifetime, regardless of writes that land
+afterward.
+- **Append by commit.** Writes are staged and published as a commit. A
+commit produces new superfiles and a new manifest; it never mutates
+existing superfiles.
+- **Pluggable storage.** Superfile bytes live behind a storage backend,
+and the table layer behaves the same way over in-memory, local-disk,
+and object storage.
+
+## Public API
+
+A supertable is the table handle an application holds. It is obtained
+from a **`Connection`** — the catalog of tables opened with
+`connect(uri)`, which creates / opens / lists / drops tables and runs
+SQL across them. The handle's public operations are **synchronous
+methods on the supertable itself**: `append`, `update`, `delete`, the
+search methods (`bm25_search` / `vector_search` / `hybrid_search`,
+returning Arrow rows; the unranked `token_match` / `exact_match`), and
+`schema`.
+
+Internally those methods drive a **reader** (a pinned, consistent
+snapshot) for queries and a single **writer** (staged changes published
+by commit) for mutations, with a **stats** view for introspection. The
+reader / writer / stats accessors, the manifest, and the superfile
+internals behind them are implementation details, never part of the
+public surface.
+
+Operations fall into two groups: **Read** and **Write**.
+
+### Read
+
+Reads run through a **reader** — a snapshot pinned at the moment it is
+taken, so a sequence of queries observes one consistent view of the
+table regardless of concurrent writes.
+
+Every read returns the same shape internally: a list of hits. A hit
+references a single row by its superfile and the row's offset within that
+superfile, plus a score when the query ranks results. BM25 fills the score
+with relevance (higher is better); vector search fills it with distance
+under the column's metric (smaller is closer); a SQL filter leaves it
+unset.
+
+Those superfile-local hits are the reader's internal representation. The
+public `Supertable` search methods resolve each hit to the table's
+stable `_id` and return Arrow `RecordBatch` rows. All five (`bm25_search`,
+`vector_search`, `hybrid_search`, and the unranked `token_match` /
+`exact_match`) take a
+column `projection`: `None` returns the engine-native `_id` + `score`
+(no scalar decode), and naming columns decodes only those — so
+materializing row data is an explicit opt-in (the cheap default is the
+right shape for a retrieval step feeding a follow-up fetch).
+
+- **Vector search.** k-nearest-neighbor over a vector column for a
+query vector, returning the `k` closest rows ordered by ascending
+distance. Per-query recall/latency knobs (number of clusters probed,
+rerank breadth) are passed as search options. An optional text predicate
+(an FTS-indexed column, a query string, and a boolean mode) restricts the
+search to matching rows — pushed into the ranking, not applied as a
+post-filter, so the `k` returned are the nearest rows that satisfy the
+predicate rather than a thinned-out slice of the global top-`k`.
+- **Full-text search.** BM25 over a text column for a query string,
+returning the `k` highest-scoring rows ordered by descending score.
+Search options carry the boolean combination mode (match any term or
+all terms) and default to matching any term.
+- **Full-text prefix search.** BM25 over a text column where the query
+is expanded as a term prefix, returning the `k` highest-scoring rows.
+- **Token match.** The *unranked* counterpart of full-text search:
+given a token list and a combination mode, return every row whose
+text contains all the tokens (`And`) or any of them (`Or`). No
+scoring and no top-k — the score is left unset. This is a set
+membership question ("which rows match"), not a ranking.
+- **Exact match.** Given a raw string, return every row whose stored
+value equals that string exactly. It runs in two passes — a token
+match prunes candidate rows from the index, then the candidates' text
+is verified against the raw string — so it never scans the whole
+column. Tokenization is used only to prune; the match itself is a
+raw-string comparison. Also unranked.
+- **SQL.** A SQL query over the table's scalar and full-text columns,
+returning the matching rows. Search is also reachable from SQL
+through table-valued functions, so a query can filter, project, join,
+and order search results alongside scalar columns:
+  - `vector_search(column, query, k)` — vector kNN as a relation.
+  - `bm25_search(column, query, k)` and
+  `bm25_search_prefix(column, prefix, k)` — full-text / prefix BM25.
+  - `token_match(column, query, mode)` and `exact_match(column, value)`
+  — the unranked token / exact-match relations. Negation is then a
+  SQL composition over them (e.g. `token_match(..,'rust') EXCEPT token_match(..,'compiler')`), keeping it index-bounded rather than a
+  dedicated `NOT` engine feature.
+  - `hybrid_search(text_col, q_text, vec_col, q_vec, k)` — BM25 and
+  vector results fused with reciprocal-rank fusion into one `score`.
+  Because each retriever is a relation, hybrid ranking is ordinary SQL
+  composition: join or union `vector_search` and `bm25_search` and rank
+  by a fusion score. `hybrid_search` packages the most common fusion as
+  a single function.
+  Each function runs against the reader's pinned snapshot and yields
+  the table's `_id`, the projected scalar columns, and a `score`. Vector
+  columns are never scanned as SQL columns — they live in the superfile's
+  embedded blob — so they are reached only through `vector_search` (or
+  `hybrid_search`, which calls it).
+
+The reader also answers cheap snapshot questions — superfile count,
+document count, manifest identity — without touching superfile bytes. A
+separate **stats** view adds process-level observability (cache
+residency, resident memory) for the whole table.
+
+### Write
+
+Writes run through a **writer**: changes are staged on it and made
+durable by a single commit; nothing is persisted until commit
+succeeds. A commit applies all staged work atomically from the
+caller's perspective.
+
+- **Append.** Stage a batch of rows for insertion.
+- **Delete.** Stage the removal of every row matching a predicate. The
+predicate is resolved against the current snapshot at call time.
+- **Update.** Stage a 1:1 replacement of every row matching a
+predicate with a supplied batch of equal cardinality.
+- **Commit.** Flush all staged appends, updates, and deletes,
+publishing a new snapshot of the table.
+
+### Lifecycle
+
+A table is created or opened from a set of options (schema, indexed
+columns, tokenizer, storage backend, consistency policy). The options
+used to construct the table are readable back from the handle. Read
+freshness under concurrent writers is governed by the configured
+consistency policy and applied by the engine on every read; callers
+never refresh by hand.
+
+## Manifest
+
+The manifest is the source of truth for which superfiles make up the
+table at a point in time. It holds table-level configuration (schema,
+indexed columns, tokenizer) and an ordered list of superfile entries.
+
+```mermaid
+flowchart TD
+    reader["Reader<br/>(pinned snapshot)"] --> manifest["Manifest<br/>(immutable snapshot)"]
+    manifest --> e1["Superfile entry (summary)"]
+    manifest --> e2["Superfile entry (summary)"]
+    manifest --> e3["Superfile entry (summary)"]
+    e1 --> s1["Superfile bytes"]
+    e2 --> s2["Superfile bytes"]
+    e3 --> s3["Superfile bytes"]
+    s1 --> store["Storage backend"]
+    s2 --> store
+    s3 --> store
+```
+
+
+
+The manifest is immutable. Each commit builds a successor manifest and
+publishes it atomically; a reader pins the manifest current at the time
+it was created and never observes a partially applied commit.
+Successor manifests share the superfile entries they carry forward, so
+publishing a commit allocates only the new entries rather than copying
+the whole list.
+
+Each superfile entry is a summary of one superfile, holding the
+information the table layer needs to route and prune queries without
+reading the superfile bytes:
+
+- **Location.** A storage-backend identifier for the superfile's bytes.
+- **Row range.** The superfile's document count and the range of primary
+identifiers it covers.
+- **Scalar statistics.** Per-column minimum and maximum values for the
+scalar columns, used to skip superfiles for predicate queries.
+- **Full-text summary.** Per text column, a term presence filter (a
+bloom filter over the superfile's terms) and the lexicographic range of
+its terms, used to skip superfiles for term and prefix queries.
+- **Vector summary.** Per vector column, a representative centroid and
+radius, used to order and route vector queries.
+
+The superfile bytes themselves are held by the storage backend, not the
+manifest, so a manifest stays small and cheap to share across many
+concurrent readers.
+
+### Partitioned, hierarchical manifest
+
+At scale the entry list is not a single flat array. Superfiles are
+assigned to partitions by a partition strategy that is chosen when the
+table is created and is immutable thereafter. Within a partition,
+entries are grouped into manifest *parts*; a new commit's superfiles
+append to a partition's current part until that part crosses a soft
+cap on either entry count or compressed size, at which point the next
+commit starts a fresh part rather than rewriting the existing one. A
+top-level manifest list names the parts and carries the per-part
+aggregate summaries used for pruning, so a query can discard whole
+parts before touching any per-superfile entry.
+
+Parts load on one of two paths, selected by a threshold on part count:
+
+- **Eager.** For a small number of parts, opening the table
+parallel-fetches every part up front and exposes the flat union of
+their entries. This is the path the flat-iteration query APIs use.
+- **Lazy.** Above the threshold, parts are left unloaded and fetched
+on first access, so opening a large table does not pull every part
+into memory. Coalesced loading ensures concurrent readers of a cold
+part share a single fetch.
+
+## Commit pipeline
+
+A commit turns staged record batches into new superfiles and a new
+manifest. It runs in the following stages:
+
+- **Stage.** Appended record batches accumulate in a write buffer. A
+commit consumes the current buffer; a size threshold can also trigger
+a commit automatically to bound the buffer's footprint.
+- **Shard.** The buffered rows are partitioned into balanced shards so
+that superfile builds run in parallel, independent of how the caller
+batched its appends.
+- **Build.** Each shard is built into one superfile, including its
+full-text and vector indexes, on a worker pool.
+- **Summarize.** Each new superfile's manifest entry is derived — row
+range, scalar statistics, and the full-text and vector summaries.
+- **Publish.** The superfile bytes are written to the storage backend and
+a successor manifest containing the existing and new entries is
+published atomically.
+
+## Storage
+
+Superfile files are stored as ordinary Parquet files. The manifest is a
+catalog over those files; it does not change the superfile format. Any
+Parquet reader can open an individual superfile file and read its
+columnar data directly, ignoring the embedded indexes.
+
+For persistent tables, the storage backend holds three things: the
+superfile files, the manifest, and a pointer to the current manifest.
+Publishing a commit writes the new superfiles and manifest first, then
+swings the pointer in a single atomic step, so a reader resolving the
+pointer always lands on a complete manifest. When multiple processes
+write the same table, the pointer update is guarded so that a writer
+working from a stale manifest cannot silently overwrite another
+writer's commit: a conflicting publish is retried with backoff,
+refreshing from the current manifest and rebuilding on top, up to a
+bounded number of attempts before the commit surfaces a contention
+error.
+
+Superfile uploads adapt to size. Below a configurable threshold a
+superfile is written in a single put; at or above it the upload is split
+into fixed-size chunks driven in parallel, which lowers peak memory
+during the write and limits the cost of a transient backend failure
+mid-upload.
+
+Range reads are exact-or-error. A read for a byte range yields exactly
+that many bytes or a typed error — a reader never sees a silently short
+buffer. Recovering from transient backend truncation or connection
+flakiness sits beneath this contract, in the storage layer.
+
+Readers may verify the superfile's embedded checksums when opening it.
+This is on by default and can be turned off when the underlying
+storage already guarantees integrity (a content-addressed object
+store, a checksumming filesystem), trading that guarantee for faster
+cold opens.
+
+## Disk cache
+
+When a table is backed by remote storage, an optional disk cache keeps
+hot superfiles local. A cold query is served from remote byte ranges
+while the full superfile is fetched in the background; once a superfile is
+resident it is served from a local memory-mapped file. The cache tracks
+residency per superfile and is bounded by a configurable budget, evicting
+cold superfiles when the budget is reached.
+
+The cache distinguishes on-disk residency from memory residency. An
+optional memory budget bounds the mapped working set rather than the
+on-disk set: when the resident pages exceed the budget, the oldest
+entries are advised out of memory while their backing files stay on
+disk, so pages re-fault on next access without a re-download. Eviction
+is safe during use because an open reader keeps its mapping alive even
+after the on-disk file is unlinked, so in-flight queries finish
+correctly and eviction is only ever a reclaim-and-refetch cost.
+
+## Queries
+
+SQL, full-text, and vector search share the same fan-out shape:
+
+1. Start from the reader's pinned manifest.
+2. Use the manifest summaries to skip superfiles that cannot match the
+  query.
+3. Run the per-superfile query against each remaining superfile in
+  parallel.
+4. Merge the per-superfile results into a single ranked result for the
+  table.
+
+Skip pruning reads only the manifest summaries, never the superfile
+bytes, and is always conservative: when the manifest cannot prove a
+superfile is irrelevant, the superfile is kept. The pruning inputs are:
+
+- **Term queries** use each superfile's term presence filter.
+- **Prefix queries** use each superfile's lexicographic term range.
+- **Predicate (SQL) queries** use the per-column scalar statistics
+  (min/max and null count). `=` / `IN` / same-column `OR` prune on
+  min/max; `IS NULL` / `IS NOT NULL` prune on the null count — an
+  all-null column records a null-valued min/max plus its null count so
+  the all-null case is detectable.
+- **Vector queries** use the per-column vector summary to order and
+route work.
+
+Pruning can remove work but never a correct result; a kept superfile that
+turns out not to match only costs a per-superfile query, while a superfile
+is never wrongly dropped.
+
+Full-text and vector search delegate to each superfile's index (the same
+search the single-superfile reader runs) and merge globally. SQL is
+executed over the columnar (Parquet) data and does not require the
+search indexes — but it can still reach them through the search
+table-valued functions (`vector_search`, `bm25_search`,
+`bm25_search_prefix`, `token_match`, `exact_match`), which run the same
+per-superfile index fan-out and hand their results back into the SQL plan
+as a relation.
+
+A SQL `WHERE` predicate on a full-text column also uses the index
+directly, as the **row-level** companion to the superfile-level term
+skip: an equality (and its `AND`/`OR`/`IN` combinations) is resolved
+through the term postings to a candidate set of rows, so only those
+rows are decoded and the engine re-checks the exact predicate over
+them — instead of decoding the whole column and filtering. A predicate
+the index cannot bound (negation, range, a non-indexed column) falls
+back to a column scan. So a selective filter on an indexed text column
+reads work proportional to the matches, not the column size. A hybrid
+ranking is then expressed *in SQL* — fuse the `vector_search` and
+`bm25_search` relations with a join/union and a fusion score. The
+`hybrid_search` table function is a convenience that packages the
+common case: it runs the BM25 and vector kernels concurrently and fuses
+the two rankings with reciprocal-rank fusion, so a row surfaced by both
+retrievers ranks above one surfaced by a single retriever. It is a
+SQL-level fusion, not a separate engine kernel.
+
+## Concurrency
+
+- **Reader/writer isolation.** Reads and writes do not block each
+other. A reader holds an immutable manifest snapshot; a writer builds
+new superfiles and a new manifest independently.
+- **Atomic publication.** A reader sees either the manifest before a
+commit or the manifest after it, never an intermediate state.
+- **Single writer.** One writer is active per table at a time.
+- **Separate pools.** Query fan-out and superfile builds use separate
+worker pools, so background writes do not starve foreground reads.
+
+## Scope
+
+- Superfiles are immutable; updates are expressed by publishing a new
+manifest over different superfiles.
+- One writer is active per table at a time.
+- Full-text and vector search are distinct query paths; combined
+relevance scoring is left to the caller.
+
+---
+
+# Versioning & release policy
+
+Source: https://github.com/infino-ai/infino/blob/main/docs/versioning.md
+
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<!-- SPDX-FileCopyrightText: Copyright The Infino Authors -->
+
+# Versioning & release policy
+
+infino ships as three published artifacts built from one engine:
+
+| Artifact            | Source                | Registry  | Version field                  |
+| ------------------- | --------------------- | --------- | ------------------------------ |
+| Rust crate `infino` | `Cargo.toml` (root)   | crates.io | `Cargo.toml` `version`         |
+| Node binding        | `infino-node/`        | npm       | `infino-node/package.json`     |
+| Python binding      | `infino-python/`      | PyPI      | `infino-python/Cargo.toml`     |
+
+All three use [semantic versioning](https://semver.org). This document is the
+contract for how their versions relate.
+
+## The rules
+
+1. **Pre-1.0 for now.** The engine stays on major version `0` for roughly the
+   first year while the public API settles. Under semver, while major is `0` a
+   **breaking change bumps the minor** (`0.1 → 0.2`), not the major. We do not
+   bump to `1.0` until we deliberately declare the API stable.
+
+2. **`major.minor` is locked in sync across all three packages.** A release line
+   is `0.<minor>`, and every package shares it: Rust `0.3.x`, Node `0.3.y`,
+   Python `0.3.z` all sit on the `0.3` line. Never publish a binding on a
+   different `major.minor` than the engine.
+
+3. **`patch` is independent per package.** Each package bumps its own patch for
+   fixes that only affect it — a Node loader fix, a Python wheel fix, a
+   Rust-only bug fix — without touching the others. So patch numbers will
+   diverge (e.g. Rust `0.3.4`, Node `0.3.2`, Python `0.3.5`). That is expected
+   and fine; only `major.minor` must agree.
+
+4. **The Rust crate is the source of truth for `major.minor`.** The engine
+   defines the release line; the bindings follow it. When the crate moves to a
+   new minor, the bindings move with it.
+
+## What bumps which number
+
+- **Patch** (`0.3.4 → 0.3.5`) — bug fix, no public API change. Bumped per
+  package, independently, whenever that package needs a fix. Registries are
+  immutable (you can never republish a version), so **every publish needs a
+  fresh patch.**
+- **Minor** (`0.3.x → 0.4.0`) — a new feature **or** a breaking API change
+  (breaking changes are minor bumps while we are pre-1.0). This is a
+  **coordinated** event: bump the Rust crate's minor first, then bring Node and
+  Python onto the same minor (resetting their patch to `0`). All three publish
+  on the new line.
+- **Major** (`0 → 1`) — deferred until we declare the API stable (~a year out).
+  A single coordinated release across all three.
+
+## How to release
+
+A `v<version>` tag is the release trigger; what it publishes depends on whether
+it is a patch or a coordinated minor/major.
+
+- **Crate patch** (`vX.Y.Z`, `Z > 0`, e.g. `v0.1.1`) — bump `version` in the root
+  `Cargo.toml`, then push the matching tag. The `Publish crate` workflow
+  (`.github/workflows/crate-publish.yml`) asserts the tag matches `Cargo.toml` and
+  publishes to crates.io. **The Node and Python workflows skip a patch tag** —
+  their coordinated-release gate fires only when `patch == 0` — so the crate
+  patches alone. (You can also run `Publish crate` manually from the Actions
+  tab — the default is a dry run.)
+- **Coordinated minor/major** (`vX.Y.0`, e.g. `v0.2.0`) — land the engine change,
+  **update the Node and Python binding code for any new or changed engine
+  surface**, bump the crate *and* both bindings (`infino-node/package.json`,
+  `infino-python/Cargo.toml`) to the same `X.Y.0`, then push the `vX.Y.0` tag. All
+  three publish workflows fire on it — crate → crates.io, Node → npm, Python →
+  PyPI — at `X.Y.0`. (Node's `napi prepublish` derives the per-platform package
+  versions and `optionalDependencies` pins from that single `package.json`
+  field.) The bindings must never ship a new minor before their code exposes that
+  minor's engine changes.
+- **Binding-only patch** (Node or Python, independent of the crate's patch) — bump
+  that binding's version and run its workflow **manually** (`Node publish` /
+  `publish-python`, `workflow_dispatch`). No tag; the crate is untouched.
+
+**Patch counters are independent per package and never shared**, so the crate's
+patch and a binding's patch can never collide on a registry — only `major.minor`
+is kept in sync across the three.
+
+## Worked example
+
+| Event                                   | Rust  | Node  | Python |
+| --------------------------------------- | ----- | ----- | ------ |
+| Initial release                         | 0.1.0 | 0.1.0 | 0.1.0  |
+| Node loader bug fix (Node only)         | 0.1.0 | 0.1.1 | 0.1.0  |
+| Python wheel fix (Python only)          | 0.1.0 | 0.1.1 | 0.1.1  |
+| Engine bug fix (Rust only)              | 0.1.1 | 0.1.1 | 0.1.1  |
+| New feature → coordinated minor         | 0.2.0 | 0.2.0 | 0.2.0  |
+| Breaking API change (still pre-1.0)     | 0.3.0 | 0.3.0 | 0.3.0  |
+
+Patches diverge between coordinated minors; a minor bump realigns everything on
+`0.<minor>.0`.
+
+## Don'ts
+
+- **Don't bump major** before the deliberate `1.0` stability declaration.
+- **Don't publish a binding on a `major.minor` the engine isn't on.** Bindings
+  never lead the engine's release line.
+- **Don't let bindings differ on `major.minor`** from each other.
+- **Don't try to republish a version** — registries are immutable. Bump the
+  patch instead.
+- **Don't add a commit-message-driven release bot** (semantic-release and
+  friends). They compute each package's version independently and will break the
+  `major.minor` lockstep. Version selection stays a deliberate, coordinated step.
+
+## Open gaps
+
+- **Rust publish automation: done.** The `Publish crate` workflow
+  (`.github/workflows/crate-publish.yml`) publishes the engine to crates.io on a
+  `v<version>` tag; Node and Python still publish via their own manual workflows.
+  Still worth naming a clear owner for the engine's version bumps so the crate
+  doesn't fall behind the bindings on the shared release line.
+- **No drift guard yet.** A small CI check that asserts the `major.minor` of the
+  root `Cargo.toml`, `infino-node/package.json`, and `infino-python/Cargo.toml`
+  all agree (patch ignored) would enforce rule 2 cheaply. Recommended.
+
+---
+
+# Security Policy
+
+Source: https://github.com/infino-ai/infino/blob/main/SECURITY.md
+
+# Security Policy
+
+## Reporting a vulnerability
+
+**Please do not open a public issue for security vulnerabilities.**
+
+Report security issues privately through GitHub's private vulnerability
+reporting: open the **Security** tab on
+<https://github.com/infino-ai/infino> and choose **Report a vulnerability**.
+
+Please include enough detail to reproduce the issue (affected version or
+commit, steps, and impact). We aim to acknowledge reports within a few
+business days and will keep you updated on remediation. Coordinated
+disclosure is appreciated — we will credit reporters who wish to be named.
+
+## Supported versions
+
+infino is pre-1.0 and under active development. Security fixes are applied
+to the latest release on the default branch; there are no long-term support
+branches yet.
+
+---

@@ -1,0 +1,738 @@
+# hyperpb
+
+Source: https://github.com/bufbuild/hyperpb-go/blob/main/README.md
+
+![The Buf logo](https://raw.githubusercontent.com/bufbuild/hyperpb-go/main/.github/buf-logo.svg)
+
+# hyperpb
+
+`hyperpb` is a highly optimized dynamic message library for Protobuf or read-only
+workloads. It is designed to be a drop-in replacement for
+[`dynamicpb`][dynamicpb],
+`protobuf-go`'s canonical solution for working with completely dynamic messages.
+
+`hyperpb`'s parser is an efficient VM for a special instruction set, a variant of
+table-driven parsing (TDP), pioneered by [the UPB project][upb].
+
+Our parser is very fast, beating `dynamicpb` by 10x, and often beating
+`protobuf-go`'s generated code by a factor of 2-3x, especially for workloads with
+many nested messages.
+
+![Barchart of benchmarks for hyperpb](https://raw.githubusercontent.com/bufbuild/hyperpb-go/main/.github/benchmarks.png)
+
+Here, we show two benchmark variants for `hyperpb`: out-of-the-box performance with no optimizations turned on, and real-time profile-guided optimization (PGO) with all optimizations we currently offer enabled. These benchmarks are a subset of the ones you can run
+using `make bench`.
+
+You can read about `hyperpb` on the Buf blog, or on project lead
+[Miguel](https://github.com/mcy)'s blog.
+
+* [Introducing hyperpb](https://buf.build/blog/hyperpb)
+* [Parsing Protobuf Like Never Before](https://mcyoung.xyz/2025/07/16/hyperpb)
+* [Cheating the Reaper in Go](https://mcyoung.xyz/2025/04/21/go-arenas/)
+
+## Usage
+
+The core conceit of `hyperpb` is that you must pre-compile a parser using
+`hyperpb.Compile` at runtime, much like regular expressions require that you
+`regexp.Compile` them. Doing this allows `hyperpb` to run optimization passes on
+your message, and delaying it to runtime allows us to continuously improve
+layout optimizations, without making any source-breaking changes.
+
+For example, let's say that we want to compile a parser for some type baked into
+our binary, and parse some data with it.
+
+<!-- weatherDataBytes values match data used in example_test.go and should be kept in sync -->
+
+```go
+package main
+
+import (
+    "fmt"
+    "log"
+
+    "buf.build/go/hyperpb"
+    "google.golang.org/protobuf/proto"
+
+    weatherv1 "buf.build/gen/go/bufbuild/hyperpb-examples/protocolbuffers/go/example/weather/v1"
+)
+
+// Byte slice representation of a valid *weatherv1.WeatherReport.
+var weatherDataBytes = []byte{
+    0x0a, 0x07, 0x53, 0x65, 0x61, 0x74, 0x74, 0x6c,
+    0x65, 0x12, 0x1d, 0x0a, 0x05, 0x4b, 0x41, 0x44,
+    0x39, 0x33, 0x15, 0x66, 0x86, 0x22, 0x43, 0x1d,
+    0xcd, 0xcc, 0x34, 0x41, 0x25, 0xd7, 0xa3, 0xf0,
+    0x41, 0x2d, 0x33, 0x33, 0x13, 0x40, 0x30, 0x03,
+    0x12, 0x1d, 0x0a, 0x05, 0x4b, 0x48, 0x42, 0x36,
+    0x30, 0x15, 0xcd, 0x8c, 0x22, 0x43, 0x1d, 0x33,
+    0x33, 0x5b, 0x41, 0x25, 0x52, 0xb8, 0xe0, 0x41,
+    0x2d, 0x33, 0x33, 0xf3, 0x3f, 0x30, 0x03,
+}
+
+func main() {
+    // Compile a type for your message. Make sure to cache this!
+    // Here, we're using a compiled-in descriptor.
+    msgType := hyperpb.CompileMessageDescriptor(
+        (*weatherv1.WeatherReport)(nil).ProtoReflect().Descriptor(),
+    )
+
+    // Allocate a fresh message using that type.
+    msg := hyperpb.NewMessage(msgType)
+
+    // Parse the message, using proto.Unmarshal like any other message type.
+    if err := proto.Unmarshal(weatherDataBytes, msg); err != nil {
+        // Handle parse failure.
+        log.Fatalf("failed to parse weather data: %v", err)
+    }
+
+    // Use reflection to read some fields. hyperpb currently only supports access
+    // by reflection. You can also look up fields by index using fields.Get(), which
+    // is less legible but doesn't hit a hashmap.
+    fields := msgType.Descriptor().Fields()
+
+    // Get returns a protoreflect.Value, which can be printed directly...
+    fmt.Println(msg.Get(fields.ByName("region")))
+
+    // ... or converted to an explicit type to operate on, such as with List(),
+    // which converts a repeated field into something with indexing operations.
+    stations := msg.Get(fields.ByName("weather_stations")).List()
+    for i := range stations.Len() {
+        // Get returns a protoreflect.Value too, so we need to convert it into
+        // a message to keep extracting fields.
+        station := stations.Get(i).Message()
+        fields := station.Descriptor().Fields()
+
+        // Here we extract each of the fields we care about from the message.
+        // Again, we could use fields.Get if we know the indices.
+        fmt.Println("station:", station.Get(fields.ByName("station")))
+        fmt.Println("frequency:", station.Get(fields.ByName("frequency")))
+        fmt.Println("temperature:", station.Get(fields.ByName("temperature")))
+        fmt.Println("pressure:", station.Get(fields.ByName("pressure")))
+        fmt.Println("wind_speed:", station.Get(fields.ByName("wind_speed")))
+        fmt.Println("conditions:", station.Get(fields.ByName("conditions")))
+    }
+}
+```
+
+Currently, `hyperpb` only supports manipulating messages through the reflection
+API; it shines best when you need write a very generic service that
+downloads types off the network and parses messages using those types, which
+forces you to use reflection.
+
+Mutation is currently not supported; any operation which would mutate an
+already-parsed message will panic. Which methods of `*hyperpb.Message` panic
+is included in the documentation.
+
+### Using types from a registry
+
+We can use the `hyperpb.CompileFileDescriptorSet` function to parse a dynamic type and
+use it to walk the fields of a message:
+
+```go
+func processDynamicMessage(
+    schema *descriptorpb.FileDescriptorSet,
+    messageName protoreflect.FullName,
+    data []byte,
+) error {
+    msgType, err := hyperpb.CompileFileDescriptorSet(schema, messageName) // Remember to cache this!
+    if err != nil {
+        return err
+    }
+
+    msg := hyperpb.NewMessage(msgType)
+    if err := proto.Unmarshal(data, msg); err != nil {
+        return err
+    }
+
+    // Range will iterate over all of the populated fields in msg. Here we
+    // use Range with go1.24 iterator syntax.
+    for field, value := range msg.Range {
+        // Do something with each populated field.
+    }
+    return nil
+}
+```
+
+Since any generic, non-mutating operation will work with `hyperpb` messages,
+we can use them as an efficient transcoding medium from the wire format, for
+runtime-loaded messages.
+
+```go
+func dynamicMessageToJSON(
+    schema *descriptorpb.FileDescriptorSet,
+    messageName protoreflect.FullName,
+    data []byte,
+) ([]byte, error) {
+    msgType, err := hyperpb.CompileFileDescriptorSet(schema, messageName)
+    if err != nil {
+        return nil, err
+    }
+
+    msg := hyperpb.NewMessage(msgType)
+    if err := proto.Unmarshal(data, msg); err != nil {
+        return nil, err
+    }
+
+    // Dump the message to JSON. This just works!
+    return protojson.Marshal(msg)
+}
+```
+
+`protovalidate` also works directly on reflection, so it works out-of-the-box:
+
+```go
+func validateDynamicMessage(
+    schema *descriptorpb.FileDescriptorSet,
+    messageName protoreflect.FullName,
+    data []byte,
+) error {
+    // Unmarshal like before.
+    msgType, err := hyperpb.CompileFileDescriptorSet(schema, messageName)
+    if err != nil {
+        return err
+    }
+
+    msg := hyperpb.NewMessage(msgType)
+    if err := proto.Unmarshal(data, msg); err != nil {
+        return err
+    }
+
+    // Run custom validation. This just works!
+    return protovalidate.Validate(msg)
+}
+```
+
+## Advanced Usage
+
+`hyperpb` is all about parsing as fast as possible, so there are a number of
+optimization knobs available. Calling `Message.Unmarshal` directly instead
+of `proto.Unmarshal` allows setting custom `UnmarshalOption`s:
+
+```go
+func unmarshalWithCustomOptions(
+    schema *descriptorpb.FileDescriptorSet,
+    messageName protoreflect.FullName,
+    data []byte,
+) error {
+    msgType, err := hyperpb.CompileFileDescriptorSet(schema, messageName)
+    if err != nil {
+        return err
+    }
+
+    msg := hyperpb.NewMessage(msgType)
+    return msg.Unmarshal(
+        data,
+        hyperpb.WithMaxDecodeMisses(16),
+        // Additional options...
+    )
+}
+```
+
+The compiler also takes `CompileOptions`, such as for configuring how extensions
+are resolved:
+
+```go
+msgType, err := hyperpb.CompileFileDescriptor(
+    schema,
+    messageName,
+    hyperpb.WithExtensionsFromTypes(typeRegistry),
+    // Additional options...
+)
+```
+
+### Memory Reuse
+
+`hyperpb` also has a memory-reuse mechanism that side-steps the Go garbage
+collector for improved allocation latency. `hyperpb.Shared` is book-keeping
+state and resources shared by all messages resulting from the same parse.
+After the message goes out of scope, these resources are ordinarily reclaimed
+by the garbage collector.
+
+However, a `hyperpb.Shared` can be retained after its associated message goes
+away, allowing for re-use. Consider the following example of a request handler:
+
+```go
+type requestContext struct {
+    shared *hyperpb.Shared
+    types map[string]*hyperpb.MessageType
+    // Additional context fields...
+}
+
+func (c *requestContext) Handle(req Request) {
+    msgType := c.types[req.Type]
+    msg := c.shared.NewMessage(msgType)
+    defer c.shared.Free()
+
+    c.process(msg, req, ...)
+}
+```
+
+Beware that `msg` must not outlive the call to `Shared.Free`; failure to do so
+will result in memory errors that Go cannot protect you from.
+
+### Profile-Guided Optimization (PGO)
+
+`hyperpb` supports online PGO for squeezing extra performance out of the parser
+by optimizing the parser with knowledge of what the average message actually
+looks like. For example, using PGO, the parser can predict the expected size of
+repeated fields and allocate more intelligently.
+
+For example, suppose you have a corpus of messages for a particular type. You
+can build an optimized type, using that corpus as the profile, using
+`Type.Recompile`:
+
+```go
+func compilePGO(
+    md protoreflect.MessageDescriptor,
+    corpus [][]byte,
+) (*hyperpb.MessageType, error) {
+    // Compile the type without any profiling information.
+    msgType := hyperpb.CompileMessageDescriptor(md)
+
+    // Construct a new profile recorder.
+    profile := msgType.NewProfile()
+
+    // Parse all of the specimens in the corpus, making sure to record a profile
+    // for all of them.
+    s := new(hyperpb.Shared)
+    for _, specimen := range corpus {
+        if err := s.NewMessage(msgType).Unmarshal(
+            specimen,
+            hyperpb.WithRecordProfile(profile, 1.0),
+        ); err != nil {
+            return nil, err
+        }
+        s.Free()
+    }
+
+    // Recompile with the profile.
+    return msgType.Recompile(profile), nil
+}
+```
+
+Using a custom sampling rate in `hyperpb.WithRecordProfile`, it's possible to
+sample data on-line as part of a request flow, and recompile dynamically:
+
+```go
+type requestContext struct {
+    shared *hyperpb.Shared
+    types map[string]*typeInfo
+    // Additional context fields...
+}
+
+type typeInfo struct {
+    msgType atomic.Pointer[hyperpb.MessageType]
+    prof atomic.Pointer[hyperpb.Profile]
+    seen atomic.Int64
+}
+
+func (c *requestContext) Handle(req Request) {
+    // Look up the type in the context's type map.
+    typeInfo := c.types[req.Type]
+
+    // Parse the type as usual.
+    msg := c.shared.NewMessage(typeInfo.msgType.Load())
+    defer c.shared.Free()
+
+    if err := msg.Unmarshal(
+        data,
+        // Only profile 1% of messages.
+        hyperpb.WithRecordProfile(typeInfo.prof.Load(), 0.01),
+    ); err != nil {
+        // Process error...
+    }
+    typeInfo.seen.Add(1)
+
+    // Every 100,000 messages, spawn a goroutine to asynchronously recompile the type.
+    if typeInfo.seen.Load() % 100000 == 0 {
+        go func() {
+            prof := typeInfo.prof.Load()
+            if !typeInfo.prof.CompareAndSwap(prof, nil) {
+                // Avoid a race condition.
+                return
+            }
+
+            // Recompile the type. This is gonna be really slow, because
+            // the compiler is slow, which is why we're doing it asynchronously.
+            typeInfo.msgType.Store(typeInfo.msgType.Load().Recompile(typeInfo.prof.Load()))
+            typeInfo.prof.Store(typeInfo.msgType.Load().NewProfile())
+        }
+    }
+
+    // Do something with msg.
+}
+```
+
+## Compatibility
+
+`hyperpb` is experimental software, and the API may change drastically before
+`v1`. It currently implements all Protobuf language constructs. It does not
+implement mutation of parsed messages, however.
+
+### Supported Targets
+
+`hyperpb` is currently only supported on 64-bit x86 and ARM targets (Go calls
+these `amd64` and `arm64`). The library will not build on other architectures,
+and PRs to add new architectures without a way to run tests for them in CI will
+be rejected.
+
+Support for 32-bit targets is unlikely to happen, even if we have test runners.
+`hyperpb` assumes a 64-bit general-purpose register width, and attempting to
+tune for a 32-bit register size will require a 32-bit re-implementation of the
+parser VM.
+
+Similarly, we assume little-endian in many places for performance, particularly
+because Protobuf's wire format is little-endian. Getting big-endian support will
+be a lot of work and is unlikely to perform anywhere close to little-endian.
+
+If you would like to try to use an architecture that we don't support, build
+with the `hyperpb.unsupported` tag. If it breaks, you get to keep both pieces:
+which is to say, issues stemming from use of this build tag will be closed.
+
+## Contributing
+
+For a detailed explanation of the implementation details of `hyperpb`, see
+the [`DESIGN.md`](DESIGN.md) file. Contributions that significantly change the
+parser will require benchmarks; you can run them with `make bench`.
+
+## Legal
+
+Offered under the [Apache 2 license][license].
+
+[dynamicpb]: https://pkg.go.dev/google.golang.org/protobuf/types/dynamicpb
+[upb]: https://github.com/protocolbuffers/protobuf/tree/main/upb
+[license]: https://github.com/bufbuild/hyperpb-go/blob/main/LICENSE
+
+---
+
+# Hacking Tips
+
+Source: https://github.com/bufbuild/hyperpb-go/blob/main/DESIGN.md
+
+# Hacking Tips
+
+The implementation of the message and parser follows the design principles of
+UPB, an even faster C runtime. All memory is allocated on arenas, and where
+possible fields are zero-copy references of the original parse input.
+
+Schematically, this package can be thought of as having two major components.
+
+  1. A compiler that generates `Type`s at runtime. `Type`s can be thought of
+     as highly optimized programs for parsing Protobuf messages. The compiler
+     is not optimized for speed, because it is expected to be a one-time call
+     per message type.
+
+  2. An highly optimized interpreter for the programs that the compiler
+     generates. No expense is spared in making this interpreter as fast as
+     possible, beyond limitations incurred by the Go compiler's mediocre
+     register allocation and other codegen bugs.
+
+## Benchmarking and Profiling
+
+To ensure that your changes don't make performance worse, you should use the
+provided benchmarks. `make bench` will run all benchmarks; `make profile`
+will run a CPU profile and display it in a local `pprof` instance.
+`make asm` will dump the assembly of the benchmarks for manual inspection.
+
+The benchmarks are also run against `protobuf-go`'s generated code, and
+`dynamicpb`, which this package replaces.Benchmarks are defined by `.yaml`
+files in the `internal/testdata` directory.
+
+When filing a PR, it is recommended that it include a before/after comparison
+of the benchmarks.
+
+## File Structure
+
+The main package, `hyperpb`, is mostly a facade over a collection of internal
+packages. The bulk of the complicated stuff lives in `internal/tdp`:
+
+* `tdp` itself contains the "tables", or "executable format", of the
+  parser VM.
+* `tdp/dynamic` contains the rudiments for dynamic message types based
+  on the layout information from `tdp`. See also `tdp/empty`.
+* `tdp/vm` is the parser VM itself.
+* `tdp/compiler` is the compiler that generates the tables from `tdp`.
+* `tdp/thunks` is the specialized code for parsing each of the hundreds
+  of field type combinations.
+
+The other important internal packages are:
+
+* `arena` - All allocations go through here. See
+  <https://mcyoung.xyz/2025/04/21/go-arenas/> for an introduction.
+* `debug` - Debugging utilities. Enable with `-tags debug`.
+* `swiss` - Full-fledged Swisstable implementation.
+* `tools/hyperstencil` - Code generator for manually specializing generic functions.
+* `xunsafe` - Unsafe helpers.
+
+# Implementation Details
+
+## A Brief Primer on Go's Memory Semantics
+
+Go does not specify the precise semantics of its garbage collector; however,
+there are some GC behaviors that would be very difficult for Go to change
+without breaking existing code. We assume that these behaviors will not
+change to enable side-stepping the GC in several situations where it would
+result in non-optimal code generation.
+
+  1. The GC will never move data that has escaped to the heap. That is, it
+     will not look for and update pointers whose address refers to a value
+     that has escaped to the heap.
+     Doing so requires both stopping the world and searching the whole heap
+     for addresses within any ranges being moved, something that is many
+     times more expensive than Go's current marking phase, and which cannot
+     be done concurrently. Non-native GC'ed languages avoid this cost by,
+     among other things, avoiding having to mark interior pointers.
+
+  2. It is possible to reliably force data to escape to the heap. This can
+     be done, for example, by writing to a global `unsafe.Pointer`.
+     `runtime.KeepAlive` is the prototypal example.
+
+  3. If the GC can find a pointer to anywhere within an object, even an
+     offset that would be otherwise misaligned (such as pointing midway into
+     an interface or an integer), the GC will mark the entire struct, not
+     just a pointed-to subobject.
+     This is because Go pointers are untyped from the perspective of the
+     runtime, an assumption that is baked into the GC and the unsafe package.
+     Loads and stores are typed, but pointers are not (similar to LLVM).
+
+  4. Go tolerates unaligned loads and stores if the underlying machine does.
+     This is only true for loads and stores of pointer-free data. If the
+     load is a pointer load, it may emit a write barrier, which may trigger
+     an alignment check. Because pointers are untyped, Go tolerates unaligned
+     pointers merely existing (like Rust, but unlike C++).
+
+  5. It is possible to allocate memory of arbitrary GC shape at runtime. This
+     can be achieved using reflection to create a fresh struct type and then
+     allocate a value thereof.
+
+  6. Storing pointer data without a write barrier (by storing a `uintptr`
+     instead) is fine as long as the location being stored to does not
+     actually have pointer shape, so the GC would not be potentially
+     concurrently tracing through it.
+
+The most important corollary of this are that it is possible to store
+pointers in heap memory that is not of GC shape, then load those addresses
+and load/store through them, so long as:
+
+  1. That pointer is forced to escape to the heap in one way or another.
+
+  2. That pointer is transitively reachable by the GC from the allocation
+     that contains the heap memory the pointer is stored to.
+
+This enables many data structure optimizations in this package, and in the
+`arena.Arena` type it depends on. In particular, so long as all pointers in
+an arena were allocated by the arena itself, the GC will never invalidate
+them, because the arena is carefully written such that holding a pointer
+into any arena memory will cause the whole arena to be traced by the GC
+
+This blogpost contains some of the same information:
+<https://mcyoung.xyz/2025/04/21/go-arenas/>.
+
+## The Compiler
+
+The compiler consumes descriptors and generates a program. This program
+specifies:
+
+  1. How many bytes to allocate for a particular message type.
+
+  2. What fields must be parsed for that message type.
+
+  3. What message types those fields have, so that the parser can recurse
+     into them.
+
+The compiler is responsible for laying out the in-memory representation of
+each message. A message consists of a fixed header (the fields of 
+`dynamic.Message`), an array of "bitfield words", which are used to store
+has-bits of optional fields and the values of `bool` fields, and the storage for
+all of the field values. For example, an `optional int32` compiles to one bit
+plus four bytes of storage.
+
+The offsets for the storage of a given field, plus a thunk for actually
+extracting the field value as a `protobuf.Value`, are stored in the field's
+`Getter`. There are dozens of storage strategies for a field; rather than
+storing the field's type information, we record the address of a thunk that
+implicitly contains this information. This means that getting a field costs
+an indirect branch, instead of whatever mess Go would choose to codegen for
+a massive switch.
+
+The compiler also selects the parser thunks for the field, of which there may
+be up to two. These are called into when the parser decides to actually
+populate a field; again, these are thunks because a single indirect branch is
+faster than a massive switch. Each thunk is keyed by its Protobuf record tag,
+which is stored in an unusual form described in the parser. The compiler
+is responsible for assembling this key.
+
+This compiler's equivalent of instruction selection (which we call archetype
+selection) is the mechanism by which a `FieldDescriptor` is associated with one
+of dozens of `compiler.Archetype`s, which represent the various ways in which a
+field can be parsed and accessed. For example, for each `protoreflect.Kind`,
+there is an archetype for that field appearing as implicit presence (called
+"singular" here), explicit presence (i.e. "optional") or repeated.
+
+The addition of extra archetypes is not a performance penalty if they are
+not used in a particular parser, which allows for arbitrary levels of
+specialization for a given field. For example, messages are always stored as
+pointers, but particularly small messages (such as messages with one or two
+fields) could be directly inlined into the message.
+
+## Type Representation
+
+All of the types that a particular compiled `tdp.Type` depends on live on a
+giant byte buffer, called a `tdp.Library`. Each `*tdp.Type` is a pointer to this
+buffer. This buffer also contains a pointer to the descriptor the `tdp.Type` was
+compiled from, to ensure that the GC does not sweep the descriptors while the
+`tdp.Type` is still alive.
+
+Each `tdp.Type` is followed by at least one `tdp.Field`. The fields are laid out
+in field index order. This is useful for efficiently implementing reflection.
+
+It also contains a `tdp.TypeParser`, which contains `tdp.FieldParsers`.
+Each includes an pointer to a `tdp.Type` for its message type, if it has one,
+as well as offset and parsing information.
+
+Note that the compiled `tdp.Type` does NOT contain a `reflect.Type` for the
+struct that the compiler laid out for it. Go reflection is not used for
+manipulating dynamic message types; instead, we rely on raw loads and stores,
+and the value allocated from a `tdp.Type` does not have a GC shape that contains
+pointers.
+
+This allows us to never perform stores of types which contain pointers, even
+though the dynamic message types do contain pointers (into the arena in which
+they are allocated), and thus avoids the need for write barriers, which incur
+touching a highly-contended atomic global, triggering a guaranteed cache
+miss. This in turn is fine, because the pointers we manipulate are arena
+pointers that are marked for us via other means.
+
+Finally, each `tdp.TypeParser` contains a hand-written hashmap that maps field
+numbers to field indices, for quickly re-synchronizing the parser in the event
+of encountering fields out of the expected order. Currently, all types have a
+number table, but many message types have number/index relationships that are
+1:1, in which case number == index for all fields; as a future optimization,
+we should remove the table in this case.
+
+## Parser Design
+
+The parser is an VM for the programs encoded in `tdp.TypeParser`s. It is a
+threaded interpreter, which means that all of its state is threaded by-value
+through function calls, to minimize the need for spilling state to the stack
+across calls (regardless, Go's mediocre register allocator still
+unnecessarily spills a lot of state).
+
+The parser state is split across three types, `vm.P1`, `vm.P2`, and
+`vm.p3`, to work around various bugs in Go's codegen that would result in
+worse performance. These structs should be thought of as being the same
+entity.
+
+The main loop of the interpreter is `vm.loop`, which is not actually
+a loop but rather a strongly connected component of blocks joined by `goto`s.
+This is because the main loop has three different sections which we want
+to be able to jump to from any other section. These are:
+
+  1. Partially decoding a field tag.
+
+  2. Matching the partially decoded tag against the parsers for the current
+     field.
+
+  3. Resynchronizing the field pointer in the event of failing to make
+     progress in (2) enough times.
+
+The core parser loop isn't even recursive; we manage our own message recursion
+stack instead.
+
+We will now dive into each of these components separately.
+
+## Partial Tag Decode
+
+It turns out that we don't need to fully decode a tag in most cases. Each
+parser thunk within a field knows what the field needs to look like when
+encoded on the wire, so we could just compare bytes without shifting or
+variable-length masking.
+
+However, we also need to accept overlong tags, up to 10 bytes. To do this,
+we first load eight bytes and use bit tricks to count the number of sign bits
+(treating the uint64 as a janky uint8x8 SIMD vector). If this is large
+enough, we hit a slow path to check the remaining two bytes.
+
+Then, we use the varint byte length to mask off all bytes after the highest
+order one which is relevant; in the case of 8, 9, and 10 byte varints, we
+don't mask off any bytes.
+
+Finally, we clear the sign bits, which are the only discrimination between
+the various potential encodings for the varint. All of the bytes beyond the
+non-zero bytes for this tag must be zero for the match to succeed; if the
+tag was over-long, those bytes are left untouched by the prior masking step.
+
+This step also advances the parser past the varint, so there's no need to
+store the length of the varint anymore past this point.
+
+This step only needs to be performed once per record, and the resulting
+partially decoded value is cached to compare against the `tdp.Tag` values
+in the next phase. The interpreter only jumps to this block when it is ready
+to start parsing a new record.
+
+## Tag Matching and Fallback
+
+Each field parser contains the tag (fused field number + wire type) it
+expects for that field, so it's sufficient to perform an equality check. This
+avoids the need to actually decode the varint by slightly shifting each byte,
+and then shifting out the wire type.
+
+If a field matches, it calls into the parser thunk, which consumes the field
+value and may chose to advance the field table pointer in the parser state.
+Some thunks choose not to do this for optimization reasons: when encountering
+a non-packed repeated field, the thunk predicts the next record will be for
+the same field. For packed repeated fields, however, it is very likely that
+the entire field value is contained in one record, so the parser can advance
+to the next field. (This can be thought of as a sort of statically-computed
+branch prediction.)
+
+Then, the parser jumps back to the partial tag decode code.
+
+If a field does not match, the field table pointer is advanced and we try
+again a few more times. If we keep failing, we instead fall into the
+fallback code, where we fully decode the tag and search the number table,
+and potentially skip some unknown fields.
+
+## Parser Thunks
+
+As mentioned previously, there are many, many parser thunks. This is because
+if unused, those thunks will not appear in the BHT (branch history table)
+entry for the indirect branch to the thunk in `vm.P1.Field()`. This means
+that it is beneficial to hyper-specialize thunks so that within a thunk,
+additional branches are kept to a minimum. Thus, instead of having one thunk
+that handles both optional and singular fields, and branches internally based
+on some value, we have one thunk for each, which amortizes the cost of that
+branch into the thunk call's branch instruction.
+
+Similarly, there are distinct parsers for varint, zigzag, and fixed integers.
+
+That said, if parsers can be reused across archetypes with zero overhead, it
+is beneficial to do so as a matter of instruction cache friendliness. For
+example, int32, uint32, and enum fields of the same presence discipline will
+use the same thunk, because they're all parsed and stored as 32-bit varints.
+The same is true of fixed32, sfixed32, and float32.
+
+To learn more about a particular archetype's implementation choices, look at
+the `field_*.go` files.
+
+## Parser Threading And Inlining
+
+Many functions in the parser have been manually inlined, for two reasons:
+
+  1. Go's inline heuristic is not good. It will not inline code in many cases
+     where the win is obvious (such as functions that are only called in one
+     place).
+
+  2. We want to avoid calling functions that do not thread parser1 and
+     parser2 in a consistent way, because this results in spills across
+     calls.
+
+We don't make very much use of `protowire`'s primitives, because they don't
+inline well and perform bounds checks that we statically know to be
+redundant, but which Go does not perform sufficient inlining to realize.
+For example, the core varint decoding code for field values (not tags) is
+an almost unchanged inlined copy of `protowire.ConsumeVarint`, because this
+is a very hot function and doing so improves performance significantly,
+particularly because we can remove many of the branches.
+
+---
