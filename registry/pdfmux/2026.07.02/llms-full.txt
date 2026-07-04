@@ -1,0 +1,1555 @@
+# pdfmux
+
+Source: https://github.com/nameetp/pdfmux/blob/main/README.md
+
+# pdfmux
+
+
+**Self-healing PDF extraction with per-page confidence scoring.** Open-source LlamaParse alternative for RAG pipelines, MCP server for Claude Desktop, LangChain + LlamaIndex loaders. Ranked #2 on opendataloader-bench (0.900).
+
+The only PDF extractor that audits its own output. Catches blank pages, scrambled columns, broken tables — re-extracts them with a stronger backend. So your LLM gets clean data, not silent garbage. Routes each page to the best of 5 rule-based backends + BYOK LLM fallback (Gemini / Claude / GPT-4o / Ollama). One CLI. One API. Zero config.
+
+<p align="center">
+  <img src="demo.svg" alt="pdfmux terminal demo" width="700" />
+</p>
+
+```
+PDF ──> pdfmux router ──> best extractor per page ──> audit ──> re-extract failures ──> Markdown / JSON / chunks
+            |
+            ├─ PyMuPDF         (digital text, 0.01s/page)
+            ├─ OpenDataLoader  (complex layouts, 0.05s/page)
+            ├─ RapidOCR        (scanned pages, CPU-only)
+            ├─ Docling         (tables, 97.9% TEDS)
+            ├─ Surya           (heavy OCR fallback)
+            ├─ Marker          (academic papers, neural)
+            ├─ Mistral OCR     ($0.002/page, 96.6% tables)
+            └─ YOUR LLM        (Gemini / Gemma 4 / Claude / GPT-4o / Ollama / Mistral — BYOK via YAML)
+```
+
+## Install
+
+```bash
+pip install pdfmux
+```
+
+That handles digital PDFs. **For any real-world batch, install `pdfmux[ocr]` too** — almost every directory of PDFs has at least one scan, and without OCR those pages return empty text:
+
+```bash
+pip install "pdfmux[ocr]"             # ⭐ recommended — RapidOCR for scanned pages (~200MB, CPU)
+```
+
+Other backends, by document type:
+
+```bash
+pip install "pdfmux[tables]"          # Docling — table-heavy docs (~500MB)
+pip install "pdfmux[opendataloader]"  # OpenDataLoader — complex layouts (Java 11+)
+pip install "pdfmux[marker]"          # Marker — neural extraction for academic papers
+pip install "pdfmux[llm]"             # Gemini fallback (default LLM)
+pip install "pdfmux[llm-claude]"      # Claude (Sonnet / Opus)
+pip install "pdfmux[llm-openai]"      # GPT-4o family
+pip install "pdfmux[llm-ollama]"      # Ollama (any local model)
+pip install "pdfmux[llm-mistral]"     # Mistral OCR API ($0.002/page)
+pip install "pdfmux[llm-all]"         # all LLM providers (incl. Gemma 4 via Gemini key)
+pip install "pdfmux[watch]"           # `pdfmux watch <dir>` auto-convert on change
+pip install "pdfmux[all]"             # everything
+```
+
+Requires Python 3.11+.
+
+## Quick Start
+
+### CLI
+
+```bash
+# zero config — just works
+pdfmux convert invoice.pdf
+# invoice.pdf -> invoice.md (2 pages, 95% confidence, via pymupdf4llm)
+
+# RAG-ready chunks with token limits
+pdfmux convert report.pdf --chunk --max-tokens 500
+
+# cost-aware extraction with budget cap
+pdfmux convert report.pdf --mode economy --budget 0.50
+
+# schema-guided structured extraction (5 built-in presets)
+pdfmux convert invoice.pdf --schema invoice
+
+# BYOK any LLM for hardest pages
+pdfmux convert scan.pdf --llm-provider claude
+
+# use a built-in or saved profile (invoices, receipts, papers, contracts, bulk-rag)
+pdfmux convert invoice.pdf --profile invoices
+
+# predict cost before running anything
+pdfmux estimate big-report.pdf --llm-provider gemini
+
+# stream pages as NDJSON as they finish (great for long documents)
+pdfmux stream report.pdf --quality high
+
+# auto-convert any new PDFs that land in a folder
+pdfmux watch ./inbox/ -o ./output/
+
+# diff two extractions side-by-side
+pdfmux diff old.pdf new.pdf
+
+# batch a directory — writes manifest.json with per-doc confidence
+pdfmux convert ./docs/ -o ./output/
+
+# CI mode: fail the run if any document is below 0.20 confidence
+pdfmux convert ./docs/ -o ./output/ --strict --min-confidence 0.20
+
+# pre-flight a directory: which extras do you actually need for THIS batch?
+pdfmux doctor --check ./docs/
+
+# results are cached by file hash — re-runs are instant; bypass with --no-cache
+pdfmux convert report.pdf --no-cache
+pdfmux convert report.pdf --clear-cache
+```
+
+### Python
+
+For batch processing, use `batch_extract()` — not a `subprocess.run(['pdfmux', ...])` loop. Same pipeline, no per-file process spawn, handles non-ASCII filenames:
+
+```python
+import pdfmux
+from pathlib import Path
+
+# Batch extract — yields (path, result) tuples as each PDF completes.
+pdfs = list(Path("./inbox").glob("*.pdf"))
+for path, result in pdfmux.batch_extract(pdfs, quality="standard"):
+    if isinstance(result, Exception):
+        print(f"FAILED {path.name}: {result}")
+        continue
+    if result.confidence < 0.50:
+        print(f"REVIEW {path.name} ({result.confidence:.2f})")
+    else:
+        print(f"OK     {path.name} ({result.confidence:.2f})")
+
+# Single-file helpers.
+text   = pdfmux.extract_text("report.pdf")             # markdown string
+data   = pdfmux.extract_json("report.pdf")             # locked schema dict
+chunks = pdfmux.chunk("report.pdf", max_tokens=500)    # RAG-ready chunks
+```
+
+> **Don't wrap pdfmux with your own pypdf/pdfplumber fallback.** pdfmux already routes per page through PyMuPDF → RapidOCR → vision LLM. PyMuPDF tolerates malformed PDFs that pypdf rejects ("Stream has ended unexpectedly"), so a downstream pypdf fallback turns recoverable PDFs into failures. Trust the router; check the confidence score on the result.
+
+## Architecture
+
+```
+                           ┌─────────────────────────────┐
+                           │     Segment Detector         │
+                           │  text / tables / images /    │
+                           │  formulas / headers per page │
+                           └─────────────┬───────────────┘
+                                         │
+                    ┌────────────────────────────────────────┐
+                    │            Router Engine                │
+                    │                                        │
+                    │   economy ── balanced ── premium        │
+                    │   (minimize $)  (default)  (max quality)│
+                    │   budget caps: --budget 0.50            │
+                    └────────────────────┬───────────────────┘
+                                         │
+          ┌──────────┬──────────┬────────┴────────┬──────────┐
+          │          │          │                  │          │
+     PyMuPDF   OpenData    RapidOCR           Docling     LLM
+     digital   Loader      scanned            tables    (BYOK)
+     0.01s/pg  complex     CPU-only           97.9%    any provider
+               layouts                        TEDS
+          │          │          │                  │          │
+          └──────────┴──────────┴────────┬────────┴──────────┘
+                                         │
+                    ┌────────────────────────────────────────┐
+                    │           Quality Auditor               │
+                    │                                        │
+                    │   4-signal dynamic confidence scoring   │
+                    │   per-page: good / bad / empty          │
+                    │   if bad -> re-extract with next backend│
+                    └────────────────────┬───────────────────┘
+                                         │
+                    ┌────────────────────────────────────────┐
+                    │           Output Pipeline               │
+                    │                                        │
+                    │   heading injection (font-size analysis)│
+                    │   table extraction + normalization      │
+                    │   text cleanup + merge                  │
+                    │   confidence score (honest, not inflated)│
+                    └────────────────────────────────────────┘
+```
+
+### Key design decisions
+
+- **Router, not extractor.** pdfmux does not compete with PyMuPDF or Docling. It picks the best one per page.
+- **Agentic multi-pass.** Extract, audit confidence, re-extract failures with a stronger backend. Bad pages get retried automatically.
+- **Segment-level detection.** Each page is classified by content type (text, tables, images, formulas, headers) before routing.
+- **4-signal confidence.** Dynamic quality scoring from character density, OCR noise ratio, table integrity, and heading structure. Not hardcoded thresholds.
+- **Document cache.** Each PDF is opened once, not once per extractor. Shared across the full pipeline.
+- **Data flywheel.** Local telemetry tracks which extractors win per document type. Routing improves with usage.
+
+## Features
+
+| Feature | What it does | Command |
+|---------|-------------|---------|
+| Zero-config extraction | Routes to best backend automatically | `pdfmux convert file.pdf` |
+| RAG chunking | Section-aware chunks with token estimates | `pdfmux convert file.pdf --chunk --max-tokens 500` |
+| Cost modes | economy / balanced / premium with budget caps | `pdfmux convert file.pdf --mode economy --budget 0.50` |
+| Schema extraction | 5 built-in presets (invoice, receipt, contract, resume, paper) | `pdfmux convert file.pdf --schema invoice` |
+| Profiles | Save and re-use config; built-ins for invoices/receipts/papers/contracts/bulk-rag | `pdfmux convert file.pdf --profile invoices` |
+| BYOK LLM | Gemini, Gemma 4, Claude, GPT-4o, Ollama, Mistral, any OpenAI-compatible API | `pdfmux convert file.pdf --llm-provider claude` |
+| Cost estimate | Predict spend before running | `pdfmux estimate file.pdf --llm-provider gemini` |
+| Streaming output | NDJSON events page-by-page for long docs | `pdfmux stream file.pdf` |
+| Smart cache | Hash-keyed result cache, 30-day TTL, 1 GB LRU | `pdfmux convert file.pdf` (auto), `--no-cache` to bypass |
+| Watch mode | Auto-convert any PDF added to a folder | `pdfmux watch ./inbox/` |
+| Diff | Compare two extractions | `pdfmux diff a.pdf b.pdf` |
+| Benchmark | Eval all installed extractors against ground truth | `pdfmux benchmark` |
+| Doctor | Show installed backends, coverage gaps, recommendations | `pdfmux doctor` |
+| MCP server | AI agents read PDFs via stdio or HTTP | `pdfmux serve` |
+| Batch processing | Convert entire directories | `pdfmux convert ./docs/` |
+| Page-level streaming API | Bounded-memory page iteration for large files | `for page in ext.extract("500pg.pdf")` |
+| Retry with backoff | Every LLM provider auto-retries with exponential backoff + `Retry-After` | (built-in) |
+
+## CLI Reference
+
+### `pdfmux convert`
+
+```bash
+pdfmux convert <file-or-dir> [options]
+
+Options:
+  -o, --output PATH          Output file or directory
+  -f, --format FORMAT        markdown | json | csv | llm (default: markdown)
+  -q, --quality QUALITY      fast | standard | high (default: standard)
+  -s, --schema SCHEMA        JSON schema file or preset (invoice, receipt, contract, resume, paper)
+  --chunk                    Output RAG-ready chunks
+  --max-tokens N             Max tokens per chunk (default: 500)
+  --mode MODE                economy | balanced | premium (default: balanced)
+  --budget AMOUNT            Max spend per document in USD
+  --llm-provider PROVIDER    LLM backend: gemini | claude | openai | ollama
+  --confidence               Include confidence score in output
+  --stdout                   Print to stdout instead of file
+```
+
+### `pdfmux serve`
+
+Start the MCP server for AI agent integration.
+
+```bash
+pdfmux serve              # stdio mode (Claude Desktop, Cursor)
+pdfmux serve --http 8080  # HTTP mode
+```
+
+### `pdfmux doctor`
+
+```bash
+pdfmux doctor
+# ┌──────────────────┬─────────────┬─────────┬──────────────────────────────────┐
+# │ Extractor        │ Status      │ Version │ Install                          │
+# ├──────────────────┼─────────────┼─────────┼──────────────────────────────────┤
+# │ PyMuPDF          │ installed   │ 1.25.3  │                                  │
+# │ OpenDataLoader   │ installed   │ 0.3.1   │                                  │
+# │ RapidOCR         │ installed   │ 3.0.6   │                                  │
+# │ Docling          │ missing     │ --      │ pip install pdfmux[tables]       │
+# │ Surya            │ missing     │ --      │ pip install pdfmux[ocr-heavy]    │
+# │ LLM (Gemini)     │ configured  │ --      │ GEMINI_API_KEY set               │
+# └──────────────────┴─────────────┴─────────┴──────────────────────────────────┘
+```
+
+### `pdfmux benchmark`
+
+```bash
+pdfmux benchmark report.pdf
+# ┌──────────────────┬────────┬────────────┬─────────────┬──────────────────────┐
+# │ Extractor        │   Time │ Confidence │      Output │ Status               │
+# ├──────────────────┼────────┼────────────┼─────────────┼──────────────────────┤
+# │ PyMuPDF          │  0.02s │        95% │ 3,241 chars │ all pages good       │
+# │ Multi-pass       │  0.03s │        95% │ 3,241 chars │ all pages good       │
+# │ RapidOCR         │  4.20s │        88% │ 2,891 chars │ ok                   │
+# │ OpenDataLoader   │  0.12s │        97% │ 3,310 chars │ best                 │
+# └──────────────────┴────────┴────────────┴─────────────┴──────────────────────┘
+```
+
+### `pdfmux estimate`
+
+Predict spend (and which backends will run) before processing.
+
+```bash
+pdfmux estimate report.pdf --quality high --llm-provider gemini
+# Pages       : 47
+# Extractors  : pymupdf4llm + gemini-2.5-flash on 9 pages
+# Estimated   : $0.0234
+# Cache hit?  : no  (first run for this file)
+```
+
+### `pdfmux stream`
+
+Emit NDJSON events as pages complete — useful for very long PDFs and live UIs.
+
+```bash
+pdfmux stream long.pdf --quality high
+# {"event":"classified","page_count":312,"plan":"pymupdf+gemini-fallback"}
+# {"event":"page","page_num":0,"confidence":0.97,"chars":1842}
+# {"event":"page","page_num":1,"confidence":0.92,"chars":1611,"ocr":true}
+# ...
+# {"event":"complete","confidence":0.94,"cost_usd":0.0712}
+```
+
+### `pdfmux watch`
+
+Auto-convert any PDFs that land in a directory. Survives until Ctrl+C.
+
+```bash
+pdfmux watch ./inbox/ -o ./output/ --profile bulk-rag
+```
+
+### `pdfmux diff`
+
+Side-by-side extraction comparison (quality, content, cost).
+
+```bash
+pdfmux diff a.pdf b.pdf --quality standard
+```
+
+### `pdfmux profiles`
+
+Saved configs at `~/.config/pdfmux/profiles.yaml`. Built-ins ship for the
+common shapes; save your own for project defaults.
+
+```bash
+pdfmux profiles list
+# invoices    quality=standard, schema=invoice, format=json
+# receipts    quality=fast,     schema=receipt, format=json
+# papers      quality=high,     chunk=true, max_tokens=500
+# contracts   quality=high,     schema=contract
+# bulk-rag    quality=standard, format=llm, chunk=true
+
+pdfmux profiles show invoices
+pdfmux profiles save my-default --quality high --format llm --chunk
+pdfmux profiles delete my-default
+
+# use a profile when converting
+pdfmux convert file.pdf --profile invoices
+```
+
+## Python API
+
+### Text extraction
+
+```python
+import pdfmux
+
+text = pdfmux.extract_text("report.pdf")                    # -> str (markdown)
+text = pdfmux.extract_text("report.pdf", quality="fast")    # PyMuPDF only, instant
+text = pdfmux.extract_text("report.pdf", quality="high")    # LLM-assisted
+```
+
+### Structured extraction
+
+```python
+data = pdfmux.extract_json("report.pdf")
+# data["page_count"]   -> 12
+# data["confidence"]   -> 0.91
+# data["ocr_pages"]    -> [2, 5, 8]
+# data["pages"][0]["key_values"]  -> [{"key": "Date", "value": "2026-02-28"}]
+# data["pages"][0]["tables"]      -> [{"headers": [...], "rows": [...]}]
+```
+
+### RAG chunking
+
+```python
+chunks = pdfmux.chunk("report.pdf", max_tokens=500)
+for c in chunks:
+    print(f"{c['title']}: {c['tokens']} tokens (pages {c['page_start']}-{c['page_end']})")
+```
+
+### Schema-guided extraction
+
+```python
+data = pdfmux.extract_json("invoice.pdf", schema="invoice")
+# Uses built-in invoice preset: extracts date, vendor, line items, totals
+# Also accepts a path to a custom JSON Schema file
+```
+
+### Streaming (bounded memory)
+
+```python
+from pdfmux.extractors import get_extractor
+
+ext = get_extractor("fast")
+for page in ext.extract("large-500-pages.pdf"):  # Iterator[PageResult]
+    process(page.text)  # constant memory, even on 500-page PDFs
+```
+
+### Types and errors
+
+```python
+from pdfmux import (
+    # Enums
+    Quality,              # FAST, STANDARD, HIGH
+    OutputFormat,         # MARKDOWN, JSON, CSV, LLM
+    PageQuality,          # GOOD, BAD, EMPTY
+
+    # Data objects (frozen dataclasses)
+    PageResult,           # page: text, page_num, confidence, quality, extractor
+    DocumentResult,       # document: pages, source, confidence, extractor_used
+    Chunk,                # chunk: title, text, page_start, page_end, tokens
+
+    # Errors
+    PdfmuxError,          # base -- catch this for all pdfmux errors
+    FileError,            # file not found, unreadable, not a PDF
+    ExtractionError,      # extraction failed
+    ExtractorNotAvailable,# requested backend not installed
+    FormatError,          # invalid output format
+    AuditError,           # audit could not complete
+)
+```
+
+## Framework Integrations
+
+### LangChain
+
+```bash
+pip install langchain-pdfmux
+```
+
+```python
+from langchain_pdfmux import PDFMuxLoader
+
+loader = PDFMuxLoader("report.pdf", quality="standard")
+docs = loader.load()  # -> list[Document] with confidence metadata
+```
+
+### LlamaIndex
+
+```bash
+pip install llama-index-readers-pdfmux
+```
+
+```python
+from llama_index.readers.pdfmux import PDFMuxReader
+
+reader = PDFMuxReader(quality="standard")
+docs = reader.load_data("report.pdf")  # -> list[Document]
+```
+
+### MCP Server (AI Agents)
+
+Listed on [mcpservers.org](https://mcpservers.org). One-line setup:
+
+```json
+{
+  "mcpServers": {
+    "pdfmux": {
+      "command": "npx",
+      "args": ["-y", "pdfmux-mcp"]
+    }
+  }
+}
+```
+
+Or via Claude Code:
+
+```bash
+claude mcp add pdfmux -- npx -y pdfmux-mcp
+```
+
+Tools exposed: `convert_pdf`, `analyze_pdf`, `extract_structured`,
+`extract_streaming`, `get_pdf_metadata`, `batch_convert`.
+
+## BYOK LLM Configuration
+
+pdfmux supports any LLM via 5 lines of YAML. Bring your own keys -- nothing leaves your machine unless you configure it to.
+
+```yaml
+# ~/.pdfmux/llm.yaml
+provider: claude          # gemini | claude | openai | ollama | any OpenAI-compatible
+model: claude-sonnet-4-20250514
+api_key: ${ANTHROPIC_API_KEY}
+base_url: https://api.anthropic.com  # optional, for custom endpoints
+max_cost_per_page: 0.02   # budget cap
+```
+
+Supported providers:
+
+| Provider | Models | Local? | Cost |
+|----------|--------|--------|------|
+| Gemini | 2.5 Flash, 2.5 Pro | No | ~$0.01/page |
+| Gemma 4 | 27B IT, 12B IT (great for Arabic) | No (via Gemini key) | ~$0.005/page |
+| Claude | Sonnet, Opus | No | ~$0.015/page |
+| GPT-4o | GPT-4o, GPT-4o-mini | No | ~$0.01/page |
+| Mistral | `mistral-ocr-latest` | No | $0.002/page |
+| Ollama | Any local model | Yes | Free |
+| Custom | Any OpenAI-compatible API | Configurable | Varies |
+
+Every provider's `extract_page()` is wrapped in `@with_retry(max_attempts=3,
+backoff_base=2.0)`, which honors `Retry-After` headers on 429s and skips
+retries on auth failures so a bad key fails fast.
+
+## Arabic & RTL Support
+
+pdfmux ships first-class support for Arabic, Persian, Urdu, and Hebrew.
+Out of the box, RTL detection runs on every PDF and PyMuPDF-extracted
+pages are passed through the Unicode Bidirectional Algorithm so glyphs
+that were stored in left-to-right order render in correct reading order.
+
+```bash
+# Default install — already includes python-bidi for RTL reordering
+pip install pdfmux
+
+# Recommended for Arabic-heavy docs — adds Gemma 4 vision OCR
+pip install "pdfmux[arabic,llm-gemma]"
+
+# One credential covers Gemma + Gemini (same Google endpoint)
+export GEMINI_API_KEY=...
+```
+
+What happens automatically:
+
+- `pdfmux convert` detects Arabic content and routes pages with >5%
+  Arabic characters through the Arabic-aware extractor chain.
+- PyMuPDF, RapidOCR, and Docling outputs are post-processed with the
+  Bidi algorithm — markdown headings (`#`) and pipe-table rows preserve
+  structure, only inner text is reordered.
+- `DocumentResult.has_arabic` is set to `True` whenever any page contains
+  Arabic script.
+
+What requires opt-in:
+
+- Vision LLM extraction. Set `--llm-provider gemma` (or any vision
+  provider) to route Arabic pages through Gemma 4 instead of PyMuPDF.
+- Aggressive normalization (Tatweel removal, Alef/Yeh unification,
+  Tashkeel stripping) — call `pdfmux.arabic.normalize_arabic(text)`
+  on extracted strings if you need canonicalized output for search or
+  embedding.
+
+```python
+from pdfmux.arabic import (
+    is_arabic_text,
+    is_rtl_dominant,
+    fix_bidi_order,
+    normalize_arabic,
+)
+
+text = "مرحبا بالعالم"
+assert is_arabic_text(text)
+assert is_rtl_dominant(text)
+
+# Fix glyph order from PyMuPDF / OCR engines
+visual = fix_bidi_order(text)
+
+# Canonicalize for indexing — strip Tatweel, unify Alef variants, drop diacritics
+indexable = normalize_arabic("أَحْمَدْ")  # → "احمد"
+```
+
+## Benchmark
+
+Tested on [opendataloader-bench](https://github.com/opendataloader-project/opendataloader-bench) -- 200 real-world PDFs across financial reports, legal filings, academic papers, and scanned documents.
+
+| Engine | Overall | Reading Order | Tables (TEDS) | Headings | Requires |
+|--------|---------|---------------|---------------|----------|----------|
+| opendataloader hybrid | 0.909 | 0.935 | 0.928 | 0.828 | API calls ($) |
+| **pdfmux** | **0.905** | **0.920** | **0.911** | **0.852** | **CPU only, $0** |
+| docling | 0.877 | 0.900 | 0.887 | 0.802 | ~500MB models |
+| marker | 0.861 | 0.890 | 0.808 | 0.796 | GPU recommended |
+| opendataloader local | 0.844 | 0.913 | 0.494 | 0.761 | CPU only |
+| mineru | 0.831 | 0.857 | 0.873 | 0.743 | GPU + ~2GB models |
+
+#2 overall, #1 among free tools. 99.5% of the paid #1 score at zero cost per page. Best heading detection of any engine tested. Image table OCR extracts tables embedded as images.
+
+## Smart Result Cache
+
+Re-running the same extraction is instant. pdfmux hashes every input PDF
+(SHA-256) and keys results on `(file_hash, quality, format, schema)`. Cache
+files live under `~/.cache/pdfmux/results/`, expire after 30 days, and are
+LRU-evicted at 1 GB.
+
+```bash
+pdfmux convert big-report.pdf            # first run: 14.2s
+pdfmux convert big-report.pdf            # cache hit: 0.05s
+pdfmux convert big-report.pdf --no-cache # bypass cache (still writes back)
+pdfmux convert big-report.pdf --clear-cache  # purge and re-run
+```
+
+The cache also speeds up `--profile`, `--schema`, and `--format` switches —
+each combination is keyed independently, so you can flip between Markdown
+and JSON for the same document for free after the first extraction.
+
+## Confidence Scoring
+
+Every result includes a 4-signal confidence score:
+
+- **95-100%** -- clean digital text, fully extractable
+- **80-95%** -- good extraction, minor OCR noise on some pages
+- **50-80%** -- partial extraction, some pages unrecoverable
+- **<50%** -- significant content missing, warnings included
+
+When confidence drops below 80%, pdfmux tells you exactly what went wrong and how to fix it:
+
+```
+Page 4: 32% confidence. 0 chars extracted from image-heavy page.
+  -> Install pdfmux[ocr] for RapidOCR support on 6 image-heavy pages.
+```
+
+## Cost Modes
+
+| Mode | Behavior | Typical cost |
+|------|----------|-------------|
+| economy | Rule-based backends only. No LLM calls. | $0/page |
+| balanced | LLM only for pages that fail rule-based extraction. | ~$0.002/page avg |
+| premium | LLM on every page for maximum quality. | ~$0.01/page |
+
+Set a hard budget cap: `--budget 0.50` stops LLM calls when spend reaches $0.50 per document.
+
+## Why pdfmux?
+
+pdfmux is not another PDF extractor. It is the orchestration layer that picks the right extractor per page, verifies the result, and retries failures.
+
+| Tool | Good at | Limitation |
+|------|---------|-----------|
+| PyMuPDF | Fast digital text | Cannot handle scans or image layouts |
+| Docling | Tables (97.9% accuracy) | Slow on non-table documents |
+| Marker | Neural extraction for academic papers | Needs GPU for speed; overkill for digital PDFs |
+| Mistral OCR | Tables (96.6% TEDS), $0.002/page | Cloud-only API |
+| Unstructured | Enterprise platform | Complex setup, paid tiers |
+| LlamaParse | Cloud-native | Requires API keys, not local |
+| Reducto | High accuracy | $0.015/page, closed source |
+| **pdfmux** | **Orchestrates all of the above** | Routes per page, audits, re-extracts |
+
+Open source Reducto alternative: what costs $0.015/page elsewhere is free with pdfmux's rule-based backends, or ~$0.002/page average with BYOK LLM fallback.
+
+## Development
+
+```bash
+git clone https://github.com/NameetP/pdfmux.git
+cd pdfmux
+python3.12 -m venv .venv && source .venv/bin/activate
+pip install -e ".[dev]"
+
+pytest              # 659 tests
+ruff check src/ tests/
+ruff format src/ tests/
+```
+
+## Contributing
+
+1. Fork the repo
+2. Create a branch (`git checkout -b feature/your-feature`)
+3. Write tests for new functionality
+4. Ensure `pytest` and `ruff check` pass
+5. Open a PR
+
+## License
+
+[MIT](LICENSE)
+
+<!-- mcp-name: io.github.NameetP/pdfmux -->
+
+
+---
+
+# Architecture Note: Column-Aware Reading Order
+
+Source: https://github.com/nameetp/pdfmux/blob/main/ARCH-READING-ORDER.md
+
+# Architecture Note: Column-Aware Reading Order
+
+**Goal**: 0.900 → 0.910+ overall (beat paid #1 at 0.909)
+**Primary lever**: NID 0.918 → 0.935 (+0.017)
+**Root cause**: 40 docs have correct text but wrong reading order (multi-column interleaving)
+
+---
+
+## Current State
+
+### How reading order works today
+
+```
+PDF → pymupdf4llm.to_markdown() → text with baked-in reading order
+                                    ↓
+                              no reordering anywhere
+                                    ↓
+                              pipeline merges pages → clean_text → output
+```
+
+pymupdf4llm is a **black box** for reading order. It uses PyMuPDF's internal layout analysis, which works well for single-column docs but fails on:
+- 2-column academic papers (reads across columns instead of down)
+- Financial reports with sidebars
+- Multi-column resumes
+- Newsletters and magazines
+
+### What already exists (unused)
+
+`detect.py:322-425` has a complete `detect_layout()` function that:
+1. Extracts text blocks with bounding boxes via `page.get_text("blocks")`
+2. Clusters x0 positions with 50pt gap detection
+3. Builds column boundaries
+4. Returns a `PageLayout` with column count + reading order
+
+`types.py:129-138` has the `PageLayout` dataclass ready to go.
+
+**This code is defined but NEVER CALLED in the pipeline.**
+
+---
+
+## Proposed Architecture
+
+### The integration point
+
+The fix goes in `extractors/fast.py` and `pipeline.py`. Two strategies depending on confidence:
+
+#### Strategy A: Post-extraction reorder (safer, simpler)
+
+After pymupdf4llm extracts text, detect if the page is multi-column. If so, re-extract using fitz blocks in the correct reading order instead of using pymupdf4llm's text.
+
+```
+PDF → pymupdf4llm.to_markdown() → text (possibly wrong order)
+  ↓
+  page → detect_layout(page)
+           ↓
+           columns == 1? → keep pymupdf4llm text as-is
+           columns >= 2? → re-extract with fitz blocks in correct column order
+                            ↓
+                          merge block texts: col1 top→bottom, col2 top→bottom
+                            ↓
+                          use THIS text instead of pymupdf4llm text
+```
+
+**Where to wire it**: `fast.py:153-175`, after pymupdf4llm extraction, before heading injection.
+
+```python
+# fast.py — after line 153 (pymupdf4llm extraction)
+for i, chunk in enumerate(chunks):
+    text = chunk.get("text", "")
+
+    # NEW: detect multi-column and reorder if needed
+    if i < len(doc):
+        layout = detect_layout(doc[i])
+        if layout.columns >= 2:
+            text = _reorder_by_layout(doc[i], layout)
+
+    # existing: heading injection, quality checks, etc.
+    if i < len(doc):
+        text = inject_headings(text, doc[i])
+    ...
+```
+
+#### Strategy B: Parallel extraction with quality comparison (more robust)
+
+Extract text TWO ways, compare, pick the better one:
+
+```
+PDF page → pymupdf4llm text  ──→ NID-like self-score ─┐
+     ↓                                                  ├→ pick better
+     └──→ column-reordered text ──→ NID-like self-score ┘
+```
+
+Self-scoring heuristic: compare text against a "reference" built from all text blocks. The extraction with more sequential block-to-block matches wins.
+
+**This is more complex but avoids regressions** — if column reordering makes things worse (e.g., false column detection), the original pymupdf4llm text is preserved.
+
+### Recommendation: Start with Strategy A, add B if regressions appear
+
+---
+
+## The `_reorder_by_layout()` function
+
+This is the new function that needs to be built. It takes a fitz page + PageLayout and returns correctly-ordered text.
+
+### Algorithm
+
+```python
+def _reorder_by_layout(page: fitz.Page, layout: PageLayout) -> str:
+    """Re-extract page text in column-aware reading order."""
+
+    blocks = page.get_text("blocks")
+    text_blocks = [(i, b) for i, b in enumerate(blocks) if b[6] == 0 and b[4].strip()]
+
+    # Use the reading_order from detect_layout
+    ordered_texts = []
+    for block_idx in layout.reading_order:
+        for i, b in text_blocks:
+            if i == block_idx:
+                ordered_texts.append(b[4].strip())
+                break
+
+    return "\n\n".join(ordered_texts)
+```
+
+### Key decisions
+
+**1. What text format to use from fitz blocks?**
+
+`page.get_text("blocks")` returns raw text without markdown formatting. pymupdf4llm adds:
+- Bold markers (`**text**`)
+- Heading markers (`# text`)
+- Table formatting (`| cell | cell |`)
+- List markers (`- item`)
+
+Options:
+- **Option A**: Use raw block text (lose formatting). Heading injection + bold promotion still runs after, so headings will be recovered. Tables are overlaid from Docling anyway.
+- **Option B**: Use `page.get_text("dict")` for richer data (font info, spans). More work but preserves more structure.
+- **Option C**: Use pymupdf4llm's text but reorder the paragraphs based on the layout analysis. This is tricky because pymupdf4llm's text doesn't have block boundaries.
+
+**Recommendation: Option A** for simplicity. The heading injection pipeline already recovers structural formatting. The main thing we need is correct text ORDER, not formatting.
+
+**2. How to handle spanning elements?**
+
+A full-width heading in a 2-column doc should NOT be split across columns. Detection:
+- A block whose x0→x1 spans >60% of page width is a "spanning element"
+- Spanning elements are inserted at their y-position in the reading order, between column blocks
+
+```python
+# Pseudocode for spanning element handling
+for block in text_blocks:
+    x0, y0, x1, y1 = block[:4]
+    block_width = x1 - x0
+    if block_width > page_width * 0.6:
+        # This is a spanning element (heading, table, figure caption)
+        # Insert at correct y-position, not assigned to any column
+        spanning_elements.append((y0, block))
+    else:
+        # Assign to nearest column
+        assign_to_column(block)
+
+# Merge: interleave spanning elements with column text by y-position
+```
+
+**3. When to skip reordering?**
+
+Don't reorder when:
+- Page has < 6 text blocks (too few to determine columns)
+- Page has tables (table blocks span columns and confuse detection)
+- Classification says page is graphical/scanned (OCR text has unreliable positions)
+- Column detection confidence is low (ambiguous clustering)
+
+**4. What about the `pymupdf_layout` package?**
+
+pymupdf4llm prints a deprecation-style message: "Consider using the pymupdf_layout package for a greatly improved page layout analysis." This is PyMuPDF's official layout analysis library. Worth investigating as an alternative to our custom column detection.
+
+```python
+# Check if available
+try:
+    import pymupdf_layout
+    # May provide better column detection than our custom clustering
+except ImportError:
+    pass
+```
+
+---
+
+## Impact on the pipeline
+
+### Files to modify
+
+| File | Change | Risk |
+|---|---|---|
+| `extractors/fast.py` | Wire `detect_layout()` + `_reorder_by_layout()` after pymupdf4llm extraction | Medium — could regress single-column docs if column detection false-positives |
+| `detect.py` | May need tuning of `_COLUMN_GAP_MIN` (currently 50pt). Add spanning element logic. Add confidence score | Low — isolated function |
+| `audit.py` | Apply same reordering in the audit path (line 293) | Low — mirrors fast.py change |
+| `pipeline.py` | Pass `PageLayout` through to merge step for potential cross-page column awareness | Low |
+
+### Files NOT to modify
+
+| File | Why |
+|---|---|
+| `headings.py` | Heading injection works on the final text — independent of reading order |
+| `postprocess.py` | Text cleaning is order-independent |
+| `regions.py` | Region OCR is supplemental — doesn't affect main extraction |
+
+---
+
+## Testing strategy
+
+### Fast validation (6 docs)
+
+Pick 3 known multi-column docs from the benchmark + 3 single-column docs. Run before/after and verify:
+- Multi-column NID improves
+- Single-column NID doesn't regress
+
+### Full validation (200 docs)
+
+Run the full benchmark. Accept if:
+- Overall >= 0.905
+- Regressions <= 5
+- No single doc drops more than 0.05
+
+### Manual spot-check
+
+For the 40 wrong-order docs, visually compare output vs GT for 5 representative docs. Verify the column interleaving is fixed.
+
+---
+
+## Edge cases to handle
+
+1. **3+ columns** (rare but exists in newspapers): The algorithm already handles N columns — just ensure gap detection works for 3 clusters.
+
+2. **Mixed layout** (first half single-column, second half two-column): Detect per-page, not per-document. Each page gets its own layout analysis.
+
+3. **Marginal notes / sidebars**: These are narrow columns at page edges. The gap detection should catch them, but the text may be ancillary (footnotes, references). Consider ignoring columns < 15% of page width.
+
+4. **Right-to-left text** (Arabic, Hebrew): Column order reverses. Detect via Unicode character analysis of extracted text. Out of scope for v1 but note for future.
+
+5. **Tables spanning columns**: If a table spans the full page width in a 2-column doc, it should be treated as a spanning element, not split.
+
+6. **Headers/footers**: These span the full page width. The spanning element detection (>60% of page width) should catch them, but they should be at the top/bottom of the reading order.
+
+---
+
+## Estimated effort
+
+| Task | Complexity | Time |
+|---|---|---|
+| Wire `detect_layout()` into fast.py | Simple | 30 min |
+| Add spanning element detection | Medium | 1 hour |
+| Add `_reorder_by_layout()` function | Medium | 1 hour |
+| Tune `_COLUMN_GAP_MIN` threshold | Iteration | 1-2 hours |
+| Wire into audit.py path | Simple | 30 min |
+| Run benchmark + fix regressions | Iteration | 2-3 hours |
+| **Total** | | **5-7 hours** |
+
+---
+
+## Success criteria
+
+- Overall: 0.900 → **0.910+** (beats paid #1 at 0.909)
+- NID: 0.918 → **0.930+**
+- MHS: no regression (stay >= 0.840)
+- TEDS: no regression (stay >= 0.887)
+- Zero new dependencies
+- < 2ms overhead per page
+
+---
+
+## Experiment Results (2026-03-21)
+
+### What was tested
+
+Three approaches were tested against the 200-doc benchmark:
+
+#### Attempt 1: Raw fitz block replacement (50pt gap)
+- Detected 148/200 docs as multi-column (way too many)
+- Replaced pymupdf4llm text with raw fitz blocks in column order
+- **Result: 0.878 overall (DOWN from 0.900), 45 regressions**
+- Root cause: 50pt gap threshold detected single-column docs with indented text as multi-column. Raw fitz blocks lost all markdown formatting (bold, headings, lists), crashing MHS from 0.844 to 0.772.
+
+#### Attempt 2: Raw fitz block replacement (200pt gap)
+- Detected 46/200 docs as multi-column (more reasonable)
+- Same raw block replacement approach
+- **Result: 0.894 overall (DOWN from 0.900), 11 regressions**
+- Root cause: Even at 200pt, some docs were being replaced with raw text unnecessarily. MHS still dropped to 0.822.
+
+#### Attempt 3: Paragraph reordering (200pt gap)
+- Keep pymupdf4llm text, match paragraphs to fitz blocks by text overlap, reorder paragraphs
+- **Result: 0.895 overall (DOWN from 0.900), 18 regressions**
+- Root cause: Paragraph-to-block matching was too imprecise (first-50-chars overlap). Docs where pymupdf4llm already had correct order were being scrambled. Major regressions on docs 069 (-0.132 NID), 097 (-0.135 NID), 153 (-0.559 MHS).
+
+### Key findings
+
+1. **pymupdf4llm handles many multi-column docs correctly already.** Blindly reordering everything multi-column causes more harm than good.
+
+2. **Column detection false positives are deadly.** Even at 200pt gap threshold, docs with wide margins, centered text, or indented code blocks get falsely detected as multi-column.
+
+3. **Text replacement destroys formatting.** Any approach that replaces pymupdf4llm text with raw fitz blocks loses heading markers, bold, lists, and table formatting — crashing MHS.
+
+4. **Paragraph matching is fragile.** pymupdf4llm splits text differently than fitz blocks. Character-overlap matching at 50 chars is not reliable enough for correct reordering.
+
+### What must change for v2
+
+The approach needs to be fundamentally different:
+
+1. **Only reorder when provably wrong.** Need a heuristic to detect when pymupdf4llm's order is actually incorrect (e.g., compare consecutive paragraphs — if a paragraph's y-position jumps UP, the order is likely wrong).
+
+2. **Never replace text.** Reorder pymupdf4llm's existing paragraphs, don't substitute with raw fitz text. This preserves all formatting.
+
+3. **Better paragraph-to-block matching.** Use `fuzz.partial_ratio` or longest-common-subsequence instead of first-50-chars overlap. Or use the y-position of each paragraph's first line (available from `page.get_text("dict")`) to establish correspondence.
+
+4. **Conservative column detection.** The gap threshold alone isn't enough. Also require:
+   - At least 3 blocks per column (not just 2 x-positions far apart)
+   - Blocks in different columns must have comparable y-ranges (actual interleaving)
+   - Page must have enough text to warrant reordering (>200 chars per column)
+
+5. **A/B comparison.** Run both orderings, compute a self-consistency score (e.g., do consecutive sentences flow logically?), pick the better one. This makes the feature safe — worst case, it's a no-op.
+
+---
+
+# pdfmux — Agent Instructions
+
+Source: https://github.com/nameetp/pdfmux/blob/main/CLAUDE.md
+
+# pdfmux — Agent Instructions
+
+## Project
+
+PDF extraction that checks its own work. Multi-pass pipeline: fast extract → audit → selective OCR → merge.
+
+- **Language**: Python 3.11+
+- **Build**: hatchling (pyproject.toml)
+- **Lint**: ruff
+- **Test**: pytest
+- **Site**: static HTML in `site/` (no build step)
+
+## Commands
+
+```bash
+# Python
+ruff check src/ tests/          # lint
+ruff format src/ tests/         # format
+pytest -v                       # test
+
+# Site
+python3 design-system/lint.py site/   # design system lint
+npx serve site/ -l 3456              # local dev server
+```
+
+## Design System
+
+**When editing any file in `site/`, you MUST follow the design system.**
+
+1. Read `design-system/DESIGN_SYSTEM.md` for all visual rules
+2. Read `design-system/SKILL.md` for agent-specific instructions
+3. After changes, run `python3 design-system/lint.py site/` and fix all violations
+
+Key rules:
+- No raw hex/rgb/hsl colors outside `:root` — use CSS custom properties
+- No inline `font-family` — use `var(--font)` or `var(--mono)`
+- Border-radius: only `4px`, `8px`, or `10px`
+- Transitions: only `0.15s` duration
+- No external CSS or JS — site is self-contained HTML
+- Max content width: `720px`
+
+---
+
+# Contributing to pdfmux
+
+Source: https://github.com/nameetp/pdfmux/blob/main/CONTRIBUTING.md
+
+# Contributing to pdfmux
+
+Thanks for your interest in contributing! Here's how to get started.
+
+## Setup
+
+```bash
+git clone https://github.com/NameetP/pdfmux.git
+cd pdfmux
+python3.12 -m venv .venv && source .venv/bin/activate
+pip install -e ".[dev,serve]"
+```
+
+## Running tests
+
+```bash
+# full suite (151 tests)
+pytest
+
+# with coverage
+pytest --cov=pdfmux --cov-report=term-missing
+
+# single file
+pytest tests/test_pipeline.py -v
+```
+
+## Linting
+
+```bash
+ruff check src/ tests/
+ruff format src/ tests/
+```
+
+Both checks run in CI and must pass before merge.
+
+## Code style
+
+- **Type annotations** on all public functions and method signatures.
+- **Frozen dataclasses** for all data objects flowing through the pipeline.
+- **Docstrings** on all public functions (Google style).
+- **Imports**: use `from __future__ import annotations` in every module.
+- Line length: 100 characters (configured in `pyproject.toml`).
+
+## Adding a new extractor
+
+1. Create `src/pdfmux/extractors/your_extractor.py`.
+2. Implement the `Extractor` protocol (see `extractors/__init__.py`):
+   - `name` property
+   - `available()` method — return `True` only if deps are installed
+   - `extract(file_path, pages=None)` — yield `PageResult` per page
+3. Register with `@register(name="your_name", priority=N)`.
+4. Add an optional dependency group in `pyproject.toml`.
+5. Add tests in `tests/test_your_extractor.py`.
+6. Update `pdfmux doctor` in `cli.py` to check for the new extractor.
+
+## Pull request process
+
+1. Fork the repo and create a feature branch.
+2. Make your changes with tests.
+3. Run `pytest` and `ruff check` locally.
+4. Open a PR against `main` with a clear description.
+5. CI must pass (lint + test on Python 3.11/3.12/3.13 + build).
+
+## Commit messages
+
+Use imperative mood: "Add feature" not "Added feature". Keep the first line under 72 characters.
+
+## Questions?
+
+Open an [issue](https://github.com/NameetP/pdfmux/issues) or start a discussion.
+
+---
+
+# Architecture — pdfmux v1.6.0
+
+Source: https://github.com/nameetp/pdfmux/blob/main/docs/ARCHITECTURE.md
+
+# Architecture — pdfmux v1.6.0
+
+PDF extraction that checks its own work. This document describes how.
+
+## System Overview
+
+```
+pdfmux Python API / CLI / MCP server
+    │
+    ├─ __init__.py        public API: extract_text, extract_json, load_llm_context + type/error exports
+    │
+    ├─ types.py           frozen dataclasses + enums: Quality, OutputFormat, PageResult, DocumentResult, Chunk
+    ├─ errors.py          exception hierarchy with .user_message / .suggestion / .reproduce_cmd
+    ├─ retry.py           @with_retry — exponential backoff, Retry-After aware, skips on auth failures
+    │
+    ├─ detect.py          classify PDF (digital / scanned / graphical / mixed / tables / arabic / academic)
+    │
+    ├─ pipeline.py        route to extractor based on classification + quality
+    │   │                 (consults result_cache before running, persists on success)
+    │   │
+    │   ├─ quality=fast     → FastExtractor only
+    │   ├─ quality=high     → LLM → OCR → Fast fallback
+    │   ├─ has_tables       → TableExtractor → Fast fallback
+    │   └─ standard         → multi-pass pipeline (below)
+    │
+    ├─ audit.py           5-check per-page confidence scoring + quality classification
+    │
+    ├─ chunking.py        section-aware splitting + token estimation
+    │
+    ├─ result_cache.py    SHA-256 file hashing → ~/.cache/pdfmux/results/, 30d TTL, 1 GB LRU
+    ├─ streaming.py       generator yielding NDJSON StreamEvents (classified/page/warning/complete)
+    ├─ profiles.py        ~/.config/pdfmux/profiles.yaml + 5 built-ins
+    ├─ arabic.py          BiDi reordering + Arabic detection + canonicalization
+    │
+    ├─ extractors/
+    │   ├─ __init__.py      Extractor protocol + @register decorator + priority-ordered registry
+    │   ├─ fast.py          PyMuPDF / pymupdf4llm — 0.01s/page, handles 90% (priority 10)
+    │   ├─ rapid_ocr.py     RapidOCR (PaddleOCR v4 + ONNX) — ~200MB, CPU (priority 20)
+    │   ├─ mistral_ocr.py   Mistral OCR API — $0.002/page, 96.6% TEDS  (priority 25)
+    │   ├─ ocr.py           Surya OCR — legacy, ~5GB, GPU (priority 30)
+    │   ├─ marker.py        Marker neural extractor — academic papers (priority 35)
+    │   ├─ tables.py        Docling — 97.9% table accuracy (priority 40)
+    │   ├─ opendataloader.py Java-backed reading-order extractor (priority 45)
+    │   └─ llm.py           BYOK vision LLM — Gemini, Gemma 4, Claude, GPT-4o, Ollama, Mistral (priority 50)
+    │
+    ├─ providers/
+    │   ├─ base.py            LLMProvider protocol + ModelInfo + CostEstimate
+    │   ├─ _discovery.py      auto-registers all built-in providers
+    │   ├─ gemini.py          Gemini 2.5 Flash / Pro
+    │   ├─ gemma.py           Gemma 4 27B IT (Gemini OpenAI-compat endpoint, reuses GEMINI_API_KEY)
+    │   ├─ claude.py          Claude Sonnet / Opus
+    │   ├─ openai_native.py   GPT-4o family
+    │   ├─ openai_compatible.py  Mistral + custom OpenAI-compatible APIs
+    │   └─ ollama.py          local models
+    │
+    ├─ postprocess.py     text cleanup + Arabic BiDi (markdown-aware)
+    │
+    └─ formatters/        markdown, json, csv, llm output
+```
+
+## Type System
+
+All data flowing through the pipeline is represented by frozen dataclasses and enums defined in `types.py`. Nothing is a raw dict. Nothing is mutable after construction.
+
+```python
+class Quality(Enum):         # FAST, STANDARD, HIGH
+class OutputFormat(Enum):    # MARKDOWN, JSON, CSV, LLM
+class PageQuality(Enum):     # GOOD, BAD, EMPTY
+
+@dataclass(frozen=True)
+class PageResult:            # page_num, text, confidence, quality, extractor, image_count, ocr_applied
+@dataclass(frozen=True)
+class DocumentResult:        # pages, source, confidence, extractor_used, format, text, warnings, ocr_pages
+@dataclass(frozen=True)
+class Chunk:                 # title, text, page_start, page_end, tokens, confidence
+```
+
+All types are exported from `import pdfmux`. They are frozen (`@dataclass(frozen=True)`) so they can be hashed, stored in sets, and passed across threads safely.
+
+## Error Hierarchy
+
+Exceptions follow a flat hierarchy in `errors.py`:
+
+```
+PdfmuxError                      base — catch this to handle all pdfmux errors
+├── FileError                    bad path, unreadable, not a PDF, corrupted
+├── ExtractionError              extractor failed to produce output
+├── ExtractorNotAvailable        optional dependency not installed (includes install instructions)
+├── FormatError                  invalid or unsupported output format
+└── AuditError                   per-page quality audit failed (non-fatal in pipeline)
+```
+
+Propagation rules:
+- `FileError` → raise immediately, nothing to retry
+- `ExtractorNotAvailable` → log + try next extractor in registry
+- `ExtractionError` → log + try next extractor in registry
+- `FormatError` → raise immediately, caller picked bad format
+- `AuditError` → log + skip audit, return unaudited result
+
+## Extractor Protocol & Registry
+
+Every extractor implements the `Extractor` protocol:
+
+```python
+@runtime_checkable
+class Extractor(Protocol):
+    @property
+    def name(self) -> str: ...
+    def extract(self, file_path: str | Path, pages: list[int] | None = None) -> Iterator[PageResult]: ...
+    def available(self) -> bool: ...
+```
+
+Extractors register themselves with `@register(name, priority)` at class definition time:
+
+```python
+@register(name="fast", priority=10)
+class FastExtractor:
+    ...
+```
+
+The registry maintains priority order. Lower priority = tried first. The pipeline queries at runtime:
+
+- `get_extractor("fast")` — get a specific extractor by name
+- `available_extractors()` — list all extractors whose dependencies are installed
+- `extractor_names()` — list all registered names (installed or not)
+
+| Priority | Registry Name | Backend | Use Case |
+|----------|--------------|---------|----------|
+| 10 | `fast` | PyMuPDF / pymupdf4llm | Digital text PDFs |
+| 20 | `rapidocr` | RapidOCR (PaddleOCR v4) | Lightweight OCR (~200MB, CPU) |
+| 25 | `mistral_ocr` | Mistral OCR API | Cloud table OCR — 96.6% TEDS, $0.002/page |
+| 30 | `surya` | Surya OCR | Heavy OCR (~5GB, GPU) |
+| 35 | `marker` | Marker neural extractor | Academic papers, dense layouts |
+| 40 | `docling` | Docling | Table-heavy documents |
+| 45 | `opendataloader` | OpenDataLoader (Java) | Complex multi-column reading order |
+| 50 | `llm` | BYOK vision LLM | Complex layouts, handwriting, Arabic, charts |
+
+The router (`router/engine.py`) maintains a `ROUTING_MATRIX` keyed by page
+type (`digital`, `scanned`, `graphical`, `tables`, `academic`, `arabic`)
+and a `quality` preset, plus per-extractor `QUALITY_ESTIMATES` and
+`COST_PER_PAGE` to power `pdfmux estimate`.
+
+## Streaming Architecture
+
+All extractors yield `Iterator[PageResult]` — one page object at a time. The pipeline consumes pages lazily. This bounds memory to roughly one page of text plus extractor overhead, regardless of document length.
+
+Measured: ~135MB peak on a 500-page PDF. Before v0.5.0, memory scaled linearly with page count.
+
+```
+Extract (streaming) → Audit (per-page) → Re-extract failures (streaming) → Merge → Format
+```
+
+## 5-Check Confidence Scoring
+
+Each page receives a confidence score from 0.0 to 1.0, computed from 5 independent checks in `audit.score_page()`:
+
+| Check | What it measures |
+|-------|-----------------|
+| Character density | Characters per page — catches blank extractions |
+| Alphabetic ratio | Proportion of alphabetic characters — catches garbage/binary data |
+| Word structure | Average word length and variance — catches joined/split text |
+| Whitespace sanity | Whitespace distribution — catches formatting collapse |
+| Encoding quality | Mojibake detection via regex — catches encoding failures |
+
+Document-level confidence (`audit.compute_document_confidence()`) is a content-weighted average: longer pages contribute more than shorter ones. Additional penalties for OCR'd pages and unrecovered pages.
+
+## Multi-Pass Pipeline
+
+This is what makes pdfmux different from other PDF extractors. Instead of running one extractor and hoping for the best, pdfmux verifies every page and re-extracts the ones that came out wrong.
+
+### Flow
+
+```
+PDF
+ │
+ ▼
+classify()                              ← detect.py
+ │
+ ▼
+_multipass_extract()                    ← pipeline.py
+ │
+ ├── Pass 1: Fast extract + audit
+ │    │
+ │    ├── pymupdf4llm extracts every page (page_chunks=True)
+ │    ├── audit.score_page() scores each page with 5 checks
+ │    │    ├── "good":  sufficient text density and quality
+ │    │    ├── "bad":   low text with images (text in images)
+ │    │    └── "empty": near-blank page
+ │    │
+ │    └── All pages good? → return fast text. Done. Zero overhead.
+ │
+ ├── Pass 2: Selective OCR on bad/empty pages
+ │    │
+ │    ├── Try RapidOCR (preferred — lightweight, CPU)
+ │    │    ├── "bad" pages: use OCR only if it got MORE text than fast
+ │    │    └── "empty" pages: accept any OCR result >10 chars
+ │    │
+ │    ├── Try Surya OCR (fallback — heavier, GPU)
+ │    │    └── Same comparison logic for remaining pages
+ │    │
+ │    └── Try Gemini LLM (last resort — API call)
+ │         └── Same comparison logic for remaining pages
+ │
+ └── Pass 3: Merge + clean + score
+      │
+      ├── Combine good pages + OCR'd pages in page order
+      ├── postprocess.clean_text() cleans text
+      └── audit.compute_document_confidence() scores the merged result
+```
+
+### Why Multi-Pass?
+
+**Problem**: A pitch deck with 12 slides. PyMuPDF extracts text from 6 slides perfectly, but the other 6 have all their text baked into images. A single-pass extractor either:
+- Uses fast extraction → misses 50% of the content
+- Uses OCR on everything → wastes time on the 6 good pages
+
+**Solution**: Extract fast, audit, OCR only the bad pages. Fast pages stay fast. Bad pages get fixed. Result: 85% confidence instead of 30%.
+
+## Module Details
+
+### `detect.py` — PDF Classification
+
+Opens the PDF with PyMuPDF. Inspects every page for:
+- Text content (character count)
+- Embedded images (count + coverage area)
+- Line patterns (table detection)
+- Text alignment patterns (table detection)
+
+Raises `FileError` for missing files, non-PDFs, or corrupted documents.
+
+Returns a `PDFClassification` dataclass:
+```python
+@dataclass
+class PDFClassification:
+    page_count: int
+    is_digital: bool
+    is_scanned: bool
+    is_mixed: bool
+    is_graphical: bool        # image-heavy (pitch decks, infographics)
+    has_tables: bool
+    graphical_pages: list[int]
+    page_types: list[str]     # per-page: "digital", "scanned", "graphical"
+```
+
+### `pipeline.py` — Routing + Multi-Pass Orchestration
+
+Central orchestrator. Routes based on quality preset and classification:
+
+```
+quality=fast     → FastExtractor (skip audit)
+quality=high     → LLM → OCR → Fast
+has_tables       → Docling → Fast (skip if graphical)
+standard         → _multipass_extract()
+```
+
+Key design decision: **graphical PDFs with false-positive table detection skip Docling** and go through multi-pass. Table formatting is less valuable than OCR text recovery for image-heavy content.
+
+`process()` returns a `ConversionResult` (legacy wrapper) with text, confidence, extractor_used, ocr_pages, and warnings.
+
+`process_batch()` uses `ThreadPoolExecutor` for concurrent processing with per-file error isolation.
+
+### `chunking.py` — Section-Aware Splitting
+
+Splits extracted Markdown into chunks at heading boundaries for LLM consumption.
+
+**Strategy:**
+1. Build page offset map from `\n\n---\n\n` separators
+2. Find all ATX headings (`^#{1,6} `) as section boundaries
+3. Map each section to `page_start`/`page_end` via character offsets
+4. No headings → fall back to one chunk per page with title "Page N"
+
+**Token estimation:** `len(text.strip()) // 4` — standard GPT-family approximation, no external tokenizer dependency.
+
+Uses `Chunk` from `pdfmux.types`:
+```python
+@dataclass(frozen=True)
+class Chunk:
+    title: str           # heading text, or "Page N"
+    text: str            # content under this heading
+    page_start: int      # 1-indexed
+    page_end: int        # 1-indexed
+    tokens: int          # estimated token count
+    confidence: float    # inherited from document
+```
+
+### `__init__.py` — Public Python API
+
+Three thin wrappers around `pipeline.process()`:
+
+```python
+extract_text(path, *, quality="standard") → str            # Markdown string
+extract_json(path, *, quality="standard") → dict           # dict with locked schema
+load_llm_context(path, *, quality="standard") → list[dict] # chunk dicts with tokens
+```
+
+All imports are lazy (inside functions) to avoid circular deps and keep `import pdfmux` fast.
+
+Re-exports all 6 types and all 6 error classes for convenience.
+
+### `postprocess.py` — Cleanup
+
+Text cleanup:
+- Remove control characters (except newlines/tabs)
+- Fix broken hyphenation across lines
+- Normalize excessive blank lines
+- Fix spaced-out text artifacts ("W i t h" → "With")
+
+### `mcp_server.py` — MCP Server
+
+JSON-RPC over stdio (or HTTP via `pdfmux serve --http <port>`). Implements
+the MCP protocol for AI agent integration.
+
+Tools exposed:
+
+| Tool | Purpose |
+|------|---------|
+| `convert_pdf` | Full extraction → markdown / json / csv / llm |
+| `analyze_pdf` | Quick triage: classification, page count, recommended quality |
+| `extract_structured` | Tables and key-values via schema preset |
+| `extract_streaming` | NDJSON page-by-page events for very long documents |
+| `get_pdf_metadata` | Title, author, page count, embedded metadata |
+| `batch_convert` | Run a directory of PDFs through the pipeline |
+
+When confidence < 80% or warnings exist, responses include a metadata
+header (confidence, extractor, OCR pages, warnings) so agents know what
+they're working with.
+
+## Dependency Model
+
+```
+Base (every install):
+  pymupdf, pymupdf4llm, typer, rich, python-bidi
+
+Optional:
+  pdfmux[ocr]              → rapidocr + onnxruntime         (~200MB, CPU)
+  pdfmux[ocr-heavy]        → surya-ocr                      (~5GB, GPU)
+  pdfmux[tables]           → docling                        (~500MB)
+  pdfmux[opendataloader]   → opendataloader-pdf             (Java 11+)
+  pdfmux[marker]           → marker-pdf                     (~2GB models)
+  pdfmux[llm]              → google-genai                   (Gemini API key)
+  pdfmux[llm-claude]       → anthropic
+  pdfmux[llm-openai]       → openai
+  pdfmux[llm-ollama]       → ollama
+  pdfmux[llm-mistral]      → mistralai
+  pdfmux[llm-all]          → all LLM providers (Gemma 4 piggybacks on Gemini key)
+  pdfmux[langchain]        → langchain-core
+  pdfmux[llamaindex]       → llama-index-core
+  pdfmux[serve]            → mcp + uvicorn (MCP server)
+  pdfmux[watch]            → watchdog (`pdfmux watch <dir>`)
+  pdfmux[all]              → everything
+```
+
+## v1.6 Additions
+
+### `result_cache.py` — Smart result cache
+
+Hash every input PDF (SHA-256). Build a cache key from
+`(file_hash, quality, format, schema)`. Cache hit returns the previous
+`DocumentResult` in milliseconds; miss runs the pipeline and persists the
+result. Cache lives at `~/.cache/pdfmux/results/{hash}.json`, expires after
+30 days, LRU-evicts at 1 GB. The CLI exposes `--no-cache` (bypass) and
+`--clear-cache` (purge then run).
+
+### `streaming.py` — Page-at-a-time NDJSON
+
+Generator that yields `StreamEvent` objects in order:
+
+```
+classified  → page → page → ... → warning? → complete
+```
+
+Each `page` event ships once a page exits the audit/recovery pipeline so
+clients can render output progressively. Wired into the CLI as
+`pdfmux stream` and into the MCP server as `extract_streaming`.
+
+### `profiles.py` — Saved configurations
+
+YAML-backed preset store at `~/.config/pdfmux/profiles.yaml`. Built-ins:
+`invoices`, `receipts`, `papers`, `contracts`, `bulk-rag`. CRUD via
+`pdfmux profiles list/show/save/delete`. `convert --profile <name>` merges
+profile values with explicit flags (explicit flags win).
+
+### `arabic.py` — RTL pipeline
+
+- `is_arabic_text` / `arabic_ratio` — fast detection.
+- `fix_bidi_order` — Unicode Bidi Algorithm (`python-bidi`) with
+  markdown awareness: heading prefixes (`#`), list markers, code fences,
+  and pipe-table cells are preserved while inner text is reordered.
+- `normalize_arabic` — Tatweel removal, Alef/Yeh/Hamza unification,
+  Tashkeel stripping for indexable / embeddable strings.
+
+`detect.py` samples the first 20 pages and sets
+`PDFClassification.is_arabic` + `arabic_pages`. The router's
+`ROUTING_MATRIX` includes an `arabic` page type that prefers the Gemma 4
+provider when available.
+
+### `retry.py` — Decorator on every LLM provider
+
+`@with_retry(max_attempts=3, backoff_base=2.0)` wraps each provider's
+`extract_page()`. Honors `Retry-After` headers, returns immediately on
+auth failures (401/403), and uses exponential backoff with jitter on
+5xx / 429 / network errors.
+
+## Design Principles
+
+1. **Each version ships independently.** No multi-part refactors.
+2. **Don't break existing interfaces.** CLI flags and import paths stay stable.
+3. **Deterministic by default.** Same PDF → same output. OCR is the exception (documented).
+4. **Base install stays small.** ~30MB. OCR is opt-in.
+5. **Flat is better than nested.** No `core/`, `recovery/` folders until complexity justifies it.
+6. **Types over dicts.** All data flows through frozen dataclasses. No raw dicts in the pipeline.
+7. **Hardest technical risk first.** Multi-pass shipped before API polish.
+
+---
+
+# Security Policy
+
+Source: https://github.com/nameetp/pdfmux/blob/main/SECURITY.md
+
+# Security Policy
+
+## Reporting a Vulnerability
+
+**Do not open public issues for security vulnerabilities.**
+
+Please report security vulnerabilities via GitHub's [private vulnerability reporting](https://github.com/NameetP/pdfmux/security/advisories/new).
+
+You will receive a response within 48 hours. If the issue is confirmed, a patch will be released as soon as possible, typically within 7 days.
+
+## Supported Versions
+
+| Version | Supported |
+|---------|-----------|
+| Latest  | Yes       |
+| < Latest | No       |
+
+Only the latest release receives security updates. We recommend always using the latest version.
+
+## Scope
+
+The following are in scope for security reports:
+
+- Arbitrary file read/write via crafted PDF input
+- Path traversal in file handling
+- Denial of service via malformed PDFs
+- Dependency vulnerabilities in core dependencies
+- Information leakage through error messages or logs
+
+## Disclosure Policy
+
+- We follow coordinated disclosure — please allow us time to patch before publishing
+- Credit will be given in the release notes unless you prefer to remain anonymous
+
+---
