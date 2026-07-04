@@ -1,0 +1,443 @@
+# DBOS Transact (Rust)
+
+Source: https://github.com/hwuiwon/dbos-transact-rust/blob/main/README.md
+
+# DBOS Transact (Rust)
+
+Lightweight **durable workflow orchestration** on Postgres or SQLite.
+
+> A Rust port of [**DBOS Transact**](https://github.com/dbos-inc) — the durable-workflow platform by
+> [DBOS, Inc.](https://www.dbos.dev) This is an independent, community implementation; see
+> [Credits](#credits).
+
+DBOS makes ordinary `async` functions **durable**: their inputs, outputs, and each *step* are
+checkpointed in a database, so if your program crashes, each workflow automatically resumes from its
+last completed step — with exactly-once side effects — when it restarts. You get durable workflows,
+queues, scheduling, and notifications by writing normal Rust, with no separate orchestrator to run.
+
+```rust
+use std::time::Duration;
+use dbos::{Config, WfCtx, DbosError, RunOptions};
+
+async fn checkout(ctx: WfCtx, order_id: String) -> Result<String, DbosError> {
+    // Each step is checkpointed: on recovery it is replayed, never re-run.
+    let charge = ctx.run_step("charge_card", {
+        let order_id = order_id.clone();
+        move |_step| async move { charge_card(&order_id).await }
+    }).await?;
+    ctx.run_step("ship", move |_step| async move { ship(&order_id, &charge).await }).await
+}
+
+#[tokio::main]
+async fn main() -> Result<(), DbosError> {
+    let ctx = dbos::new_context(Config {
+        app_name: "store".into(),
+        database_url: Some("sqlite::memory:".into()),   // or "postgres://user:pass@host/db"
+        ..Default::default()
+    }).await?;
+
+    dbos::register_workflow::<String, String, _, _>(&ctx, "checkout", checkout)?;
+    ctx.launch().await?;
+
+    let handle = dbos::run_workflow::<String, String>(
+        &ctx, "checkout", "order-42".into(), RunOptions::default()).await?;
+    println!("{}", handle.get_result().await?);
+
+    ctx.shutdown(Duration::from_secs(5)).await;
+    Ok(())
+}
+# async fn charge_card(_: &str) -> Result<String, DbosError> { Ok("ok".into()) }
+# async fn ship(_: &str, _: &str) -> Result<String, DbosError> { Ok("shipped".into()) }
+```
+
+## Install
+
+This is a Cargo workspace. Depend on the engine crate `dbos-core` (library name `dbos`):
+
+```toml
+[dependencies]
+dbos-core = { git = "https://github.com/hwuiwon/dbos-transact-rust" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+```
+
+The optional `dbos-server` crate adds an admin HTTP API and a control-plane WebSocket client; the
+`dbos-cli` crate provides a `dbos` binary.
+
+## Concepts
+
+### Context
+
+Create a context, register your workflows and queues, then `launch`. Registration must happen before
+launch; running/management happens after.
+
+```rust
+let ctx = dbos::new_context(Config {
+    app_name: "myapp".into(),
+    database_url: Some("postgres://localhost/myapp".into()),
+    ..Default::default()
+}).await?;
+// register_workflow / register_queue / register_scheduled_workflow ...
+ctx.launch().await?;
+// run_workflow / enqueue / ... 
+ctx.shutdown(Duration::from_secs(5)).await;
+```
+
+### Workflows and steps
+
+A workflow is an `async fn(WfCtx, P) -> Result<R, DbosError>` registered under a name. Side effects
+go in **steps** (`ctx.run_step`), which are checkpointed and replayed on recovery instead of re-run.
+
+```rust
+async fn my_workflow(ctx: WfCtx, input: MyInput) -> Result<MyOutput, DbosError> {
+    let a = ctx.run_step("fetch", |_s| async move { fetch().await }).await?;
+    let b = ctx.run_step("process", move |_s| async move { process(a).await }).await?;
+    Ok(b)
+}
+dbos::register_workflow::<MyInput, MyOutput, _, _>(&ctx, "my_workflow", my_workflow)?;
+```
+
+Steps can retry with exponential backoff:
+
+```rust
+use dbos::StepOptions;
+ctx.run_step_opts("call_api", StepOptions { max_retries: 5, ..Default::default() },
+    |_s| async move { call_api().await }).await?;
+```
+
+Run options control the workflow id, queue, deduplication, priority, delay, timeout, and auth:
+
+```rust
+let handle = dbos::run_workflow::<P, R>(&ctx, "my_workflow", input, RunOptions {
+    workflow_id: Some("idempotency-key".into()),
+    timeout: Some(Duration::from_secs(30)),
+    ..Default::default()
+}).await?;
+let result: R = handle.get_result().await?;
+```
+
+Re-running with the same `workflow_id` is idempotent — it attaches to the existing run.
+
+### Child workflows, sleep
+
+```rust
+// inside a workflow body:
+let child = ctx.run_child_workflow::<P, R>("other_workflow", input, RunOptions::default()).await?;
+let r = child.get_result().await?;
+ctx.sleep(Duration::from_secs(60)).await?;   // durable: a recovered workflow sleeps the remainder
+```
+
+### Queues
+
+Queues bound concurrency and rate, and support priority and delayed execution:
+
+```rust
+use dbos::{QueueOptions, RateLimiter};
+dbos::register_queue(&ctx, "work", QueueOptions {
+    global_concurrency: Some(10),
+    worker_concurrency: Some(2),
+    rate_limit: Some(RateLimiter { limit: 100, period: Duration::from_secs(1) }),
+    ..Default::default()
+})?; // before launch
+
+// enqueue:
+let h = dbos::run_workflow::<P, R>(&ctx, "my_workflow", input,
+    RunOptions { queue: Some("work".into()), ..Default::default() }).await?;
+```
+
+### Scheduling
+
+Run a workflow on a cron schedule (5- or 6-field). The workflow receives the scheduled time:
+
+```rust
+use dbos::ScheduledTime;
+async fn nightly(ctx: WfCtx, _scheduled: ScheduledTime) -> Result<(), DbosError> { Ok(()) }
+dbos::register_scheduled_workflow::<(), _, _>(&ctx, "nightly", "0 0 * * *", nightly)?; // static
+
+// or manage schedules at runtime:
+dbos::create_schedule(&ctx, dbos::CreateScheduleOptions { /* name, workflow, cron, ... */ }).await?;
+dbos::pause_schedule(&ctx, "nightly").await?;
+dbos::resume_schedule(&ctx, "nightly").await?;
+dbos::delete_schedule(&ctx, "nightly").await?;
+```
+
+### Notifications and events
+
+```rust
+// notifications (FIFO, exactly-once):
+dbos::send(&ctx, "target-workflow-id", payload, "topic").await?;          // from anywhere
+let msg: Msg = ctx.recv("topic", Duration::from_secs(30)).await?;          // inside a workflow
+
+// key/value events:
+ctx.set_event("status", "ready").await?;                                   // inside a workflow
+let v: Option<String> = dbos::get_event(&ctx, "wf-id", "status", Duration::from_secs(5)).await?;
+
+// append-only streams:
+ctx.write_stream("log", entry).await?;
+ctx.close_stream("log").await?;
+let (entries, closed): (Vec<Entry>, bool) = dbos::read_stream(&ctx, "wf-id", "log").await?;
+```
+
+### Managing workflows
+
+```rust
+dbos::cancel_workflow(&ctx, "wf-id").await?;
+let h = dbos::resume_workflow::<R>(&ctx, "wf-id").await?;
+let h = dbos::fork_workflow::<R>(&ctx, dbos::ForkOptions { original_workflow_id: "wf-id".into(), start_step: 2, ..Default::default() }).await?;
+let list = dbos::list_workflows(&ctx, dbos::ListWorkflowsInput::default()).await?;
+let steps = dbos::get_workflow_steps(&ctx, "wf-id").await?;
+```
+
+### Debouncer
+
+Coalesce a burst of calls for the same key into a single run after the input settles:
+
+```rust
+let deb = dbos::Debouncer::<In, Out>::new(&ctx, "my_workflow", Duration::from_secs(10))?; // before launch
+let handle = deb.debounce(&ctx, "doc-123", Duration::from_millis(500), input).await?;
+```
+
+### External client
+
+Connect from a separate process to enqueue and manage workflows without running an executor:
+
+```rust
+let client = dbos::Client::new(dbos::ClientConfig {
+    app_name: "client".into(),
+    database_url: "postgres://localhost/myapp".into(),
+    ..Default::default()
+}).await?;
+let h = client.enqueue::<P, R>("work", "my_workflow", input, dbos::EnqueueOptions::default()).await?;
+```
+
+## Backends
+
+SQLite and Postgres are both first-class, selected by the `database_url` scheme
+(`sqlite::memory:`, `sqlite:///path/to.db`, or `postgres://…`). One portable migration set is shared
+by both. Postgres connections automatically retry transient database failures, so workflows survive
+a database restart.
+
+## Admin server & CLI
+
+```rust
+let handle = dbos_server::start_admin_server(ctx.clone(), 3001).await?; // GET /dbos-healthz, POST /workflows, ...
+```
+
+```sh
+dbos serve --port 3001 --database-url postgres://localhost/myapp
+dbos workflow list --status PENDING
+dbos workflow cancel <id>
+```
+
+## Testing
+
+```sh
+cargo test --workspace                                  # in-process SQLite, no services
+DBOS_TEST_DATABASE_URL=postgres://localhost cargo test -p dbos-core -- --test-threads=4   # against Postgres
+```
+
+## Credits
+
+This is a Rust port of [DBOS Transact](https://github.com/dbos-inc), the durable-workflow platform
+created by [DBOS, Inc.](https://www.dbos.dev) The programming model — durable workflows, memoized
+steps, queues, scheduling, and notifications backed by Postgres — and the reference implementations
+([Go](https://github.com/dbos-inc/dbos-transact-golang),
+[Python](https://github.com/dbos-inc/dbos-transact-py),
+[TypeScript](https://github.com/dbos-inc/dbos-transact-ts)) are their work. This project is an
+independent Rust implementation and is not affiliated with or endorsed by DBOS, Inc.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
+
+---
+
+# Contributing
+
+Source: https://github.com/hwuiwon/dbos-transact-rust/blob/main/CONTRIBUTING.md
+
+# Contributing
+
+Thanks for your interest in contributing! Contributions of all kinds are welcome — bug reports,
+docs, tests, and code.
+
+## Getting started
+
+```sh
+# fork the repo on GitHub, then:
+git clone https://github.com/<your-username>/dbos-transact-rust
+cd dbos-transact-rust
+cargo build --workspace
+cargo test --workspace        # runs against in-process SQLite, no services needed
+```
+
+You need a recent stable Rust toolchain (see `rust-version` in `Cargo.toml`).
+
+## Development workflow
+
+This repository uses a **fork + pull request** model, and `main` is protected:
+
+1. Fork the repo and create a topic branch (`git checkout -b my-change`).
+2. Make your change with tests.
+3. Make sure the checks below pass locally.
+4. Push to your fork and open a pull request against `main`.
+5. A maintainer review is **required** before a PR can be merged, and all CI checks must pass.
+
+Please keep PRs focused; open an issue first for large or design-affecting changes.
+
+## Checks (must pass)
+
+```sh
+cargo fmt --all --check                       # formatting
+cargo clippy --workspace --all-targets -- -D warnings   # lints
+cargo test --workspace                        # tests (SQLite)
+```
+
+To also run the suite against Postgres (optional locally; CI does it):
+
+```sh
+docker run -d --name dbos-pg -e POSTGRES_PASSWORD=dbos -e POSTGRES_USER=dbos \
+  -e POSTGRES_DB=dbos -p 5433:5432 postgres:17
+DBOS_TEST_DATABASE_URL='postgres://dbos:dbos@localhost:5433' \
+  cargo test -p dbos-core -- --test-threads=4
+```
+
+## Guidelines
+
+- Match the surrounding code style; `cargo fmt` is the source of truth.
+- Add tests for new behavior; keep the default test suite free of external-service dependencies
+  (gate anything that needs Postgres behind `DBOS_TEST_DATABASE_URL`/`#[ignore]`).
+- Write clear doc comments on public items.
+- Keep commits reasonably scoped with descriptive messages.
+
+## License
+
+By contributing, you agree that your contributions are licensed under the [MIT License](LICENSE).
+
+---
+
+# Architecture
+
+Source: https://github.com/hwuiwon/dbos-transact-rust/blob/main/docs/ARCHITECTURE.md
+
+# Architecture
+
+> A Rust port of [DBOS Transact](https://github.com/dbos-inc) by [DBOS, Inc.](https://www.dbos.dev)
+
+DBOS Transact makes ordinary async Rust functions **durable**: a workflow's input, its output, and
+each memoized *step* are checkpointed in a system database, so after a crash the workflow resumes
+from its last completed step with exactly-once side-effect semantics.
+
+## Crates
+
+- **`dbos-core`** (library name `dbos`) — the engine: context lifecycle, the workflow/step
+  execution model, the system database, queues, scheduler, debouncer, and client.
+- **`dbos-server`** — an [axum](https://github.com/tokio-rs/axum) admin HTTP API and a reconnecting
+  WebSocket conductor client (both optional networking layers).
+- **`dbos-cli`** — the `dbos` binary (`serve`, `workflow list/get/steps/cancel/resume`).
+
+## The context
+
+`Arc<DbosContext>` is the cheaply-cloneable handle that owns everything: the database pool, the
+in-memory workflow and queue registries, a `CancellationToken` (the cancellation root), a
+`TaskTracker` (which all long-lived tasks join so shutdown can drain them), the queue runner, and
+the scheduler. Free functions and `WfCtx`/`StepCtx` methods take `&Arc<DbosContext>`.
+
+Lifecycle: `new_context(config)` builds it (no side effects beyond opening the pool);
+`launch()` runs migrations, registers the application version, starts the queue runner and
+schedule reconciler, and performs one recovery pass; `shutdown(timeout)` cancels the token, drains
+in-flight work, and closes the pool. Workflows and queues are registered **before** launch.
+
+## Durability model
+
+All durable state lives behind an object-safe `SystemDatabase` trait, held as
+`Arc<dyn SystemDatabase>`. There are two implementations — `SqliteDb` and `PostgresDb` — sharing
+**one dialect-portable migration** (`crates/dbos-core/migrations/0001_initial_schema.sql`) applied
+by a single-counter runner. Postgres connections are wrapped in a `RetryingDb` decorator that
+retries transient connection failures with capped backoff, so workflows survive a database that
+goes away and comes back.
+
+Core tables:
+
+- `workflow_status` — one row per workflow: status, name, input/output/error, executor, attempts,
+  queue/dedup/priority/delay fields, timeout/deadline, and an `owner_xid` used for ownership.
+- `operation_outputs` — one row per recorded step, keyed by `(workflow_uuid, function_id)`. This
+  primary key is the exactly-once guarantee: a duplicate step record is a conflict.
+- `notifications`, `workflow_events`(`_history`), `streams` — communication primitives.
+- `queues`, `workflow_schedules`, `application_versions` — queue/schedule/version metadata.
+
+Two durability invariants underpin everything:
+
+1. **Deterministic step ids** — a per-run counter (starting at -1, pre-incremented) assigns each
+   step a stable `function_id`, so a replay maps each call back to its recorded result.
+2. **Memoization** — before running a step, the engine checks `operation_outputs`; a recorded
+   result (success *or* error) is returned without re-executing. A function-name mismatch at a step
+   id is reported as a non-determinism error.
+
+## Typed erasure & serialization
+
+Generic workflow inputs `P` and outputs `R` are serialized with `serde` at registration: each
+registered workflow is stored as an erased closure
+`Arc<dyn Fn(WfCtx, Option<String>, String) -> BoxFuture<Result<Option<String>, DbosError>>>` that
+decodes `P`, runs the body, and encodes `R`. The stored form is `Option<String>` (`None` = SQL
+NULL); every row records its serialization format (`DBOS_JSON` base64 by default, or `portable_json`
+for cross-language interop) so the right decoder is chosen on read.
+
+## Execution & recovery
+
+`run_workflow` derives the workflow id, inserts the status row (handling attempt counting,
+dead-letter parking, dedup, and the owner/skip decision), then either spawns the body on the task
+tracker (returning a channel-backed handle) or — when the workflow is enqueued, already terminal, or
+owned elsewhere — returns a polling handle. The body runs under `catch_unwind`, so a panic becomes a
+recorded error; durable writes never run inside a cancellation branch.
+
+Recovery lists `PENDING` workflows for an executor and, for each, either resets a queued workflow to
+`ENQUEUED` (for the runner to re-dispatch) or re-runs the body via its erased entry — replaying
+completed steps and incrementing the recovery-attempt counter, parking at the dead-letter state once
+the maximum is exceeded.
+
+## Concurrency
+
+Everything is built on Tokio. The cancellation root is one `CancellationToken` (children derive via
+`child_token()`); the `TaskTracker` is the join point for graceful shutdown. The queue runner is a
+single supervisor loop that promotes delayed workflows, then dequeues and dispatches eligible work
+per queue honoring global/worker concurrency, rate limits, and priority. The scheduler runs a
+firing task per cron entry plus a reconciler that syncs the in-memory entries with the
+`workflow_schedules` table. Notifications/events are awaited by polling durable state with a
+checkpointed deadline, so a crash mid-wait resumes correctly.
+
+## Testing
+
+Every test runs against in-process SQLite with no external services (`cargo test --workspace`). The
+same engine suite also runs against Postgres when `DBOS_TEST_DATABASE_URL` is set (each test
+provisions its own database). A gated chaos test restarts a Postgres container while workflows are
+in flight and asserts they all still complete correctly. Recovery is exercised deterministically
+throughout the suite by forcing a completed workflow back to `PENDING` and recovering it.
+
+---
+
+# Security Policy
+
+Source: https://github.com/hwuiwon/dbos-transact-rust/blob/main/SECURITY.md
+
+# Security Policy
+
+## Supported versions
+
+This project is pre-1.0; security fixes are applied to the latest `0.x` release.
+
+| Version | Supported |
+| ------- | --------- |
+| 0.1.x   | ✅        |
+
+## Reporting a vulnerability
+
+Please **do not** open a public issue for security vulnerabilities.
+
+Report them privately via GitHub's
+[private vulnerability reporting](https://github.com/hwuiwon/dbos-transact-rust/security/advisories/new),
+or by email to **hwuiwon.kim@gmail.com**.
+
+You can expect an initial response within a few days. Please include steps to reproduce and the
+affected version. Thank you for helping keep the project and its users safe.
+
+---
