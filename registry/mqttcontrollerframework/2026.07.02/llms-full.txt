@@ -1,0 +1,2037 @@
+# MqttControllerFramework
+
+Source: https://github.com/thnak/mqttcontrollerframework/blob/master/README.md
+
+# MqttControllerFramework
+
+An ASP.NET Core–style **source-generated MQTT controller framework** for .NET, built on top of [MQTTnet 5](https://github.com/dotnet/MQTTnet). Define topic handlers with attributes; the compile-time source generator handles routing, dispatch, and DI wiring — zero reflection at runtime.
+
+## Features
+
+| Feature | Description |
+|---|---|
+| **Attribute-driven routing** | `[MqttController]` + `[MqttTopic("sensors/+/temperature")]` |
+| **Source-generated dispatch** | Routing, dispatcher, and registration code generated at compile time |
+| **Compile-time route validation** | MQTT001/MQTT002 diagnostics flag duplicate and ambiguous topic patterns at build time |
+| **Middleware pipeline** | ASP.NET Core–style `IMqttMiddleware` with per-message DI scope |
+| **Authentication** | `IMqttAuthenticationProvider` — username/password with lockout support |
+| **Authorization** | `IMqttAuthorizationProvider` — publish + subscribe, QoS and retain constraints |
+| **Connection validation** | `IMqttConnectionValidator` — pre-auth ClientId/IP checks, session-item seeding, auth bypass |
+| **Token-bucket rate limiting** | `[TokenBucketRateLimit(capacity, refillRate, intervalMs)]` per-route |
+| **Broker stats** | `IMqttBrokerStatsService` — message counters, byte throughput, per-topic summaries |
+| **TLS hot-swap** | Reload PEM / PKCS#12 certificates at runtime without restart |
+| **Server-side publish** | `IMqttClientActionService` — push messages from broker to topics |
+| **Custom payload parsers** | `IMqttPayloadParser<T>` — binary, MessagePack, Protobuf, etc. |
+| **Pluggable retain storage** | `IRetainStorage` — swap the built-in JSON file backend for a database, Redis, or blob store |
+| **Lifecycle events** | Connected, disconnected, subscribed, unsubscribed |
+| **Multi-target** | `net8.0` and `net10.0` |
+
+## Installation
+
+```bash
+dotnet add package MqttControllerFramework
+```
+
+Or add directly to your project file:
+
+```xml
+<PackageReference Include="MqttControllerFramework" Version="1.0.0" />
+```
+
+## Quick Start
+
+### 1. Register the broker
+
+```csharp
+// Program.cs
+builder.Services
+    .AddMqttServer(builder.Configuration.GetSection("MqttSettings"))
+    .WithControllers<GeneratedMqttControllerRegistration>()
+    .WithAuthentication<MyAuthProvider>();
+
+var app = builder.Build();
+app.Run();
+```
+
+### 2. Configure
+
+```json
+// appsettings.json
+{
+  "MqttSettings": {
+    "EnableNonSsl": true,
+    "NonSslPort": 1883
+  }
+}
+```
+
+### 3. Write a controller
+
+```csharp
+using MqttControllerFramework.Attributes;
+
+[MqttController]
+public class SensorsController
+{
+    [MqttTopic("sensors/+/temperature")]
+    public async Task OnTemperature(
+        [FromMqttTopic(1)] string deviceId,
+        TemperaturePayload payload,
+        CancellationToken ct)
+    {
+        Console.WriteLine($"Device {deviceId}: {payload.Value}°C");
+    }
+}
+
+public record TemperaturePayload(double Value, string Unit);
+```
+
+### 4. Implement authentication
+
+```csharp
+public class MyAuthProvider : IMqttAuthenticationProvider
+{
+    public ValueTask<MqttAuthenticationResult> AuthenticateAsync(
+        string username, string password, CancellationToken ct)
+    {
+        var ok = username == "device" && password == "secret";
+        return ValueTask.FromResult(
+            ok ? MqttAuthenticationResult.Authenticated()
+               : MqttAuthenticationResult.Failed("Invalid credentials"));
+    }
+}
+```
+
+> The source generator produces `GeneratedMqttControllerRegistration` in the `<YourAssembly>.Mqtt.Generated` namespace at build time.
+> Add a `using` for that namespace, or use a global using, to reference the class.
+
+## Full Builder API
+
+```csharp
+builder.Services
+    .AddMqttServer(configuration)            // registers the broker, reads MqttSettings section
+    .WithControllers<TRegistration>()        // source-generated registration class
+    .WithAuthentication<TProvider>()         // IMqttAuthenticationProvider (required)
+    .WithAuthorization<TProvider>()          // IMqttAuthorizationProvider (optional)
+    .WithConnectionValidator<TValidator>()   // IMqttConnectionValidator — pre-auth hook
+    .WithNetworkTracker<TTracker>()          // replace built-in in-memory tracker
+    .WithRetainStorage<TStorage>()           // IRetainStorage — custom retain message backend
+    .UseMiddleware<TMiddleware>()            // IMqttMiddleware (ordered, chainable)
+    .WithRateLimiting()                      // enable token-bucket rate limiting
+    .OnClientConnected<THandler>()           // IMqttClientConnectedEvent
+    .OnClientDisconnected<THandler>()        // IMqttClientDisconnectedEvent
+    .OnClientSubscribedTopic<THandler>()     // IMqttClientSubscribedTopicEvent
+    .OnClientUnsubscribedTopic<THandler>();  // IMqttClientUnsubscribedTopicEvent
+```
+
+## Middleware Example (multi-tenancy)
+
+`SessionItems` is populated once during connection validation and lives for the lifetime of the TCP connection — ideal for tenant, user, or role resolution:
+
+```csharp
+// Connection validator — runs once per connection
+public class ConnectionValidator : IMqttConnectionValidator
+{
+    public async ValueTask<MqttConnectionValidationResult> ValidateAsync(
+        ValidatingConnectionEventArgs ctx, CancellationToken ct)
+    {
+        ctx.SessionItems["tenantId"] = await ResolveTenantAsync(ctx.UserName);
+        return MqttConnectionValidationResult.Accept();
+    }
+}
+
+// Middleware — runs for every message
+public class TenantMiddleware(ITenantContext tenant) : IMqttMiddleware
+{
+    public Task InvokeAsync(MqttMessageContext ctx, MqttRequestDelegate next)
+    {
+        if (ctx.SessionItems["tenantId"] is string tid)
+            tenant.SetTenant(tid);
+        return next(ctx);
+    }
+}
+```
+
+Register both:
+
+```csharp
+builder.Services
+    .AddMqttServer(configuration)
+    .WithControllers<GeneratedMqttControllerRegistration>()
+    .WithConnectionValidator<ConnectionValidator>()
+    .UseMiddleware<TenantMiddleware>()
+    .WithAuthentication<MyAuthProvider>();
+```
+
+## Rate Limiting
+
+```csharp
+[MqttController]
+public class TelemetryController
+{
+    // Allow burst of 10, refill 5 tokens every 1 second, consume 1 per message
+    [MqttTopic("telemetry/+/data")]
+    [TokenBucketRateLimit(capacity: 10, refillRate: 5, refillIntervalMs: 1000)]
+    public Task OnData([FromMqttTopic(1)] string deviceId, SensorData payload) { ... }
+}
+```
+
+Enable rate limiting in the builder:
+
+```csharp
+.WithRateLimiting()
+```
+
+## TLS
+
+```json
+"MqttSettings": {
+  "EnableSsl": true,
+  "SslPort": 8883,
+  "PkcsPath": "/etc/certs/broker.pfx",
+  "PkcsPassword": "changeme"
+}
+```
+
+PEM + separate key file:
+
+```json
+"MqttSettings": {
+  "EnableSsl": true,
+  "SslPort": 8883,
+  "PkcsPath": "/etc/certs/broker.crt",
+  "PkcsKeyPath": "/etc/certs/broker.key"
+}
+```
+
+## Documentation
+
+| Topic | Page |
+|---|---|
+| Controllers & routing | [docs/wiki/Controllers-and-Routing.md](docs/wiki/Controllers-and-Routing.md) |
+| Middleware pipeline | [docs/wiki/Middleware.md](docs/wiki/Middleware.md) |
+| Authentication | [docs/wiki/Authentication.md](docs/wiki/Authentication.md) |
+| Authorization | [docs/wiki/Authorization.md](docs/wiki/Authorization.md) |
+| Connection validation | [docs/wiki/Connection-Validation.md](docs/wiki/Connection-Validation.md) |
+| Rate limiting | [docs/wiki/Rate-Limiting.md](docs/wiki/Rate-Limiting.md) |
+| TLS & certificates | [docs/wiki/TLS-and-Security.md](docs/wiki/TLS-and-Security.md) |
+| Retained messages | [docs/wiki/Retained-Messages.md](docs/wiki/Retained-Messages.md) |
+| Lifecycle events | [docs/wiki/Events.md](docs/wiki/Events.md) |
+| Server-side publish | [docs/wiki/Server-Actions.md](docs/wiki/Server-Actions.md) |
+| Broker statistics | [docs/wiki/Broker-Stats.md](docs/wiki/Broker-Stats.md) |
+| Performance | [docs/wiki/Performance.md](docs/wiki/Performance.md) |
+| Configuration reference | [docs/wiki/Configuration-Reference.md](docs/wiki/Configuration-Reference.md) |
+
+## License
+
+[MIT](LICENSE) © IoT Viet Solution
+
+---
+
+# Authentication
+
+Source: https://github.com/thnak/mqttcontrollerframework/blob/master/docs/wiki/Authentication.md
+
+# Authentication
+
+## Overview
+
+Authentication is **required** — the broker rejects all connections if no `IMqttAuthenticationProvider` is registered. Implement the interface and register it with `.WithAuthentication<T>()`.
+
+## `IMqttAuthenticationProvider`
+
+```csharp
+public interface IMqttAuthenticationProvider
+{
+    ValueTask<MqttAuthenticationResult> AuthenticateAsync(
+        string username,
+        string password,
+        CancellationToken cancellationToken = default);
+}
+```
+
+The method is called for every incoming CONNECT packet. Return one of:
+
+| Factory | Meaning |
+|---|---|
+| `MqttAuthenticationResult.Authenticated()` | Connection accepted |
+| `MqttAuthenticationResult.Failed(reason)` | Connection rejected — wrong credentials |
+| `MqttAuthenticationResult.Locked(lockTimeRemaining)` | Connection rejected — account temporarily locked |
+
+## Minimal Example
+
+```csharp
+public class ApiKeyAuthProvider : IMqttAuthenticationProvider
+{
+    private static readonly Dictionary<string, string> _keys = new()
+    {
+        ["device-001"] = "key-abc123",
+        ["device-002"] = "key-def456",
+    };
+
+    public ValueTask<MqttAuthenticationResult> AuthenticateAsync(
+        string username, string password, CancellationToken ct)
+    {
+        var result = _keys.TryGetValue(username, out var key) && key == password
+            ? MqttAuthenticationResult.Authenticated()
+            : MqttAuthenticationResult.Failed("Unknown device or invalid key");
+
+        return ValueTask.FromResult(result);
+    }
+}
+```
+
+Register:
+
+```csharp
+builder.Services
+    .AddMqttServer(configuration)
+    .WithControllers<GeneratedMqttControllerRegistration>()
+    .WithAuthentication<ApiKeyAuthProvider>();
+```
+
+## Database-Backed Example
+
+```csharp
+public class DbAuthProvider(IUserRepository users) : IMqttAuthenticationProvider
+{
+    public async ValueTask<MqttAuthenticationResult> AuthenticateAsync(
+        string username, string password, CancellationToken ct)
+    {
+        var user = await users.FindAsync(username, ct);
+        if (user is null)
+            return MqttAuthenticationResult.Failed("User not found");
+
+        if (user.IsLocked)
+            return MqttAuthenticationResult.Locked(user.LockTimeRemaining);
+
+        return PasswordHasher.Verify(password, user.PasswordHash)
+            ? MqttAuthenticationResult.Authenticated()
+            : MqttAuthenticationResult.Failed("Invalid password");
+    }
+}
+```
+
+## `MqttAuthenticationResult` Properties
+
+| Property | Type | Description |
+|---|---|---|
+| `IsAuthenticated` | `bool` | `true` when authentication succeeded |
+| `FailureReason` | `string?` | Human-readable failure message (logged, not sent to client) |
+| `IsLocked` | `bool` | `true` when the account is temporarily locked |
+| `LockTimeRemaining` | `TimeSpan?` | Duration until the lockout expires |
+
+## Notes
+
+- The provider is registered as **scoped**, so it can inject scoped services such as `DbContext`.
+- `password` arrives as plain text. Hash comparison is the implementor's responsibility.
+- The framework does not impose a lockout policy — implement it in the provider if needed.
+
+---
+
+# Authorization
+
+Source: https://github.com/thnak/mqttcontrollerframework/blob/master/docs/wiki/Authorization.md
+
+# Authorization
+
+## Overview
+
+Authorization controls which clients can **publish** to a topic or **subscribe** to a topic filter. It is optional — if no `IMqttAuthorizationProvider` is registered, the broker skips publish/subscribe authorization entirely.
+
+## `IMqttAuthorizationProvider`
+
+```csharp
+public interface IMqttAuthorizationProvider
+{
+    ValueTask<MqttAuthorizationResult> AuthorizePublishAsync(
+        string userName, string topic, int qos, bool retain,
+        CancellationToken cancellationToken = default);
+
+    ValueTask<MqttAuthorizationResult> AuthorizeSubscribeAsync(
+        string userName, string topicFilter, int requestedQos,
+        CancellationToken cancellationToken = default);
+}
+```
+
+Return `MqttAuthorizationResult.Allow()` to permit or `MqttAuthorizationResult.Deny(reason)` to block.
+
+## Minimal Example
+
+```csharp
+public class RoleBasedAuthzProvider(IUserRoleStore roles) : IMqttAuthorizationProvider
+{
+    public async ValueTask<MqttAuthorizationResult> AuthorizePublishAsync(
+        string userName, string topic, int qos, bool retain, CancellationToken ct)
+    {
+        var userRoles = await roles.GetAsync(userName, ct);
+
+        // Only "device" role may publish to "sensors/#"
+        if (topic.StartsWith("sensors/") && !userRoles.Contains("device"))
+            return MqttAuthorizationResult.Deny("Insufficient role to publish sensor data");
+
+        return MqttAuthorizationResult.Allow();
+    }
+
+    public ValueTask<MqttAuthorizationResult> AuthorizeSubscribeAsync(
+        string userName, string topicFilter, int requestedQos, CancellationToken ct)
+        => ValueTask.FromResult(MqttAuthorizationResult.Allow()); // open subscriptions
+}
+```
+
+Register:
+
+```csharp
+builder.Services
+    .AddMqttServer(configuration)
+    .WithControllers<GeneratedMqttControllerRegistration>()
+    .WithAuthentication<MyAuthProvider>()
+    .WithAuthorization<RoleBasedAuthzProvider>();
+```
+
+## `[MqttAuthorize]` Attribute
+
+Apply to a controller class or a specific method. When the route is dispatched, the framework calls `AuthorizePublishAsync` before invoking the handler.
+
+```csharp
+[MqttController]
+[MqttAuthorize]                    // all handlers in this controller require authorization
+public class AdminController
+{
+    [MqttTopic("admin/+/command")]
+    public Task OnCommand([FromMqttTopic(1)] string deviceId, AdminCommand cmd) { ... }
+
+    [MqttTopic("admin/ping")]
+    [MqttAllowAnonymous]           // override class-level — no auth required
+    public Task OnPing() { ... }
+}
+```
+
+Attribute properties:
+
+| Property | Type | Description |
+|---|---|---|
+| `Roles` | `string?` | Comma-separated list of allowed roles |
+| `Policies` | `string?` | Comma-separated list of required policies |
+| `Policy` | `string?` | Named authorization policy |
+| `RequireAllRoles` | `bool` | `true` = AND logic; `false` (default) = OR logic |
+| `UnauthorizedMessage` | `string?` | Custom message sent to client on denial |
+
+## `[MqttAllowAnonymous]`
+
+Bypasses `[MqttAuthorize]` applied at the class level for a specific method:
+
+```csharp
+[MqttController]
+[MqttAuthorize]
+public class SecureController
+{
+    [MqttTopic("secure/data")]
+    public Task OnData(DataPayload payload) { ... }   // requires authorization
+
+    [MqttTopic("secure/health")]
+    [MqttAllowAnonymous]
+    public Task OnHealth() { ... }                    // bypasses authorization
+}
+```
+
+## `MqttAuthorizationResult` Properties
+
+| Property | Type | Description |
+|---|---|---|
+| `IsAuthorized` | `bool` | `true` when the request is authorized |
+| `DenialReason` | `string?` | Human-readable reason for denial (logged and returned to client) |
+| `MaxQoS` | `int?` | Cap the QoS level the client may use — `null` means no constraint |
+| `AllowRetain` | `bool?` | Whether the retain flag is permitted — `null` means no constraint |
+
+### Constraining QoS
+
+```csharp
+// Allow publish but cap at QoS 1
+return new MqttAuthorizationResult { IsAuthorized = true, MaxQoS = 1 };
+
+// Or use Deny with a cap (note: IsAuthorized = false here)
+return MqttAuthorizationResult.Deny("QoS 2 not allowed", maxQoS: 1);
+```
+
+## Notes
+
+- Authorization runs **after** authentication.
+- The provider is registered as **scoped**, so it can inject `DbContext` or other scoped services.
+- Route-level `[MqttAuthorize]` authorization is enforced by the generated routing service; the provider's `AuthorizePublishAsync` is called inline for each matching route.
+
+---
+
+# Broker Statistics
+
+Source: https://github.com/thnak/mqttcontrollerframework/blob/master/docs/wiki/Broker-Stats.md
+
+# Broker Statistics
+
+## Overview
+
+`IMqttBrokerStatsService` exposes real-time metrics for the running broker. Inject it into any service, controller, or API endpoint to expose stats over HTTP, push them to a metrics system, or drive health checks.
+
+## Injecting the Service
+
+```csharp
+public class MetricsEndpoints(IMqttBrokerStatsService stats) : IHostedService
+{
+    public Task StartAsync(CancellationToken ct) => Task.CompletedTask;
+    public Task StopAsync(CancellationToken ct) => Task.CompletedTask;
+}
+```
+
+Or in a minimal API:
+
+```csharp
+app.MapGet("/metrics/mqtt", (IMqttBrokerStatsService stats) => new
+{
+    messages   = stats.GetTotalMessageCount(),
+    clients    = stats.GetTotalConnectedClientCount(),
+    uptime     = stats.GetUptime().ToString(),
+    bytesIn    = stats.GetTotalBytesReceivedByBroker(),
+    bytesOut   = stats.GetTotalBytesSentByBroker(),
+    topics     = stats.GetTopicSummary(),
+});
+```
+
+## Available Methods
+
+### Counters
+
+| Method | Returns | Description |
+|---|---|---|
+| `GetTotalMessageCount()` | `ulong` | Total messages received |
+| `GetTotalMessageSize()` | `ulong` | Total payload bytes received |
+| `GetDroppedMessageCount()` | `ulong` | Messages dropped (rate limited or rejected) |
+| `GetUnconsumedMessageCount()` | `ulong` | Messages published to a topic with no matching route |
+| `GetAcknowledgedMessageCount()` | `ulong` | QoS 1/2 messages acknowledged |
+| `GetQueueOverwriteCount()` | `ulong` | Persistent queue overwrites |
+
+### Throughput
+
+| Method | Returns | Description |
+|---|---|---|
+| `GetTotalBytesReceivedByBroker()` | `ulong` | Bytes received by the broker |
+| `GetTotalBytesSentByBroker()` | `ulong` | Bytes sent by the broker |
+| `GetTotalBytesReceivedByClients()` | `ulong` | Total bytes received across all clients |
+| `GetTotalBytesSentByClients()` | `ulong` | Total bytes sent to all clients |
+
+### Connection and session
+
+| Method | Returns | Description |
+|---|---|---|
+| `GetTotalConnectedClientCount()` | `ulong` | Currently connected clients |
+| `GetSessionCount()` | `int` | Active sessions (including persistent) |
+| `GetSubscriptionCount()` | `int` | Total active subscriptions |
+| `GetRetainedMessageCount()` | `ulong` | Stored retained messages |
+
+### Per-topic summary
+
+```csharp
+Dictionary<string, TopicStatistics> summary = stats.GetTopicSummary();
+foreach (var (topic, ts) in summary)
+    Console.WriteLine($"{topic}: {ts.MessageCount} msgs, {ts.ByteCount} bytes");
+```
+
+`TopicStatistics` contains message count and byte count per topic.
+
+### Uptime and availability
+
+| Method | Returns | Description |
+|---|---|---|
+| `GetUptime()` | `TimeSpan` | Time since the broker started |
+| `GetAcceptNewConnections()` | `bool` | Whether the broker is accepting new connections |
+| `SetAcceptNewConnections(bool)` | `void` | Enable or disable new connections (graceful drain) |
+
+## Graceful Drain Example
+
+Stop accepting new connections before a maintenance window while letting existing clients finish:
+
+```csharp
+app.MapPost("/admin/drain", (IMqttBrokerStatsService stats) =>
+{
+    stats.SetAcceptNewConnections(false);
+    return Results.Ok("Broker is draining — no new connections accepted.");
+});
+
+app.MapPost("/admin/resume", (IMqttBrokerStatsService stats) =>
+{
+    stats.SetAcceptNewConnections(true);
+    return Results.Ok("Broker resumed accepting connections.");
+});
+```
+
+## Notes
+
+- `IMqttBrokerStatsService` is registered as a **singleton** and is thread-safe.
+- Counters are `ulong` and do not overflow on 64-bit platforms for realistic workloads.
+- `MarkBrokerStarted()` is called internally by the hosted service — do not call it manually.
+
+---
+
+# Configuration Reference
+
+Source: https://github.com/thnak/mqttcontrollerframework/blob/master/docs/wiki/Configuration-Reference.md
+
+# Configuration Reference
+
+## `MqttSettings`
+
+Bound from the `"MqttSettings"` section of `appsettings.json` (or any `IConfiguration` source). Pass the configuration root to `AddMqttServer(configuration)`.
+
+```json
+"MqttSettings": {
+  "EnableNonSsl": true,
+  "NonSslPort": 1883,
+  "EnableSsl": false,
+  "SslPort": 8883,
+  "PkcsPath": "",
+  "PkcsPassword": "",
+  "PkcsKeyPath": "",
+  "ClientCertStorage": "",
+  "RetainedMessagesFilePath": "RetainedMessages.json",
+  "ServerOriginPropertyName": "x-mqtt-origin",
+  "ServerOriginPropertyValue": "server"
+}
+```
+
+## Property Reference
+
+### Network
+
+| Property | Type | Default | Description |
+|---|---|---|---|
+| `EnableNonSsl` | `bool` | `true` | Listen on a plain TCP port |
+| `NonSslPort` | `int` | `1883` | Plain TCP port number |
+| `EnableSsl` | `bool` | `false` | Listen on a TLS port |
+| `SslPort` | `int` | `8883` | TLS port number |
+
+### TLS Certificates
+
+| Property | Type | Default | Description |
+|---|---|---|---|
+| `PkcsPath` | `string` | `""` | Path to the PKCS#12 (`.pfx`) or PEM certificate (`.crt`) file |
+| `PkcsPassword` | `string` | `""` | Password for the PKCS#12 bundle; leave empty for PEM |
+| `PkcsKeyPath` | `string` | `""` | Path to the PEM private-key file (`.key`). When set, `PkcsPath` is treated as the public certificate |
+| `ClientCertStorage` | `string` | `""` | Directory for persisting trusted client certificates (`.cer`). Loaded on startup if set |
+
+### Retained Messages
+
+| Property | Type | Default | Description |
+|---|---|---|---|
+| `RetainedMessagesFilePath` | `string` | `"RetainedMessages.json"` | File path for retained message persistence across restarts |
+
+### Self-Loop Prevention
+
+| Property | Type | Default | Description |
+|---|---|---|---|
+| `ServerOriginPropertyName` | `string` | `"x-mqtt-origin"` | MQTT user-property name added to server-originated messages |
+| `ServerOriginPropertyValue` | `string` | `"server"` | Value of that property used to identify server traffic |
+
+## Minimal Configurations
+
+### Plain TCP only (development)
+
+```json
+"MqttSettings": {
+  "EnableNonSsl": true,
+  "NonSslPort": 1883
+}
+```
+
+### TLS only (production)
+
+```json
+"MqttSettings": {
+  "EnableNonSsl": false,
+  "EnableSsl": true,
+  "SslPort": 8883,
+  "PkcsPath": "/etc/certs/broker.pfx",
+  "PkcsPassword": "changeme"
+}
+```
+
+### Both ports (migration / dev-prod parity)
+
+```json
+"MqttSettings": {
+  "EnableNonSsl": true,
+  "NonSslPort": 1883,
+  "EnableSsl": true,
+  "SslPort": 8883,
+  "PkcsPath": "/etc/certs/broker.pfx",
+  "PkcsPassword": "changeme"
+}
+```
+
+### PEM certificate + private key
+
+```json
+"MqttSettings": {
+  "EnableSsl": true,
+  "SslPort": 8883,
+  "PkcsPath": "/etc/certs/broker.crt",
+  "PkcsKeyPath": "/etc/certs/broker.key"
+}
+```
+
+## Environment Variables
+
+`MqttSettings` values can also be set via environment variables using the `__` separator (standard .NET configuration convention):
+
+```bash
+MqttSettings__EnableSsl=true
+MqttSettings__SslPort=8883
+MqttSettings__PkcsPath=/etc/certs/broker.pfx
+MqttSettings__PkcsPassword=changeme
+```
+
+This is the recommended approach for Docker and Kubernetes deployments.
+
+## Docker Compose Example
+
+```yaml
+services:
+  mqtt-broker:
+    image: myapp:latest
+    environment:
+      - MqttSettings__EnableNonSsl=false
+      - MqttSettings__EnableSsl=true
+      - MqttSettings__SslPort=8883
+      - MqttSettings__PkcsPath=/certs/broker.pfx
+      - MqttSettings__PkcsPassword=changeme
+    ports:
+      - "8883:8883"
+    volumes:
+      - ./certs:/certs:ro
+```
+
+---
+
+# Connection Validation
+
+Source: https://github.com/thnak/mqttcontrollerframework/blob/master/docs/wiki/Connection-Validation.md
+
+# Connection Validation
+
+## Overview
+
+`IMqttConnectionValidator` is an optional pre-authentication hook called for every incoming CONNECT packet **before** the authentication provider runs. Use it to:
+
+- Enforce ClientId format rules
+- Block specific IP addresses or subnets
+- Pre-populate `SessionItems` with connection-level data (tenant ID, roles, etc.) so subsequent middleware and controllers do not need to repeat the lookup per message
+
+## Interface
+
+```csharp
+public interface IMqttConnectionValidator
+{
+    ValueTask<MqttConnectionValidationResult> ValidateAsync(
+        ValidatingConnectionEventArgs context,
+        CancellationToken cancellationToken = default);
+}
+```
+
+`ValidatingConnectionEventArgs` is the raw MQTTnet event args — it exposes `ClientId`, `UserName`, `Password`, `RemoteEndPoint`, `SessionItems`, and more.
+
+## Result
+
+| Factory | Meaning |
+|---|---|
+| `MqttConnectionValidationResult.Accept()` | Allow the connection to proceed |
+| `MqttConnectionValidationResult.AcceptAndBypassAuth()` | Allow the connection **and skip** the `IMqttAuthenticationProvider` step |
+| `MqttConnectionValidationResult.Reject(reason, code?)` | Refuse immediately |
+
+`reason` is logged server-side; `code` is the `MqttConnectReasonCode` sent to the client (default: `NotAuthorized`).
+
+### Result properties
+
+| Property | Type | Description |
+|---|---|---|
+| `IsValid` | `bool` | `true` when the connection is accepted |
+| `RejectReason` | `string?` | Logged server-side on rejection |
+| `RejectReasonCode` | `MqttConnectReasonCode` | Sent to the client on rejection (default: `NotAuthorized`) |
+| `BypassAuthentication` | `bool` | `true` when the authentication provider step is skipped |
+
+## Example: ClientId format check
+
+```csharp
+public class ClientIdValidator : IMqttConnectionValidator
+{
+    // Expect ClientIds like "device-{guid}"
+    private static readonly Regex _pattern =
+        new(@"^device-[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+    public ValueTask<MqttConnectionValidationResult> ValidateAsync(
+        ValidatingConnectionEventArgs ctx, CancellationToken ct)
+    {
+        if (!_pattern.IsMatch(ctx.ClientId))
+            return ValueTask.FromResult(
+                MqttConnectionValidationResult.Reject(
+                    $"Invalid ClientId format: '{ctx.ClientId}'"));
+
+        return ValueTask.FromResult(MqttConnectionValidationResult.Accept());
+    }
+}
+```
+
+## Example: IP allowlist
+
+```csharp
+public class IpAllowlistValidator(IIpAllowlist allowlist) : IMqttConnectionValidator
+{
+    public async ValueTask<MqttConnectionValidationResult> ValidateAsync(
+        ValidatingConnectionEventArgs ctx, CancellationToken ct)
+    {
+        var ip = (ctx.RemoteEndPoint as System.Net.IPEndPoint)?.Address;
+        if (ip is not null && !await allowlist.IsAllowedAsync(ip, ct))
+            return MqttConnectionValidationResult.Reject(
+                $"IP {ip} is not on the allowlist",
+                MqttConnectReasonCode.Banned);
+
+        return MqttConnectionValidationResult.Accept();
+    }
+}
+```
+
+## Example: Seeding SessionItems
+
+Populate `SessionItems` once here; middleware reads the values on every subsequent message without extra lookups:
+
+```csharp
+public class TenantConnectionValidator(ITenantStore tenants) : IMqttConnectionValidator
+{
+    public async ValueTask<MqttConnectionValidationResult> ValidateAsync(
+        ValidatingConnectionEventArgs ctx, CancellationToken ct)
+    {
+        var tenant = await tenants.FindByUsernameAsync(ctx.UserName, ct);
+        if (tenant is null)
+            return MqttConnectionValidationResult.Reject("Tenant not found");
+
+        // Stored for the lifetime of the TCP connection
+        ctx.SessionItems["tenantId"]  = tenant.Id;
+        ctx.SessionItems["tenantPlan"] = tenant.Plan;
+
+        return MqttConnectionValidationResult.Accept();
+    }
+}
+```
+
+In middleware:
+
+```csharp
+public class TenantMiddleware(ITenantContext ctx) : IMqttMiddleware
+{
+    public Task InvokeAsync(MqttMessageContext context, MqttRequestDelegate next)
+    {
+        if (context.SessionItems["tenantId"] is string tid)
+            ctx.SetTenant(tid);
+        return next(context);
+    }
+}
+```
+
+## Example: bypass authentication for pre-verified clients
+
+Use `AcceptAndBypassAuth()` when the validator has already verified the client (e.g. by ClientId lookup or mutual TLS), making a separate username/password check redundant:
+
+```csharp
+public class DeviceRegistryValidator(IDeviceRegistry registry) : IMqttConnectionValidator
+{
+    public async ValueTask<MqttConnectionValidationResult> ValidateAsync(
+        ValidatingConnectionEventArgs ctx, CancellationToken ct)
+    {
+        if (!await registry.IsRegisteredAsync(ctx.ClientId, ct))
+            return MqttConnectionValidationResult.Reject("Unknown device");
+
+        ctx.SessionItems["deviceId"] = ctx.ClientId;
+
+        // Auth provider is skipped — device identity is confirmed by registry lookup
+        return MqttConnectionValidationResult.AcceptAndBypassAuth();
+    }
+}
+```
+
+## Registration
+
+```csharp
+builder.Services
+    .AddMqttServer(configuration)
+    .WithConnectionValidator<TenantConnectionValidator>()
+    .WithAuthentication<MyAuthProvider>()
+    .WithControllers<GeneratedMqttControllerRegistration>();
+```
+
+## Notes
+
+- The validator runs **before** authentication. You can reject the connection before any credentials are checked.
+- `AcceptAndBypassAuth()` skips `IMqttAuthenticationProvider` entirely — use only when the validator provides equivalent identity assurance.
+- The validator is registered as **scoped**.
+- `SessionItems` is an `IDictionary` (non-generic) backed by MQTTnet. Cast values to the expected type when reading.
+
+---
+
+# Controllers and Routing
+
+Source: https://github.com/thnak/mqttcontrollerframework/blob/master/docs/wiki/Controllers-and-Routing.md
+
+# Controllers and Routing
+
+## Overview
+
+Controllers are plain C# classes decorated with `[MqttController]`. Each public method decorated with `[MqttTopic]` becomes a topic handler. The source generator scans these at build time and emits a DFA-based routing service — there is no reflection or dictionary lookup at runtime.
+
+## `[MqttController]`
+
+```csharp
+[MqttController]                      // no prefix
+public class SensorsController { }
+
+[MqttController("devices")]           // all routes prefixed with "devices/"
+public class DeviceController { }
+```
+
+`prefix` is prepended to every `[MqttTopic]` template in the class, separated by `/`.
+
+## `[MqttTopic]`
+
+```csharp
+[MqttTopic("sensors/+/temperature")]  // single-level wildcard
+[MqttTopic("logs/#")]                 // multi-level wildcard (must be last segment)
+[MqttTopic("system/status")]          // exact match
+```
+
+MQTT wildcard rules apply:
+- `+` matches exactly one topic level.
+- `#` matches the rest of the topic; must be the last segment.
+
+The **final template** is `{prefix}/{template}` with empty parts stripped. A controller with `prefix = "devices"` and template `"+/telemetry"` produces `"devices/+/telemetry"`.
+
+## Parameter Binding
+
+The generator resolves method parameters in this order:
+
+| Parameter type | Resolution |
+|---|---|
+| Decorated with `[FromMqttTopic(n)]` | Extracted from the *n*-th `+` wildcard segment of the topic |
+| `CancellationToken` | Forwarded from MQTTnet |
+| `byte[]` | Raw payload bytes |
+| `InterceptingPublishEventArgs` | Full MQTTnet event args |
+| Implements `IMqttPayloadParser<T>` | Custom binary parser (see below) |
+| Any other type | JSON-deserialized from the payload |
+
+### Topic segment binding — `[FromMqttTopic]`
+
+```csharp
+[MqttTopic("devices/+/sensors/+/data")]
+public Task OnData(
+    [FromMqttTopic(1)] string deviceId,   // first '+'
+    [FromMqttTopic(2)] string sensorId,   // second '+'
+    SensorReading payload)
+{ }
+```
+
+For `enum` parameters the segment is parsed with `Enum.TryParse` (case-insensitive). For all other types `Convert.ChangeType` is used.
+
+> **Tip:** Named parameters work the same way — the name in the method signature does not need to match the topic segment; only the `[FromMqttTopic(index)]` matters.
+
+### Named-segment shorthand
+
+If your topic template uses `{name}` style segments instead of bare `+`, declare the parameter with the matching name and no attribute:
+
+```csharp
+[MqttController("sensors")]
+public class SensorsController
+{
+    [MqttTopic("{deviceId}/temperature")]
+    public async Task OnTemperature(string deviceId, TemperaturePayload payload) { }
+}
+```
+
+The generator maps the parameter by name to the corresponding `+` position in the compiled template (`sensors/+/temperature`).
+
+## Custom Payload Parsers
+
+For non-JSON payloads implement `IMqttPayloadParser<T>` on the payload type and tag it with `[MqttPayloadContentType("...")]`:
+
+```csharp
+[MqttPayloadContentType("application/x-messagepack")]
+public class MessagePackSensorReading : IMqttPayloadParser<MessagePackSensorReading>
+{
+    public double Value { get; set; }
+    public string Unit { get; set; } = "";
+
+    public MessagePackSensorReading Parse(ReadOnlySpan<byte> payload)
+        => MessagePackSerializer.Deserialize<MessagePackSensorReading>(payload.ToArray());
+}
+```
+
+Use it as a parameter type:
+
+```csharp
+[MqttTopic("sensors/+/packed")]
+public Task OnPacked([FromMqttTopic(1)] string id, MessagePackSensorReading data) { }
+```
+
+The generator registers the parser automatically for the declared content-type. If the incoming message has a matching `ContentType` property the custom parser is used; otherwise the framework falls back to JSON.
+
+## Request-Response Pattern
+
+A handler can return `Task<TResponse>`. If the incoming message has a `ResponseTopic`, the framework serializes the return value as JSON and publishes it back:
+
+```csharp
+[MqttTopic("queries/+/status")]
+public async Task<DeviceStatus> GetStatus([FromMqttTopic(1)] string deviceId)
+{
+    return await _repository.GetStatusAsync(deviceId);
+}
+```
+
+The client sets `ResponseTopic` on its publish; the broker sends the JSON response to that topic automatically.
+
+## Controller DI
+
+Controllers are registered as **scoped** services. Inject any scoped or singleton dependency via the constructor:
+
+```csharp
+[MqttController("telemetry")]
+public class TelemetryController(IDataRepository repo, ILogger<TelemetryController> log)
+{
+    [MqttTopic("+/readings")]
+    public async Task OnReading([FromMqttTopic(1)] string deviceId, SensorData data)
+    {
+        await repo.SaveAsync(deviceId, data);
+        log.LogInformation("Saved reading from {DeviceId}", deviceId);
+    }
+}
+```
+
+## Compile-Time Route Diagnostics
+
+The source generator validates all topic templates at build time and reports conflicts as Roslyn diagnostics:
+
+| ID | Severity | Condition |
+|---|---|---|
+| `MQTT001` | **Error** | Two handler methods share the exact same full topic template |
+| `MQTT002` | **Warning** | Two topic patterns overlap — a concrete topic can match both |
+
+### MQTT001 — duplicate route
+
+```
+error MQTT001: Topic 'devices/status' is already handled by 'DeviceController.OnStatus'.
+               Duplicate handler: 'AdminController.OnStatus'.
+```
+
+Occurs when two methods (in the same or different controllers) produce the same final template after prefix expansion.
+
+### MQTT002 — ambiguous overlap
+
+```
+warning MQTT002: Topic pattern 'devices/sensor/data' in 'DeviceController.OnSensorData'
+                 overlaps with 'devices/+/data' in 'TelemetryController.OnData':
+                 both match the same messages.
+```
+
+Occurs when one pattern (e.g. `devices/sensor/data`) is a subset of another wildcard pattern (e.g. `devices/+/data`), or when a `#` wildcard subsumes a more specific pattern. Both handlers would match the same incoming message — the first registered route wins at runtime.
+
+Resolve by making patterns non-overlapping, or by moving the shared logic into a single handler.
+
+## Generated Code
+
+At build time the generator emits three files into `<YourAssembly>.Mqtt.Generated`:
+
+| File | Contents |
+|---|---|
+| `MqttControllerRegistration.g.cs` | `GeneratedMqttControllerRegistration : IMqttControllerRegistration` |
+| `{Controller}Dispatcher.g.cs` | Per-controller dispatcher and `I{Controller}Dispatcher` interface |
+| `GeneratedMqttRoutingService.g.cs` | DFA topic matcher + `RouteMatchCache` (128-entry LRU) |
+
+Reference `GeneratedMqttControllerRegistration` in `WithControllers<>()`. Add a using for the generated namespace if needed:
+
+```csharp
+using MyApp.Mqtt.Generated;
+
+builder.Services
+    .AddMqttServer(configuration)
+    .WithControllers<GeneratedMqttControllerRegistration>();
+```
+
+---
+
+# Lifecycle Events
+
+Source: https://github.com/thnak/mqttcontrollerframework/blob/master/docs/wiki/Events.md
+
+# Lifecycle Events
+
+## Overview
+
+Four event interfaces let you react to client lifecycle changes. Multiple handlers can be registered for each event; they are all invoked sequentially.
+
+| Interface | Builder method | Triggered when |
+|---|---|---|
+| `IMqttClientConnectedEvent` | `.OnClientConnected<T>()` | A client successfully connects |
+| `IMqttClientDisconnectedEvent` | `.OnClientDisconnected<T>()` | A client disconnects |
+| `IMqttClientSubscribedTopicEvent` | `.OnClientSubscribedTopic<T>()` | A client subscribes to a topic filter |
+| `IMqttClientUnsubscribedTopicEvent` | `.OnClientUnsubscribedTopic<T>()` | A client unsubscribes from a topic filter |
+
+## `IMqttClientConnectedEvent`
+
+```csharp
+public interface IMqttClientConnectedEvent
+{
+    Task OnClientConnectedAsync(string clientId);
+}
+```
+
+Example — notify a presence service:
+
+```csharp
+public class PresenceConnectedHandler(IPresenceService presence) : IMqttClientConnectedEvent
+{
+    public Task OnClientConnectedAsync(string clientId)
+        => presence.SetOnlineAsync(clientId);
+}
+```
+
+## `IMqttClientDisconnectedEvent`
+
+```csharp
+public interface IMqttClientDisconnectedEvent
+{
+    Task OnClientDisconnectedAsync(string clientId);
+}
+```
+
+Example — clean up resources:
+
+```csharp
+public class PresenceDisconnectedHandler(IPresenceService presence) : IMqttClientDisconnectedEvent
+{
+    public Task OnClientDisconnectedAsync(string clientId)
+        => presence.SetOfflineAsync(clientId);
+}
+```
+
+## `IMqttClientSubscribedTopicEvent`
+
+```csharp
+public interface IMqttClientSubscribedTopicEvent
+{
+    Task OnClientSubscribedTopicAsync(string clientId, string topicFilter);
+}
+```
+
+Example — audit log:
+
+```csharp
+public class SubscribeAuditHandler(IAuditLog audit) : IMqttClientSubscribedTopicEvent
+{
+    public Task OnClientSubscribedTopicAsync(string clientId, string topicFilter)
+        => audit.RecordAsync($"SUBSCRIBE {clientId} → {topicFilter}");
+}
+```
+
+## `IMqttClientUnsubscribedTopicEvent`
+
+```csharp
+public interface IMqttClientUnsubscribedTopicEvent
+{
+    Task OnClientUnsubscribedTopicAsync(string clientId, string topicFilter);
+}
+```
+
+## Registration
+
+Chain all the handlers you need:
+
+```csharp
+builder.Services
+    .AddMqttServer(configuration)
+    .WithControllers<GeneratedMqttControllerRegistration>()
+    .WithAuthentication<MyAuthProvider>()
+    .OnClientConnected<PresenceConnectedHandler>()
+    .OnClientConnected<AuditConnectedHandler>()         // two handlers for the same event
+    .OnClientDisconnected<PresenceDisconnectedHandler>()
+    .OnClientSubscribedTopic<SubscribeAuditHandler>()
+    .OnClientUnsubscribedTopic<UnsubscribeAuditHandler>();
+```
+
+All handlers are registered as **scoped** services and resolved from a new scope per event.
+
+---
+
+# MqttControllerFramework — Wiki
+
+Source: https://github.com/thnak/mqttcontrollerframework/blob/master/docs/wiki/Home.md
+
+# MqttControllerFramework — Wiki
+
+Welcome to the documentation for **MqttControllerFramework**, a source-generated MQTT controller framework for .NET built on [MQTTnet 5](https://github.com/dotnet/MQTTnet).
+
+## Pages
+
+| Topic | Description |
+|---|---|
+| [Controllers and Routing](Controllers-and-Routing.md) | Defining controllers, topic templates, parameter binding, custom parsers, compile-time diagnostics |
+| [Middleware](Middleware.md) | Pipeline, `MqttMessageContext`, `SessionItems`, per-message state |
+| [Authentication](Authentication.md) | Username/password auth, lockout support |
+| [Authorization](Authorization.md) | Publish/subscribe authorization, roles, policies, `[MqttAuthorize]` |
+| [Connection Validation](Connection-Validation.md) | Pre-auth hooks, IP/ClientId filtering, session-item seeding, auth bypass |
+| [Rate Limiting](Rate-Limiting.md) | Token-bucket rate limiting per route |
+| [TLS and Security](TLS-and-Security.md) | PKCS#12, PEM, hot-swap, client certificate allowlist |
+| [Retained Messages](Retained-Messages.md) | Pluggable retain storage — file, database, Redis, or custom |
+| [Events](Events.md) | Client connected / disconnected / subscribed / unsubscribed |
+| [Server Actions](Server-Actions.md) | Publishing messages from the broker to topics |
+| [Broker Statistics](Broker-Stats.md) | Message counters, byte throughput, per-topic summaries |
+| [Performance](Performance.md) | Route matching internals, zero-reflection dispatch, JSON, scoped DI, tuning tips |
+| [Configuration Reference](Configuration-Reference.md) | All `MqttSettings` options |
+
+## At a Glance
+
+```
+[MqttController]        ← marks the class as a controller
+[MqttTopic("a/+/b")]    ← maps a method to a topic template
+[FromMqttTopic(1)]      ← binds a parameter to the 1st '+' wildcard segment
+[MqttAuthorize]         ← requires authorization for this handler
+[MqttAllowAnonymous]    ← bypasses class-level [MqttAuthorize]
+[TokenBucketRateLimit]  ← applies token-bucket rate limiting
+```
+
+The **source generator** reads these attributes at build time and emits:
+
+- `GeneratedMqttControllerRegistration` — `IMqttControllerRegistration` passed to `WithControllers<>()`
+- `{Controller}Dispatcher` — one per controller, handles deserialization and method dispatch
+- `GeneratedMqttRoutingService` — DFA-based topic router with an LRU cache; no reflection at runtime
+
+MQTT001 and MQTT002 diagnostics flag duplicate and ambiguous topic patterns at **build time**, before any code runs.
+
+---
+
+# Middleware
+
+Source: https://github.com/thnak/mqttcontrollerframework/blob/master/docs/wiki/Middleware.md
+
+# Middleware
+
+## Overview
+
+MqttControllerFramework has an ASP.NET Core–style middleware pipeline. Every incoming publish passes through all registered middleware in registration order before reaching the controller dispatcher.
+
+```
+MQTT Publish
+     │
+     ▼
+[Middleware 1]  ─→  [Middleware 2]  ─→  ...  ─→  [Controller Dispatcher]
+```
+
+Each middleware decides whether to call `next(ctx)` to continue the chain or short-circuit it (e.g. drop a message or send a response without invoking the controller).
+
+## `IMqttMiddleware`
+
+```csharp
+public interface IMqttMiddleware
+{
+    Task InvokeAsync(MqttMessageContext ctx, MqttRequestDelegate next);
+}
+```
+
+Call `next(ctx)` to pass execution to the next stage; skip it to short-circuit.
+
+## `MqttMessageContext`
+
+The context object passed through every stage:
+
+```csharp
+public sealed class MqttMessageContext
+{
+    // Raw MQTTnet event args — full control over ProcessPublish, Response, etc.
+    public InterceptingPublishEventArgs Args { get; }
+
+    // Per-message DI scope — resolve scoped services
+    public IServiceProvider Services { get; }
+
+    // Convenience accessors
+    public string UserName { get; }    // publishing client's username
+    public string Topic { get; }       // MQTT topic
+    public string ClientId { get; }    // MQTT client identifier
+    public CancellationToken CancellationToken { get; }
+
+    // State bags
+    public IDictionary SessionItems { get; }       // connection-scoped (see below)
+    public IDictionary<string, object?> Items { get; } // per-message
+}
+```
+
+### `SessionItems` — connection-scoped state
+
+`SessionItems` is backed by MQTTnet's own session dictionary and **persists for the lifetime of the TCP connection**. Populate it once in `IMqttConnectionValidator.ValidateAsync`; read it in every subsequent middleware or controller for that client.
+
+```csharp
+// In IMqttConnectionValidator:
+ctx.SessionItems["tenantId"] = await tenantStore.ResolveAsync(ctx.UserName);
+ctx.SessionItems["roles"]    = await authStore.GetRolesAsync(ctx.UserName);
+
+// In middleware:
+var tenantId = context.SessionItems["tenantId"] as string;
+```
+
+This avoids a database round-trip on every message.
+
+### `Items` — per-message state
+
+`Items` is a fresh `Dictionary<string, object?>` for each publish. Use it to pass data between middleware stages without touching `SessionItems`.
+
+```csharp
+public class LoggingMiddleware : IMqttMiddleware
+{
+    public async Task InvokeAsync(MqttMessageContext ctx, MqttRequestDelegate next)
+    {
+        var sw = Stopwatch.StartNew();
+        ctx.Items["requestStart"] = sw;
+        await next(ctx);
+        sw.Stop();
+        Console.WriteLine($"{ctx.Topic} handled in {sw.ElapsedMilliseconds} ms");
+    }
+}
+```
+
+## Registering Middleware
+
+Call `UseMiddleware<T>()` on the builder. Multiple calls register multiple middleware in order:
+
+```csharp
+builder.Services
+    .AddMqttServer(configuration)
+    .WithControllers<GeneratedMqttControllerRegistration>()
+    .UseMiddleware<TenantMiddleware>()      // runs first
+    .UseMiddleware<LoggingMiddleware>()     // runs second
+    .UseMiddleware<RateLimitMiddleware>()   // runs third
+    .WithAuthentication<MyAuthProvider>();
+```
+
+Middleware is resolved from the **per-message DI scope**, so it can inject scoped services.
+
+## Multi-Tenancy Example
+
+A typical multi-tenant setup:
+
+```csharp
+// 1. Seed the tenant into SessionItems at connection time
+public class ConnectionValidator(ITenantStore store) : IMqttConnectionValidator
+{
+    public async ValueTask<MqttConnectionValidationResult> ValidateAsync(
+        ValidatingConnectionEventArgs ctx, CancellationToken ct)
+    {
+        var tenant = await store.FindByUsernameAsync(ctx.UserName, ct);
+        if (tenant is null)
+            return MqttConnectionValidationResult.Reject("Unknown tenant");
+
+        ctx.SessionItems["tenantId"] = tenant.Id;
+        return MqttConnectionValidationResult.Accept();
+    }
+}
+
+// 2. Apply the tenant on every message
+public class TenantMiddleware(ITenantContext tenantCtx) : IMqttMiddleware
+{
+    public Task InvokeAsync(MqttMessageContext ctx, MqttRequestDelegate next)
+    {
+        if (ctx.SessionItems["tenantId"] is string tid)
+            tenantCtx.SetTenant(tid);
+        return next(ctx);
+    }
+}
+```
+
+## Short-Circuiting
+
+Skip `next(ctx)` to prevent the message from reaching the controller:
+
+```csharp
+public class MaintenanceModeMiddleware(IMaintenanceFlag flag) : IMqttMiddleware
+{
+    public Task InvokeAsync(MqttMessageContext ctx, MqttRequestDelegate next)
+    {
+        if (flag.IsEnabled)
+        {
+            ctx.Args.ProcessPublish = false;
+            return Task.CompletedTask; // short-circuit
+        }
+        return next(ctx);
+    }
+}
+```
+
+## Resolving Services in Middleware
+
+`ctx.Services` exposes the per-message DI scope:
+
+```csharp
+public class AuditMiddleware : IMqttMiddleware
+{
+    public async Task InvokeAsync(MqttMessageContext ctx, MqttRequestDelegate next)
+    {
+        var audit = ctx.Services.GetRequiredService<IAuditService>();
+        await audit.LogAsync(ctx.ClientId, ctx.Topic);
+        await next(ctx);
+    }
+}
+```
+
+---
+
+# Performance
+
+Source: https://github.com/thnak/mqttcontrollerframework/blob/master/docs/wiki/Performance.md
+
+# Performance
+
+## Overview
+
+MqttControllerFramework is designed to add as little overhead as possible on top of [MQTTnet](https://github.com/dotnet/MQTTnet). Raw broker throughput is determined by MQTTnet; this page documents what the framework itself does on each publish and how to get the most out of it.
+
+## Route Matching
+
+The generated routing service uses a **two-stage strategy**:
+
+### Stage 1 — LRU string cache (128 entries)
+
+```
+topic string  →  cache lookup  →  route id (if hit)
+```
+
+On a cache hit the route is dispatched immediately. The cache is a fixed ring-buffer of 128 topic→route-id pairs. Frequently published topics (e.g. a fixed set of device topics) will typically remain cached after the first message, making repeated dispatches a simple string scan over ≤128 entries with no pattern matching at all.
+
+### Stage 2 — DFA pattern match (cache miss)
+
+On a cache miss the topic is encoded to UTF-8 bytes and fed into the generated DFA:
+
+- **Exact routes** — FNV-1a hash → `switch` → `ReadOnlySpan<byte>.SequenceEqual` against a pre-allocated static `byte[]`. Matches in O(topic-length) with SIMD assistance via `SequenceEqual`.
+- **Wildcard routes** — an `unsafe`, pointer-based byte scanner marked `[MethodImpl(AggressiveInlining | AggressiveOptimization)]`. It reads the topic byte-by-byte, advancing past `/` separators for `+` segments and short-circuiting immediately for `#` patterns. No regex, no allocations.
+
+After a successful DFA match the result is inserted into the LRU cache so the next identical topic is a cache hit.
+
+### Implications
+
+- **Publish the same topic repeatedly**: hits the cache from message 2 onward.
+- **Avoid needlessly varying topic segments** (e.g. appending a timestamp to the topic) — it defeats the LRU cache and forces a DFA scan every time.
+- **Exact routes are faster than wildcard routes**: the hash + `SequenceEqual` path is shorter than the byte scanner. If a handler receives only one well-known topic, make it exact.
+
+## Zero-Reflection Dispatch
+
+Controllers are **never invoked via reflection**. The source generator emits a dedicated `{Controller}Dispatcher` class for each controller with hand-inlined deserialization and method calls:
+
+```csharp
+// Generated — no MethodInfo.Invoke, no expression trees
+public async ValueTask Dispatch_OnTemperature(
+    InterceptingPublishEventArgs args, string topic, CancellationToken ct)
+{
+    var topicSegments = topic.Split('/');
+    var deviceId = (string)Convert.ChangeType(topicSegments[1], typeof(string));
+
+    var payload = default(TemperaturePayload);
+    if (args.ApplicationMessage.Payload.Length > 0)
+    {
+        var ti = _typeInfoCache.TryGet(typeof(TemperaturePayload))
+              ?? _jsonOptions.GetTypeInfo(typeof(TemperaturePayload));
+        if (ti != null) { var r = new Utf8JsonReader(args.ApplicationMessage.Payload);
+                          payload = (TemperaturePayload)JsonSerializer.Deserialize(ref r, ti)!; }
+    }
+
+    await _controller.OnTemperature(deviceId, payload!, ct);
+}
+```
+
+**Topic-segment extraction** is `string.Split('/')` followed by array indexing — no parsing library, no allocations beyond the split array.  
+**Enum segments** use `Enum.TryParse` (case-insensitive, no boxing for value types in .NET 8+).  
+**JSON deserialization** reads directly from `ReadOnlySequence<byte>` via `Utf8JsonReader` — no intermediate `string` conversion.
+
+## JSON Serialization
+
+### Default behaviour
+
+`JsonSerializerOptions` is resolved from DI and used with `GetTypeInfo(typeof(T))`. If a matching `JsonTypeInfo` is registered (e.g. from a source-generated context), deserialization is fully AOT-safe and allocation-minimal.
+
+### Registering your own source-generated context
+
+Pass a configure delegate to `WithControllers<>()`:
+
+```csharp
+[JsonSerializable(typeof(TemperaturePayload))]
+[JsonSerializable(typeof(DeviceCommand))]
+public partial class AppJsonContext : JsonSerializerContext { }
+
+builder.Services
+    .AddMqttServer(configuration)
+    .WithControllers<GeneratedMqttControllerRegistration>(options =>
+    {
+        options.TypeInfoResolverChain.Insert(0, AppJsonContext.Default);
+    });
+```
+
+With a source-generated context the deserializer:
+- Uses no reflection
+- Allocates no intermediate buffers
+- Is trimmer- and AOT-safe
+
+Without one, `JsonSerializer` falls back to reflection-based metadata — still fast for most workloads, but not AOT-compatible.
+
+## Per-Message DI Scope
+
+The framework creates **exactly one `IServiceScope` per incoming publish**:
+
+```
+rate-limit check  →  [create scope]  →  authorization  →  middleware pipeline  →  controller dispatch
+                                           └─────────────────────────────────────────────────────────┘
+                                                          single shared scope
+```
+
+This means `GetService<T>()` is called once per scoped service type across the entire pipeline — no double-resolution. The scope is disposed at the end of the pipeline via `await using`.
+
+Connection-related work (validation, authentication) uses separate short-lived scopes since they run on a different event path.
+
+**Implication**: keep scoped services lightweight to construct. If a service has an expensive constructor (e.g. opens a DB connection), consider initializing lazily or moving heavy work to the method level.
+
+## Structured Logging
+
+All framework-internal log calls are generated via `[LoggerMessage]`:
+
+```csharp
+[LoggerMessage(LogLevel.Warning, "Rate limit exceeded for client {clientId} on topic {topic}: {reason}")]
+partial void LogRateLimitExceeded(string clientId, string topic, string? reason);
+```
+
+This means:
+- **Zero string allocation** when the log level is disabled — the format string is never interpolated.
+- **Strongly typed parameters** — no boxing of value types.
+- Dispatcher-level trace logging (`LogLevel.Trace`) is compiled out in Release builds when trace is not enabled.
+
+In production, set the minimum log level to `Information` or higher for framework namespaces to eliminate all dispatcher trace overhead:
+
+```json
+"Logging": {
+  "LogLevel": {
+    "MqttControllerFramework": "Warning"
+  }
+}
+```
+
+## Self-Origin Detection
+
+Messages published by the broker via `IMqttClientActionService` carry a user property that prevents re-dispatch. The check uses a pre-encoded `ReadOnlyMemory<byte>` compared with `Span.SequenceEqual`:
+
+```csharp
+// Encoded once at startup, compared on every publish
+private readonly ReadOnlyMemory<byte> _systemName = Encoding.UTF8.GetBytes(settings.ServerOriginPropertyValue);
+
+private bool IsServerMessage(List<MqttUserProperty>? properties)
+{
+    var prop = properties?.FirstOrDefault(p => p.Name == _settings.ServerOriginPropertyName);
+    return prop != null && prop.ValueBuffer.Span.SequenceEqual(_systemName.Span);
+}
+```
+
+No string allocation on the hot path — `ValueBuffer` is compared directly as bytes.
+
+## Recommendations
+
+| Scenario | Recommendation |
+|---|---|
+| High-frequency single device | Use exact topic templates (`"devices/abc/telemetry"`) — hash + `SequenceEqual` is faster than the DFA scanner |
+| Many distinct topics | Increase the LRU cache size by forking the framework or accepting cache miss overhead |
+| Large payloads | Use `byte[]` or a custom `IMqttPayloadParser<T>` — avoids JSON overhead entirely |
+| AOT / NativeAOT | Register a `JsonSerializerContext` via `WithControllers<>()` configure delegate |
+| Many middleware | Keep middleware count low; each registered middleware adds a delegate allocation per message |
+| Tracing overhead | Set `MqttControllerFramework` log level to `Warning` in production |
+| Rate limiting | Rate-limit checks run before the DI scope is created — cheap to apply broadly |
+
+## What MQTTnet Controls
+
+The following are determined entirely by MQTTnet and are outside the framework's influence:
+
+- TCP accept and read/write throughput
+- MQTT packet serialization and parsing
+- QoS 1/2 acknowledgement state machines
+- WebSocket framing
+- Session persistence and re-delivery
+- Maximum pending messages per client (configured via `AddMqttServer` → `WithMaxPendingMessagesPerClient`)
+
+Refer to the [MQTTnet documentation](https://github.com/dotnet/MQTTnet) for tuning those aspects.
+
+---
+
+# Rate Limiting
+
+Source: https://github.com/thnak/mqttcontrollerframework/blob/master/docs/wiki/Rate-Limiting.md
+
+# Rate Limiting
+
+## Overview
+
+MqttControllerFramework includes a **token-bucket rate limiter** that enforces per-client, per-route message limits. Apply `[TokenBucketRateLimit]` to any topic handler and call `.WithRateLimiting()` on the builder.
+
+## Enabling
+
+```csharp
+builder.Services
+    .AddMqttServer(configuration)
+    .WithControllers<GeneratedMqttControllerRegistration>()
+    .WithAuthentication<MyAuthProvider>()
+    .WithRateLimiting();   // ← registers the rate limit service
+```
+
+## `[TokenBucketRateLimit]`
+
+```csharp
+[TokenBucketRateLimit(capacity, refillRate, refillIntervalMs)]
+```
+
+| Parameter | Type | Description |
+|---|---|---|
+| `capacity` | `int` | Maximum tokens in the bucket (burst limit) |
+| `refillRate` | `int` | Tokens added per refill interval |
+| `refillIntervalMs` | `int` | Refill interval in milliseconds |
+| `TokensPerRequest` | `int` | Tokens consumed per message (default: 1) |
+
+### Example: allow up to 10 messages/second with a burst of 10
+
+```csharp
+[MqttController]
+public class TelemetryController
+{
+    [MqttTopic("telemetry/+/data")]
+    [TokenBucketRateLimit(capacity: 10, refillRate: 10, refillIntervalMs: 1000)]
+    public Task OnData([FromMqttTopic(1)] string deviceId, SensorData data) { ... }
+}
+```
+
+Token bucket behaviour:
+- Bucket starts full (`capacity` tokens).
+- Each incoming message consumes `TokensPerRequest` tokens.
+- Tokens refill at `refillRate` per `refillIntervalMs`.
+- If the bucket is empty the message is **dropped** (not queued).
+
+### Example: high-cost operation — 5 tokens per request
+
+```csharp
+[MqttTopic("bulk/+/import")]
+[TokenBucketRateLimit(capacity: 50, refillRate: 10, refillIntervalMs: 1000, TokensPerRequest = 5)]
+public Task OnBulkImport([FromMqttTopic(1)] string deviceId, BulkPayload payload) { ... }
+```
+
+### Stacking multiple limits
+
+Multiple attributes can be applied to the same method (e.g. a burst limit and a sustained limit):
+
+```csharp
+[MqttTopic("commands/+/execute")]
+[TokenBucketRateLimit(capacity: 5,  refillRate: 5,  refillIntervalMs: 1000,  Name = "burst")]
+[TokenBucketRateLimit(capacity: 60, refillRate: 60, refillIntervalMs: 60000, Name = "sustained")]
+public Task OnExecute([FromMqttTopic(1)] string deviceId, Command cmd) { ... }
+```
+
+## How Limits Are Keyed
+
+By default the rate limit applies per **ClientId + route**. Each connecting client gets its own token bucket for each rate-limited route.
+
+## Custom Rate Limit Strategy
+
+Implement `IRateLimitStrategy` and create a custom attribute that inherits `RateLimitAttribute` to add strategies beyond the built-in token bucket:
+
+```csharp
+public sealed class SlidingWindowRateLimitAttribute(int windowMs, int maxRequests)
+    : RateLimitAttribute
+{
+    public override string StrategyType => "SlidingWindow";
+    public override bool ValidateConfiguration() => windowMs > 0 && maxRequests > 0;
+    public override Dictionary<string, object> GetConfiguration() => new()
+    {
+        ["WindowMs"] = windowMs,
+        ["MaxRequests"] = maxRequests
+    };
+}
+```
+
+Then implement `IRateLimitStrategy` and register it with the DI container.
+
+## Notes
+
+- Rate limiting is enforced by the generated routing service before the controller dispatcher runs.
+- Messages dropped by the rate limiter are counted in `IMqttBrokerStatsService.GetDroppedMessageCount()`.
+- `TokensPerRequest` must be `> 0` and `<= capacity` — an invalid configuration is detected at build time via `ValidateConfiguration()`.
+
+---
+
+# Retained Messages
+
+Source: https://github.com/thnak/mqttcontrollerframework/blob/master/docs/wiki/Retained-Messages.md
+
+# Retained Messages
+
+## Overview
+
+A retained MQTT message is stored by the broker and delivered to any client that subscribes to the matching topic — even if the publisher has long since disconnected. MqttControllerFramework persists retained messages across restarts via the `IRetainStorage` interface.
+
+The built-in default is **file-based JSON** (`FileRetainStorage`). Replace it with a custom implementation to store retained messages in a database, Redis, blob storage, or any other backend.
+
+## Default Behaviour
+
+Out of the box, retained messages are written to a JSON file whenever they change. The path is controlled by `MqttSettings.RetainedMessagesFilePath`:
+
+```json
+"MqttSettings": {
+  "RetainedMessagesFilePath": "RetainedMessages.json"
+}
+```
+
+The file is created automatically. If it does not exist at startup the broker starts with an empty retained message set.
+
+## `IRetainStorage`
+
+```csharp
+public interface IRetainStorage
+{
+    // Called on broker startup — return all previously persisted messages
+    Task<IReadOnlyList<MqttApplicationMessage>> LoadAsync(CancellationToken cancellationToken = default);
+
+    // Called after any change — messages is the complete current snapshot
+    Task SaveAsync(IReadOnlyList<MqttApplicationMessage> messages, CancellationToken cancellationToken = default);
+
+    // Called when the broker clears all retained messages
+    Task ClearAsync(CancellationToken cancellationToken = default);
+}
+```
+
+`SaveAsync` receives the **full snapshot** of retained messages every time any retained message changes. `LoadAsync` is called once at startup.
+
+## Custom Implementation
+
+### Example: in-memory (no persistence)
+
+```csharp
+public class InMemoryRetainStorage : IRetainStorage
+{
+    private IReadOnlyList<MqttApplicationMessage> _messages = [];
+
+    public Task<IReadOnlyList<MqttApplicationMessage>> LoadAsync(CancellationToken ct = default)
+        => Task.FromResult(_messages);
+
+    public Task SaveAsync(IReadOnlyList<MqttApplicationMessage> messages, CancellationToken ct = default)
+    {
+        _messages = messages;
+        return Task.CompletedTask;
+    }
+
+    public Task ClearAsync(CancellationToken ct = default)
+    {
+        _messages = [];
+        return Task.CompletedTask;
+    }
+}
+```
+
+### Example: SQL Server
+
+```csharp
+public class SqlRetainStorage(IDbConnectionFactory db) : IRetainStorage
+{
+    public async Task<IReadOnlyList<MqttApplicationMessage>> LoadAsync(CancellationToken ct = default)
+    {
+        await using var conn = await db.OpenAsync(ct);
+        var rows = await conn.QueryAsync<RetainedRow>("SELECT Topic, Payload, ContentType FROM RetainedMessages");
+        return rows.Select(r => new MqttApplicationMessageBuilder()
+            .WithTopic(r.Topic)
+            .WithPayload(r.Payload)
+            .WithContentType(r.ContentType)
+            .WithRetainFlag(true)
+            .Build()).ToList();
+    }
+
+    public async Task SaveAsync(IReadOnlyList<MqttApplicationMessage> messages, CancellationToken ct = default)
+    {
+        await using var conn = await db.OpenAsync(ct);
+        await conn.ExecuteAsync("DELETE FROM RetainedMessages");
+        foreach (var m in messages)
+            await conn.ExecuteAsync(
+                "INSERT INTO RetainedMessages(Topic, Payload, ContentType) VALUES(@Topic, @Payload, @ContentType)",
+                new { m.Topic, Payload = m.Payload.ToArray(), m.ContentType });
+    }
+
+    public async Task ClearAsync(CancellationToken ct = default)
+    {
+        await using var conn = await db.OpenAsync(ct);
+        await conn.ExecuteAsync("DELETE FROM RetainedMessages");
+    }
+}
+```
+
+### Registration
+
+```csharp
+builder.Services
+    .AddMqttServer(configuration)
+    .WithControllers<GeneratedMqttControllerRegistration>()
+    .WithAuthentication<MyAuthProvider>()
+    .WithRetainStorage<SqlRetainStorage>();  // replaces FileRetainStorage
+```
+
+`WithRetainStorage<T>()` registers your implementation as a singleton and replaces the built-in file backend.
+
+## Notes
+
+- `IRetainStorage` is registered as a **singleton**; it must be thread-safe.
+- `SaveAsync` is called on the broker's event thread — keep implementations fast. Offload heavy I/O to a background queue if needed.
+- Setting `RetainedMessagesFilePath` has no effect when a custom `IRetainStorage` is registered.
+
+---
+
+# Server-Side Publish (Server Actions)
+
+Source: https://github.com/thnak/mqttcontrollerframework/blob/master/docs/wiki/Server-Actions.md
+
+# Server-Side Publish (Server Actions)
+
+## Overview
+
+`IMqttClientActionService` lets the broker publish messages to MQTT topics from server-side code — background jobs, API endpoints, domain events, etc. Server-originated messages are automatically tagged with a user property so the broker ignores its own traffic (prevents infinite loops when the server also consumes its own topics).
+
+## Interface
+
+```csharp
+public interface IMqttClientActionService
+{
+    // Publish raw bytes
+    Task SendMessageAsync(
+        string topic,
+        ReadOnlySequence<byte> message,
+        CancellationToken cancellationToken = default);
+
+    // Publish bytes and await a typed response on the reply topic
+    Task<TResult?> SendMessageAsync<TResult>(
+        string topic,
+        ReadOnlySequence<byte> message,
+        CancellationToken cancellationToken = default);
+
+    // Send an empty request and await a typed response
+    Task<TResult?> GetDataFromTopicAsync<TResult>(
+        string topic,
+        CancellationToken cancellationToken = default);
+}
+```
+
+## Publishing from a Background Service
+
+```csharp
+public class AlertPublisher(IMqttClientActionService mqtt) : BackgroundService
+{
+    protected override async Task ExecuteAsync(CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            await Task.Delay(TimeSpan.FromMinutes(1), ct);
+
+            var alert = new AlertMessage { Level = "warning", Text = "High temperature" };
+            var bytes = JsonSerializer.SerializeToUtf8Bytes(alert);
+            await mqtt.SendMessageAsync("alerts/temperature", new ReadOnlySequence<byte>(bytes), ct);
+        }
+    }
+}
+```
+
+## Publishing from a Minimal API Endpoint
+
+```csharp
+app.MapPost("/api/devices/{deviceId}/command", async (
+    string deviceId,
+    DeviceCommand command,
+    IMqttClientActionService mqtt,
+    CancellationToken ct) =>
+{
+    var payload = JsonSerializer.SerializeToUtf8Bytes(command);
+    await mqtt.SendMessageAsync(
+        $"devices/{deviceId}/commands",
+        new ReadOnlySequence<byte>(payload),
+        ct);
+
+    return Results.Accepted();
+});
+```
+
+## Request-Response via MQTT
+
+Use `SendMessageAsync<TResult>` to publish and wait for a response on a reply topic:
+
+```csharp
+var request = JsonSerializer.SerializeToUtf8Bytes(new StatusRequest { Verbose = true });
+var status = await mqtt.SendMessageAsync<DeviceStatus>(
+    $"devices/{deviceId}/status/request",
+    new ReadOnlySequence<byte>(request),
+    ct);
+
+if (status is not null)
+    Console.WriteLine($"Device status: {status.State}");
+```
+
+Or use `GetDataFromTopicAsync<T>` when no payload is needed in the request:
+
+```csharp
+var latest = await mqtt.GetDataFromTopicAsync<SensorReading>("sensors/room1/temperature/latest", ct);
+```
+
+## Self-Loop Prevention
+
+All messages published via `IMqttClientActionService` include an MQTT user property:
+
+```
+x-mqtt-origin: server
+```
+
+The broker intercepts this property and marks the message with `ProcessPublish = false`, so the framework will not re-dispatch server-originated messages to controllers. The header name and value are configurable via `MqttSettings`:
+
+```json
+"MqttSettings": {
+  "ServerOriginPropertyName": "x-mqtt-origin",
+  "ServerOriginPropertyValue": "server"
+}
+```
+
+## Notes
+
+- `IMqttClientActionService` is registered as a **singleton**.
+- Inject it into any service that has access to the DI container.
+- The request-response overloads rely on the client setting a `ResponseTopic` on outbound publishes — the framework's generated dispatchers handle this on the server side when a controller method returns a value.
+
+---
+
+# TLS and Security
+
+Source: https://github.com/thnak/mqttcontrollerframework/blob/master/docs/wiki/TLS-and-Security.md
+
+# TLS and Security
+
+## Overview
+
+MqttControllerFramework supports TLS through `HotSwappableServerCertProvider`. It loads a server certificate at startup and allows you to swap it at runtime without restarting the broker. It also maintains an in-memory allowlist of trusted client certificates.
+
+## Enabling TLS
+
+Set `EnableSsl: true` in `MqttSettings` and provide the certificate path.
+
+### PKCS#12 / PFX bundle
+
+```json
+"MqttSettings": {
+  "EnableNonSsl": false,
+  "EnableSsl": true,
+  "SslPort": 8883,
+  "PkcsPath": "/etc/certs/broker.pfx",
+  "PkcsPassword": "changeme"
+}
+```
+
+### PEM certificate + separate private key
+
+```json
+"MqttSettings": {
+  "EnableSsl": true,
+  "SslPort": 8883,
+  "PkcsPath": "/etc/certs/broker.crt",
+  "PkcsKeyPath": "/etc/certs/broker.key"
+}
+```
+
+When `PkcsKeyPath` is non-empty the framework treats `PkcsPath` as the public certificate and `PkcsKeyPath` as the RSA private-key PEM.
+
+### Running both plain and TLS simultaneously
+
+```json
+"MqttSettings": {
+  "EnableNonSsl": true,
+  "NonSslPort": 1883,
+  "EnableSsl": true,
+  "SslPort": 8883,
+  "PkcsPath": "/etc/certs/broker.pfx",
+  "PkcsPassword": "changeme"
+}
+```
+
+## Runtime Certificate Hot-Swap
+
+Inject `IHotSwappableServerCertProvider` anywhere in your application and call `UpdateCertificate`:
+
+```csharp
+public class CertRotationJob(IHotSwappableServerCertProvider certProvider) : IHostedService
+{
+    public async Task StartAsync(CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            await Task.Delay(TimeSpan.FromHours(24), ct);
+
+            var newCert = LoadLatestCertificate();
+            certProvider.UpdateCertificate(newCert);
+        }
+    }
+
+    public Task StopAsync(CancellationToken ct) => Task.CompletedTask;
+}
+```
+
+The swap is atomic — new TLS handshakes immediately use the new certificate; existing connections are unaffected.
+
+## Client Certificate Allowlist
+
+`HotSwappableServerCertProvider` maintains an in-memory allowlist of trusted client certificates. Only clients presenting a certificate with a matching thumbprint are allowed.
+
+```csharp
+public class DeviceOnboardingService(IHotSwappableServerCertProvider certProvider)
+{
+    public void OnboardDevice(byte[] certBytes)
+    {
+        var cert = new X509Certificate2(certBytes);
+        certProvider.InstallNewClientCert(cert);
+    }
+
+    public void RevokeDevice(string thumbprint)
+    {
+        certProvider.RemoveClientCert(thumbprint);
+    }
+
+    public List<string> ListDevices()
+        => certProvider.GetInstalledClientCertThumbprints();
+}
+```
+
+### Persisting client certificates
+
+Set `ClientCertStorage` to a directory path. Installed certificates are saved as `.cer` files and reloaded automatically on startup:
+
+```json
+"MqttSettings": {
+  "ClientCertStorage": "/var/mqtt/client-certs"
+}
+```
+
+## `IHotSwappableServerCertProvider` API
+
+| Method | Description |
+|---|---|
+| `UpdateCertificate(X509Certificate2)` | Atomically replaces the server certificate |
+| `GetCertificate()` | Returns the current server certificate |
+| `InstallNewClientCert(X509Certificate2)` | Adds a certificate to the client allowlist (persisted if `ClientCertStorage` is set) |
+| `RemoveClientCert(string thumbprint)` | Removes a certificate from the allowlist |
+| `GetInstalledClientCertThumbprints()` | Lists thumbprints of all installed client certificates |
+| `GetInstalledClientCerts()` | Lists subjects of all installed client certificates |
+
+## Notes
+
+- `HotSwappableServerCertProvider` implements both `ICertificateProvider` (MQTTnet) and `IHotSwappableServerCertProvider`. It is registered as a singleton.
+- On .NET 9+ the framework uses `X509CertificateLoader` (no SYSLIB0057); on .NET 8 it falls back to `X509Certificate2` constructors.
+- The client certificate validation callback uses thumbprint matching — full chain validation is not performed by default.
+
+---
