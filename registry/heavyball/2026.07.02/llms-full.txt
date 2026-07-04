@@ -1,0 +1,610 @@
+# HeavyBall
+
+Source: https://github.com/homebrewml/heavyball/blob/main/README.md
+
+# HeavyBall
+
+[![PyPI version](https://img.shields.io/pypi/v/heavyball?color=blue)][pypi] [![Downloads](https://img.shields.io/pypi/dm/heavyball)][pypi] [![License](https://img.shields.io/badge/license-BSD--2--Clause-blue.svg)][license]
+
+HeavyBall is an optimizer library for PyTorch where every optimizer is assembled from composable, compiled building
+blocks. It includes API-compatible replacements for `torch.optim.AdamW`, `SGD`, and `RMSprop`, alongside Muon, SOAP (
+Shampoo), PSGD (Kronecker), LATHER, ADOPT, Schedule-Free, LaProp, and others.
+
+The building blocks, over 100 functions in [`utils.py`](heavyball/utils.py), are each compiled with
+`torch.compile(fullgraph=True)` and fuse into Triton kernels. Features like MARS gradient correction,
+cautious updates, and [ECC state compression](#ecc) are implemented as chainable transforms that work as flags on any
+optimizer. DDP and FSDP are [supported](#distributed-training), with automatic repartitioning for second-order methods.
+
+## Quick Start
+
+```bash
+pip install heavyball
+```
+
+Requires PyTorch >= 2.2.
+
+```python
+from heavyball import AdamW
+
+opt = AdamW(model.parameters(), lr=1e-3)
+```
+
+```python
+from heavyball import SOAP  # Shampoo-based preconditioning
+
+opt = SOAP(model.parameters(), lr=3e-3)
+```
+
+```python
+from heavyball import LATHER  # Lie-group Adam Through Harmonic Eigenbasis Rotations
+
+opt = LATHER(model.parameters(), lr=1e-3)
+```
+
+```python
+from heavyball import Muon
+
+opt = Muon(model.parameters(), lr=0.02, ecc="bf16+8", mars=True, caution=True)
+```
+
+```python
+from heavyball import SplitOpt, Muon, AdamW
+
+opt = SplitOpt([
+    {'params': matrices, 'optimizer': Muon, 'lr': 0.02},
+    {'params': vectors, 'optimizer': AdamW, 'lr': 1e-3},
+])
+```
+
+The API matches `torch.optim`, with the same parameter groups, same `step()`/`zero_grad()` interface. See [
+`examples/`](examples/) for training scripts.
+By default, HeavyBall consumes gradients during `step()` and clears `p.grad` once it has used it. Pass
+`consume_grad=False` if your training loop needs gradients to remain attached after the optimizer step.
+
+## Optimizers
+
+The library covers first-order methods (AdamW, NAdam, RMSprop, ADOPT, LaProp, SGD), orthogonal methods (Muon),
+Shampoo-based preconditioning (SOAP and variants), PSGD with Kronecker and low-rank factorization, Schedule-Free
+training, and SAM.
+
+<details>
+<summary>Full list</summary>
+
+**First-order:**
+AdamW, NAdam, RMSprop, ADOPT, AdEMAMix, LaProp, SignLaProp, SGD, Scion, UnscaledAdamW, AdamC, SUDSAdamW
+
+**Schedule-Free:**
+SFAdamW
+
+Schedule-Free optimizers override `.eval()` and `.train()` to swap between training and evaluation parameter states.
+Call `opt.eval()` before validation and `opt.train()` before resuming training.
+
+**Orthogonal:**
+Muon, MuonAdamW, MuonLaProp, HyperBallAdamW, OrthoLaProp, LaPropOrtho
+
+**Shampoo-based (SOAP):**
+SOAP, SOAPNAdam, SOAPAdEMAMix, SOLP
+
+**PSGD (Kronecker):**
+PSGDKron, LATHER, PSGDPRO, QSGD
+
+**PSGD (Low-Rank):**
+PSGDLRA
+
+**SAM:**
+SAMWrapper, MSAMLaProp
+
+SAMWrapper requires a closure passed to `step()`.
+
+MSAMLaProp overrides `.eval()` and `.train()` to swap between training and evaluation parameter states.
+Call `opt.eval()` before validation and `opt.train()` before resuming training.
+
+**Meta:**
+SplitOpt
+
+</details>
+
+## Composable Features
+
+These flags compose freely. For example, `LaProp(..., ecc="bf16+8", mars=True, caution=True, palm=True)` is valid.
+They are available on all optimizers except SAMWrapper and SplitOpt, which delegate to inner optimizers.
+
+| Flag                    | Effect                                                                                                                                                                           |
+|-------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `mars=True`             | Applies [MARS variance reduction](https://arxiv.org/pdf/2411.10438) via previous gradients.                                                                                      |
+| `caution=True`          | [Masks update elements](https://arxiv.org/abs/2411.16085) that disagree with the gradient direction.                                                                             |
+| `ecc="bf16+8"`          | [Compresses optimizer state](https://arxiv.org/pdf/2602.23349) to bf16 + int8 correction (3 bytes vs fp32's 4). See [ECC](#ecc).                                                 |
+| `param_ecc="bf16+8"`    | Applies the same compression to parameters.                                                                                                                                      |
+| `palm=True`             | Enables [PaLM-style beta2 scheduling](https://arxiv.org/abs/2204.02311). Only available on optimizers with beta2                                                                 |
+| `gradient_clipping=...` | Clips incoming gradients. Accepts `"l2_clip_"`, `"rmsnorm_clip_"`, `"trust_region_clip_"`, `"a_law_compress"`, `"mu_law_compress"`, `"softsign_compress"`, or a custom callable. |
+| `update_clipping=...`   | Clips outgoing updates after all transforms. Same options as `gradient_clipping`.                                                                                                |
+| `promote=True`          | Promotes gradients to fp32 before the update.                                                                                                                                    |
+| `warmup_steps=N`        | Linear learning rate warmup over N steps.                                                                                                                                        |
+
+### ECC
+
+ECC stores each optimizer state tensor as a bf16 value plus an int8 correction term (3 bytes total vs fp32's 4 bytes),
+based on the approach from [FlashOptim](https://arxiv.org/abs/2602.23349). HeavyBall integrates ECC as a composable
+flag: correction tensors are attached as attributes at call time, so any built-in optimizer handles ECC without
+per-optimizer changes.
+
+```python
+opt = AdamW(model.parameters(), lr=1e-3, ecc="bf16+8")
+opt = Muon(model.parameters(), lr=0.02, ecc="bf16+8", param_ecc="bf16+8")  # state + params
+```
+
+For first-order optimizers (where all state is momentum and variance), `bf16+8` gives roughly 25% state memory savings
+compared to fp32.
+For second-order methods, preconditioner matrices are not compressed, so total savings are lower. The encode and decode
+operations are fully elementwise and fuse into the compiled kernel.
+
+Available modes: `bf16+8`, `bf16+16`, `fp16+8`, `fp16+16`.
+
+## Distributed Training
+
+HeavyBall works with both DDP and FSDP. First-order optimizers are elementwise and operate directly on FSDP shards with
+no repartitioning. Second-order methods (Muon, SOAP, PSGD) need the full parameter to compute their update, so HeavyBall
+auto-detects FSDP-sharded parameters on the first step and repartitions them with a metadata-first `all_to_all_single`
+exchange: each weight matrix is deterministically assigned to one rank, shard metadata is exchanged up front, the owner
+reconstructs the full parameter, computes the update once, and returns the updated shards. This saves both compute and
+memory compared to DDP-style redundant updates, at the cost of communication.
+
+```python
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from heavyball import Muon
+
+model = FSDP(model, use_orig_params=True)  # use_orig_params required for shape detection
+opt = Muon(model.parameters(), lr=0.02)
+```
+
+For non-FSDP sharding backends, capture the original parameter shapes before wrapping:
+
+```python
+from heavyball import SOAP, capture_param_shapes
+
+shapes = capture_param_shapes(model)
+model = your_sharding_wrapper(model)
+opt = SOAP(model.parameters(), lr=3e-3, orig_shapes=shapes)
+```
+
+## Building Custom Optimizers
+
+Every built-in optimizer is a chain of `FunctionTransform`s, an API also available for building custom optimizers.
+`Parallel` runs parallel transform paths with a merge function, which is useful for grafted optimizers or ensemble
+updates.
+
+```python
+import heavyball.chainable as C
+
+
+def graft(outputs, eps=1e-8):
+    adam_update, sgd_update = outputs
+    return [s * (a.norm() / s.norm().add(eps)) for a, s in zip(adam_update, sgd_update)]
+
+
+class GraftedAdam(C.BaseOpt):
+    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8,
+                 weight_decay=0, warmup_steps=0, multi_tensor=True):
+        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay,
+                        warmup_steps=warmup_steps, multi_tensor=multi_tensor)
+        branch = C.Parallel(branches=[[C.scale_by_adam], [C.identity]], merge_fn=graft)
+        super().__init__(params, defaults, fns=(branch,))
+```
+
+Custom optimizers that inherit from `BaseOpt` get ECC, MARS, caution, clipping, warmup, and stochastic rounding
+automatically.
+
+Key transforms: `scale_by_adam`, `scale_by_laprop`, `scale_by_soap`, `scale_by_psgd`, `scale_by_adopt`,
+`scale_by_ademamix`, `orthogonalize_update`, `exp_avg`, `nesterov_ema`, `heavyball_momentum`, `mars`, `palm_beta2`,
+`sign`, `identity`.
+
+<details>
+<summary>How it compiles</summary>
+
+Every building block in `utils.py` is wrapped with `torch.compile(fullgraph=True)`. When one
+compiled function calls another, the inner function inlines and nested calls fuse into the same compiled graph.
+
+For fused first-order optimizers (AdamW, LaProp, ADOPT, NAdam, AdEMAMix), the entire update runs in a single compiled
+function and fuses into minimal kernels. Stochastic rounding, ECC encode/decode, weight decay, and cautious
+masking all fold into the same graph, reducing the memory traffic to a minimum. Adam without add-ons gets reduced from
+14 reads + 9 writes in O(N) kernels to 4 reads + 3 writes in one kernel, a 3x speedup.
+
+Second-order methods compile their preconditioning steps separately: Newton-Schulz iterations (Muon) and Kronecker
+factor updates (PSGD, SOAP) each compile as individual regions, while their elementwise portions still fuse. This avoids
+suboptimal code paths, at the cost of one graph break.
+
+Custom optimizers built via the chainable API inherit this behavior.
+
+</details>
+
+## Benchmarks
+
+HeavyBall includes a benchmark suite via [LightBench](https://github.com/HomebrewML/LightBench) that tests
+for silent optimizer failures across difficulty levels. Results and methodology are documented
+in [docs/benchmark.md](docs/benchmark.md).
+
+[`benchmarks/bench_release_optimizers.py`](benchmarks/bench_optimizer_step.py) measures optimizer latency, with
+AdamW step times dropping from 10.63 ms in HeavyBall 2 to 4.15 ms in HeavyBall 3.
+
+## Migrating
+
+**From 2.x** See the [3.0.0 migration guide](docs/heavyball3.md) for renamed classes, removed kwargs, and checkpoint
+conversion.
+
+**From 1.x** See the [2.0.0 migration notes](docs/heavyball2.md), then follow the 3.0.0 guide.
+
+## Contributing
+
+To contribute, fork the repository, install with `pip install -e .[dev]`, and run `pytest`.
+
+## License
+
+BSD-2-Clause, see [LICENSE](LICENSE).
+
+The name "HeavyBall" comes from [Polyak's heavy-ball method](https://doi.org/10.1016/0041-5553(64)90137-5), the momentum
+technique underlying most modern optimizers.
+
+[pypi]: https://pypi.org/project/heavyball/
+
+[license]: LICENSE
+
+---
+
+# Beyond the Leaderboard: A Diagnostic Benchmark for Optimizer Reliability
+
+Source: https://github.com/homebrewml/heavyball/blob/main/docs/benchmark.md
+
+# Beyond the Leaderboard: A Diagnostic Benchmark for Optimizer Reliability
+
+Traditional machine learning benchmarks often incentivize "teaching to the test," a race to top leaderboards that may
+not reflect real-world performance. This practice can mask a critical issue: **silent failures**. Optimizers may
+converge without reporting an error, yet settle in a suboptimal solution, leading to models that underperform in subtle
+but significant ways. Such failures are costly, as they often go undetected until significant downstream damage has occurred.
+
+The HeavyBall Benchmark was created to address this problem. It's not another leaderboard but a diagnostic tool
+designed to expose hidden optimizer weaknesses. Each test provides a clear, pass/fail check against known optimization
+challenges, creating a detailed map of an optimizer's strengths and weaknesses.
+
+## The Problem of Silent Failures
+
+A silent failure occurs when an optimizer converges without error yet settles in a suboptimal basin, leading to poor
+downstream model performance. A descending loss curve can be profoundly misleading. Without a clear point of comparison,
+an optimizer that has simply gotten stuck can appear identical to one that has found a genuinely good solution.
+
+![Three optimizers (SGD, L-BFGS, PSGD) converging to different loss values on the same problem.](assets/early_stopping.png)
+*Figure 3 from ["Black Box Lie Group Preconditioners for SGD"](https://arxiv.org/abs/2211.04422). As shown, SGD (blue)
+appears converged, but PSGD (black) finds a significantly better basin. This highlights a fundamental capability gap.*
+
+The graph above illustrates this trap. All three optimizers seem to converge as their loss curves flatten. An
+unsuspecting practitioner might see the flatlining loss of the blue curve (SGD) and conclude the job is done. Yet, the
+black curve (PSGD) consistently finds a solution that is an order of magnitude better. This isn't a matter of an unlucky
+random seed; it's a capability gap. No amount of rerunning SGD will find the better solution that PSGD locates with
+ease.
+
+This capability gap often goes unnoticed. The training logs provide no explicit error, leaving developers to discover
+the underperformance only through expensive downstream evaluation.
+
+## The HeavyBall Diagnostic Benchmark
+
+Instead of a single score, the HeavyBall Benchmark provides a granular, diagnostic map of an optimizer's performance.
+It's built on a suite of over 150 independent, pass/fail tests, each targeting a specific, well-understood challenge
+known to cause hidden failures.
+
+![A heatmap showing various optimizers (columns) and their success rate on different benchmark tasks (rows).](assets/benchmark_matrix.png)
+*This map reveals systemic strengths and weaknesses in popular optimizers. Each cell represents a pass/fail outcome for
+a solver (column) on a specific task (row). Darker blue indicates a higher success rate.*
+
+There is no partial credit; the optimizer either solves the problem or it does not. This binary outcome makes failure
+modes explicit, turning abstract weaknesses into concrete, observable data.
+
+### Experimental Setup
+
+To ensure a fair comparison, we gave each optimizer a generous budget: 1,000 hyperparameter trials per task, with each
+trial running for up to 1,000,000 steps. This setup tests the optimizer's raw capability, not just its default settings.
+The `Attempts` column in our results reflects the average number of trials needed for success; a lower number indicates
+that the method is easier to tune for the problems it can solve.
+
+## Benchmark Results: No Single Best Optimizer
+
+Our results show that no single optimizer dominates. Even the best-performing optimizers exhibit surprising weaknesses,
+reinforcing the need for diagnostic rather than purely comparative evaluation.
+
+| Optimizer      | Cautious¹ | Mars² | Success | Attempts | Avg Runtime (s) |
+|:---------------|:----------|:------|:--------|:---------|:----------------|
+| PSGDKron       | No        | No    | 77.0%   | 73.2     | 8240            |
+| PSGDKron (Newton) | No     | No    | 77.0%   | 80.5     | 9052            |
+| AdamW          | Yes       | No    | 75.7%   | 61.2     | 8072            |
+| SOAP           | No        | No    | 72.5%   | 77.9     | 7827            |
+| AdamW          | No        | No    | 72.3%   | 107.8    | 10029           |
+| MuonLaProp     | No        | No    | 68.2%   | 82.7     | 10141           |
+| RMSprop        | No        | No    | 55.6%   | 114.4    | 10725           |
+| Muon           | No        | No    | 51.0%   | 129.1    | 14525           |
+
+<small>¹ `Cautious`: Avoids taking a step in a direction the current gradient does not agree with</small>
+<br>
+<small>² `Mars`: Reduces variance in gradients</small>
+
+*This is a subset of the full results. For a complete breakdown, see
+the [full benchmark results](https://github.com/HomebrewML/LightBench/blob/master/lightbench/benchmark_results.md).*
+
+### Case Study: The `AdamW` Family
+
+The results for the popular AdamW optimizer are particularly revealing. The standard implementation has a respectable
+72.3% success rate. However, enabling the `Cautious` flag boosts the success rate to 75.7% and significantly reduces the
+number of attempts needed to find a solution. This isn't just a number; it's a diagnostic signal. The standard `AdamW`
+is more prone to getting stuck in ways that its `Cautious` variant can avoid, allowing a practitioner to make a more
+informed choice.
+
+### Case Study: Escaping the Saddle Point
+
+An optimizer’s inability to navigate a saddle point is a classic example of a silent failure. A key test of an
+optimizer's robustness is its ability to navigate a saddle point - a region that is a minimum in one direction but a
+maximum in another. The gradient approaches zero at the center, trapping first-order methods that rely solely on the
+gradient.
+
+![Animation: Optimizer paths on a saddle point, showing SGD getting stuck while a momentum-based optimizer successfully escapes.](assets/saddle_point_comparison.gif)
+
+Our benchmark includes a specific test for this challenge. An optimizer that passes demonstrates a greater capacity to
+handle the complex non-convex landscapes common in deep learning. A failure provides a clear diagnostic signal that the
+optimizer may be unreliable in these settings.
+
+## Conclusion
+
+The HeavyBall Benchmark represents a necessary shift in how we evaluate optimizers, moving from a culture of
+score-chasing to one of deep, diagnostic understanding. These hidden failures aren’t rare edge cases - they’re a routine
+source of wasted compute and disappointing models. By making them explicit, the benchmark equips researchers and
+practitioners with a detailed map of an optimizer's capabilities. By clearly identifying hidden failure modes,
+practitioners can confidently choose, tune, or reconsider their optimization strategies, ultimately leading to more
+robust and reliable models. Future work will focus on expanding our suite of diagnostic tests to cover more complex
+failure modes and developing novel visualization techniques.
+
+---
+
+**Resources:**
+
+* **Full Results:** [LightBench/src/lightbench/benchmark_results.md](https://github.com/HomebrewML/HeavyBall/blob/main/LightBench/src/lightbench/benchmark_results.md)
+* **Benchmark Code:** [https://github.com/HomebrewML/HeavyBall/tree/main/LightBench](https://github.com/HomebrewML/HeavyBall/tree/main/LightBench)
+
+---
+
+# HeavyBall 2.0.0
+
+Source: https://github.com/homebrewml/heavyball/blob/main/docs/heavyball2.md
+
+# HeavyBall 2.0.0
+
+## Highlights
+
+* First‑class SAM via `SAMWrapper` (closure‑based)
+* More robust checkpoint/restore with HeavyBall‑internal state
+* New optimizers: `SGD`, `AdamC`, `MSAMLaProp`
+* Overhauled chainable pipeline: indexed transforms, branching, internal gradient‑accumulation, and `SqueezeGrad`
+* Faster, more accurate code paths
+* New `heavyball.helpers` with Optuna‑compatible samplers and utilities
+
+---
+
+## Detailed changes
+
+### New & improved
+
+* `SAMWrapper` applies sharpness‑aware minimization to any HeavyBall optimizer while preserving the wrapped step logic;
+  requires a closure
+* `SGD` built on the chainable internals
+* `AdamC`, a ["corrected version of Adam"](https://arxiv.org/abs/2506.02285) with weight decay normalized by the
+  maximum LR
+* `MSAMLaProp` built on top of [Momentum‑SAM](https://arxiv.org/abs/2401.12033)
+* Chainable pipeline:
+    * Every transform carries a `transform_idx`; state keys include this index
+    * [Optimizer branching](https://github.com/HomebrewML/HeavyBall/blob/2f7e095fb8217a58600d86ea6b19682c10e7eb33/examples/branched_optimizer.py#L15-L28),
+      for more freedom in optimizer design and native [grafting](https://openreview.net/forum?id=FpKgG31Z_i9) support
+    * `PrecondGradAccumGuard` enables gradient accumulation for preconditioner fitting
+    * `SqueezeGrad` removes size‑1 dims before functional transforms, improving PSGD's speed and preconditioner fitting
+* PSGD and SOAP speedups through new, more accurate SVD calculation and better compilation
+* `heavyball.helpers` module with Optuna‑compatible samplers and sweep utilities
+
+### Breaking changes
+
+* Default orthogonalization switches to Newton-Schulz, impacting Muon; SOAP relies on `precise_zeroth_power_mode="qr"`
+  and remains unchanged
+* Optimizer state keys include the per‑transform index (e.g., `exp_avg_3`), breaking old checkpoints
+
+## Upgrade checklist
+
+1. Re‑test optimizers sensitive to orthogonalization; set `utils.zeroth_power_mode="qr"` to restore 1.x behavior
+2. Migrate checkpoints using `python scripts/migrate_optimizer_state.py <checkpoint_path> heavyball.<OptimizerClass>`
+3. Update any custom state‑dict tooling to handle transform‑indexed keys
+
+---
+
+# HeavyBall 3.0.0
+
+Source: https://github.com/homebrewml/heavyball/blob/main/docs/heavyball3.md
+
+# HeavyBall 3.0.0
+
+## Highlights
+
+* Simplified public API: `Foreach*` prefixes removed, short names are now the canonical classes
+* New optimizers: `HyperBallAdamW`, `MuonAdamW`, `LATHER`, `PSGDPRO`
+* `LATHER`, "Lie-group Adam Through Harmonic Eigenbasis Rotations", performs AdamW in the PSGD eigenbasis
+* `Route`-based param dispatch replaces manual `SplitOpt` for mixed-architecture optimizers
+* `ScheduleFree` and `MSAM` mode switches are now idempotent (`eval()` twice is safe)
+* Higher-precision PSGD preconditioner updates
+* New `consume_grad` option: `step()` clears `p.grad` after consuming it by default; set `consume_grad=False` to keep gradients attached after the step
+* `orig_shapes` is now an explicit documented optimizer argument; use `capture_param_shapes(...)` before wrapping models with sharding backends that do not preserve original parameter shapes
+* `torch.compile`-friendly step with automatic eager fallback for init/preconditioning
+
+---
+
+## Release benchmarks
+
+HeavyBall 3.0.0 was benchmarked against HeavyBall 2.0.0 and `torch.optim` with
+[`benchmarks/bench_release_optimizers.py`](../benchmarks/bench_release_optimizers.py), with compiled AdamW step latency
+dropping from 10.63 ms in HeavyBall 2.0.0 to 4.15 ms in HeavyBall 3.0.0, a 2.56x speedup.
+
+## Breaking changes
+
+### Class renames
+
+Every `Foreach*` class is renamed to its short form. The old short-form aliases (which existed
+in 2.x) keep working, only the `Foreach*` imports break.
+
+| 2.x name | 3.x name |
+|---|---|
+| `ForeachAdamW` | `AdamW` |
+| `ForeachNAdam` | `NAdam` |
+| `ForeachAdEMAMix` | `AdEMAMix` |
+| `ForeachAdamC` | `AdamC` |
+| `ForeachRMSprop` | `RMSprop` |
+| `ForeachSFAdamW` | `SFAdamW` |
+| `ForeachADOPT` | `ADOPT` |
+| `ForeachMuon` | `Muon` |
+| `ForeachLaProp` | `LaProp` |
+| `ForeachSignLaProp` | `SignLaProp` |
+| `ForeachSOAP` | `SOAP` |
+| `ForeachSOAPNAdam` | `SOAPNAdam` |
+| `ForeachSOAPAdEMAMix` | `SOAPAdEMAMix` |
+| `ForeachSOLP` | `SOLP` |
+| `ForeachPSGDKron` | `PSGDKron` |
+| `ForeachPSGDLRA` | `PSGDLRA` |
+
+### Removed optimizer classes
+
+These were thin subclasses that only set a class-level default. Use the parent class with the
+corresponding constructor argument instead.
+
+| 2.x class | 3.x equivalent |
+|---|---|
+| `PaLMForeachSFAdamW` / `PaLMSFAdamW` | `SFAdamW(..., palm=True)` |
+| `PaLMForeachSOAP` / `PaLMSOAP` / `PalmForEachSoap` | `SOAP(..., palm=True)` |
+| `PrecondScheduleForeachSOAP` / `PrecondScheduleSOAP` | `SOAP(..., use_precond_schedule=True)` |
+| `PrecondSchedulePaLMForeachSOAP` / `PrecondSchedulePaLMSOAP` | `SOAP(..., palm=True, use_precond_schedule=True)` |
+| `ForeachPurePSGD` / `PurePSGD` | `PSGDKron(..., exp_avg_input=False)` |
+| `ForeachCachedPSGDKron` / `CachedPSGDKron` | `PSGDKron(...)` (caching is now the default) |
+| `ForeachDelayedPSGD` / `DelayedPSGD` | `PSGDKron(..., delayed=True)` |
+| `ForeachCachedDelayedPSGDKron` / `CachedDelayedPSGDKron` | `PSGDKron(..., delayed=True)` |
+| `ForeachCachedNewtonPSGD` / `NewtonPSGDKron` | `PSGDKron(..., hessian_approx=True)` |
+| `NewtonHybrid2PSGDKron` | `PSGDKron(..., hessian_approx=True, hvp_interval=2)` |
+| `ForeachDelayedPSGDLRA` / `DelayedPSGDLRA` | `PSGDLRA(..., delayed=True)` |
+| `ForeachNewtonPSGDLRA` / `NewtonPSGDLRA` | `PSGDLRA(..., hessian_approx=True)` |
+| `NewtonHybrid2PSGDLRA` | `PSGDLRA(..., hessian_approx=True, hvp_interval=2)` |
+
+### Renamed parameters
+
+| 2.x parameter | 3.x parameter | Notes |
+|---|---|---|
+| `foreach` | `multi_tensor` | Passing `foreach` emits a `FutureWarning` and remaps automatically |
+
+### Removed parameters
+
+These raise `TypeError` if passed. They were either unused or replaced by better defaults.
+
+| Parameter | Previously on | Notes                                                    |
+|---|---|----------------------------------------------------------|
+| `stochastic_schedule` | SOAP, PSGDKron, PSGDLRA | Deterministic accumulation schedule is now the only mode |
+| `normalize_grads` | SOAP variants | Was unused in the transform pipeline                     |
+| `correct_bias` | SOAP variants | Was unused in the transform pipeline                     |
+| `inverse_free` | PSGDKron | Use `quad_torch` or PSGDPRO for inverse-free PSGD        |
+| `adaptive` | PSGDKron | Removed                                                  |
+
+### Helper sampler kwargs
+
+These compatibility kwargs were removed from `heavyball.helpers` samplers and now raise
+`TypeError`.
+
+| Class | Removed kwargs |
+|---|---|
+| `BoTorchSampler` | `constraints_func`, `consider_running_trials` |
+| `HEBOSampler` | `constant_liar` |
+| `ImplicitNaturalGradientSampler` | `lr`, `warn_independent_sampling` |
+| `AutoSampler` | `constraints_func` |
+
+### Chainable API renames
+
+| 2.x name | 3.x name |
+|---|---|
+| `Branch` | `Parallel` |
+
+### Behavioral changes
+
+* **ScheduleFree / MSAM `eval()` / `train()`**: Now idempotent. Calling `eval()` twice no
+  longer flips back to train mode. Both methods accept a `mode` argument matching
+  `nn.Module.train(mode)` and return `self`.
+* **Gradient lifetime**: `consume_grad=True` is available on all optimizers and clears `p.grad`
+  during `step()` once the gradient has been consumed. Set `consume_grad=False` if your code
+  reads gradients after stepping or relies on them remaining attached.
+* **Sharded parameter shapes**: Built-in optimizers now expose `orig_shapes` explicitly. Use
+  `capture_param_shapes()` before wrapping parameters if your sharding backend hides original
+  shapes.
+* **PSGD dampening**: `dampen_grad` default changed from `2**-13` to `1e-9`, and dampening
+  epsilon uses `torch.finfo(float32).eps` regardless of input dtype. This improves
+  preconditioner accuracy but may change convergence behavior.
+
+---
+
+## Checkpoint migration
+
+Use the migration CLI to convert 1.x or 2.x checkpoints:
+
+```bash
+python scripts/migrate_optimizer_state.py <checkpoint.pt> <OptimizerClass>
+```
+
+Old class names (including all aliases listed above) are resolved automatically.
+The `foreach` → `multi_tensor` key rename in param groups is handled automatically.
+
+---
+
+## Upgrade checklist
+
+1. Replace `from heavyball import Foreach*` with the short name (e.g., `ForeachAdamW` → `AdamW`)
+2. Replace `foreach=` with `multi_tensor=` in constructor calls
+3. Replace removed subclass instantiations with parent + kwargs (see table above)
+4. Remove any `stochastic_schedule`, `normalize_grads`, `correct_bias`, `inverse_free`, or `adaptive` kwargs
+5. Replace `Branch(...)` with `Parallel(...)` in custom chainable code
+6. Migrate checkpoints: `python scripts/migrate_optimizer_state.py <ckpt> heavyball.<Optimizer>`
+7. If you relied on `eval(); eval()` toggling back to train mode, update your code
+8. If your training loop reads `p.grad` after `step()`, pass `consume_grad=False`
+9. Remove obsolete compatibility kwargs from `heavyball.helpers` samplers
+
+---
+
+# PSGD Efficiency
+
+Source: https://github.com/homebrewml/heavyball/blob/main/docs/psgd_efficiency.md
+
+# PSGD Efficiency
+
+This document discusses various methods of reducing PSGD's memory and compute overhead, as well as the trade-offs
+involved.
+
+## `triu_as_line`
+
+`triu_as_line` is an argument that reduces the preconditioniner (`Q`) storage overhead by storing only the upper
+triangle of the triangular `Q` as a 1D array, halving memory usage.\
+This comes at the cost of having to remap the 1D array to a 2D array every time the preconditioner is used, which needs
+significant memory bandwidth.
+`triu_as_line` is enabled by default, and can be disabled by setting it to `False`.\
+
+A high-overhead test-case (`python3 xor_digit.py --batch 16 --size 1024 --length 4 --depth 1`) showed that the total
+step time may be increased by up ~58% when training with `triu_as_line=True`.\
+Larger batch sizes help ammortize this issue.
+
+![psgd_efficiency_triu_as_line.png](assets/psgd_efficiency_triu_as_line.png)
+
+## Cached Preconditioner
+
+For `PSGDKron`, there's an alternative variant, `CachedPSGDKron`.\
+PSGDKron computes the preconditioning matrix on the fly based on the triangular `Q`. However, this preconditioner can be
+precomputed and reused across steps. This reduces the per-step overhead of computing the preconditioner, but doubles
+the memory overhead.
+
+![psgd_efficiency_cache.png](assets/psgd_efficiency_cache.png)
+
+If the doubled memory cost of `CachedPSGDKron` is too high, it's possible to use `CachedPSGDKron` with
+`triu_as_line=True`, which reduces the total memory cost from 2x `Q` to 1.5x `Q`.
+
+![psgd_efficiency_cache_triu_as_line.png](assets/psgd_efficiency_cache_triu_as_line.png)
+
+---
