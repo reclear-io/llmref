@@ -1,0 +1,1176 @@
+# buildhost
+
+Source: https://github.com/wow-look-at-my/buildhost/blob/master/README.md
+
+# buildhost
+
+Self-hosted universal package registry. Upload a release artifact once, download it in any packaging format.
+
+## Supported formats
+
+From a single uploaded binary, buildhost serves:
+
+- **Raw binary** download
+- **tar.gz**, **tar.xz**, **tar.zst** archives
+- **zip** archive
+- **APT repository** (`.deb` packages with repo metadata)
+- **Homebrew tap** (Ruby formula with computed sha256)
+- **npm registry** (platform-specific npm packages)
+- **OCI/Docker registry** (minimal container images synthesized from the binary, with CA certificates and a minimal rootfs so networked services run out of the box)
+
+## Homebrew
+
+buildhost exposes a generated Homebrew tap as a Git repository. Add the tap once,
+then install formulas through the tap name:
+
+```bash
+brew tap pazer/build https://brew.pazer.build/tap.git
+brew install pazer/build/go-toolchain
+```
+
+Do not install formulas with a naked remote URL such as
+`brew install https://brew.pazer.build/go-toolchain`; modern Homebrew treats that
+as a formula or tap name instead of cloning it as a formula URL.
+
+## APT (Debian / Ubuntu)
+
+buildhost serves each project as its own GPG-signed APT repository at
+`apt.<domain>/<project>` (suite `stable`, component `main`). Packages are
+generated on demand from the uploaded binary -- nothing is pre-built.
+
+Import the repository signing key once, add the source, then install. The key is
+served per project path but is the same server-wide key:
+
+```bash
+sudo install -d -m 0755 /etc/apt/keyrings
+curl -fsSL https://apt.pazer.build/myapp/key.asc \
+  | sudo gpg --dearmor -o /etc/apt/keyrings/buildhost.gpg
+echo "deb [signed-by=/etc/apt/keyrings/buildhost.gpg] https://apt.pazer.build/myapp stable main" \
+  | sudo tee /etc/apt/sources.list.d/myapp.list
+sudo apt update && sudo apt install myapp
+```
+
+### Private projects
+
+A private project requires a token on every APT request. Put it in an
+`apt.conf.d`-style auth file so both `apt update` and the package download
+(which redirects to the `static` subdomain) authenticate. buildhost reads the
+token from the HTTP Basic **password** field (the username is ignored, so any
+value works -- `token` is used here by convention):
+
+```bash
+sudo install -d -m 0755 /etc/apt/keyrings
+# key.asc is itself gated for a private project, so authenticate the key fetch too
+curl -fsSL -u "token:$TOKEN" https://apt.pazer.build/myapp/key.asc \
+  | sudo gpg --dearmor -o /etc/apt/keyrings/buildhost.gpg
+echo "deb [signed-by=/etc/apt/keyrings/buildhost.gpg] https://apt.pazer.build/myapp stable main" \
+  | sudo tee /etc/apt/sources.list.d/myapp.list
+cat <<EOF | sudo tee /etc/apt/auth.conf.d/buildhost.conf >/dev/null
+machine apt.pazer.build login token password $TOKEN
+machine static.pazer.build login token password $TOKEN
+EOF
+sudo chmod 600 /etc/apt/auth.conf.d/buildhost.conf
+sudo apt update && sudo apt install myapp
+```
+
+### Slash-namespaced projects
+
+A Debian package name cannot contain `/` (or `_`), so for a slash-namespaced
+project the package name folds those characters to `-`. Project
+`pr-reviewer-agent/server` is served at `apt.pazer.build/pr-reviewer-agent/server`
+(the slash stays in the repository URL) but installs as the package
+**`pr-reviewer-agent-server`**, and the binary lands at
+`/usr/bin/pr-reviewer-agent-server`:
+
+```bash
+echo "deb [signed-by=/etc/apt/keyrings/buildhost.gpg] https://apt.pazer.build/pr-reviewer-agent/server stable main" \
+  | sudo tee /etc/apt/sources.list.d/pr-reviewer-agent-server.list
+sudo apt update && sudo apt install pr-reviewer-agent-server
+```
+
+## Web frontend
+
+buildhost serves a public, read-only browse UI on the main domain (no subdomain). It is plain server-rendered HTML with **no JavaScript**, so it is consumable and indexable by crawlers and agents without evaluating a single-page app.
+
+- `GET /` &mdash; index of every public project
+- `GET /projects/{project}` &mdash; a project's metadata, published releases, deployed static sites, and copy-paste install/download commands
+- `GET /projects/{project}/releases/{version}` &mdash; a release's artifacts with per-format download links (`raw`, `tar.gz`, `tar.xz`, `tar.zst`, `zip`), or a `docker pull` for image releases
+
+Private projects are hidden: they are never listed for anonymous visitors, and visiting one's page directly returns a `404` &mdash; identical to a project that does not exist, so the frontend never reveals that a private project exists (the same way GitHub treats private repositories). A read-scoped token authorized for the project reveals it. Download links point at the `dl` subdomain; the single stylesheet is served from `/_ui/style.css` and no other assets are loaded. The authenticated admin dashboard remains a separate app on its own port (see [Container image](#container-image)).
+
+## Synthesized container images
+
+When a project has only a plain binary (no pushed image), buildhost synthesizes an OCI
+image from it on demand -- `docker pull` / `crane pull` just works. The image is
+deliberately minimal but ships the runtime essentials of `gcr.io/distroless/static`, so a
+networked service works without pushing a real image:
+
+- A real public **CA certificate bundle** at `/etc/ssl/certs/ca-certificates.crt` (and
+  `SSL_CERT_FILE` pointing at it), so outbound HTTPS works -- no more
+  `x509: certificate signed by unknown authority`.
+- `/etc/passwd` and `/etc/group` with `root`, `nobody` and `nonroot` (UID 65532), an
+  `/etc/nsswitch.conf` (`hosts: files dns`) and a sticky `/tmp`.
+- The binary at `/<project>` as the entrypoint, a sane `PATH`, and `WorkingDir=/`.
+
+The image runs as **root** by default. To run as another user, set `oci_user` on the
+release (`uid[:gid]` or `name[:group]`, e.g. `65532:65532` for the bundled nonroot user);
+it is emitted as the image's `config.User`:
+
+```bash
+buildhost publish --oci-user 65532:65532 ...   # or oci_user in a release manifest / the
+                                               # oci_user field of the create-release JSON
+```
+
+The synthesized image is regenerated on demand (not stored), so its digest is not pinned
+and may change between buildhost versions.
+
+## Publishing real Docker images
+
+Some projects need to ship a real prebuilt image (custom base image, native
+libraries, entrypoint, exposed ports) rather than a binary wrapped in a minimal
+layer. buildhost is a writable OCI registry, so you can `docker push` directly:
+
+The OCI registry is served on the `oci.` subdomain (the apex host serves the
+API, not `/v2/`):
+
+```bash
+docker login oci.builds.example.com -u oidc -p "$TOKEN"   # any username; password is a write-scoped token
+docker buildx build --push -t oci.builds.example.com/myproject:v1.2.3 .
+docker pull oci.builds.example.com/myproject:v1.2.3
+```
+
+A release that contains a pushed image is a **docker build**: it is served only
+through the OCI (`/v2`) endpoint. The apt/brew/npm and raw-download endpoints do
+not apply to it -- it is just a container image. Pushed image layers are
+content-addressed and deduplicated, so unchanged layers are not re-uploaded on
+later pushes. Per-blob size is capped by `BUILDHOST_MAX_BLOB_SIZE` (default 10 GiB).
+
+### From GitHub Actions
+
+Use the `buildhost-publish-docker` action to build and push in one step,
+authenticating with a GHA OIDC token (no static secret -- the project
+auto-provisions on first push):
+
+```yaml
+permissions:
+  id-token: write   # required to mint the OIDC token
+  contents: read
+steps:
+  - uses: actions/checkout@v4
+  - uses: wow-look-at-my/buildhost/.github/actions/buildhost-publish-docker@master
+    with:
+      server: https://builds.example.com   # optional, defaults to https://pazer.build
+      context: .                            # optional
+      # tags default to the commit SHA and "latest"; bare tags are expanded to
+      # <registry>/<project>:<tag>, full references (with "/" or ":") are used as-is.
+      tags: |
+        ${{ github.sha }}
+        latest
+```
+
+For a build you drive yourself (e.g. `docker buildx imagetools` to copy an
+existing multi-arch image), use the lower-level `buildhost-docker-login` action,
+which performs the OIDC `docker login` and exposes the registry host
+(`oci.<domain>`) as its `registry` output, so you can push to
+`<registry>/<project>:<tag>` and then run your own docker commands.
+
+## Container image
+
+A container image is published to `ghcr.io/wow-look-at-my/buildhost:latest` on every push to master.
+
+The image is based on `gcr.io/distroless/static-debian12:nonroot` and runs as UID 65532. It contains:
+
+- `/usr/local/bin/buildhost` -- the statically linked binary
+- CA certificates (from distroless base)
+- `/etc/passwd` with `nonroot` user (UID 65532)
+
+No shell, no package manager, no other binaries.
+
+### Recommended docker-compose configuration
+
+```yaml
+services:
+  buildhost:
+    image: ghcr.io/wow-look-at-my/buildhost:latest
+    ports:
+      - "8080:8080"
+    volumes:
+      - buildhost-data:/var/lib/buildhost
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    pids_limit: 256
+    mem_limit: 512m
+    networks:
+      - buildhost
+
+  # The admin dashboard (port 9090) has NO built-in authentication.
+  # It MUST be placed behind a reverse proxy with access control
+  # (e.g., Cloudflare Access on a separate hostname).
+  # Do NOT expose port 9090 to untrusted networks.
+
+networks:
+  buildhost:
+    driver: bridge
+    internal: true
+
+volumes:
+  buildhost-data:
+```
+
+**Note:** The server reads the container's memory cgroup at startup and sets `GOMEMLIMIT` to ~90% of it (via [automemlimit](https://github.com/KimMachineGun/automemlimit)), and all download/repackage paths stream (blob reads are mmap-backed, nothing buffers a whole artifact), so buildhost serves artifacts far larger than `mem_limit` without OOM-ing. Set `GOMEMLIMIT` yourself (or `AUTOMEMLIMIT=off`) to override.
+
+**Note:** Binary stripping (`strip`/`objcopy`) is not available in the hardened image. Uploaded binaries are served as-is. If you need debug info stripping, run it in your CI pipeline before uploading.
+
+## Quick start
+
+```bash
+# Start the server
+buildhost serve
+
+# Create a token (first time setup)
+buildhost token create --server http://localhost:8080 --token $BOOTSTRAP_TOKEN --name ci
+
+# Create a project
+buildhost project create --server http://localhost:8080 --token $TOKEN --name myapp
+
+# Publish an artifact
+buildhost publish \
+  --server http://localhost:8080 \
+  --token $TOKEN \
+  --project myapp \
+  --os linux --arch amd64 \
+  --artifact ./myapp-linux-amd64
+
+# Download
+curl -O http://localhost:8080/dl/myapp/latest/linux/amd64
+```
+
+## Versioning
+
+Projects use auto-incrementing versions by default (v1, v2, v3...). Opt into semver with `--versioning semver` at project creation.
+
+Git branch and commit are tracked on every release. Download the latest build of a branch:
+
+```
+GET /dl/myapp/branch/main/linux/amd64
+```
+
+`latest` (no branch) resolves to the newest published release on the project's **default branch** -- `master` by default, but buildhost detects each repo's real default branch automatically: on a GitHub Actions OIDC publish it reads the `owner/repo` from the token and asks GitHub for that repo's default branch, so a repo that releases off another branch (e.g. `v1`) gets a correct `latest` with nothing sent in the publish. A push to a feature branch never hijacks `latest`. When the default branch has no published release yet, `latest` is not available. buildhost authenticates these lookups as a **GitHub App** (`BUILDHOST_GITHUB_APP_ID` + `BUILDHOST_GITHUB_APP_PRIVATE_KEY`, PEM contents or a file path) -- recommended: short-lived installation tokens, `metadata: read` only, high rate limit. A static `BUILDHOST_GITHUB_TOKEN` PAT works as a fallback; without either, lookups are anonymous (GitHub throttles those to 60/hr/IP and cannot read private repos).
+
+## Static sites
+
+Host small, self-contained static sites with independent per-branch deployments. Each branch gets its own site that exists from first deploy until explicitly deleted.
+Directory requests serve `index.html`. If a requested file is missing and the uploaded site contains a root `404.html`, buildhost serves that page with HTTP 404.
+
+Sites are served on the `sites.` subdomain (like every other service); pass the
+apex `--server` and the CLI derives it.
+
+```bash
+# Deploy a site from a directory
+buildhost publish-site \
+  --server http://localhost:8080 \
+  --token $TOKEN \
+  --project myapp \
+  --branch main \
+  --dir ./dist
+
+# The site is available at:
+# http://sites.localhost:8080/myapp/branch/main/
+
+# Re-deploying the same branch replaces the previous site atomically.
+# Deleting a branch deployment:
+curl -X DELETE -H "Authorization: Bearer $TOKEN" \
+  http://sites.localhost:8080/myapp/branch/main
+```
+
+## Tokens
+
+Tokens authenticate all API requests. There are two kinds:
+
+- **Global tokens** (`project_id` omitted): can access all projects and manage tokens.
+- **Project-scoped tokens** (`project_id` set): limited to one project; cannot list or delete tokens.
+
+Each token has a `scopes` field, a comma-separated subset of `read`, `write`, and `share`. The default when omitted is `read`. A token can only grant scopes it already holds — a read-only token cannot mint a write token. `share` is a distinct permission to mint [temporary download links](#temporary-download-links); it is not implied by `write`, so a CI/deploy token cannot hand out shareable links to private artifacts. The bootstrap admin token holds `read,write,share`.
+
+### First-time setup
+
+On a fresh server with no tokens, use `buildhost bootstrap` to create the first admin token. It reads from the database directly and does not require a running server.
+
+```bash
+buildhost bootstrap                    # creates token named "admin"
+buildhost bootstrap --name admin-token # custom name
+```
+
+The plaintext token is printed to stdout. Store it securely — it is not retrievable later.
+
+### Create a token (CLI)
+
+```bash
+buildhost token create \
+  --server https://buildhost.example.com \
+  --token $ADMIN_TOKEN \
+  --name ci \
+  --scopes read,write
+```
+
+To create a project-scoped token, pass `--scopes` and include `project_id` in the request body directly via curl (the CLI does not expose `--project-id` yet — see below).
+
+### Create a token (API)
+
+```bash
+# Global read+write token
+curl -X POST https://buildhost.example.com/api/v1/tokens \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "ci", "scopes": "read,write"}'
+
+# Project-scoped read token (project id 3)
+curl -X POST https://buildhost.example.com/api/v1/tokens \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "deploy-bot", "project_id": 3, "scopes": "read,write"}'
+```
+
+Response:
+
+```json
+{
+  "token": "bh_plaintext_value_shown_once",
+  "details": { "id": 7, "name": "ci", "scopes": "read,write", ... }
+}
+```
+
+### List and delete tokens
+
+```bash
+# List all tokens (global token required)
+buildhost token list --server https://buildhost.example.com --token $ADMIN_TOKEN
+
+# Delete by id (global token required; cannot delete your own token)
+curl -X DELETE https://buildhost.example.com/api/v1/tokens/7 \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
+### Using a token
+
+All three forms are equivalent:
+
+```bash
+# Bearer token (preferred)
+curl -H "Authorization: Bearer $TOKEN" https://buildhost.example.com/api/v1/projects
+
+# Basic auth (password field is the token; username is ignored)
+curl -u "token:$TOKEN" https://buildhost.example.com/api/v1/projects
+
+# Query parameter (for clients that cannot set headers, e.g. APT, Brew)
+curl "https://buildhost.example.com/api/v1/projects?token=$TOKEN"
+```
+
+## Temporary download links
+
+To share a single artifact from a **private** project without handing out a token, mint a temporary, signed download link. The link works for exactly one artifact (`os`/`arch`/`fmt`/`version`) and expires (default 1 hour, max 24 hours).
+
+```bash
+curl -X POST https://buildhost.example.com/api/v1/projects/myapp/download-links \
+  -H "Authorization: Bearer $SHARE_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"os": "linux", "arch": "amd64", "version": "3", "fmt": "raw", "ttl_seconds": 3600}'
+```
+
+```json
+{
+  "url": "https://static.example.com/file?arch=amd64&fmt=raw&os=linux&project=myapp&token=bhdl_...&v=3",
+  "token": "bhdl_...",
+  "expires_at": "2026-06-11T12:00:00Z"
+}
+```
+
+Anyone with the `url` can download that one artifact until it expires — no account or token needed. Minting requires a token with the `share` scope, authorized for the project. The admin dashboard exposes the same thing as a **"temp link"** button on each release's artifact list.
+
+The link is a stateless HMAC signature (keyed by a server-side key generated on first start), bound to the exact artifact and expiry, so a leaked link cannot reach anything else in the project or outlive its expiry. Links are not individually revocable before expiry; rotate the signing key to invalidate all outstanding links.
+
+## API
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/api/v1/tokens` | Create token |
+| GET | `/api/v1/tokens` | List tokens (global token required) |
+| DELETE | `/api/v1/tokens/{id}` | Delete token (global token required) |
+| POST | `/api/v1/projects/{project}/download-links` | Mint a temporary signed download link (`share` scope) |
+| POST | `/api/v1/projects` | Create project |
+| GET | `/api/v1/projects` | List projects |
+| POST | `/api/v1/projects/{project}/releases` | Create release |
+| PUT | `/api/v1/projects/{project}/releases/{version}/artifacts/{os}/{arch}` | Upload artifact |
+| POST | `/api/v1/projects/{project}/releases/{version}/publish` | Publish release |
+| POST | `/api/v1/webhooks/github` | GitHub org webhook receiver for branch deletion cleanup |
+| GET | `/dl/{project}/{version}/{os}/{arch}` | Download |
+| GET | `/dl/{project}/latest/{os}/{arch}` | Download latest |
+| GET | `/dl/{project}/branch/{branch}/{os}/{arch}` | Download latest for branch |
+| PUT | `/sites/{project}/branch/{branch}` | Deploy static site (tar.gz body) |
+| DELETE | `/sites/{project}/branch/{branch}` | Remove static site |
+| GET | `/sites/{project}/branch/{branch}/{path}` | Serve static site file |
+| GET | `/sites/{project}/branches` | List branch deployments |
+| GET | `/llms.txt` | Plain-text guide to buildhost for LLMs ([llmstxt.org](https://llmstxt.org)) |
+| GET | `/healthz` | Liveness check (database ping); JSON body reports the running build's commit and version |
+| GET | `/` | Public read-only web frontend: index of public projects |
+| GET | `/projects/{project}` | Web frontend: project page (releases, install commands) |
+| GET | `/projects/{project}/releases/{version}` | Web frontend: release page (artifacts + download links) |
+
+## llms.txt
+
+`GET /llms.txt` serves a public, unauthenticated plain-text document that explains what buildhost is and how to use it, aimed at LLMs and automated agents. Example URLs in the document are rendered against the request's `Host`, so they always point at the live deployment.
+
+## Health and version
+
+`GET /healthz` returns `200` when the server is up and its database is reachable, and `503` when the database is unreachable. Either way the JSON body reports the exact build the server is running, so you can check which image a deployment is on:
+
+```json
+{"status":"ok","commit":"<git-sha>","version":"v0.0.<unix>"}
+```
+
+The same build info is printed by `buildhost version`.
+
+## Configuration
+
+Environment variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `BUILDHOST_LISTEN_ADDR` | `:8080` | API listen address |
+| `BUILDHOST_ADMIN_LISTEN_ADDR` | `:9090` | Admin dashboard listen address (empty to disable) |
+| `BUILDHOST_DATA_DIR` | `./data` | Data directory |
+| `BUILDHOST_DB_PATH` | `./data/buildhost.db` | SQLite database path |
+| `BUILDHOST_OIDC_ISSUERS` | (none) | Comma-separated trusted OIDC issuers for auto-provisioning |
+| `BUILDHOST_OIDC_ORGS` | (none) | Comma-separated allowed orgs for OIDC auto-provisioning, matched case-insensitively (`*` for all) |
+| `BUILDHOST_OIDC_EVENTS` | `push,pull_request,workflow_dispatch` | Comma-separated allowed event types for OIDC auto-provisioning (`*` for all) |
+| `BUILDHOST_GITHUB_WEBHOOK_SECRET` | (off) | Enables `POST /api/v1/webhooks/github`; used to verify GitHub webhook HMAC signatures |
+| `BUILDHOST_RETENTION_INTERVAL` | (off) | Background GC sweep cadence (e.g. `1h`); empty/`0` disables the sweeper |
+| `BUILDHOST_RETENTION_KEEP_N` | `10` | Initial published releases kept per `(project, git branch)` -- seeds the dashboard policy on first start, then managed in the UI |
+| `BUILDHOST_RETENTION_RECENCY_GUARD` | `24h` | Initial recency guard (never evict releases newer than this) -- seeds the dashboard policy, then managed in the UI |
+| `BUILDHOST_RETENTION_ENFORCE` | `false` | Whether the background sweeper actually deletes; default is report-only. Manual runs from the dashboard/CLI delete when you confirm regardless |
+
+## GitHub organization webhook
+
+Set `BUILDHOST_GITHUB_WEBHOOK_SECRET`, then create a GitHub organization webhook
+with:
+
+- Payload URL: `https://buildhost.example.com/api/v1/webhooks/github`
+- Content type: `application/json`
+- Secret: the same value as `BUILDHOST_GITHUB_WEBHOOK_SECRET`
+- Events: select **Delete** events
+
+When GitHub sends a branch deletion (`delete` event with `ref_type: "branch"`),
+buildhost deletes static site deployments for that branch in the repository's
+project namespace. For a repository named `myrepo`, branch `feature-x` cleanup
+applies to `myrepo` and slash-namespaced projects below it such as `myrepo/docs`.
+Tag delete events and unrelated webhook events are acknowledged and ignored.
+
+## Retention / garbage collection
+
+buildhost can reclaim storage by evicting old releases. Eviction keeps the latest
+`BUILDHOST_RETENTION_KEEP_N` published releases on each `(project, git branch)` and
+sweeps abandoned (never-published) uploads, then deletes any content-addressed blob
+no longer referenced by anything. **Pins that are never evicted:** each branch's
+latest published release, any release a `docker`/OCI tag points at, pushed-docker
+builds, and anything newer than `BUILDHOST_RETENTION_RECENCY_GUARD`.
+
+It is **report-only by default** -- nothing is deleted automatically. Manage it
+from the **admin dashboard's Retention page**: edit the policy (keep-N and recency
+guard), see a live preview of exactly which releases would be evicted and how much
+storage that frees, and click to run garbage collection on demand (with a
+confirmation). The policy is stored in the database; the `BUILDHOST_RETENTION_KEEP_N`
+/ `_RECENCY_GUARD` env vars only seed its initial values.
+
+For headless/automated use there is also a CLI and an opt-in background sweeper:
+
+```bash
+buildhost gc              # report what would be evicted (dry run)
+buildhost gc --enforce    # actually evict and reclaim
+```
+
+Set `BUILDHOST_RETENTION_INTERVAL` (e.g. `1h`) to run the sweep periodically; it
+only deletes if `BUILDHOST_RETENTION_ENFORCE=true` (otherwise it just logs what it
+would do). The background sweeper reads the live policy from the dashboard each run.
+
+Blob deletion is reference-counted: because storage is deduplicated, a blob is
+removed only once no release, site, or image references it.
+
+## OIDC auto-provisioning
+
+Set `BUILDHOST_OIDC_ISSUERS` to a comma-separated list of trusted OIDC issuers (e.g., `https://token.actions.githubusercontent.com`). When a JWT from a trusted issuer arrives and no explicit OIDC policy matches, buildhost:
+
+1. Fetches the issuer's JWKS keys (via OIDC discovery) and verifies the JWT signature
+2. Checks the org (from subject) and event type (from `event_name` claim) against the allowlists
+3. Derives the repo's project name from the subject claim (`repo:org/name:*` -> `name`)
+4. Auto-creates the project — or any project slash-namespaced beneath it — if it doesn't exist (with auto-versioning)
+5. Grants `read,write` scoped to that repo's namespace: project `name` and any `name/<...>` beneath it, but nothing else
+
+No manual project creation or OIDC policy setup needed.
+
+### Slash-namespaced projects
+
+Project names may contain `/` and nest to any depth (e.g. `log-streamer/client`). A repository's OIDC token owns its whole namespace: repo `R` may create and publish `R` and any `R/<...>`, but never a sibling like `R-evil` or an unrelated project. This is what lets a repo that ships several binaries publish each to its own project — go-toolchain's autorelease maps every built binary to `<repo>/<binary>`, stripping a redundant leading `<repo>-` (a single binary named after the repo stays flat as `<repo>`):
+
+| repo | binary | project |
+|------|--------|---------|
+| `log-streamer` | `log-streamer-client` | `log-streamer/client` |
+| `log-streamer` | `log-streamer-server` | `log-streamer/server` |
+| `foo` | `foo` | `foo` |
+| `foo` | `foo-cli` | `foo/cli` |
+
+```bash
+BUILDHOST_OIDC_ISSUERS=https://token.actions.githubusercontent.com \
+  BUILDHOST_OIDC_ORGS=wow-look-at-my,PazerOP \
+  buildhost serve
+```
+
+By default, `push`, `pull_request`, and `workflow_dispatch` events are allowed. All three limit auto-provisioning to users with write access to the repository: a `push` comes from a member/collaborator, a `pull_request` from a fork does not receive an OIDC token at all (so only same-repo PRs, i.e. members, can authenticate), and a `workflow_dispatch` (a manual run) can only be triggered by a user with write access to the repo -- so it carries the same write-access guarantee as `push`. `pull_request` is included by default so PR-preview deploys work out of the box, and `workflow_dispatch` so manual release/publish dispatches work out of the box. Set `BUILDHOST_OIDC_EVENTS=*` to allow all event types.
+
+If `BUILDHOST_OIDC_ORGS` is empty, no orgs are allowed. Use `*` to allow all orgs. Org names are matched case-insensitively (GitHub logins are), so `pazerop` and `PazerOP` are equivalent.
+
+## License
+
+MIT
+
+---
+
+# buildhost
+
+Source: https://github.com/wow-look-at-my/buildhost/blob/master/CLAUDE.md
+
+# buildhost
+
+Universal package registry server. Upload artifacts once, download in any format.
+
+## Build
+
+```bash
+go-toolchain
+```
+
+This runs mod tidy, vet, tests with coverage, and builds the binary. Do not use bare `go` commands.
+
+## Project structure
+
+- `cmd/buildhost/` - CLI entrypoint (cobra, one subcommand per file, self-registering via init()). Backend imports (backend_*.go) trigger init() registration for each handler package.
+- `internal/server/` - HTTP server, global middleware chain (auth, inflight tracking, security headers, logging, recovery)
+- `internal/api/` - REST API handlers (projects, releases, artifacts, publish, tokens). Each handler file registers its own routes via auth.OnReady(). `GET /api/v1/projects/{project}/releases/{version}` resolves `latest` (and the empty spec) to the apex latest published release via `db.GetLatestRelease` (newest published on the project's default branch -- `projects.default_branch`, default `master`, resolved per-project by buildhost itself from GitHub using the OIDC token's repo identity, see the default-branch design note below; no release on that branch yet means no apex latest, and there is deliberately no fallback to newest-overall that would let a feature branch hijack `latest`) -- mirroring how dl/static/web already treat `latest`, so a client (e.g. go-toolchain's background update check) gets the newest release's metadata (`version`, `git_commit`, `published_at`) in one bounded request instead of listing every release. Any other `{version}` is still an exact match.
+- `internal/static/` - Unified download endpoint on `static.{domain}/file`. All artifact downloads go through here. Fmt interface with self-registration; query params: `project`, `v`, `os`, `arch`, `fmt`. Includes raw/symbols formats and a bridge for repackage-based formats. Also accepts a `token` query param carrying a **signed temporary download token** (`auth.MintDownloadToken`): the static route implements `auth.PublicReadAuthorizer` so a token whose signature matches the exact `(project, v, os, arch, fmt, debug)` tuple authorizes that one artifact under a private project (the rest stays gated), mirroring public-sites-under-private-projects. `token` is a known/canonical query param (so it is **not** stripped by the canonicalization redirect like other unknown params), and a token-bearing response is served `Cache-Control: private, no-store` so a shared CDN never caches private content. `SignedURL` builds the canonical static URL + token in one call. The `raw` format serves the stored zstd blob **as-is** with `Content-Encoding: zstd` (plus `Vary: Accept-Encoding`) when the client's `Accept-Encoding` lists zstd and the artifact is not being stripped (`storage.CompressedGetter`), offloading decompression to the client; otherwise it serves the decompressed bytes as before. `canonicalQuery` also folds `os`/`arch` platform-name aliases to canonical, so every spelling resolves to one cacheable URL via the canonicalization redirect.
+- `internal/dl/` - Download handler on `dl.{domain}/{project}` with version/branch resolution via query params. Redirects to static. Self-registering via auth.OnReady(). The `latest`/branch redirects (mutable pointers) are served `Cache-Control: no-store` so a CDN never pins clients to a stale release after a new publish, while an exact-version redirect (an immutable mapping) is `Cache-Control: public, max-age=31536000, immutable`. Platform-name aliases in `os`/`arch` (GitHub Actions' RUNNER_OS `Linux`/`macOS`/`Windows`, RUNNER_ARCH `X64`/`ARM64`, uname's `x86_64`/`aarch64`, ...) are folded to canonical via `db.NormalizeOS`/`db.NormalizeArch` before redirecting, so callers can pass platform names through verbatim.
+- `internal/apt/` - APT repository endpoint on `apt.{domain}/{project}/...`. Pool downloads redirect to static. Self-registering via auth.OnReady(). The Debian package name is `repackage.DebPackageName(project.Name)` (folds `/` and `_` to `-`, since neither is legal in a deb package name) -- the same value in the served `Packages` index (`packages.go`), the InRelease hash computation (`release.go`), the deb control `Package` field, the pool filename, and the installed `/usr/bin/<pkg>` binary, so apt and dpkg always agree. A slash stays in the repo *URL* (`apt.{domain}/<repo>/<binary>`), so `servePool` still resolves the project from the request path; only the package *name* is folded (e.g. `pr-reviewer-agent/server` installs as `pr-reviewer-agent-server`).
+- `internal/brew/` - Homebrew formula and generated tap endpoints. `brew.{domain}/tap.git` redirects to the cloneable Git tap at `git.{domain}/brew/tap.git`; formulas are also fetchable at `brew.{domain}/Formula/{project}.rb` and the legacy `brew.{domain}/{project}`. Formula download URLs point to tar.gz artifacts and sha256 values are computed from the same tar.gz payload Homebrew downloads -- and are **cached in `packaged_artifacts` under `format="tar.gz"`** (`formula.go` `tarGZSHA256`: lazy fill on first request, then a DB read instead of a full repackage+hash per artifact per request). The row is a digest cache only -- `storage_key` records the SOURCE artifact blob, no tar.gz is stored, downloads still repackage on demand -- which is sound because tar.gz generation is deterministic per artifact (fixed tar header name/size/mode with zero mtimes, fixed gzip header, content-addressed input; pinned by `TestTarGZGenerationDeterministic`), and the rows ride the existing retention cascade (`deleteReleaseRows` drops them with their artifacts). The tap itself is served from a **single-entry on-disk snapshot** (`tapcache.go`): each build is materialized under `{DataDir}/tmp/brew-tap/<build>/` in the dumb-HTTP git layout and served by mmap through an `os.Root` (the storage-layer pattern; no heap buffering, no path escape), rebuilt at most every ~30s (`tapCacheTTL`) and **keyed by the request-derived base URL** so a cached tap is never served with another host's URLs baked in. Files are opened under the cache mutex (removal also happens under it), so a swap can delete the old snapshot immediately -- open fds survive the unlink; leftovers from a crashed process are swept on the next wiring (`resetTapCache` in OnReady). Besides amortizing the O(projects x artifacts) build across a `brew update`'s many loose-object GETs, the snapshot fixes a dumb-HTTP consistency race (refs from build X + objects from build Y when a publish lands mid-update). `ServeFormula` (single project) is uncached -- cheap once the digests are. Self-registering via auth.OnReady().
+- `internal/npm/` - npm registry endpoint on `npm.{domain}/@buildhost/{project}`. Tarball URLs point to static. Self-registering via auth.OnReady(). A pre-built `kind=npm-package` artifact's packument **reflects the uploaded tarball's own `package.json` manifest** (`npmManifestFields` reads `package/package.json` from the stored tarball and surfaces `dependencies`, `optionalDependencies`, `peerDependencies`/`peerDependenciesMeta`, `bundle(d)Dependencies`, `bin`, `os`, `cpu`, `engines`) rather than emitting a bare `{name,version,dist}` stub. Without this a package whose runtime depends on those fields -- e.g. a launcher whose `optionalDependencies` are its per-platform binary packages -- would publish with an empty dependency graph and install as an inert no-op (npm resolves against the packument, not the tarball). `name`/`version`/`dist` stay buildhost-authoritative and lifecycle `scripts` are deliberately never surfaced (serving a packument must not imply running install hooks); unreadable/blobs fall back to the minimal entry. `redirect.go` also registers a main-domain (host-agnostic) route that 301-redirects the apex `/npm/*` to `npm.{domain}/*` (prefix stripped), analogous to the `docker.{domain}` -> `oci.{domain}` redirect, so clients pointing an npm registry base at `https://{apex}/npm/` (e.g. the go-toolchain action) reach the npm subdomain. The redirect preserves the percent-encoded scope slash (`%2f`) via `r.URL.EscapedPath()` + string concatenation so the npm `GET /{pkg}` single-segment match still works.
+- `internal/oci/` - OCI distribution endpoint (read + write) on `oci.{domain}/v2/{project}/...`. `docker.{domain}` permanently redirects to `oci.{domain}`. GET/HEAD pulls; POST/PATCH/PUT pushes (`docker push`). The base endpoint `GET/HEAD /v2/` performs OCI auth discovery: it answers `401` with `WWW-Authenticate: Basic realm="buildhost"` when unauthenticated and `200` only once a valid credential is in the request context (the global auth middleware verifies it) -- a `200` here would make clients conclude no auth is needed and never send credentials, killing the pull on the first manifest `401`. Pull side synthesizes a minimal image from a binary artifact (in `internal/repackage/oci.go`) OR serves a real pushed image. The synthesized image has **two layers**: a shared, deterministic, memoized "essentials" base layer (an embedded public CA bundle at `/etc/ssl/certs/ca-certificates.crt` so outbound TLS works, plus `/etc/passwd`+`/etc/group` with root/nobody/nonroot, `/etc/nsswitch.conf`, and a sticky `/tmp`) followed by the per-binary layer; the base layer is content-addressed (deduped to one blob server-wide) and registered per-pull as an `oci-base-layer` packaged artifact so the `BlobBelongsToProject` gate serves it. Each per-platform **image manifest is likewise persisted and linked per-pull** (`repackage.OCI.Repackage` stores it and `LinkOCIBlob`s it into `oci_blob_links`), so a multi-arch image index -- which lists each platform's manifest by digest -- has every child retrievable by `GET /v2/{project}/manifests/<digest>` (and `/blobs/<digest>`); `serveIndex` advertises only children that resolve, so it never emits a dangling index. `serveIndex` also persists the **top-level index document itself** under its own content digest (via `persistManifestBlob` -- the same `Store.Put`+`LinkOCIBlob` `PutManifest` applies to pushed manifests), so the synthesized index is retrievable by `GET/HEAD /v2/{project}/manifests/<index-digest>`, not only by tag. The Docker classic (non-containerd / overlay2) image store reads a manifest by tag, then re-fetches it by the advertised `Docker-Content-Digest` to store it content-addressably; without the persisted index that by-digest fetch 404'd and `docker pull <repo>:<tag>` failed with `manifest unknown` even though child platform pulls worked. Config sets `Env` (incl. `SSL_CERT_FILE`), `WorkingDir`, the `/<project>` entrypoint, and `User` from the release's optional `oci_user` field (empty = root). Push side (`push.go`, `upload.go`, `putmanifest.go`) accepts blob uploads (monolithic + chunked, streamed to `DataDir/tmp/oci-uploads`) and manifest/index PUTs, recording `kind=docker` artifacts. Route `Access()` is method-aware (write for push verbs). Self-registering via auth.OnReady().
+- `internal/sites/` - Static site hosting endpoint on `sites.{domain}/{project}/...`. Upload tar.gz archives, serve files per branch or version. Self-registering via auth.OnReady(). The **bare project root** (`/{project}` and `/{project}/`) `302`-redirects (`Cache-Control: no-store`, since the target is a mutable pointer) to `/{project}/branch/{default}/` -- the project's `default_branch` (learned from GitHub on publish, e.g. `main`; seed default `master`, the same branch the apex download `latest` tracks), so a project's root URL resolves to its canonical site without the caller knowing which branch it lives on. When the resolved `default_branch` has **no published site** (e.g. the GitHub-learned default lags at the seed `master` while sites were only ever deployed to `main`, because buildhost couldn't reach a private repo to learn its real default), the redirect falls back to a branch that *does* have a site -- preferring the conventional `main`/`master` names over a more-recently-updated ephemeral PR-preview branch, then the newest site as a last resort -- so the root never bounces to a guaranteed 404 (`resolveRootBranch` in `serve.go`, used by both the redirect and its public-read gate so they stay consistent; with no sites at all it keeps the default branch unchanged). The redirect route is a literal-less `GET /{project}` that scores below the `branch`/`branches` routes (router best-match), so it only catches paths that aren't one of those and never shadows them; it is served publicly (via `AllowsPublicRead`) exactly when the resolved branch's site is public, the same rule as a single-branch read. A site uploaded with header `X-Public-Site: true` is stored with `is_public=1` and served **without a token even under a private project** -- the sites read route implements `auth.PublicReadAuthorizer` so the centralized `requireProject` opens just that one branch (the project's releases/other branches stay gated). Used for PR previews of private repos (the `buildhost-publish-site` action sends the header when `public: true`).
+- `internal/llms/` - Public `/llms.txt` endpoint (https://llmstxt.org). Serves a plain-text guide to buildhost for LLMs/agents, rendered per request from an embedded `template.md` with the server's own base URL (derived from the request `Host`) substituted in. Registered on the apex (`HandleRaw`) **and on every service subdomain** (`ServiceHandleRaw` for each of apt/brew/dl/npm/oci/sites/static) -- the router's strict host partitioning means a known subdomain never falls through to the host-agnostic apex route, so without per-subdomain registration `oci.{domain}/llms.txt`, `npm.{domain}/llms.txt`, etc. would 404. `docker.{domain}/llms.txt` 301-redirects to `oci.{domain}` like every other docker path. The rendered guide always anchors its service URLs to the apex regardless of which host served it (`apexBaseURL` strips a known leading service label, mirroring the server's own first-label dispatch), so a request on `oci.{domain}` still renders `dl.{domain}` rather than `dl.oci.{domain}`. Public (no auth). Self-registering via init().
+- `internal/web/` - Public, read-only browse frontend on the main domain (no subdomain). Server-rendered HTML via Go `html/template` (templates and the single `static/style.css` are embedded); **no JavaScript**, so the registry is indexable/consumable without a SPA. Routes: `GET /` (public project index, private projects filtered like `GET /api/v1/projects`), `GET /projects/{project}`, `GET /projects/{project}/releases/{version}`, and `GET /_ui/style.css`. Project/release pages register via `auth.Handle` with `auth.HiddenReadAccess`, so the shared `requireProject` middleware (the single home of project-auth) enforces visibility and returns a **`404`** -- never a `401` -- for a private project the viewer may not see, indistinguishable from a project that does not exist (GitHub-style; no existence leak). A read-scoped token authorized for the project reveals it. Only published releases are shown. Download links point at the `dl` subdomain (`dl.{host}/{project}?v=&os=&arch=&fmt=`); install snippets mirror llms.txt. The page handlers relax the global `default-src 'none'` CSP just enough for the one same-origin stylesheet (`style-src 'self'`); no `script-src` is ever emitted. Self-registering via init() (routes) + OnReady (DB). Distinct from `internal/admin/` (the authenticated admin SPA on a separate port).
+- `internal/auth/` - Token auth, OIDC JWT verification, centralized project-auth middleware (requireProject), route registry (Handle/HandleRaw/HandleHandler for main-domain routes; ServiceHandle/ServiceHandleRaw/ServiceHandleHandler/ServiceRedirect for subdomain routes) backed by `github.com/wow-look-at-my/router`, RouteInfo interface. Service registrations are rewritten to host+path patterns (`<sub>.{domain}/<path>`) on the single router, so dispatch and route listing use the router's own host matching -- there is no per-subdomain dispatch table. `downloadtoken.go` mints/verifies **stateless, artifact-bound, expiring download tokens** (HMAC-SHA256 over `(project, version, os, arch, fmt, debug, expiry)` with a `bhdl_` prefix; key persisted at `{DataDir}/download-signing.key`, generated on first start like the APT key) used by the temporary-link endpoints, plus `ApexServiceURL` (derives the registry apex from any request Host by stripping a known leading service/admin label -- correct from the apex API too, unlike the unconditional-strip `DeriveServiceURL`).
+- `internal/db/` - SQLite database layer (modernc.org/sqlite, no CGo), OIDC policy storage. Types (Project, Release, Artifact, APIToken, OIDCPolicy) and validation functions live here. Uses sqlc for query generation from `internal/db/queries/*.sql` with schema in `internal/db/schema.sql`.
+- `internal/db/queries/` - SQL query files for sqlc code generation
+- `internal/db/schema.sql` - SQLite schema used by sqlc
+- `internal/storage/` - Content-addressed blob storage (filesystem backend, zstd-compressed, key validation). `Get` **memory-maps the compressed blob** (via `github.com/wow-look-at-my/go-mmap`, mapping the `os.Root`-opened fd to keep the path-traversal sandbox) and returns a streaming zstd decoder reading off the mapping, so a read never loads the whole artifact into the heap -- the decoder pulls kernel-paged pages on demand (`MADV_SEQUENTIAL`) and Close unmaps. Uncompressed blobs are served straight from the mapping; an empty blob returns an empty reader. `GetCompressed` (the optional `CompressedGetter` capability, implemented by `Filesystem` and forwarded by `TracedStorage`) returns the stored bytes **without** decompressing -- the raw zstd stream for a compressed blob (Encoding `zstd`), or the identity bytes for one stored raw -- so a handler can pass `Content-Encoding: zstd` straight through to a zstd-accepting client and skip server-side decompression entirely.
+- `internal/repackage/` - On-demand repackaging and stripping (tar.gz, tar.xz, tar.zst, zip, deb, brew, npm, oci). **Everything streams**: `Input` carries an `io.Reader`+`Size` (not a `[]byte`) and each format pipes the artifact through its compressor via `io.Pipe` rather than buffering it, so memory is bounded by the compressor window, not the artifact size. `Output.Reader` is an `io.ReadCloser`; a streamed format whose compressed length isn't known up front returns `Size = SizeUnknown` (the handler then omits Content-Length and the body is chunk-encoded). `OpenArtifactStream` binds the (optionally stripped) reader to its exact size -- so a tar/ar/npm header can never disagree with the body -- and `ChainClose` ties the input stream's lifetime to the output reader (a lazily-read pipe keeps its source open until the consumer is done). deb spools only the *compressed* data.tar.gz member to a temp under `Input.TmpDir` to learn its `ar` length; oci streams the layer into `Store.Put` while teeing the uncompressed tar through sha256 for the diffID. Self-registering via init(); Generator uses registry. Orchestrator just publishes releases. `cacerts/ca-certificates.crt` is a public CA bundle baked into the synthesized OCI essentials layer via `//go:embed`. It is **fetched at build time** (`scripts/fetch-cacerts.sh`, run by the CI `build` job before go-toolchain) and **gitignored**, not committed -- so the repo carries no unreviewable cert blob. `go build` fails on a missing-embed error until the script has been run; see `cacerts/README.md`.
+- `internal/strip/` - Binary debug info stripping (shells out to strip/objcopy). `StripReader`/`StripReaderDebug` spool a reader to a temp, run the file-based strip, and stream the stripped/debug file back (no `[]byte` round-trip). `strip` is a random-access ELF tool, so it inherently needs a file -- but it is **absent in the distroless prod image** (`Available()` is false), so the strip path never runs where the OOM happens.
+- `internal/retention/` - Eviction policy + reference-counted garbage collection. Keeps the latest `BUILDHOST_RETENTION_KEEP_N` published releases per `(project, git_branch)` and sweeps abandoned (unpublished) uploads, then deletes content-addressed blobs no longer referenced by anything (the global `db.IsBlobReferenced`, generalizing `BlobBelongsToProject`). The whole eviction runs in one `db.EvictReleases` transaction that is **rolled back for dry-run / committed for enforce**, so report-only and enforce produce identical exact results (and a blob shared by several evicted releases is freed once). Single source of truth for the background sweeper (`cmd/buildhost/serve.go`), the `buildhost gc` CLI, and the **admin dashboard Retention page**. The policy (keep-N, recency guard) is **DB-backed and UI-editable** -- stored in the single-row `retention_settings` table, seeded from the `BUILDHOST_RETENTION_*` env defaults on first start (`SeedRetentionSettings`, INSERT OR IGNORE) and managed thereafter from the dashboard; the sweeper and CLI read it live each run via `db.GetRetentionSettings` + `retention.ConfigFromSettings`. The admin endpoints (`internal/admin/retention.go`: `GET/PUT /api/retention`, `POST /api/retention/run`) expose the policy, a dry-run preview (`Plan`), and on-demand enforce. `keep_n=0` still keeps each branch tip (the keep-N query floors at `max(keep_n, 1)`). **Report-only by default**: the background sweeper deletes only when `BUILDHOST_RETENTION_ENFORCE=true`; a manual dashboard/CLI run deletes when the operator confirms `--enforce`/the run button. Pins (never evicted): each branch's latest published release, oci-tagged releases, `kind=docker` releases, and anything newer than the recency guard. The shared `DeleteBlobIfUnreferenced` helper also fixes the sites delete/re-upload paths, which previously `Store.Delete`d unconditionally and could break a dedup-shared blob. Background sweeper is opt-in via `BUILDHOST_RETENTION_INTERVAL` (0 = off) and defers while writes are in flight (`admin.InflightWrites()`). NOTE: there is no standalone repackage-cache eviction -- non-OCI formats are regenerated per request, not stored (see `docs/eviction-policies.md`); dedicated docker/OCI blob GC is deferred.
+- `internal/version/` - Release version resolution logic (resolves a version spec like `latest`/`v1`/semver to a `db.Release`)
+- `internal/buildinfo/` - Build-time VCS stamps (commit, time, dirty flag) read once from `runtime/debug.ReadBuildInfo()`; reported by `buildhost version` and the `GET /healthz` JSON body
+- `internal/admin/` - Admin dashboard (separate HTTP server, JSON API + static SPA frontend), inflight write counter for update coordination
+- `internal/config/` - Server configuration from env vars
+- `migrations/` - SQLite schema (embedded via go:embed)
+
+## Key design decisions
+
+- Versioning: auto-increment (default) or semver (opt-in per project)
+- Git branch is a first-class field on releases, not just metadata
+- Apex `latest` (a download with no `?v=` and no `?branch=` -- e.g. `dl/{project}/latest/{os}/{arch}`) resolves to the newest published release on the project's **default branch** -- a per-project field (`projects.default_branch`, `migrations/011_project_default_branch.sql`) that defaults to `master` (`db.LatestBranch`). buildhost learns the real default branch **itself, with nothing sent in the publish**: on a GitHub-OIDC write the centralized `requireProject` reads `owner/repo` from the verified OIDC subject (`repo:OWNER/REPO:...`) and asks GitHub for that repo's default branch (`auth.GitHubDefaultBranch` -> `GET api.github.com/repos/{owner}/{repo}`, best-effort + cached, gated on the GitHub Actions issuer), then records it via `db.SetProjectDefaultBranch` -- so a repo that releases off another branch (e.g. go-toolchain on `v1`) gets a correct `latest` without any publisher cooperation. buildhost authenticates these lookups as a **GitHub App** when configured (`BUILDHOST_GITHUB_APP_ID` + `BUILDHOST_GITHUB_APP_PRIVATE_KEY`, inline PEM -- real or env-`\n`-escaped, normalized by `config.resolvePEM` -- or a file path; `auth.SetGitHubApp` -> app JWT -> per-installation token, cached): short-lived `metadata:read` installation tokens with a high rate limit. It falls back to a static `BUILDHOST_GITHUB_TOKEN` PAT, then to anonymous (throttled 60 req/hr/IP). The release-create API still accepts an optional `default_branch` field as a manual override (non-GitHub publishers / private repos buildhost can't reach). A push to a feature branch never hijacks `latest`. When the default branch has no published release yet, unqualified `latest` is not available (no fallback to newest-overall, which would defeat the no-hijack guarantee). Centralized in `db.GetLatestRelease` (a single JOIN on `projects.default_branch`), so dl/brew/apt/web, the OCI `latest` tag, and the npm `latest` dist-tag stay consistent. Per-branch downloads (`?branch=`) are unaffected.
+- Repackaging and stripping happen on-demand at download time, not at publish time. Only the original upload is stored.
+- **Bounded memory**: blob reads are mmap-backed and decoded as a stream, and every download/repackage path streams (no `io.ReadAll` of an artifact, no whole-archive `bytes.Buffer`), so per-request memory is bounded by the compressor window rather than the artifact size. The server also sets `GOMEMLIMIT` from the container's memory cgroup at startup (`automemlimit`, 0.9 ratio; no-ops if `GOMEMLIMIT`/`AUTOMEMLIMIT=off` is set), so the GC runs harder near the limit instead of letting the heap grow into an OOM-kill. Together these let buildhost serve artifacts far larger than its `mem_limit`.
+- All artifact downloads go through `static.{domain}/file?project=&v=&os=&arch=&fmt=` -- a single CDN-cacheable endpoint with sorted query params, strong ETags, and immutable cache headers. Format handlers (dl, apt, brew, npm) redirect to static after resolving version/branch. `v=latest` returns 400 (callers must resolve first). Repackage formats self-register via `Fmt` interface.
+- Storage is content-addressed (SHA-256) with zstd compression and deduplication
+- Auth: Bearer token, Basic auth, or query param — all resolve to the same token system
+- OIDC: JWT-based auth for GitHub Actions (and any OIDC provider), keys fetched from issuer's JWKS endpoint
+- OIDC auto-provisioning: trusted issuers (BUILDHOST_OIDC_ISSUERS) can create projects on first publish -- project name derived from JWT subject claim; a repo's token is authorized for its own project and any `<repo>/<...>` sub-namespace (multi-binary repos publish each binary to `<repo>/<binary>`, e.g. `log-streamer/client`); org allowlist (BUILDHOST_OIDC_ORGS, matched case-insensitively, use `*` to allow all), event allowlist (BUILDHOST_OIDC_EVENTS, defaults to `push,pull_request,workflow_dispatch` -- all three imply write access to the repo: a push/same-repo PR comes from a member and fork PRs get no OIDC token, and `workflow_dispatch` (a manual run) can only be triggered by a user with repo write access)
+- Project names are slash-namespaced and may nest to any depth (`<repo>/<binary>`, even deeper). The api-layer validator (`internal/api/projects.go`, generated regex) allows `/`-separated segments; the `wow-look-at-my/router` `{project}` token matches multiple path segments greedily (anchored by trailing literals like `releases`/`artifacts`), so no `%2F` encoding is needed; storage is content-addressed so a `/` in a name never touches a filesystem path. The deb/APT format is the exception that cannot carry a `/` in its identifier: its package-name grammar forbids `/` and `_`, so the deb package name is folded via `repackage.DebPackageName` (`/`,`_` -> `-`, so `pr-reviewer-agent/server` installs as `pr-reviewer-agent-server`) while the slash stays in the repo URL
+- Private projects require auth on all endpoints including format-specific ones (APT, Brew, NPM, OCI)
+- Project auth enforced once in centralized requireProject middleware — handlers never check auth
+- Each backend defines a RouteInfo implementation (private route struct) for full URL parsing
+- Backends self-register routes via auth.OnReady() on auth.Router(); adding a backend = adding files, no existing files modified. Each backend uses auth.ServiceHandle/ServiceHandleRaw/ServiceHandleHandler(subdomain, pattern, ...) for host-based routing; the registry prefixes the subdomain and a `{domain}` host token to the pattern so the router matches by Host (e.g. `apt.{domain}/{path...}`).
+- Tokens are project-scoped or global; project-scoped tokens cannot escalate privileges
+- Token expiry is enforced at lookup time
+- Default token scope is "read" (least privilege). Scopes are `read`, `write`, and `share` (`db.ValidScopes`); `share` is a distinct permission to mint temporary download links (below), deliberately not implied by `write` so a CI/deploy token cannot hand out shareable links. The bootstrap admin token holds `read,write,share`.
+- Temporary download links: a private artifact can be shared without a project token via a short-lived, **artifact-bound, HMAC-signed** URL -- `static.{domain}/file?...&token=bhdl_...`. Mint with `POST /api/v1/projects/{project}/download-links` (REST, requires a `share`-scoped token authorized for the project) or `POST /api/projects/{name}/download-links` (admin dashboard, trusted behind its reverse proxy). On a **private** project's release page the admin SPA's per-artifact `raw`/`debug`/`fmt` links would 401 through `dl`, so they mint-on-click instead (fetch a signed link, then download it); a plain "temp link" button copies a shareable signed URL. Public projects keep the plain (cacheable, permanent) `dl` links. The signature binds `(project, version, os, arch, fmt, debug)` + expiry (default 1h, max 24h), so a leaked link exposes only that one file until it expires; it is stateless (no DB row, not individually revocable -- rotate `download-signing.key` to invalidate all). The link points at `static` directly (no `dl` hop) with the version already resolved, since the binding needs an exact version.
+- Upload size capped at 2 GiB (REST artifact PUT, configurable via `BUILDHOST_MAX_UPLOAD_SIZE`); JSON endpoints capped at 1 MiB. OCI `docker push` uploads each layer as a separate blob with its own cap (`BUILDHOST_MAX_BLOB_SIZE`, default 10 GiB), so multi-GB images are not bound by the REST cap
+- Docker push: a release containing pushed `kind=docker` artifacts is a "docker build" -- served only via the OCI endpoint. `kind=docker` is gated out of apt/brew/npm and the raw `/static` (+ `/dl`) paths. Pushed blobs/manifests are linked to the project in `oci_blob_links` (so the existing `BlobBelongsToProject` pull gate serves them); pushed tags live in `oci_tags` as mutable pointers (`latest` is an alias, digests are immutable, identical re-push is a no-op, a changed image creates a new auto-versioned release and repoints the tag). `docker login` uses Basic auth -> the token system; a GHA OIDC JWT works as the password and auto-provisions the project
+- Storage keys validated as hex SHA-256 to prevent path traversal
+- Static sites: uploaded as tar.gz (`Content-Type: application/gzip`) or zip (`Content-Type: application/zip`). Both formats are stored as raw tar internally and served by scanning tar headers per request. Each branch is an independent deployment (one row in `sites` table). Re-deploying a branch replaces the previous site atomically. Upload size capped at 256 MiB, max 10,000 files per site. A site row carries a per-branch `is_public` flag (set by the `X-Public-Site: true` upload header): a public site is served anonymously even when the project is private, so a PR preview of a private repo gets a working shareable URL without exposing the project's release artifacts. The project's own visibility is unchanged (still derived from the OIDC `repository_visibility` claim and re-synced on every write).
+
+## First-time setup
+
+```bash
+buildhost bootstrap          # Creates initial admin token (only works when no tokens exist)
+buildhost bootstrap --name admin-token
+```
+
+## Listing routes
+
+```bash
+buildhost routes   # prints all registered HTTP routes, sorted
+```
+
+Routes are printed exactly as registered. Main-domain routes are path-only
+(`/api/v1/projects {GET,POST}`, `/healthz {GET}`); subdomain routes carry their
+service label and the `{domain}` host token (`apt.{domain}/{path...} {GET}`,
+`oci.{domain}/v2/ {*}`, `static.{domain}/file {GET}`). Nothing is synthesized at
+listing time -- the `{domain}` token is the real host wildcard the router matches.
+
+## Running
+
+```bash
+BUILDHOST_LISTEN_ADDR=:8080 buildhost serve
+```
+
+Each service is accessed via a subdomain derived from the incoming request's `Host` header: `apt.example.com`, `brew.example.com`, `git.example.com`, `npm.example.com`, `oci.example.com` (canonical, `docker.example.com` 301-redirects), `dl.example.com`, `sites.example.com`, `static.example.com`. API routes stay on the main domain. No domain configuration is required -- the server dispatches by matching the first label of the Host header against known service names.
+
+To disable application-level zstd compression (e.g., on ZFS or Btrfs with filesystem-level compression):
+
+```bash
+BUILDHOST_STORAGE_COMPRESS=false buildhost serve
+```
+
+The admin dashboard starts automatically on a separate port (default `:9090`). Set `BUILDHOST_ADMIN_LISTEN_ADDR` to change the address, or set it to empty to disable.
+
+```bash
+BUILDHOST_ADMIN_LISTEN_ADDR=:9090 buildhost serve   # listen on all interfaces (default)
+BUILDHOST_ADMIN_LISTEN_ADDR= buildhost serve         # disable admin dashboard
+```
+
+## Telemetry (OpenTelemetry)
+
+Set `BUILDHOST_OTEL_ENDPOINT` to enable distributed tracing and log export via OTLP/HTTP:
+
+```bash
+BUILDHOST_OTEL_ENDPOINT=https://otel.example.com buildhost serve
+```
+
+When set, the server exports:
+- **Traces** to `{endpoint}/v1/traces` -- every HTTP request gets a root span, with child spans for DB queries (`db.exec`, `db.query`, `db.query_row`), storage operations (`storage.put`, `storage.get`, `storage.delete`, `storage.exists`), auth (OIDC verification), repackaging (`repackage.generate`), and download resolution (`dl.serve_artifact`).
+- **Logs** to `{endpoint}/v1/logs` -- all slog output is bridged to OTEL with trace/span correlation.
+
+Spans include attributes like `project.name`, `auth.type`, `http.method`, `url.path`, `http.status_code`, `db.statement`, `storage.key`, `storage.size`, `repackage.format`, etc.
+
+When `BUILDHOST_OTEL_ENDPOINT` is unset (default), tracing is fully disabled with zero overhead (noop tracer).
+
+## Graceful shutdown and update coordination
+
+The server handles SIGTERM/SIGINT by calling `http.Server.Shutdown` with a 5-minute timeout, allowing in-flight requests (especially large uploads) to complete before the process exits.
+
+For zero-downtime updates, use docker-updater's rolling update mode (`docker-updater.rolling: "true"`) with an nginx sidecar. docker-updater starts the new container before stopping the old one; nginx routes via Docker DNS. See `deploy/` for an example compose stack.
+
+### Ready-to-update endpoint
+
+`GET /ready-to-update` on the main server (`:8080`) returns HTTP 200 when the server is idle, or HTTP 503 when there are in-flight write requests. It is designed for docker-updater's HTTP pre-update checks -- no exec into the container (the distroless image has no shell).
+
+docker-updater reaches it over the **shared `internal` Docker network** via buildhost's DNS alias, configured as a full URL:
+
+```yaml
+labels:
+  docker-updater.pre-check.url: "http://buildhost-backend:8080/ready-to-update"
+```
+
+Do **not** use docker-updater's `:8080/...` (port-only) pre-check form: that one resolves the container's bridge IP and therefore requires running docker-updater with `--network host`. The full-URL form only needs docker-updater to share a network with buildhost (it joins `internal` in `deploy/docker-compose.yml`), which keeps the updater off host networking. Note that rolling updates (below) **skip** pre-checks entirely -- the old container drains via graceful shutdown -- so the pre-check endpoint matters only for non-rolling setups and the `try-update` CLI.
+
+The `try-update` CLI subcommand wraps this endpoint for manual use or other pre-update hooks:
+
+```bash
+buildhost try-update                    # queries localhost:8080/ready-to-update
+buildhost try-update --addr :9090       # custom listen address
+```
+
+Exit 0 means idle (safe to update); non-zero means busy or unreachable (skip this poll cycle).
+
+The admin endpoint `GET /admin/inflight` on `:9090` still returns `{"inflight": N}` with the raw count for dashboards.
+
+Docker Compose label configuration for docker-updater with rolling updates:
+
+```yaml
+labels:
+  docker-updater.enable: "true"
+  docker-updater.rolling: "true"
+stop_grace_period: 5m
+```
+
+## OIDC for GitHub Actions
+
+Configure an OIDC policy so GHA workflows can authenticate without static tokens:
+
+```bash
+# Create a policy that grants read,write to project ID 1 for any workflow in myorg/myrepo
+curl -X POST https://buildhost.example.com/api/v1/oidc/policies \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"issuer":"https://token.actions.githubusercontent.com","subject_pattern":"repo:myorg/myrepo:*","project_id":1,"scopes":"read,write"}'
+```
+
+In the GHA workflow, request an OIDC token and use it as a Bearer token:
+
+```yaml
+permissions:
+  id-token: write
+steps:
+  - uses: actions/github-script@v7
+    id: token
+    with:
+      script: return await core.getIDToken('https://buildhost.example.com')
+  - run: |
+      curl -H "Authorization: Bearer ${{ steps.token.outputs.result }}" \
+        https://buildhost.example.com/api/v1/projects
+```
+
+## Code generation
+
+`internal/api/gen_project_name.go` is generated by [go-regex-compiler](https://github.com/wow-look-at-my/go-regex-compiler). The `go:generate` directive lives in `internal/api/projects.go`.
+
+Database query code in `internal/db/*.sql.go` is generated by [sqlc](https://sqlc.dev/). Config is in `sqlc.yaml`. To regenerate after editing queries in `internal/db/queries/`:
+
+```bash
+sqlc generate
+```
+
+## Testing
+
+`go-toolchain` runs all tests. Integration tests use httptest.NewServer with a temp SQLite DB.
+OIDC tests generate ephemeral RSA keys and run a local JWKS server.
+
+`internal/server/llms_endpoints_test.go` guards the `/llms.txt` document against drift: it parses the *served* document and asserts every URL it references resolves to a registered route, then exercises the documented flows (downloads, APT/Brew/npm/OCI, the `/static` latest-rejection) end to end against a seeded server. Editing `internal/llms/template.md` to reference a nonexistent endpoint fails CI.
+
+`test/e2e/` is a synthesized-OCI-image end-to-end test (CI job `synthesized-image-e2e` in `ci.yml`, not part of `go-toolchain`). It publishes a tiny static binary (`test/e2e/testdata/netcheck/`; under `testdata/` so `go list ./...` -- and thus go-toolchain's build/vet/coverage -- ignores it, while the e2e job still builds it explicitly) to a real `buildhost serve`, then uses **crane** (go-containerregistry) to pull the image buildhost synthesizes, assert its config (entrypoint, `SSL_CERT_FILE`, two ordered `diff_ids`) and flattened rootfs (CA bundle, `nonroot` in `/etc/passwd`, sticky `/tmp`), and run the entrypoint -- which does an outbound HTTPS request validated **only** against the image's baked-in CA bundle, proving a networked service works in the synthesized image. crane (not docker) because buildhost's layers are `tar+zstd`, which go-containerregistry pulls but the default GitHub Docker may not.
+
+## Docker image
+
+The image is built from `gcr.io/distroless/static-debian12:nonroot`. It runs as UID 65532 (nonroot) with no shell, no package manager, and no writable paths except the data volume. The server handles SIGTERM for graceful shutdown.
+
+The admin dashboard on `:9090` has **no built-in authentication**. It must be placed behind a reverse proxy with access control (e.g., Cloudflare Access on a separate hostname). Never expose port 9090 to untrusted networks.
+
+Binary stripping (`strip`/`objcopy`) is not available in the hardened image. The `strip.Available()` check handles this gracefully -- binaries are served as-is. Run stripping in your CI pipeline before uploading if needed.
+
+All temporary files are written to `BUILDHOST_DATA_DIR/tmp`, not to `/tmp`. The image is compatible with `read_only: true` as long as the data volume is mounted.
+
+## Security notes (for future security reviews)
+
+The following items have been reviewed and addressed or are intentional design choices:
+
+- **Rate limiting**: Handled at the reverse proxy layer, not in the application
+- **OIDC SSRF**: jwks_uri is validated to match the issuer's host and require HTTPS (loopback exempted for tests)
+- **OIDC issuer scheme**: fetchJWKS requires HTTPS for non-loopback issuers
+- **Token in query param**: Intentional for clients that cannot set headers (APT, Brew). Mitigated by Referrer-Policy: no-referrer and redaction from OTEL trace attributes
+- **Temporary download links**: `&token=bhdl_...` is a stateless HMAC-SHA256 signature over `(project, version, os, arch, fmt, debug, expiry)` keyed by `{DataDir}/download-signing.key` (32 random bytes, 0600, generated on first start). It only ever *grants* read to the single artifact it is signed for under an otherwise-private project -- it cannot escalate, cross projects, or outlive its (capped, <=24h) expiry, and verification is constant-time (`hmac.Equal`). Minting requires the `share` scope (REST) or the access-controlled admin dashboard. Trade-off: links are not individually revocable before expiry (rotate the key to invalidate all); acceptable for short-lived links. Token-gated responses are `Cache-Control: private, no-store` so the shared CDN never caches them. Same query-param exposure profile as the existing APT/Brew token param (Referrer-Policy: no-referrer, OTEL redaction), but short-lived and single-artifact rather than a full project token.
+- **No TLS termination**: Intentional -- runs behind a reverse proxy in Docker
+- **Strip temp file permissions**: Runs in a single-user Docker container; permissions are 0600 anyway
+- **APT Release signing**: RSA 4096 key auto-generated on first startup, stored in `BUILDHOST_DATA_DIR/apt-signing.key`. InRelease (clearsigned), Release.gpg (detached), and key.asc (public key) endpoints are all served. Clients add the key via `curl .../key.asc | gpg --dearmor > /etc/apt/keyrings/buildhost.gpg` and use `[signed-by=/etc/apt/keyrings/buildhost.gpg]` in sources.list
+- **List endpoints**: No LIMIT -- all behind auth, SQLite serialized, not a DoS vector
+- **Symlink rejection**: Storage layer rejects symlinks via Lstat check
+- **Admin dashboard auth**: None -- must be behind a reverse proxy with access control (Cloudflare Access, etc.)
+- **Container user**: Runs as nonroot (UID 65532) via distroless base image
+- **Graceful shutdown**: Server handles SIGTERM/SIGINT with 5-minute timeout for clean connection draining
+- **Ready-to-update endpoint**: `GET /ready-to-update` on :8080 returns 200/503 with no body content -- reveals only idle/busy state, no sensitive data
+- **Inflight endpoint**: `GET /admin/inflight` on :9090 is unauthenticated -- same trust model as the rest of the admin dashboard (internal-only, behind reverse proxy)
+- **No writes outside data dir**: Temp files use BUILDHOST_DATA_DIR/tmp, not system /tmp
+- **OIDC audience check**: The auto-provisioning path does NOT gate on the token's `aud` claim -- trust for a trusted-issuer token comes from the JWKS signature plus the org allowlist (`BUILDHOST_OIDC_ORGS`), the event allowlist (`BUILDHOST_OIDC_EVENTS`), and the subject claim. (Telling the server its own URL was never a meaningful trust boundary, and a stale/missing value caused a production 401 outage, so the gate was removed.) A per-policy `audience` field on an `OIDCPolicy` is still honored as an optional, opt-in restriction for explicitly configured policies. The server is never told its own URL: generated links are derived per request from the `Host` header (`auth.RequestBaseURL`).
+- **OIDC event check**: Tokens without an `event_name` claim are rejected when `BUILDHOST_OIDC_EVENTS` is configured (default: `push,pull_request,workflow_dispatch`). This prevents bypass via providers that omit the claim. The default set is deliberately limited to events that imply the actor has write access to the repo: fork PRs in GitHub Actions do not receive OIDC tokens (so `pull_request` means a same-repo, i.e. member, PR), and GitHub only lets users with write access trigger a manual `workflow_dispatch` run -- so `workflow_dispatch` carries the same write-access guarantee as `push` and is safe to include by default (it makes manual release/publish dispatches auto-provision out of the box).
+- **OIDC RSA key size**: JWKS keys below 2048 bits are rejected
+- **Default-branch GitHub lookup**: On a GitHub-OIDC write, buildhost resolves the repo's default branch via `GET api.github.com/repos/{owner}/{repo}` (`auth.GitHubDefaultBranch`). The `owner/repo` comes only from the **verified** OIDC subject and is validated (`validRepoPath`) before being interpolated into the fixed-host URL, so there is no SSRF or injection surface; the returned branch is re-validated (`validRefName`) before it is stored. The lookup is gated on the GitHub Actions issuer (no call for other OIDC providers), best-effort (a failure leaves the existing default branch -- it never fails a publish), and cached (1h positive / 5m negative) so it cannot hammer GitHub. Authenticated as a **GitHub App** (`auth.SetGitHubApp`: app JWT signed with the configured private key -> short-lived per-installation token, both cached) when `BUILDHOST_GITHUB_APP_ID`/`BUILDHOST_GITHUB_APP_PRIVATE_KEY` are set, else a static `BUILDHOST_GITHUB_TOKEN` PAT, else anonymous. The App private key / PAT only widen rate limits and reach private repos; they are never logged or echoed, and a malformed key disables App auth (logged) rather than crashing startup. An inline PEM whose newlines were escaped to the literal `\n` sequence in transit through an environment variable (the common Docker/compose footgun) is un-escaped by `config.resolvePEM` before parsing -- otherwise the key fails to parse, App auth is silently disabled, and default-branch lookups degrade to anonymous, which 404s on a private repo and leaves `projects.default_branch` stuck at the `master` seed
+- **OIDC visibility sync**: When an OIDC token's `repository_visibility` claim changes project visibility, the change is logged at WARN level with project name, old/new visibility, and OIDC subject
+- **Sites decompression**: Decompressed tar size is capped at 1 GiB to prevent gzip bomb attacks. ZIP uploads are also bounded by the 256 MiB upload limit and the 1 GiB decompressed tar cap.
+- **Sites security headers**: Served site files drop the app's strict `Content-Security-Policy: default-src 'none'` and `X-Frame-Options: DENY` that the global middleware sets (`internal/sites/serve.go` `setSiteSecurityHeaders`). Hosted sites are third-party static content on the dedicated `sites.{domain}` subdomain (isolated from the app/admin origins) and must be able to load their own and external assets, like any static host. They set `Access-Control-Allow-Origin: *` for non-credentialed cross-origin asset reads, plus `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: credentialless`. `X-Content-Type-Options: nosniff` is kept.
+- **Public sites under private projects**: A site uploaded with `X-Public-Site: true` is served anonymously even when its project is private. This is **opt-in per upload** (the publisher's own OIDC/token write explicitly sets it) and **scoped to that one site branch** -- it does not change the project's visibility, and release artifacts / other branches / the `/branches` listing stay gated. The bypass is enforced centrally in `requireProject` (the sites read route implements `PublicReadAuthorizer`), not by the sites handler, so the "auth enforced once" invariant holds. The `buildhost-publish-site` action defaults `public` to `false`; the PR-preview reusable workflow opts in (`public: true`) because preview URLs are meant to be shareable -- matching how a private repo can already serve a public GitHub Pages site.
+- **Browser sign-in with GitHub (per-repo authorization)**: a browser hitting a private resource (e.g. a private static-site PR preview or download) used to get a raw JSON `401` with no way to authenticate. When GitHub login is configured (`BUILDHOST_GITHUB_CLIENT_ID` + `BUILDHOST_GITHUB_CLIENT_SECRET`), `requireProject`'s `unauthorizedResponse` (`internal/auth/middleware.go`) `303`-redirects a **browser navigation** (`Accept: text/html`) with no token to the apex `/__signin?next=<full original URL>`, which runs the GitHub OAuth Authorization Code flow (`internal/auth/githublogin.go`). `handleSigninStart` sets a short-lived signed-state + CSRF nonce cookie and redirects to GitHub with `scope=repo` (the only classic OAuth scope that grants private-repo visibility, needed by the access check below); `handleSigninCallback` (the fixed `redirect_uri`) verifies state + nonce, exchanges the code for a user token, and reads the user's login (`GET /user`). It mints a buildhost-signed `bh_session` cookie carrying **login + the GitHub token** (HMAC over `login\x00token|exp` with the shared `download-signing.key`; HttpOnly, SameSite=Lax, Secure-on-https, 12h), set **domain-wide** (`Domain=<apex>`) so one login on the single apex callback works across every service subdomain. **Authorization is per-repo, not an org allowlist**: each project records the GitHub `owner/repo` it was provisioned from (`projects.github_repo`, set from the OIDC publish subject `repo:OWNER/NAME:...` via `WithOIDCRepo` on create + re-synced on each write). `Authenticate` verifies `bh_session` -> `WithUser(login)` + `WithGitHubToken`; `requireProject` calls `userCanReadProject`, which grants read iff the signed-in user can access that repo -- `GET /repos/{owner}/{repo}` with the user's token returns `200` (`canAccessRepo`, cached per (login, repo, token-fingerprint) for 5m). The cache stores **only authoritative answers** -- a definite `200` (access) or `404` (no access; GitHub 404s a repo the token can't see) -- so a *transient* failure (network error, 5xx, 429, or a rate-limit/propagation 401/403) denies just the one request without being cached, instead of pinning an authorized owner to "Access denied" for the whole TTL on a momentary GitHub hiccup; and keying on a token fingerprint means a fresh re-login with a broader-scoped token is never shadowed by a negative cached against the previous token. Applies to ReadAccess and HiddenReadAccess; it never grants write (writes still require a `write` token). A project with no recorded `github_repo` can't be opened via GitHub login (token only). **A signed-in browser that is still unauthorized** (its GitHub account can't read the backing repo, or the project has no `github_repo`) is NOT redirected -- it already holds a valid session, so a `/__signin` bounce would loop (GitHub re-auths the same account). Instead `unauthorizedResponse` renders an actionable HTML `403` (`signedInForbiddenHTML`): it names the repo access required and offers a "Sign out & switch account" link (apex `/__signout?next=<resource>`, via `signoutURL`), so the user can re-authenticate as an account that has access -- replacing the dead-end JSON `401` a browser could not act on. (The resolved project is put in the request context before the access switch so the page can name the repo.) The page relaxes CSP to `default-src 'none'; style-src 'unsafe-inline'` for one inline `<style>`; no scripts. `safeNextURL` accepts only a same-site path or an apex/subdomain URL (no open redirect); `apexRootURL` derives the apex by stripping a known service label. The whole flow is apex-only (`/__signin`, `/__signin/callback`, `/__signout` via `HandleRaw`) since GitHub OAuth registers a single callback URL. When unconfigured, browsers fall back to the plain JSON `401` (programmatic clients and `/v2/` OCI are always unchanged). Public sites (`X-Public-Site: true`) are still served with no auth at all. **Setup**: create a GitHub OAuth App with callback `https://{apex}/__signin/callback`, set `BUILDHOST_GITHUB_CLIENT_ID` + `BUILDHOST_GITHUB_CLIENT_SECRET`. (Trade-off: the `repo` scope is broad and the user's token lives in the signed session cookie; a GitHub App with fine-grained read-only repo permission would narrow this in a future iteration.)
+- **Admin error messages**: Admin API handlers return generic error messages; raw errors are logged server-side only
+- **Migrations**: Each migration runs in a single transaction (DDL + schema_migrations record) to prevent partial application on crash
+- **OIDC auto-provisioning**: Trusted issuers can auto-create projects. Project name derived from subject claim (repo:org/name:* -> name), lowercased and validated against `[a-z0-9][a-z0-9._-]{0,127}`. Authorized for read,write on that repo's whole namespace -- project `R` plus any slash-namespaced `R/<...>` beneath it (so a multi-binary repo publishes `R/<binary>` for each binary), gated by a trailing-slash boundary so sibling prefixes (`R-evil`) and unrelated projects are refused. `requireProject` validates an auto-created namespaced name per-segment before creating it. Optional BUILDHOST_OIDC_ORGS allowlist restricts which orgs can auto-provision. **Provisioning is write-only**: `requireProject` only creates a missing project for a `WriteAccess` route (the publish POST/PUT flow, docker push, site deploy). A read (`ReadAccess`/`HiddenReadAccess`: dl/static/apt/brew/npm and the web frontend) never provisions -- a GET 404s instead, so it can never materialize a project as a side effect.
+- **OIDC_ORGS wildcard risk**: Setting `BUILDHOST_OIDC_ORGS=*` allows any GitHub org to auto-provision projects. Since project names are derived from repo names, any repo in any org with the same name as an existing project would derive the same project name. The first push creates the project; subsequent pushes from other orgs are blocked by `AuthorizedForProjectName`. However, avoid `BUILDHOST_OIDC_ORGS=*` in production -- scope the allowlist to trusted orgs only
+
+---
+
+# Eviction / Retention Policy Design
+
+Source: https://github.com/wow-look-at-my/buildhost/blob/master/docs/eviction-policies.md
+
+# Eviction / Retention Policy Design
+
+Status: **Implemented** -- keep-N per `(project, git branch)` + abandoned-upload
+sweep + reference-counted blob GC, report-only by default. Background sweeper,
+`buildhost gc` CLI, and an admin "Reclaimable" estimate. Size-watermark / LRU
+(needs a `last_accessed_at` signal) and dedicated docker/OCI GC remain deferred.
+Scope: how buildhost reclaims storage by evicting old releases safely, given
+content-addressed deduplication.
+
+> **Correction from the original draft (Phase 1 "cache eviction" was dropped).**
+> The draft assumed the on-demand repackage formats (tar.gz/xz/zst, zip, deb,
+> brew, npm) were cached in `packaged_artifacts` and grew per download. They are
+> not: `internal/static/fmt_repackage.go` re-derives them from the original
+> artifact on every request and never stores them. In production
+> `packaged_artifacts` holds the synthesized-OCI blobs (`oci-base-layer`,
+> `oci-layer`, `oci-config`), which do not grow per download and are entangled
+> with by-digest OCI pulls, plus per-artifact `format="tar.gz"` **digest** rows
+> written lazily by the brew formula path (a sha256 cache only: `storage_key`
+> records the source artifact blob, no tar.gz blob is stored, and the rows are
+> bounded at one per artifact and dropped by the same release cascade). So
+> there is no standalone "regenerable cache" to TTL.
+> Those OCI blobs are instead reclaimed naturally when their owning release is
+> evicted by keep-N (the cascade drops their rows and the refcount sweep frees
+> any now-unreferenced blob). The real reclaim is keep-N + the abandoned sweep.
+
+---
+
+## 1. Problem statement
+
+buildhost currently **never deletes a release or artifact**. The only
+`DELETE FROM` statements in the codebase target `sites`, `api_tokens`, and
+`oidc_policies` (`internal/db/queries/{sites,tokens,oidc}.sql`). There is no
+`DeleteRelease`, no `DeleteArtifact`, and no garbage collection. Every publish
+adds rows and blobs that live forever.
+
+At the time of writing the instance holds ~35 projects / ~731 releases / ~3601
+artifacts and the dashboard reports ~77.7 GiB "Storage Used". With CI pushing a
+new release per branch per commit, this grows without bound. We need a way to
+bound it.
+
+This document proposes a design. It deliberately does **not** ship code; it
+exists to align on the model and the safety rules first.
+
+---
+
+## 2. Current architecture (what eviction has to work within)
+
+### 2.1 Storage is content-addressed and deduplicated
+
+`internal/storage/filesystem.go`:
+
+- `Put` streams to a temp file, computes the SHA-256, and uses the hex digest as
+  the key. If a blob with that key already exists on disk it returns early
+  (`fs.root.Stat(rel)` hit) -- **identical content is stored once**.
+- Blobs are zstd-compressed on disk (unless `BUILDHOST_STORAGE_COMPRESS=false`),
+  with a `BHC\x01` magic + original-size header.
+- `Delete` is a bare `os.Remove(rel)` with **no reference counting whatsoever**.
+
+### 2.2 One blob can be referenced from five columns
+
+Because the key is the content hash, a single physical blob may be pointed at by
+any of:
+
+| Table | Column(s) |
+|---|---|
+| `artifacts` | `storage_key`, `stripped_storage_key`, `debug_storage_key` |
+| `packaged_artifacts` | `storage_key` (on-demand repackage cache) |
+| `sites` | `storage_key` |
+| `oci_blob_links` | `storage_key` (pushed docker blobs + synthesized OCI layers) |
+
+The existing per-project gate `BlobBelongsToProject`
+(`internal/db/queries/artifacts.sql`) already encodes most of this union -- but
+**scoped to one project**. Eviction needs the *global* version: "is this blob
+referenced by anything, anywhere?"
+
+### 2.3 The sharpest dedup example: the OCI base layer
+
+`internal/repackage/oci.go` registers a shared "essentials" base layer
+(`oci-base-layer`) that is content-addressed and **deduped to a single blob
+server-wide**, then linked per pull. That one blob backs every synthesized OCI
+image across every project. Any eviction that deletes blobs by release ownership
+would eventually delete this blob out from under hundreds of live images.
+
+> **Takeaway:** blobs must never be deleted because "their release went away."
+> They may only be deleted when *no reference of any kind remains*.
+
+### 2.4 A latent bug we inherit
+
+`internal/sites/delete.go` already deletes inline:
+
+```go
+storageKey, err := h.DB.DeleteSite(ctx, project.ID, rt.branch)
+...
+if storageKey != "" {
+    _ = h.Store.Delete(ctx, storageKey) // unconditional
+}
+```
+
+If two site deploys (e.g. two branches at the same commit) produce byte-identical
+tarballs, they share one blob. Deleting one branch removes the shared blob and
+breaks the other. Low probability today, but it is the exact class of bug the
+eviction design must not repeat -- and the reference-counted approach below fixes
+it for free.
+
+### 2.5 Stats machinery already exists
+
+`internal/db/queries/admin.sql` `GetDashboardStats` already computes:
+
+- `total_storage_bytes` = `SUM(artifacts.size)` -- this is the **77.7 GiB**
+  headline. Logical, uncompressed, **originals only** (excludes stripped/debug
+  and packaged cache).
+- `logical_bytes` = artifacts + stripped + debug + packaged (full logical
+  footprint).
+- `physical_bytes` = dedup-aware `SUM(MAX(size) per distinct storage_key)` --
+  still uncompressed, so actual on-disk is smaller again after zstd.
+
+`GetStorageBreakdown` gives per-project totals. The admin endpoint
+`GET /api/storage` (`internal/admin/admin.go:583`) already returns
+`logical_bytes` / `physical_bytes`. A "reclaimable bytes" figure slots in here.
+
+---
+
+## 3. The foundation: reference-counted mark-and-sweep GC
+
+Everything else depends on this. **Policy decides *what* to forget; GC decides
+*when a blob is safe to delete*.** Keep them separate.
+
+### 3.1 Two-phase deletion
+
+1. **Mark (policy, transactional):** delete DB rows for the evicted unit
+   (release -> its artifacts -> their packaged_artifacts + download_counts ->
+   oci_tags), collecting the set of `storage_key`s those rows referenced.
+2. **Sweep (GC):** for each collected candidate key, delete the blob **iff** it
+   is no longer referenced by any of the five columns in 2.2.
+
+A blob with zero references is always safe to delete, and re-running the sweep is
+idempotent -- so the process is crash-safe. If the server dies between phases,
+the next sweep finishes the job.
+
+### 3.2 The "is this blob still referenced?" query
+
+The global generalization of `BlobBelongsToProject`:
+
+```sql
+-- name: IsBlobReferenced :one
+SELECT EXISTS(
+    SELECT 1 FROM artifacts
+      WHERE storage_key = @key OR stripped_storage_key = @key OR debug_storage_key = @key
+    UNION ALL SELECT 1 FROM packaged_artifacts WHERE storage_key = @key
+    UNION ALL SELECT 1 FROM sites             WHERE storage_key = @key
+    UNION ALL SELECT 1 FROM oci_blob_links    WHERE storage_key = @key
+) AS referenced;
+```
+
+### 3.3 Targeted sweep vs. full reconciliation
+
+- **Targeted sweep** (primary): only check the candidate keys produced by a
+  delete. Cheap, runs right after eviction. No races because we only consider
+  keys whose rows we just removed.
+- **Full reconciliation** (periodic safety net): walk the storage root and delete
+  any on-disk key that `IsBlobReferenced` says is dead.
+  - **Must use a grace period.** The publish path does `Store.Put` *then* inserts
+    the artifact row; there is a window where a blob is on disk with no DB row
+    yet. A full sweep must skip blobs whose mtime is newer than, say, 24h to
+    avoid deleting an in-flight upload. The targeted sweep avoids this window
+    entirely.
+
+### 3.4 Fixing the sites bug
+
+`sites/delete.go` should stop calling `Store.Delete` inline and instead route the
+freed key through the same targeted sweep (delete the blob only if no other
+reference remains). This is a small, self-contained correctness fix that lands
+with the GC foundation.
+
+---
+
+## 4. Safety rails: what must never be evicted (pins)
+
+Any policy must treat these as hard pins, independent of age or count:
+
+1. **A project's latest published release.** Always keep at least one.
+2. **The latest published release per `git_branch`.** Branch downloads
+   (`/dl/{project}/branch/{branch}/...`, resolved by
+   `GetLatestPublishedReleaseByBranch`) break otherwise.
+3. **Any release referenced by `oci_tags.release_id`.** Tags are mutable pointers;
+   deleting the backing release breaks `docker pull repo:tag`.
+4. **In-flight / very recent releases.** Don't evict something created in the last
+   N hours (avoid racing an active publish/repackage).
+5. **(Implicit via GC) shared blobs** such as the OCI base layer -- never deleted
+   while any reference remains.
+
+Unpublished releases (`published = 0`) are the opposite: they are abandoned
+partial uploads and are the *safest* thing to clean up (see Phase 2).
+
+---
+
+## 5. Signals available for policy (and the one we lack)
+
+| Signal | Source | Use |
+|---|---|---|
+| Age | `releases.created_at` / `published_at`, `artifacts.created_at` | TTL |
+| Recency of version | `releases.version_num` | keep-last-N |
+| Branch | `releases.git_branch` | per-branch keep / pin |
+| Tag pin | `oci_tags.release_id` | never-evict |
+| Publish state | `releases.published` | sweep abandoned uploads |
+| Popularity | `download_counts.count` | tie-breaker / "keep if popular" |
+| **Last access time** | **(none)** | **needed for true LRU** |
+
+We track download **count** but never **when** a download happened. A genuine
+"evict the coldest artifacts" / LRU policy would require a new
+`artifacts.last_accessed_at` (or a separate access-log table) updated on the
+download path. This is the main schema gap that distinguishes the policy options
+below.
+
+---
+
+## 6. Policy model options
+
+All three sit on top of the GC foundation and honor the Section 4 pins. They are
+not mutually exclusive -- keep-N and a size watermark compose well.
+
+### Option A -- Keep last N published releases per project (recommended default)
+
+Keep the N most-recent published releases per project; evict older ones. Plus
+pins (latest-per-branch, tagged, recent).
+
+- **Pros:** predictable, easy to explain, registry-standard (npm dist-tags,
+  ghcr retention), uses only signals we already have (`version_num`). Bounds
+  per-project growth directly.
+- **Cons:** doesn't directly target a disk budget; a few huge projects can still
+  dominate. N is a blunt instrument across very different projects.
+- **Config:** `BUILDHOST_RETENTION_KEEP_N` (global default), optional per-project
+  override column.
+
+### Option B -- Age-based TTL
+
+Evict published releases older than X days (plus pins).
+
+- **Pros:** simple, time-bounded, good for "previews older than a month go away".
+- **Cons:** bursty projects can still blow the budget within the window; quiet
+  projects lose history they may still want. Doesn't bound total size.
+- **Config:** `BUILDHOST_RETENTION_MAX_AGE` (e.g. `30d`).
+
+### Option C -- Global size watermark / LRU
+
+Evict (coldest first) until total physical size is under a target.
+
+- **Pros:** directly targets the actual constraint (disk). Adaptive.
+- **Cons:** needs the missing `last_accessed_at` signal to be meaningful;
+  otherwise "coldest" degrades to "oldest" (= a global TTL). More moving parts;
+  eviction amount varies run to run.
+- **Config:** `BUILDHOST_RETENTION_TARGET_BYTES` (high/low watermark).
+
+### Recommendation
+
+Ship **Option A (keep-N) + the always-safe Phase 1/2 cleanups**, defaulting to
+report-only. Add **Option C** later if a hard disk budget becomes necessary, at
+which point we invest in `last_accessed_at`. Option A covers the actual growth
+driver (per-branch-per-commit CI releases) with signals we already have and zero
+new tracking.
+
+---
+
+## 7. Phased rollout
+
+Ordered safest-first; each phase is independently shippable and valuable.
+
+**Phase 0 -- GC foundation (Section 3).** `DeleteRelease` cascade + global
+`IsBlobReferenced` + targeted sweep. Also fixes the `sites/delete.go` dedup bug.
+No automatic eviction yet; this is the safe primitive everything else calls.
+
+**Phase 1 -- Evict the regenerable cache.** `packaged_artifacts` are rebuilt on
+the next download, so dropping ones older than a TTL is **zero-risk** and likely
+the biggest immediate win (every format ever requested is cached forever right
+now). Exception: keep `oci-base-layer` entries (shared, cheap, hot). Config:
+`BUILDHOST_RETENTION_CACHE_TTL` (e.g. `30d`).
+
+**Phase 2 -- Sweep abandoned unpublished releases.** Delete `published = 0`
+releases older than a few hours and their artifacts (failed/partial uploads).
+Safe by construction -- nothing serves an unpublished release.
+
+**Phase 3 -- Keep-last-N retention (Option A).** Per-project, honoring all pins,
+**report-only by default**. The operator reviews the report, then flips
+enforcement on.
+
+**Phase 4 (optional, later) -- Size watermark (Option C)** + `last_accessed_at`
+tracking if a hard budget is required.
+
+Docker/OCI eviction is called out separately below and is **not** in Phases 0-3
+beyond pins.
+
+---
+
+## 8. Schema / query changes (sketch, not final)
+
+Next migration number is `009` (`migrations/` is sequential `NNN_name.sql`,
+each applied in its own transaction; mirror into `internal/db/schema.sql` for
+sqlc).
+
+- **No new tables required for Phases 0-3.** New queries only:
+  - `DeleteRelease` cascade set: delete `download_counts` and `packaged_artifacts`
+    for the release's artifacts, delete `artifacts`, delete `oci_tags` for the
+    release, delete the `releases` row -- all in one transaction, returning the
+    candidate `storage_key`s.
+  - `IsBlobReferenced` (Section 3.2).
+  - `ListEvictableReleases` per project: published releases ranked by
+    `version_num DESC`, excluding the latest-per-branch and tagged releases, with
+    `OFFSET N` for keep-N.
+  - `ListExpiredPackagedArtifacts` (Phase 1), `ListAbandonedReleases` (Phase 2).
+  - `SumReclaimableBytes` for the admin surface.
+- **Optional later:**
+  - `artifacts.last_accessed_at DATETIME` (Phase 4 / Option C).
+  - `projects.retention_keep_n INTEGER` (per-project override of the global N).
+
+---
+
+## 9. Where it runs
+
+Three surfaces, matching existing patterns:
+
+- **Background sweeper:** a goroutine on a ticker in the server, like graceful
+  shutdown. Must respect context cancellation on SIGTERM and should not fight the
+  inflight-write tracking used by `/ready-to-update`. Interval via
+  `BUILDHOST_RETENTION_INTERVAL` (e.g. `1h`); off by default.
+- **CLI subcommand:** `buildhost gc` / `buildhost evict` (cobra, one file,
+  self-registering via `init()`, per the repo's CLI conventions) with
+  `--dry-run` for cron/manual use. `--dry-run` reuses the report path.
+- **Admin surface:** extend `GET /api/storage` with reclaimable bytes per project;
+  optionally a `POST /api/gc` trigger (there is precedent for admin mutations,
+  e.g. `DELETE /api/tokens/{id}`). Admin remains behind the reverse proxy.
+
+**Default posture: report-only.** Every destructive phase computes and logs/returns
+"what would be deleted and how many bytes" before any enforcement flag is set.
+Enforcement is opt-in via env.
+
+---
+
+## 10. Docker / OCI eviction (separate, harder -- later)
+
+`oci_blob_links` is **project-scoped, not release-scoped**: pushed docker blobs
+and manifests attach to the project, shared across pushes and tags
+(`internal/oci/*.go`). So evicting a `kind=docker` release is not a simple row
+cascade -- you must drop the tag/manifest, then GC blobs no longer reachable from
+any remaining tag/manifest in that project. This deserves its own design pass and
+is out of scope for the initial keep-N work. Until then, docker images are
+retained (and tagged releases are pinned regardless).
+
+---
+
+## 11. Risks & mitigations
+
+| Risk | Mitigation |
+|---|---|
+| Delete a shared blob still in use | Reference-counted sweep (Section 3); never delete by ownership |
+| Race with in-flight publish (blob on disk, row not yet written) | Targeted sweep only touches just-deleted keys; full sweep uses a mtime grace period |
+| Evict something a download URL still resolves | Pins: latest overall, latest-per-branch, tagged (Section 4) |
+| Operator surprise / data loss | Report-only default; dry-run CLI; WARN-level logs naming every evicted release |
+| Crash mid-eviction | Two-phase + idempotent sweep; DB cascade in one transaction |
+| Docker blob sharing mishandled | Docker eviction deferred to its own phase (Section 10) |
+
+---
+
+## 12. Open decisions (for the team)
+
+1. **Policy model:** confirm keep-N (Option A) as the default, or prefer TTL /
+   size-watermark?
+2. **Default N** (e.g. 10?) and whether per-project overrides are needed up front.
+3. **Cache TTL** for Phase 1 (e.g. 30d) -- aggressive is fine since it regenerates.
+4. **Enforcement rollout:** ship report-only first and flip per-instance, or gate
+   behind an explicit `BUILDHOST_RETENTION_ENFORCE=true`?
+5. **Do we invest in `last_accessed_at`** now (enables true LRU/Option C) or defer
+   until a hard disk budget forces it?
+6. **Branch handling:** keep-N per project, or keep-N *per branch* (CI branches
+   are the real multiplier)?
+
+---

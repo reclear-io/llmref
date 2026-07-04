@@ -1,0 +1,1828 @@
+# bumblebee
+
+Source: https://github.com/perplexityai/bumblebee/blob/main/README.md
+
+# bumblebee
+
+Bumblebee is a read-only inventory collector for package, extension,
+and developer-tool metadata on macOS and Linux developer endpoints.
+
+It answers a narrow supply-chain response question: when an advisory
+names a package, extension, or version, which developer machines show
+a match in their on-disk metadata right now?
+
+SBOMs help answer what shipped, and EDR helps answer what ran or
+touched the network, but supply-chain response often needs a different
+view: messy local state across lockfiles, package-manager metadata,
+extension manifests, and supported developer-tool configs.
+
+Bumblebee turns that scattered on-disk state into structured NDJSON
+component records and, when given an exposure catalog, flags exact
+matches for fast, read-only exposure checks when responders already
+know what they are looking for.
+
+## Scope
+
+- Single static binary, Go 1.25+, zero non-stdlib dependencies.
+- Three scan profiles (`baseline`, `project`, `deep`) for different
+  populations and cadences.
+- Reads only the lockfiles, package-manager install metadata,
+  extension manifests, and supported MCP JSON configs listed in
+  [docs/inventory-sources.md](docs/inventory-sources.md). No package
+  manager execution (`npm ls`, `pip show`, `go list`, ...) and no
+  source-file reads. MCP host configs can carry environment values
+  and credentials in their `env` blocks; Bumblebee parses these
+  configs for the server inventory it needs but does not emit those
+  values in its records.
+
+## Coverage
+
+| Family | Emitted `ecosystem` | Sources |
+|---|---|---|
+| npm | `npm` | `package-lock.json`, `npm-shrinkwrap.json`, `node_modules/.package-lock.json`, `node_modules/<pkg>/package.json` |
+| pnpm | `npm` | `pnpm-lock.yaml`, `.pnpm/.../package.json` |
+| Yarn | `npm` | `yarn.lock` (Classic + Berry) |
+| Bun | `npm` | `bun.lock`; `bun.lockb` presence as diagnostic |
+| PyPI | `pypi` | `*.dist-info/METADATA`, `INSTALLER`, `direct_url.json`, `*.egg-info/PKG-INFO` |
+| Go modules | `go` | `go.sum`, `go.mod` |
+| RubyGems | `rubygems` | `Gemfile.lock`, installed `*.gemspec` |
+| Composer | `packagist` | `composer.lock`, `vendor/composer/installed.json` |
+| MCP | `mcp` | JSON host configs: `mcp.json`, `.mcp.json`, `claude_desktop_config.json`, `mcp_config.json`, `mcp_settings.json`, `cline_mcp_settings.json`, plus `~/.gemini/settings.json` (Gemini CLI / Code Assist) and `~/.claude.json` (Claude Code user- and project-scoped `mcpServers`). Non-JSON configs (Codex `config.toml`, Continue YAML) are not parsed in v0.1. |
+| Agent skills | `agent-skill` | `skills.sh` / `vercel-labs/skills` lock files: global `~/.agents/.skill-lock.json` (or `$XDG_STATE_HOME/skills/.skill-lock.json`) and project-local `skills-lock.json`. Loose `SKILL.md` directories without a lock file are not enumerated. |
+| Editor extensions | `editor-extension` | VS Code, Cursor, Windsurf, VSCodium manifests |
+| Browser extensions | `browser-extension` | Chromium-family (`manifest.json`) and Firefox (`extensions.json`) per profile |
+| Homebrew | `homebrew` | Formula `INSTALL_RECEIPT.json` files and cask `.metadata` install markers |
+
+Per-ecosystem detail: [docs/inventory-sources.md](docs/inventory-sources.md).
+
+## Install
+
+Requires Go 1.25+. Zero non-stdlib dependencies.
+
+```sh
+# Install the latest tagged release into $GOBIN.
+go install github.com/perplexityai/bumblebee/cmd/bumblebee@latest
+
+# Or pin a specific tag.
+go install github.com/perplexityai/bumblebee/cmd/bumblebee@v0.1.1
+```
+
+To build from a checkout:
+
+```sh
+go build -o bumblebee ./cmd/bumblebee
+go test ./...
+```
+
+Stamp an explicit version at build time:
+
+```sh
+go build -ldflags "-X main.Version=v0.1.1" -o bumblebee ./cmd/bumblebee
+```
+
+`bumblebee version` prints the version plus the VCS revision, build
+time, and Go runtime — so a record emitted in production can be traced
+back to a specific build. Version precedence: `-ldflags` override,
+module version recorded by `go install`, then the in-tree default
+tracked in `VERSION`.
+
+### Self-test
+
+After installing, run a built-in end-to-end check against embedded
+fixtures:
+
+```sh
+bumblebee selftest
+# selftest OK (2 findings in 1ms)
+```
+
+The fixtures live inside the binary, use deliberately fake package
+names (`bumblebee-selftest-evil@0.0.0`), and make no network calls. A
+non-zero exit means the local install can no longer detect what it
+should — a fast pre-deployment smoke test for fleet rollouts.
+
+## Profiles
+
+Bumblebee is a one-shot scanner: each invocation performs a single scan
+and exits. Cadence is the runner's responsibility (cron, launchd, systemd,
+MDM, etc.). Each record carries `profile` and a per-root `root_kind` so
+receivers can keep populations separate.
+
+| Profile | Scans | Use for |
+|---|---|---|
+| `baseline` | Common global/user package roots, language toolchains, editor extensions, browser extensions, and MCP configs. | Recurring lightweight inventory via an external runner. |
+| `project` | Configured development directories, such as `~/code`, `~/src`, or `~/work`. | Recurring inventory for known project workspaces. |
+| `deep` | Explicit `--root` paths, including broad roots like `$HOME`. | On-demand incident or campaign checks, usually with `--ecosystem`, `--exposure-catalog`, and `--findings-only`. |
+
+`baseline` and `project` refuse bare-home roots; only `deep` walks them.
+
+## Quick start
+
+```sh
+# Baseline global inventory.
+bumblebee scan --profile baseline > inventory.ndjson
+
+# Daily project sweep with explicit roots.
+bumblebee scan --profile project \
+  --root "$HOME/code" \
+  --root "$HOME/Developer"
+
+# Limit a run to selected emitted ecosystems.
+bumblebee scan --profile baseline \
+  --ecosystem npm,pypi \
+  --ecosystem go
+
+# On-demand exposure scan against a published advisory.
+bumblebee scan --profile deep \
+  --root "$HOME" \
+  --exposure-catalog ./catalog.json \
+  --max-duration 10m
+```
+
+Preview the resolved roots without scanning:
+
+```sh
+bumblebee roots --profile baseline
+# prints "<root_kind>\t<path>" lines
+```
+
+`--root` is a filesystem path to scan; repeatable, required for `deep`,
+optional for the other profiles. `--ecosystem` is repeatable and
+comma-separated. `--exposure-catalog` accepts a JSON file or a directory
+of `*.json` catalogs (merged non-recursively, all files must share
+`schema_version`). `--findings-only` requires `--exposure-catalog` and
+suppresses package records while keeping findings. `bumblebee scan --help`
+lists every flag.
+
+## Output
+
+Records are NDJSON, one per line. Diagnostics go to stderr as NDJSON. Each
+run ends with a `scan_summary` record; receivers use it to decide whether
+to promote a run to current state. See [docs/transport.md](docs/transport.md)
+for HTTPS/file output and [docs/state-model.md](docs/state-model.md) for the
+receiver-side current-state model.
+
+Package record:
+
+<details>
+<summary>Example package record</summary>
+
+```json
+{
+  "record_type": "package",
+  "record_id": "package:...",
+  "schema_version": "0.1.0",
+  "scanner_name": "bumblebee",
+  "scanner_version": "v0.1.1",
+  "run_id": "9b1f0c2e4d5a6b7c8d9e0f1a2b3c4d5e",
+  "scan_time": "2026-05-15T18:22:01.482Z",
+  "endpoint": {
+    "hostname": "alex-mbp",
+    "os": "darwin",
+    "arch": "arm64",
+    "username": "alex",
+    "uid": "501",
+    "device_id": "MDM-7F4A2B"
+  },
+  "profile": "project",
+  "ecosystem": "npm",
+  "package_name": "@tanstack/query-core",
+  "normalized_name": "@tanstack/query-core",
+  "version": "5.59.20",
+  "project_path": "/Users/alex/code/web-app",
+  "root_kind": "project_root",
+  "package_manager": "pnpm",
+  "source_type": "pnpm-lockfile",
+  "source_file": "/Users/alex/code/web-app/pnpm-lock.yaml",
+  "has_lifecycle_scripts": false,
+  "confidence": "high"
+}
+```
+
+</details>
+
+`confidence`:
+
+- `high` — exact identity and version came from canonical metadata.
+- `medium` — identity is reliable, but version or source is partial.
+- `low` — config/path/spec reference only; not proof of an installed exact version.
+
+Finding record (exposure-catalog match):
+
+<details>
+<summary>Example finding record</summary>
+
+```json
+{
+  "record_type": "finding",
+  "record_id": "finding:...",
+  "schema_version": "0.1.0",
+  "scanner_name": "bumblebee",
+  "scanner_version": "v0.1.1",
+  "run_id": "3a8c7d1e9f0b2a4c6d8e0f1a2b3c4d5e",
+  "scan_time": "2026-05-15T18:22:01.482Z",
+  "endpoint": {
+    "hostname": "alex-mbp",
+    "os": "darwin",
+    "arch": "arm64",
+    "username": "alex",
+    "uid": "501",
+    "device_id": "MDM-7F4A2B"
+  },
+  "profile": "deep",
+  "finding_type": "package_exposure",
+  "severity": "critical",
+  "catalog_id": "advisory-2026-0042",
+  "catalog_name": "example-pkg 1.2.3 (compromised release)",
+  "ecosystem": "npm",
+  "package_name": "example-pkg",
+  "normalized_name": "example-pkg",
+  "version": "1.2.3",
+  "root_kind": "deep_home_root",
+  "project_path": "/Users/alex/code/web-app",
+  "source_type": "pnpm-lockfile",
+  "source_file": "/Users/alex/code/web-app/pnpm-lock.yaml",
+  "confidence": "high",
+  "evidence": "exact name+version match (version=1.2.3)"
+}
+```
+
+</details>
+
+`record_id` is a content-addressed hash of a canonical identity tuple per
+record type, stable across runs. Per-record-type field lists and dedupe
+guidance: [docs/state-model.md](docs/state-model.md#record-identity-record_id).
+
+## Exposure Catalog Format
+
+Minimal JSON, exact `(ecosystem, name, version)` matching only:
+
+```json
+{
+  "schema_version": "0.1.0",
+  "entries": [
+    {
+      "id": "advisory-2026-0042",
+      "name": "example-pkg 1.2.3 (compromised release)",
+      "ecosystem": "npm",
+      "package": "example-pkg",
+      "versions": ["1.2.3"],
+      "severity": "critical"
+    }
+  ]
+}
+```
+
+The catalog must be a JSON object with `schema_version` and `entries`
+keys. Bare top-level arrays are rejected. Unsupported future
+`schema_version` values are rejected. Multiple catalog files can be
+loaded together by pointing `--exposure-catalog` at a directory; see
+the flag description above.
+
+### Sample exposure catalogs
+
+The [`threat_intel/`](threat_intel/) directory holds maintained exposure
+catalogs built from public threat-intelligence reporting on recent
+supply-chain campaigns, assembled with
+[Perplexity Computer](https://www.perplexity.ai/computer) and updated
+via PRs as new campaigns are reported. See
+[`threat_intel/README.md`](threat_intel/README.md) for the current
+catalog list and review guidance.
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE).
+
+---
+
+# Contributing to bumblebee
+
+Source: https://github.com/perplexityai/bumblebee/blob/main/CONTRIBUTING.md
+
+# Contributing to bumblebee
+
+Thanks for your interest. This project favours small, focused changes
+with tests.
+
+## Local development
+
+Requires Go 1.25+. No non-stdlib runtime dependencies.
+
+```sh
+go build ./cmd/bumblebee
+go test ./...
+go test -race ./...
+go vet ./...
+gofmt -l .   # should print nothing
+./bumblebee selftest
+```
+
+## Pull requests
+
+- Keep PRs small and focused. Separate refactors from behaviour changes.
+- Match the existing conventional-commits style for commit subjects:
+  `fix(scope): ...`, `feat(scope): ...`, `docs: ...`, `ci: ...`.
+- Add or update tests for behaviour changes. Prefer ephemeral fixtures
+  (`t.TempDir()` + inline strings) over committed `testdata/` files
+  unless a fixture is needed by multiple tests.
+- Update `README.md` when adding or changing a user-facing flag, profile,
+  ecosystem, or output field.
+
+## Adding an exposure catalog
+
+New catalogs land under `threat_intel/`. Before submitting:
+
+- Validate against the published schema. A quick check, using the
+  Python `jsonschema` package (`pip install jsonschema`):
+
+  ```sh
+  python3 -c "import json, jsonschema; \
+    jsonschema.validate(json.load(open('threat_intel/your-catalog.json')), \
+      json.load(open('docs/schema/v0.1.0/exposure-catalog.schema.json')))"
+  ```
+
+- Include a `_comment` field at the catalog root with the methodology
+  and source for the entries. Keep this on existing catalogs when
+  editing.
+- Use a documented severity value (`critical` is the only one used by
+  shipped catalogs today; if you introduce a new value, justify it in
+  the PR description).
+- Include `source` on each entry pointing at the public advisory or
+  research writeup that backs it.
+
+Catalogs can also be generated offline from OSV data with
+`tools/osvcatalog`; see [`threat_intel/README.md`](threat_intel/README.md).
+
+## Schema changes
+
+Any change to `docs/schema/v0.1.0/*.json` or the wire format that breaks
+existing consumers is a breaking change. Land it as a new version
+directory (`docs/schema/v0.2.0/`) and bump `model.SchemaVersion`
+together; do not edit a published schema in place.
+
+## Security issues
+
+Do not file public issues for vulnerabilities. See `SECURITY.md`.
+
+---
+
+# Deploying bumblebee on macOS
+
+Source: https://github.com/perplexityai/bumblebee/blob/main/docs/deployment-macos.md
+
+# Deploying bumblebee on macOS
+
+`bumblebee` is a one-shot binary with no built-in scheduler. On macOS
+the typical pattern is to schedule it from `launchd`. The examples below
+assume the plist is delivered by MDM, but the `launchd` mechanics are the
+same regardless of how the file is installed.
+
+Cadence is the runner's choice (cron, launchd, MDM, ...); the
+profile only determines what gets walked. Typical deployment
+shapes:
+
+- `baseline` — bounded global/user package-manager and toolchain
+  roots. Recurring, typically every 6 hours plus `RunAtLoad`.
+- `project`  — configured developer/project roots. Recurring,
+  typically daily or every 12 hours.
+- `deep`     — exposure scan over operator-supplied roots. Typically
+  on demand during a campaign; recurring is fine too (pair with
+  `--findings-only` for a low-cost finding-only stream).
+
+For backend data-modeling considerations see
+[state-model.md](state-model.md).
+
+## LaunchDaemon vs LaunchAgent
+
+Pick one, not both.
+
+- **LaunchDaemon** (`/Library/LaunchDaemons/`, runs as root). Useful when
+  one pass should scan every user on the machine. Pass `--all-users` so
+  `bumblebee` expands the profile's per-user default roots
+  (`~/.nvm/versions`, `~/.vscode/extensions`, `~/Library/Application
+  Support/Claude`, browser-extension profile dirs, etc.) across every
+  real `/Users/<name>/` home automatically; system Python and Homebrew
+  lib locations are still included exactly once. Records will carry the
+  root user's identity in `endpoint.username` because the scanner
+  process runs as root — `source_file` and `project_path` remain the
+  source of truth for which user a given record belongs to.
+- **LaunchAgent** (`/Library/LaunchAgents/`, runs per logged-in user under
+  that user's UID). Each developer reports their own inventory under their
+  own user identity. TCC prompts are owned by the user being scanned.
+
+LaunchAgent is the safer default: per-user scope is what package
+inventory actually represents.
+
+## Root-owned runs with `--all-users`
+
+A root-owned LaunchDaemon starts with `HOME=/var/root`. The profile
+defaults would otherwise resolve to `/var/root/.nvm/...`,
+`/var/root/.vscode/...`, etc., which captures system/Homebrew inventory
+but misses per-user developer tools. Passing `--all-users` expands the
+per-user default roots across every real `/Users/<name>/` home:
+
+```sh
+sudo bumblebee scan \
+  --profile baseline \
+  --all-users \
+  --max-duration 5m \
+  --output http \
+  --http-url https://inventory.example.com/v1/ingest \
+  --http-auth bearer \
+  --http-token-env BUMBLEBEE_TOKEN \
+  --device-id-env BUMBLEBEE_DEVICE_ID
+```
+
+What `--all-users` does (and does not) do:
+
+- Adds the **same known subdirectories** under each `/Users/<name>/` that
+  it would add under the current `$HOME` (toolchains, editor extensions,
+  MCP config dirs, browser-extension profile dirs). It does **not** add
+  `/Users/<name>/` itself as a recursive root — bare-home crawling is
+  still only available via `--profile deep`.
+- Includes system/Homebrew roots (`/opt/homebrew/lib`, `/usr/local/lib`,
+  `/Library/Python`) exactly once, just like the single-user run.
+- Skips well-known service entries (`Shared`, `Guest`, `root`, `Deleted
+  Users`) and any hidden entry under `/Users` (`.localized`, `.DS_Store`).
+- Cannot be combined with `--root` (explicit roots disable the
+  expansion) or `--profile=deep`. `baseline` and `project` have a
+  bounded set of known per-user subdirectories to fan out across
+  (toolchains, editor extensions, MCP config dirs, browser profiles);
+  `deep` walks operator-supplied roots and has no such known set, so
+  fanning out across users on `deep` means passing `--root /Users/<name>`
+  explicitly per user.
+- Is a macOS-only behavior. On Linux, `--all-users` is accepted but
+  resolves to the current user's home only — multi-user fanout under a
+  single root-owned scan is currently a macOS-only convenience.
+
+`endpoint.username` and `endpoint.uid` reflect the scanner process
+identity — `root` / `0` for a LaunchDaemon. This is correct: the
+endpoint identity is "who ran the scan," not "whose home this record
+came from." For attribution, downstream consumers should key on
+`project_path` and `source_file`, both of which carry the
+`/Users/<name>/...` prefix that identifies the user. The trailing
+`scan_summary.roots` list also enumerates every expanded path.
+
+## Cadence by profile
+
+| Profile     | Typical interval                                                  | launchd shape                              |
+|-------------|-------------------------------------------------------------------|--------------------------------------------|
+| `baseline` | `StartInterval 21600` (every 6 h) plus `RunAtLoad` for a login run | one LaunchAgent / LaunchDaemon per host    |
+| `project`   | `StartInterval 86400` (daily) or `43200` (12 h)                    | one LaunchAgent / LaunchDaemon per host    |
+| `deep`      | Usually on demand; recurring works with `--findings-only`          | run from your remote-execution tool on demand, or via launchd |
+
+Set `--max-duration` comfortably above each baseline job's observed P99.
+`--concurrency 4` (default) is right for most laptops.
+
+`deep` walks operator-supplied roots — typically a developer's home
+during a campaign — and pairs naturally with `--exposure-catalog` to
+emit findings. Most deployments invoke it on demand, but recurring
+runs work too; `--findings-only` keeps the per-run output small.
+
+## Output choice
+
+- **You already run a log shipper** (Vector, Fluent Bit, Filebeat, etc.):
+  use `--output file --output-file /var/log/bumblebee/inventory.ndjson`
+  with `--append` and let the shipper own forwarding, batching, and
+  retry. Most resilient on flaky networks.
+- **No log shipper**: use `--output http --http-url https://...`. The
+  HTTPS sink reads bearer or HMAC-SHA256 secrets from environment
+  variables; provision them via the launchd plist's `EnvironmentVariables`
+  block or via the MDM profile. HTTPS is required for non-loopback hosts.
+
+There is no built-in S3/GCS uploader. See [transport.md](transport.md).
+
+## Example LaunchAgent plist — baseline profile
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+ "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.example.bumblebee.baseline</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/bumblebee</string>
+    <string>scan</string>
+    <string>--profile</string>
+    <string>baseline</string>
+    <string>--max-duration</string>
+    <string>5m</string>
+    <string>--output</string>
+    <string>http</string>
+    <string>--http-url</string>
+    <string>https://inventory.example.com/v1/ingest</string>
+    <string>--http-auth</string>
+    <string>bearer</string>
+    <string>--http-token-env</string>
+    <string>BUMBLEBEE_TOKEN</string>
+    <string>--http-gzip</string>
+    <string>--device-id-env</string>
+    <string>BUMBLEBEE_DEVICE_ID</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>BUMBLEBEE_TOKEN</key>
+    <string>__TOKEN__</string>
+    <key>BUMBLEBEE_DEVICE_ID</key>
+    <string>__DEVICE_ID__</string>
+  </dict>
+
+  <key>StartInterval</key>
+  <integer>21600</integer>
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/tmp/bumblebee.baseline.out</string>
+  <key>StandardErrorPath</key>
+  <string>/var/log/bumblebee/bumblebee.baseline.err</string>
+</dict>
+</plist>
+```
+
+## Example LaunchAgent plist — project profile
+
+Same shape, plus `--root` per project tree and a daily interval:
+
+```xml
+<key>Label</key>
+<string>com.example.bumblebee.project</string>
+...
+<key>ProgramArguments</key>
+<array>
+  <string>/usr/local/bin/bumblebee</string>
+  <string>scan</string>
+  <string>--profile</string><string>project</string>
+  <string>--root</string><string>/Users/__USERNAME__/code</string>
+  <string>--root</string><string>/Users/__USERNAME__/Developer</string>
+  <string>--max-duration</string><string>10m</string>
+  <string>--output</string><string>http</string>
+  <string>--http-url</string><string>https://inventory.example.com/v1/ingest</string>
+  <string>--http-auth</string><string>bearer</string>
+  <string>--http-token-env</string><string>BUMBLEBEE_TOKEN</string>
+  <string>--http-gzip</string>
+  <string>--device-id-env</string><string>BUMBLEBEE_DEVICE_ID</string>
+</array>
+...
+<key>StartInterval</key><integer>86400</integer>
+```
+
+## Triggering the deep profile on demand
+
+`deep` is not in a plist. Operators invoke it as a one-off, typically
+via the remote-execution path the fleet already uses:
+
+```sh
+bumblebee scan \
+  --profile deep \
+  --root "$HOME" \
+  --exposure-catalog /path/to/campaign-catalog.json \
+  --max-duration 10m \
+  --output http \
+  --http-url https://inventory.example.com/v1/ingest \
+  --http-auth bearer \
+  --http-token-env BUMBLEBEE_TOKEN \
+  --device-id-env BUMBLEBEE_DEVICE_ID
+```
+
+Findings (`record_type=finding`) land in the same NDJSON stream as the
+package records and the trailing `scan_summary`.
+
+### One-off deep run from a root-context script
+
+If the runner executes as root, `$HOME` usually points at `/var/root`,
+not the developer's home. `deep` needs at least one explicit `--root`,
+so the script has to pick one deliberately. Two patterns:
+
+**1. Target the logged-in console user.** Derive the username (and
+home directory) from `/dev/console` ownership rather than trusting any
+tool-supplied variable. This works on every macOS release and does not
+assume the runner injects a `$USER`-equivalent:
+
+```sh
+#!/bin/sh
+set -eu
+
+CONSOLE_USER=$(stat -f '%Su' /dev/console)
+if [ -z "$CONSOLE_USER" ] || [ "$CONSOLE_USER" = "root" ] || [ "$CONSOLE_USER" = "loginwindow" ]; then
+  echo "no console user; skipping" >&2
+  exit 0
+fi
+CONSOLE_HOME=$(dscl . -read "/Users/$CONSOLE_USER" NFSHomeDirectory | awk '{print $2}')
+
+/usr/local/bin/bumblebee scan \
+  --profile deep \
+  --root "$CONSOLE_HOME" \
+  --exposure-catalog /var/db/bumblebee/campaign-catalog.json \
+  --max-duration 10m \
+  --output http \
+  --http-url https://inventory.example.com/v1/ingest \
+  --http-auth bearer \
+  --http-token-env BUMBLEBEE_TOKEN \
+  --device-id-env BUMBLEBEE_DEVICE_ID
+```
+
+**2. Sweep every local user home.** When a campaign needs coverage
+across all developers on a multi-user box, loop over `/Users` and
+invoke `deep` once per real home. There is no `--all-users` for `deep`
+(see [LaunchDaemon vs LaunchAgent](#launchdaemon-vs-launchagent)); the
+loop is explicit on purpose:
+
+```sh
+#!/bin/sh
+set -eu
+for u in /Users/*; do
+  name=$(basename "$u")
+  case "$name" in
+    Shared|Guest|Deleted\ Users|.localized|.*) continue ;;
+  esac
+  [ -d "$u" ] || continue
+  /usr/local/bin/bumblebee scan \
+    --profile deep \
+    --root "$u" \
+    --exposure-catalog /var/db/bumblebee/campaign-catalog.json \
+    --max-duration 10m \
+    --output http \
+    --http-url https://inventory.example.com/v1/ingest \
+    --http-auth bearer \
+    --http-token-env BUMBLEBEE_TOKEN \
+    --device-id-env BUMBLEBEE_DEVICE_ID
+done
+```
+
+Each invocation is its own `run_id`; the receiver dedupes per
+`(endpoint, ecosystem, normalized_name, version, source_file)`.
+
+Management tools differ in how they expose the logged-in username to a
+script. Treat those variables as advisory and prefer `/dev/console` or
+an explicit `/Users` loop.
+
+## Default roots per profile
+
+`bumblebee roots --profile <p>` previews the resolved roots on the
+current host (one `<root_kind>\t<path>` line per root). The defaults are:
+
+- `baseline`: language toolchains and version managers (`~/.cargo`,
+  `~/go`, `~/.pyenv/versions`, `~/.nvm/versions`, `~/.rbenv`,
+  `~/.asdf/installs`), editor-extension trees (`~/.vscode/extensions`,
+  `~/.cursor/extensions`, `~/.windsurf/extensions`, server variants,
+  VSCodium), MCP config locations (`~/.cursor`, `~/.codeium/windsurf`,
+  `~/.claude`, `~/.codex`, `~/.gemini`,
+  `~/Library/Application Support/Claude`), plus Homebrew lib prefixes
+  (`/opt/homebrew/lib`, `/usr/local/lib`) and `/Library/Python`.
+  Under `~/.gemini/`, `settings.json` is parsed path-aware (Gemini CLI /
+  Gemini Code Assist); generic `settings.json` elsewhere is not parsed,
+  and non-JSON MCP host configs (e.g. Codex `config.toml`, Continue YAML)
+  are not parsed in v0.1.
+- `project`: `~/code`, `~/src`, `~/Developer`, `~/Projects`, `~/workspace`.
+  Override with `--root` if your trees live elsewhere.
+- `deep`: no defaults. Requires at least one explicit `--root`.
+
+If a profile's defaults pick up nothing on this host the scan exits with
+a helpful error rather than silently walking the whole home directory.
+
+Pass `--all-users` to expand the baseline or project per-user candidate
+set across every real `/Users/<name>/` home. `bumblebee roots --profile
+baseline --all-users` previews exactly what a root-owned scan
+would walk.
+
+## Stable endpoint identity (`--device-id-env`)
+
+Hostnames change. Usernames change. UIDs are stable on a given install
+but reset on reinstall. For receiver-side current-state keying, a
+stable externally-supplied identifier is preferable — see
+[state-model.md](state-model.md).
+
+`bumblebee` reads the device id from an environment variable rather
+than a CLI argument so it does not appear in `ps`. Configure the
+launchd plist's `EnvironmentVariables` block (or whichever delivery
+mechanism is in use) to populate the env var from whatever attribute
+is authoritative in your environment (hardware serial, asset tag, MDM
+device UUID, etc.).
+
+If the env var is missing or empty at scan time the scan still runs;
+records simply omit `endpoint.device_id` and a `warn` diagnostic is
+written to stderr.
+
+## TCC / Full Disk Access
+
+The walker is read-only and skips credential directories by default
+(`.ssh`, `.aws`, `.azure`, `.config/gcloud`, `.kube`, `.docker`, `.gnupg`)
+and `.env` / `.envrc` files. Some locations under `~/Library/`,
+`~/Documents/`, `~/Desktop/`, and `~/Downloads/` are gated by TCC on
+recent macOS releases. If your inventory must reach those (typically
+only relevant for `deep`):
+
+- Grant the `bumblebee` binary Full Disk Access via MDM (Privacy
+  Preferences Policy Control payload). A LaunchDaemon running as root
+  still needs FDA for TCC-protected paths.
+- Or restrict `--root` to development trees only and accept that
+  TCC-protected paths are out of scope.
+
+The walker emits a `debug`-level diagnostic for unreadable paths; it does
+not abort the scan.
+
+## Verifying a deployment
+
+1. Load the plist: `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.bumblebee.baseline.plist`
+   (LaunchAgent) or `sudo launchctl bootstrap system /Library/LaunchDaemons/...plist`.
+2. Trigger one run: `launchctl kickstart -k gui/$(id -u)/com.example.bumblebee.baseline`.
+3. Check the stderr log for the final `scan complete:` info diagnostic.
+4. Confirm the receiver saw a `record_type=scan_summary` line with
+   `status=complete` for the new `run_id`. That marker is what your
+   pipeline should key on to promote the run to current state — see
+   [state-model.md](state-model.md).
+
+---
+
+# Inventory sources
+
+Source: https://github.com/perplexityai/bumblebee/blob/main/docs/inventory-sources.md
+
+# Inventory sources
+
+This document describes, per ecosystem, where installed-package state lives
+on disk, what `bumblebee` reads, and what it deliberately does not.
+
+Per-ecosystem ordering below matches v0.1 prioritization, which was driven
+by recent supply-chain incidents — see the [Why these ecosystems](#why-these-ecosystems)
+section at the bottom for the reporting that informed it.
+
+The `ecosystem` field on every record matches OSV ecosystem identifiers
+where one exists (`npm`, `pypi`, `go`, `rubygems`, `packagist`, ...). `mcp`,
+`agent-skill`, and `editor-extension` are project-local values for
+execution surfaces that do not map cleanly to a package registry; all
+three are emitted without resolved package versions.
+
+## `ecosystem` vs source toolchain
+
+pnpm, Yarn, and Bun lockfiles all install packages from the npm
+registry, so their records emit `ecosystem=npm`. The specific manager
+and source file are preserved on each record via `package_manager`
+(`npm` / `pnpm` / `yarn` / `bun`) and `source_type` (`pnpm-lockfile`,
+`yarn-lockfile`, `bun-lockfile`, ...). `--ecosystem` accepts the
+OSV-aligned values above only; `--ecosystem npm` covers all four
+package managers.
+
+## Profile-to-source mapping
+
+Each scan profile reads from a different slice of the sources below:
+
+| Profile     | Sources walked                                                                                                                                                                                                |
+|-------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `baseline` | Homebrew `Cellar` / `Caskroom` install metadata and lib prefixes; `/Library/Python`; Linux system Python (`/usr/lib/python*`, plus `/usr/local/lib`); user Python (`~/.local/lib/python*`, `~/.local/share/pipx/venvs`, `pyenv`); language version managers (`asdf`, `nvm`, `rbenv`, `rvm`); `~/.cargo`; `~/go`; editor-extension trees; MCP config locations; agent-skill lock locations (`~/.agents`, `$XDG_STATE_HOME/skills`); per-profile browser-extension trees (Chromium-family + Firefox-family, including common snap/flatpak paths). No project trees.   |
+| `project`   | Configured developer/project roots (`~/code`, `~/src`, `~/Developer`, `~/Projects`, `~/workspace`, and any explicit `--root`). All ecosystem parsers below apply within those trees.                            |
+| `deep`      | Operator-supplied roots, typically a bare home directory during a campaign. Same ecosystem parsers; recommended only in combination with `--exposure-catalog` to emit `record_type=finding` records.            |
+
+The `source_type` values emitted are the same across profiles. What
+changes is the population of files the walker visits.
+
+## Homebrew
+
+Files read:
+
+- Formulae: `<prefix>/Cellar/<formula>/<version>/INSTALL_RECEIPT.json`.
+  The formula name and installed version are derived from the Cellar path,
+  matching Homebrew's own filesystem listing behavior. The receipt is read
+  only for small install metadata such as `installed_on_request`, which is
+  emitted as `direct_dependency` when present.
+- Casks: `<prefix>/Caskroom/<token>/.metadata/<version>/<timestamp>/Casks/<token>.{internal.json,json,rb}`
+  as the installed-cask marker, plus the optional cask-level
+  `<prefix>/Caskroom/<token>/.metadata/INSTALL_RECEIPT.json` for
+  `installed_on_request`. JSON marker files are not used as a broad
+  metadata source in v0.1, and `.rb` cask definitions are never opened;
+  a `.rb` marker only proves Homebrew saved an installed cask snapshot.
+
+Captured fields emitted on the record: `package_name` (formula rack name
+or cask token), `version`, `package_manager=homebrew`,
+`source_type` (`homebrew-formula-receipt` or `homebrew-cask-metadata`),
+and `direct_dependency` when Homebrew's receipt records
+`installed_on_request`.
+
+Baseline defaults include Apple Silicon macOS (`/opt/homebrew/Cellar`,
+`/opt/homebrew/Caskroom`), Intel macOS (`/usr/local/Cellar`,
+`/usr/local/Caskroom`), Linuxbrew (`/home/linuxbrew/.linuxbrew/Cellar`,
+`/home/linuxbrew/.linuxbrew/Caskroom`). Custom Homebrew prefixes are not
+inferred from environment variables; pass their `Cellar` and `Caskroom`
+paths with `--root` when they need coverage.
+
+We do not run `brew list`, `brew info`, or any other Homebrew command. We
+do not read formula Ruby files, cask Ruby definitions, installed payload
+files, app bundles, linked `opt` symlinks, pinned symlinks, or tap source
+trees. Tap names, bottle/source build flags, install timestamps, runtime
+dependencies, and artifact lists may exist in Homebrew metadata but are
+not emitted in v0.1's slim schema.
+
+References:
+
+- Homebrew formula tab metadata: <https://docs.brew.sh/Formula-Cookbook>
+- Homebrew installation paths: <https://docs.brew.sh/Installation>
+
+## npm
+
+Files read:
+
+- `package-lock.json`, `npm-shrinkwrap.json`, `node_modules/.package-lock.json`
+  — lockfileVersion 1, 2, and 3 are all supported via a single union schema.
+- `node_modules/<pkg>/package.json` and `node_modules/@scope/<pkg>/package.json`
+  — bounded to those two depths. Subtree under `node_modules/<pkg>/` is not
+  enumerated.
+
+Captured fields emitted on the record: `package_name`, `version`,
+`install_scope` (dev/prod), `direct_dependency`, `has_lifecycle_scripts`,
+and `lifecycle_scripts` (the names of any defined npm lifecycle hooks:
+`preinstall`, `install`, `postinstall`, `prepare`, `preprepare`,
+`postprepare`). Lifecycle script bodies are NOT captured. The resolved
+URL and integrity hash in the lockfile are read for parsing but are
+intentionally not emitted in v0.1's slim schema (see
+[`internal/model/model.go`](../internal/model/model.go)).
+
+References:
+
+- npm `package-lock.json` format: <https://docs.npmjs.com/cli/v10/configuring-npm/package-lock-json>
+- npm scripts (lifecycle): <https://docs.npmjs.com/cli/v10/using-npm/scripts>
+
+## pnpm
+
+Files read:
+
+- `pnpm-lock.yaml` (v5, v6, v9). A line-oriented parser reads the top-level
+  `packages:` block and captures each version-bearing key plus its
+  `dev:` flag and `requiresBuild` flag. `resolution:` integrity/tarball are
+  read but not emitted on records in v0.1's slim schema.
+  Other sections (`importers:`, `snapshots:`, `settings:`, ...) are ignored.
+  The parser assumes pnpm's stable indent scheme (entry keys at exactly
+  2 spaces; nested fields at 4+ spaces) and emits a one-shot diagnostic
+  if a line under `packages:` deviates from that pattern. The pnpm-specific
+  `requiresBuild` flag is surfaced via the boolean `has_lifecycle_scripts`;
+  it is intentionally NOT placed in `lifecycle_scripts`, which is reserved
+  for actual npm hook names (`install`, `postinstall`, ...).
+- `node_modules/.pnpm/<name>@<version>[_peer]/node_modules/<name>/package.json`
+  — pnpm's content-addressed install layout. We extract name and version
+  from the store directory name and emit a medium-confidence installed
+  record.
+
+The on-disk encoding for scoped names in pnpm's store uses `+`:
+`@tanstack+query-core@5.0.0`. The parser converts that back to
+`@tanstack/query-core`.
+
+References:
+
+- pnpm lockfile schema (v9 notes): <https://pnpm.io/9.x/cli/install>
+- pnpm symlinked node_modules layout: <https://pnpm.io/symlinked-node-modules-structure>
+
+## Yarn
+
+Files read:
+
+- `yarn.lock` — both Yarn Classic v1 and Yarn Berry (v2+). Berry's
+  `__metadata` block is recognized and skipped. For each top-level entry
+  header (one or more comma-separated `name@spec` descriptors followed by
+  `:`), we extract `package_name` (from the first descriptor) and
+  `version`. `resolved` / `integrity` / `checksum` lines are read but
+  not emitted on records in v0.1's slim schema.
+
+Yarn PnP's `.pnp.cjs` and `.pnp.data.json` are NOT parsed in v0.1. The
+`yarn.lock` file itself is authoritative for inventory and is present in
+both linker modes.
+
+Berry protocols (`workspace:`, `patch:`, `portal:`, `git+ssh:`, `file:`,
+`http(s):`) are not decoded. The package name is extracted from the
+header descriptor and `version` is read from the entry body exactly as
+written in the lockfile. v0.1 does not emit `resolved` / `integrity` /
+`checksum` on records, so operators who need to distinguish "a workspace
+dep" from "a registry dep" should inspect the source `yarn.lock` directly
+using the `source_file` field on the record.
+
+References:
+
+- Yarn Classic lockfile format: <https://classic.yarnpkg.com/lang/en/docs/yarn-lock/>
+- Yarn Berry lockfile reference: <https://yarnpkg.com/configuration/yarnrc>
+
+## Bun
+
+Files read:
+
+- `bun.lock` — Bun's text JSONC lockfile. The parser strips `//` and
+  `/* */` comments and trailing commas, then JSON-parses. The schema
+  `{"packages": { "<id>": ["<name>@<version>", {...}] }}` and the simpler
+  `{"packages": { "<id>": {"version": "..."} }}` shape are both handled.
+  Diagnostics: an unterminated `/* */` block comment is reported as a
+  warning (the original bytes are then passed to `json.Unmarshal`, which
+  produces a parse error with line/offset). Array-form entries whose
+  first element does not parse as `<name>@<version>` are also reported
+  as warnings so silent record loss is visible to operators.
+  The sibling `package.json` next to a parsed `bun.lock` is read only
+  to annotate `direct_dependency`; no other `package.json` files are
+  walked by the Bun scanner.
+- `bun.lockb` — Bun's binary lockfile. NOT parsed in v0.1; a diagnostic is
+  emitted noting presence. Bun 1.1+ defaults to text `bun.lock`, so this
+  case is rare on recent installs.
+
+References:
+
+- Bun text lockfile: <https://bun.com/docs/install/lockfile>
+
+## PyPI
+
+Files read:
+
+- `*.dist-info/METADATA` (PEP 566) plus adjacent `INSTALLER` (PEP 376) and
+  `direct_url.json` (PEP 610).
+- Legacy `*.egg-info/PKG-INFO` (lower confidence).
+
+We read only the RFC-822 header block of METADATA / PKG-INFO and stop at
+the first blank line, so the description payload is never scanned.
+
+References:
+
+- PEP 566 (METADATA): <https://peps.python.org/pep-0566/>
+- PEP 376 (database of installed dists): <https://peps.python.org/pep-0376/>
+- PEP 610 (direct URL origin): <https://peps.python.org/pep-0610/>
+- PEP 503 (name normalization): <https://peps.python.org/pep-0503/>
+
+## Go modules
+
+Files read:
+
+- `go.sum` — authoritative content-hash record of every module version Go
+  has fetched into the module cache. Each `module v1.2.3 h1:...` line
+  produces a high-confidence record. `module v1.2.3/go.mod` companion
+  lines are deduplicated against the module line.
+- `go.mod` — the `require` block. Direct vs indirect is inferred from the
+  `// indirect` trailing comment. Lower confidence than `go.sum` because
+  `go.mod` requires may not all be in the final build set.
+
+Baseline includes `~/go` (and therefore `~/go/pkg/mod`, the per-user
+module cache) when it exists. Each cached module checks in as
+`<mod>@<version>/go.mod`, so on Go-heavy hosts the baseline output can be
+dominated by Go cache records — often tens of thousands of lines. That
+is intentional package-presence coverage of every module version Go has
+ever downloaded for the user, not a project inventory. To scope a run
+down, pair `--ecosystem` with a non-go selection (e.g.
+`--ecosystem npm,pypi`) or run the `project` profile against specific
+workspaces.
+
+We do not walk into the module cache's source-file subtrees; matching
+is filename-based on `go.mod` / `go.sum` only, and the individual
+module directories are not enumerated for anything else.
+
+References:
+
+- `go.sum` and `go.mod` reference: <https://go.dev/ref/mod#go-sum-files>
+- Module cache layout: <https://go.dev/ref/mod#module-cache>
+
+## RubyGems / Bundler
+
+Files read:
+
+- `Gemfile.lock` — `GEM`, `GIT`, and `PATH` sections. Only top-level
+  `    name (version)` lines (exactly 4 spaces of indent) are captured;
+  dependency lines at 6+ spaces are ignored to avoid double-counting
+  transitive deps.
+- `*.gemspec` under `specifications/<name>-<ver>.gemspec` or
+  `gems/<name>-<ver>/<name>.gemspec` *when* the great-grandparent looks
+  like a recognized installed-gems root (e.g. a Ruby ABI directory like
+  `3.2.0` under `gems/`, a sibling `specifications/` directory, or a
+  Bundler `vendor/bundle/ruby/<ver>/` layout). Arbitrary vendored
+  source trees that happen to contain a `gems/<x>-<y>/*.gemspec` shape
+  are rejected to avoid duplicating Gemfile.lock entries with a
+  different `project_path`. A regex-based reader extracts `s.name` and
+  `s.version` from the canonical generated forms (`s.version = "1.2.3"`
+  and `s.version = Gem::Version.new("1.2.3")`); no Ruby is interpreted.
+  Gemspecs that compute fields procedurally fall back to the parent
+  directory `<name>-<ver>` split, then to the filename split.
+
+References:
+
+- Bundler `Gemfile.lock`: <https://bundler.io/v2.5/man/gemfile.5.html>
+- RubyGems specification format: <https://guides.rubygems.org/specification-reference/>
+
+## Composer / Packagist
+
+Files read:
+
+- `composer.lock` — JSON. Both `packages` (prod) and `packages-dev` (dev)
+  arrays are captured. Each entry yields `package_name`, `version`, and
+  `install_scope` (prod/dev). `dist.url`, `dist.shasum`, and per-package
+  `type` are read for parsing but not emitted on records in v0.1's slim
+  schema.
+- `vendor/composer/installed.json` — both Composer v1 (root array) and v2
+  (`{"packages": [...]}`) shapes are recognized. An empty v2 envelope
+  (`{"packages": []}`) is accepted as a valid empty file and does not
+  fall through to a v1 parse error.
+
+References:
+
+- `composer.lock` format: <https://getcomposer.org/doc/01-basic-usage.md#commit-your-composer-lock-file-to-version-control>
+- `vendor/composer/installed.json` (Composer v2): <https://getcomposer.org/doc/articles/plugins.md>
+
+## MCP server configs
+
+Files read (JSON only):
+
+- `mcp.json`, `.mcp.json`, `claude_desktop_config.json`, `mcp_config.json`,
+  `mcp_settings.json`, `cline_mcp_settings.json`.
+- `settings.json` when its parent directory is `.gemini` (Gemini CLI /
+  Gemini Code Assist user settings). Dispatch is path-aware because
+  `settings.json` is an ambiguous basename — most notably VS Code's user
+  settings file uses the same name and must not be fed to the MCP parser.
+  The top-level `mcpServers` envelope is the same shape as Cursor /
+  Claude Code; the existing JSON parser handles it without changes.
+
+Non-JSON MCP host configs (e.g. Codex `config.toml`, Continue YAML)
+are not parsed in v0.1 even when the surrounding host directory is
+walked.
+
+### Locations and envelopes
+
+Well-known locations (not exhaustive — the walker finds these by basename
+anywhere under a configured root):
+
+- `~/.cursor/mcp.json`
+- `~/.codeium/windsurf/mcp_config.json`
+- Claude Code user-home: `~/.claude/.mcp.json`, plus any `.mcp.json` /
+  `mcp.json` written under `~/.claude/` plugin subdirectories.
+- Gemini CLI / Gemini Code Assist user-home: `~/.gemini/settings.json`
+  (top-level `mcpServers`).
+- macOS Claude Desktop: `~/Library/Application Support/Claude/claude_desktop_config.json`
+- Linux Claude Desktop: `~/.config/Claude/claude_desktop_config.json`,
+  `~/.config/Claude Code/claude_desktop_config.json`
+- Windows Claude Desktop: `%APPDATA%\Claude\claude_desktop_config.json`
+- Per-project: `.mcp.json` at a repo root
+
+Recognized envelopes:
+
+- `{ "mcpServers": {...} }`
+- `{ "servers": {...} }`
+- flat `{ "<id>": {...} }`
+
+A flat entry is recognized when it carries `command`, `url`, non-empty
+`args`, or a `type` field. Environment values and environment key names
+are never captured — neither is retained in v0.1's slim schema.
+
+### Package identity
+
+For each server, `PackageName` is parsed from the command and args:
+
+- `npx -y @modelcontextprotocol/server-github` →
+  `@modelcontextprotocol/server-github`
+- `uvx mcp-server-time` → `mcp-server-time`
+- `python -m mypkg.server` → `python:mypkg.server`
+
+If an npm-style selector is present (`@playwright/mcp@latest`,
+`left-pad@1.2.3`), the full spec is preserved in `requested_spec` and
+`PackageName` is normalized to the bare name. The configured server id is
+always preserved in `server_name`.
+
+For `uv run <script-or-dir>` without `--from <pkg>`, no package identity
+is inferred; the record falls back to the server id with `confidence=low`.
+`uvx`, `uv tool run <pkg>`, and `uv run --from <pkg> ...` use the
+published package name.
+
+Docker/OCI image refs split a pinned tag into `version`:
+`hashicorp/terraform-mcp-server:0.4.0` becomes
+`package_name=hashicorp/terraform-mcp-server`, `version=0.4.0`. Untagged
+images keep an empty version rather than synthesizing `latest`.
+Registry-port refs split only on the colon after the last slash. Digest
+refs (`name@sha256:...`) stay in `package_name` with an empty version.
+
+### Matching behavior
+
+Example jq filters:
+
+```
+# All MCP server records
+jq 'select(.record_type == "package" and .source_type == "mcp-config")' inventory.ndjson
+
+# MCP records that pinned a version selector (@latest, @1.2.3, ...)
+jq 'select(.source_type == "mcp-config" and (.requested_spec // "") != "")
+    | {server_name, package_name, requested_spec, source_file}' inventory.ndjson
+```
+
+For npm/PyPI/uv MCP launchers the record's `version` field stays empty:
+MCP configs reference packages by spec without pinning to an installed
+version, so installed-version resolution is not possible without running
+the package manager — the requested selector (if any) is recorded in
+`requested_spec`. Docker launchers are the exception: an explicit image
+tag is captured in `version` directly, since the tag is the OCI
+equivalent of a pinned version.
+
+Confidence is recorded as `low` for MCP records by default. Docker
+launchers whose image reference carries a pinned tag or `@sha256:`
+digest are bumped to `medium`: the tag/digest is the only MCP shape
+that ties a configured server to an immutable identity. Wording stays
+conservative — these are configured references, not running processes,
+and bumblebee never executes anything during the scan.
+
+`root_kind` on an MCP record is not always `mcp_config_root`. The
+scanner prefers the `root_kind` of the enclosing configured root when
+one exists: an `.mcp.json` discovered inside a `project_root` is tagged
+`project_root`, and the same file under a `deep_home_root` is tagged
+`deep_home_root`. `mcp_config_root` is the fallback when no enclosing
+root contains the file (e.g. an explicit MCP root passed through the
+scanner config).
+
+Remote MCP entries (sse/http transports identified by a `url`,
+`serverUrl`, or `httpUrl` field with no `command`) are emitted as
+package records with `package_manager=mcp-remote`. The sanitized
+endpoint is recorded in `requested_spec` reduced to `scheme://host`
+(or `//host` for scheme-less network-path references) — userinfo,
+query, fragment, and path are all dropped so embedded credentials
+cannot leak, even when they hide in a path segment — and
+`package_name` falls back to the server id. Headers and env values
+are never captured. The URL is not treated as a package identity:
+catalog matching against `mcp-remote` records is limited to records
+whose package_name (the server id) appears in a catalog with an empty
+version, which is intentionally narrow.
+
+Exposure-catalog matches against MCP records work on name only when
+the catalog entry's `versions` includes `""`, plus exact-version
+matching for docker launchers with pinned tags. v0.1 does not attempt
+npm/PyPI resolution of MCP specs.
+
+References:
+
+- MCP introduction: <https://modelcontextprotocol.io/>
+- MCP server configuration: <https://modelcontextprotocol.io/quickstart/user>
+
+## Agent skills (skills.sh / vercel-labs/skills)
+
+Files read (JSON only):
+
+- `.skill-lock.json`: the global lock written by the `skills.sh` CLI.
+  Default location is `~/.agents/.skill-lock.json`; when
+  `XDG_STATE_HOME` is set, the CLI writes to
+  `$XDG_STATE_HOME/skills/.skill-lock.json` instead.
+- `skills-lock.json`: project-local lock file written at a repo root.
+
+Both basenames share one envelope:
+
+```json
+{
+  "version": <int>,
+  "skills": {
+    "<local-name>": {
+      "source": "<owner/repo or path>",
+      "sourceType": "github" | "mintlify" | "huggingface" | "local",
+      "ref": "<branch | tag | sha>",
+      "skillPath": "<subdir>"
+    }
+  }
+}
+```
+
+Schema versions v1 (legacy `computedHash`) and v3 (current
+`skillFolderHash`) are both accepted, and unknown top-level fields and
+unknown schema versions are tolerated so a future schema bump does not
+break inventory.
+
+### Package identity
+
+For each entry, `PackageName` is the upstream source slug
+(`vercel-labs/agent-skills`, `vercel/ai`, ...). The local alias from
+the lock file's map key is preserved in `server_name` so a renamed
+install still attributes back to the slot in the lock file. For
+`sourceType=local`, the on-disk path in `source` is deliberately not
+retained — only the local alias is recorded, so the operator's
+filesystem layout does not leak through inventory; `requested_spec`
+is set to `local:` in that case.
+
+`requested_spec` is otherwise a compact install-channel descriptor
+formatted as `<sourceType>:<source>[@<ref>][/<skillPath>]`, e.g.
+`github:vercel/ai@main` or `github:vercel-labs/agent-skills/react`.
+`version` stays empty because a `ref` may be a branch, tag, or commit
+SHA and v0.1's slim schema does not distinguish them.
+
+`source_type` is always `skill-lock` regardless of the file basename;
+the basename is recoverable from `source_file`. `root_kind` is
+`agent_skill_root` only when the file falls outside every configured
+root — under a project tree the enclosing `project_root` wins (same
+rule as MCP). `confidence` is recorded as `low` for all entries;
+these are configured references, not running installs.
+
+### Matching behavior
+
+Example jq filters:
+
+```
+# All agent-skill records
+jq 'select(.record_type == "package" and .ecosystem == "agent-skill")' inventory.ndjson
+
+# Agent skills pulled from a specific upstream
+jq 'select(.ecosystem == "agent-skill" and .normalized_name == "vercel-labs/agent-skills")
+    | {server_name, package_name, requested_spec, source_file}' inventory.ndjson
+```
+
+Exposure-catalog matches against agent-skill records work on name only,
+since `version` is intentionally empty. A catalog entry that pins a
+specific source slug (e.g. `vercel-labs/agent-skills`) with `versions`
+including `""` will match every install of that upstream regardless of
+local alias or ref.
+
+Loose skill directories without a lock file — for example
+`~/.claude/skills/<name>/SKILL.md` and similar — are not enumerated in
+v0.1. Without a manifest anchoring the install to an upstream identity
+there is no stable package_name to record. Operators who want skills
+that ship outside `skills.sh` covered can pin them by hand-copying their
+upstream slug into an exposure catalog and matching at `record_type=finding`.
+
+References:
+
+- skills.sh: <https://www.skills.sh>
+- skills CLI source: <https://github.com/vercel-labs/skills>
+
+## Browser extensions (Chromium-family + Firefox)
+
+Files read:
+
+- Chromium-family (Chrome, Chromium, Brave, Edge, Vivaldi, Arc, Comet):
+  `<profile>/Extensions/<extension_id>/<version>/manifest.json`.
+  The `<extension_id>` is the 32-char a–p id. When `name` is a
+  `__MSG_<key>__` placeholder, we read
+  `<version>/_locales/<default_locale>/messages.json` (falling back to
+  `en`) to resolve it. No other extension or profile asset is opened.
+- Firefox-family (Firefox, LibreWolf, Waterfox):
+  `<profile>/extensions.json`. We emit one record per add-on with
+  `type=extension`; themes and system add-ons are skipped. Per-extension
+  XPI/source files under `<profile>/extensions/` are not opened.
+
+Captured fields: extension name (from `manifest.name` or
+`defaultLocale.name`), version, extension id (in `normalized_name`),
+and profile path (`project_path`). `package_manager` records the install
+mechanism — `chromium-extension` or `firefox-extension` — not the
+browser brand. The brand (Chrome, Brave, Edge, Vivaldi, Arc, Comet,
+LibreWolf, Waterfox, ...) can be recovered from `source_file`, which
+embeds the per-browser profile path. Every record carries
+`source_type=browser-extension` and `root_kind=browser_extension_root`.
+
+Profile coverage on `baseline`: the curated default roots include
+`Default` and `Profile 1`..`Profile 9` for each Chromium-family browser,
+plus the Firefox-family profile parents. Profiles outside that range
+must be passed via `--root`. The deliberately narrow root list keeps the
+walker out of every other Chromium / Firefox subtree (cookies, Login
+Data, IndexedDB, Local Storage, Cache), which are TCC-protected on
+macOS and privacy-sensitive on every host.
+
+Interaction with `--profile deep`: deep accepts a bare home root and
+therefore overlaps the baseline browser-extension roots. The walker
+still only opens files matched by exact path shape — Chromium
+`Extensions/<id>/<version>/manifest.json` and Firefox profile
+`extensions.json`. Sibling profile files (`Cookies`, `Cookies-journal`,
+`Login Data`, `Login Data For Account`, `Web Data`, `History`, the
+`IndexedDB/`, `Local Storage/`, `Session Storage/`, and `Cache/`
+subtrees) never match a scanner dispatch and are never read, even when
+they fall inside the deep-scan walk. On macOS the curated excludes
+additionally drop the entire `Library/Application Support/<browser>`
+subtree from a deep walk, so deep on macOS picks up browser extensions
+only when the operator passes the per-profile `Extensions/` directory
+as an explicit `--root` (the baseline curated entry). On Linux the
+deep walk descends into `~/.config/<browser>/<profile>/` but, again,
+only opens path-shape-matched manifests.
+
+Example jq filters:
+
+```
+# All browser-extension records
+jq 'select(.record_type == "package" and .source_type == "browser-extension")' inventory.ndjson
+
+# One row per (install mechanism, extension id, version) — the browser brand
+# lives in source_file, since package_manager is chromium-extension/firefox-extension
+jq -r 'select(.source_type == "browser-extension")
+       | [.package_manager, .normalized_name, .version, .package_name, .source_file] | @tsv' inventory.ndjson
+```
+
+References:
+
+- Chromium extension manifest: <https://developer.chrome.com/docs/extensions/reference/manifest>
+- Chromium extension on-disk layout: <https://chromium.googlesource.com/chromium/src/+/refs/heads/main/chrome/common/extensions/docs/examples/howto/contentscript_xhr/README.md>
+- Firefox profile / `extensions.json`: <https://support.mozilla.org/en-US/kb/profiles-where-firefox-stores-user-data>
+
+## Editor extensions (VS Code, Cursor, Windsurf, VSCodium)
+
+Files read:
+
+- `<extensions-root>/<publisher>.<name>-<version>[-<platform>]/package.json`
+
+Known extensions roots (matched by trailing path segments):
+
+- `~/.vscode/extensions`
+- `~/.vscode-server/extensions` (remote dev)
+- `~/.vscode-insiders/extensions`
+- `~/.cursor/extensions`
+- `~/.cursor-server/extensions`
+- `~/.windsurf/extensions`
+- `~/.windsurf-server/extensions`
+- `~/.vscodium/extensions`
+
+Captured fields emitted on the record: `package_name` (the full
+`publisher.name` identifier), `version`, and `package_manager` (vscode /
+cursor / windsurf / vscodium, inferred from the path).
+
+Extensions frequently ship a vendored `node_modules/` tree and sometimes
+a `package-lock.json` / `yarn.lock` / `pnpm-lock.yaml` next to their
+`package.json`. v0.1 dispatches by filename, so those vendored files are
+parsed by the generic npm/pnpm/yarn/bun parsers and emit `ecosystem=npm`
+records whose `source_file` points inside `<extensions-root>/<ext>/...`.
+This means an extension that vendors `lodash@4.17.21` shows up both as
+an `editor-extension` record (the extension itself) and as `npm` records
+(its vendored dependencies). That is intentional package-presence
+coverage — a malicious npm release bundled inside an extension is still
+an installed-package exposure on the host — but it does inflate npm
+counts under baseline on developers with many editor extensions. We do
+not scope npm/yarn/pnpm/bun dispatch by parent `root_kind` in v0.1
+because the walker dispatches on filename without per-root context;
+adding that scoping is a deliberate follow-up rather than a release
+blocker.
+
+References:
+
+- VS Code extension `package.json`: <https://code.visualstudio.com/api/references/extension-manifest>
+- VS Code extension on-disk layout: <https://code.visualstudio.com/docs/configure/extensions/extension-marketplace#_where-are-extensions-installed>
+
+## Why these ecosystems
+
+Ecosystems beyond npm + PyPI were prioritized by recent reporting on
+active supply-chain compromise campaigns:
+
+- **Wiz, *Mini Shai-Hulud strikes again — TanStack & more npm packages
+  compromised*** (May 2026). npm and PyPI compromises across TanStack,
+  UiPath, Mistral AI, OpenSearch, and others.
+  <https://www.wiz.io/blog/mini-shai-hulud-strikes-again-tanstack-more-npm-packages-compromised>
+- **Wiz, *Mini Shai-Hulud supply-chain — SAP npm + PyPI***. SAP npm
+  packages compromised, `intercom-client@7.0.5` malicious release, PyPI
+  `lightning` 2.6.2 / 2.6.3.
+  <https://www.wiz.io/blog/mini-shai-hulud-supply-chain-sap-npm>
+- **Wiz, *Shai-Hulud 2.0***. Broad npm campaign hitting Zapier, ENS,
+  PostHog, Postman, and others.
+  <https://www.wiz.io/blog/shai-hulud-2-0-ongoing-supply-chain-attack>
+- **Socket, *Malicious Ruby gems and Go modules steal secrets, poison CI***
+  (BufferZoneCorp). RubyGems and Go modules targeting CI credential theft.
+  <https://socket.dev/blog/malicious-ruby-gems-and-go-modules-steal-secrets-poison-ci>
+- **Socket, *Mini Shai-Hulud Packagist — malicious `intercom/intercom-php`
+  compromise***. Composer plugin execution as the install-time exec
+  primitive.
+  <https://socket.dev/blog/mini-shai-hulud-packagist-malicious-intercom-php-package-compromise>
+- **Socket, *PyTorch Lightning PyPI package compromised* (`lightning`
+  2.6.2, 2.6.3)**.
+  <https://socket.dev/blog/lightning-pypi-package-compromised>
+
+MCP and editor extensions are included because both have direct execution
+on developer endpoints, both have grown rapidly in 2025–2026, and both lack
+strong installed-state correlation tooling today.
+
+## What this collector deliberately does not do
+
+- No package-manager command execution. No `npm ls`, no `pnpm list`, no
+  `pip show`, no `go list`, no `bundle list`, no `composer show`, no
+  `brew list`.
+- No source-file reading. Only the metadata files listed above. The
+  walker visits directories; the scanners open only the targeted files.
+- No bundled threat intelligence. Bumblebee ships no built-in advisory
+  feed and does no automated lookups against npmjs advisories, OSV,
+  Socket feeds, GHSA, PyPA advisory DB, or any similar source. Optional
+  exact-version correlation is available when the operator supplies an
+  exposure catalog via `--exposure-catalog` (see
+  [`internal/exposure/exposure.go`](../internal/exposure/exposure.go) for
+  the schema and matching rules); without one, the output is pure
+  inventory and downstream correlation is the consumer's job.
+- No secret extraction. MCP `env` values and key names are both dropped.
+  `.env` / `.envrc` are skipped even outside excluded directories.
+
+## Not currently covered
+
+- Cargo (`Cargo.lock`).
+- Maven / Gradle (`pom.xml`, lockfiles).
+- NuGet (`packages.lock.json`).
+- Hex (`mix.lock`).
+- Swift PM (`Package.resolved`).
+- Yarn PnP (`.pnp.data.json`); the `yarn.lock` parser still covers PnP
+  installs because PnP keeps `yarn.lock`.
+- Bun binary `bun.lockb` decoder. Bun 1.1+ defaults to text `bun.lock`.
+- Safari extensions. Safari's on-disk layout
+  (`~/Library/Safari/Extensions/`, `~/Library/Containers/<bundle-id>`)
+  is TCC-protected and is not enumerated.
+- Loose agent-skill directories without a lock file (e.g.
+  `~/.claude/skills/<name>/SKILL.md`, Cursor rules, Continue agents).
+  Only `skills.sh` / `vercel-labs/skills` lock files are enumerated
+  under `ecosystem=agent-skill`; see the section above.
+
+---
+
+# State model
+
+Source: https://github.com/perplexityai/bumblebee/blob/main/docs/state-model.md
+
+# State model
+
+`bumblebee` is snapshot-only. Each run emits package records, optional
+exposure findings, and one trailing `scan_summary`. It does not keep an
+endpoint-side delta database or cache.
+
+The receiver should derive current state from complete snapshots. This keeps
+the endpoint simple and avoids bad deltas after missed runs, parser changes,
+deleted projects, moved roots, or local state corruption.
+
+## Promotion rule
+
+Only promote records from a run after receiving a matching `scan_summary` with
+`status=complete`.
+
+Do not let package rows without a complete summary remove packages from current
+state. Treat `partial`, `error`, timeout, and missing-summary runs as raw
+evidence only; the previous complete run remains authoritative.
+
+## Recommended tables
+
+### `inventory_records_raw`
+
+Append-only landing table for every received record.
+
+Useful columns:
+
+- `ingest_ts`
+- `record_type`
+- `record_id`
+- `run_id`
+- `endpoint_id`
+- `profile`
+- `schema_version`
+- `scanner_version`
+- `payload`
+
+Keep the full JSON payload. Build narrower tables or views from this layer.
+
+### `inventory_runs`
+
+One row per `scan_summary`, keyed by `(endpoint_id, profile, run_id)`.
+
+Useful columns:
+
+- `endpoint_id`
+- `profile`
+- `run_id`
+- `scan_time`
+- `end_time`
+- `status`
+- `package_records_suppressed`
+- `package_records_emitted`
+- `findings_emitted`
+- `diagnostics_count`
+- `http_batches_attempted`
+- `http_batches_succeeded`
+- `http_batches_failed`
+- `http_last_status`
+- `timed_out`
+- `roots`
+- `schema_version`
+- `scanner_version`
+
+A run is promotable only when `status='complete'`.
+
+The `http_batches_*` and `http_last_status` fields on `scan_summary`
+reflect HTTP sink delivery observed before the summary itself is
+emitted; the final flush that delivers the trailing `scan_summary`
+batch is not included in its own counters. Receivers should treat the
+arrival of a `status=complete` summary as the success signal for the
+run, not the summary's own delivery stats.
+
+### `inventory_current`
+
+Derived from package rows in the latest complete run for each
+`(endpoint_id, profile)`.
+
+Use `baseline` and `project` as separate populations, then union them for
+"what is currently installed on this endpoint." Do not use `deep` to retire
+packages from current state; `deep` is an on-demand campaign scan and may cover
+a different root set every time.
+
+Example shape:
+
+```sql
+WITH latest AS (
+  SELECT endpoint_id, profile, run_id
+  FROM inventory_runs
+  WHERE status = 'complete'
+    AND profile IN ('baseline', 'project')
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY endpoint_id, profile
+    ORDER BY end_time DESC
+  ) = 1
+)
+SELECT r.*
+FROM inventory_records_raw r
+JOIN latest l USING (endpoint_id, profile, run_id)
+WHERE r.record_type = 'package';
+```
+
+### `inventory_history`
+
+Derived by comparing consecutive complete snapshots for the same
+`(endpoint_id, profile)`.
+
+Track at least:
+
+- `endpoint_id`
+- `profile`
+- `ecosystem`
+- `normalized_name`
+- `version`
+- `source_file`
+- `first_seen`
+- `last_seen`
+- `present`
+
+Never infer removal across profiles. A `baseline` run cannot remove a package
+that was observed by `project`, and vice versa.
+
+### `exposure_findings`
+
+Derived from `record_type=finding` rows. This is the "are we exposed to this
+package advisory?" surface.
+
+Key fields:
+
+- `endpoint_id`
+- `profile`
+- `run_id`
+- `catalog_id`
+- `severity`
+- `ecosystem`
+- `normalized_name`
+- `version`
+- `project_path`
+- `source_file`
+- `confidence`
+- `evidence`
+
+Findings are package-presence matches against an operator-supplied exposure
+catalog. They are not network, process, file-hash, persistence, or dropped-file
+IOCs.
+
+## Record identity (`record_id`)
+
+`record_id` is a content-addressed hash computed from a canonical tuple
+per record type, not from the full JSON payload. It is stable across
+runs, so a package observed twice in the same configuration produces
+the same `record_id` even when `scanner_version` or `run_id` differ.
+
+Tuple fields per record type:
+
+- **package**: `profile`, `ecosystem`, `normalized_name`, `version`,
+  `project_path`, `root_kind`, `install_scope`, `package_manager`,
+  `source_type`, `source_file`, `direct_dependency`,
+  `has_lifecycle_scripts`, `lifecycle_scripts`, `confidence`,
+  `requested_spec`, `server_name`.
+- **finding**: the matched package's identity plus `finding_type` and
+  `catalog_id`.
+- **scan_summary**: the run terminator payload.
+- **diagnostic**: `(level, path, message)`.
+
+Receivers can rely on `record_id` as a dedupe key within a single run
+and as a stable join key across runs that observed the same identity
+tuple. Each record type exposes a `StableID()` method in
+`internal/model/model.go`; all four delegate to the unexported
+`stableID` helper in the same file, which performs the canonical
+hashing.
+
+`run_id` is independent of `record_id`: it is a freshly generated
+128-bit random value (hex-encoded) chosen once at scan start and
+stamped on every record the run emits. It is not derived from
+endpoint identity, scan inputs, or wall-clock time, so two runs on
+the same host always have distinct `run_id` values.
+
+## Endpoint identity
+
+Prefer a stable `endpoint.device_id` supplied via `--device-id-env`. If that is
+not available, derive `endpoint_id` from your device inventory. Hostname alone
+is a last resort because it can change.
+
+`endpoint.username` and `endpoint.uid` identify the scanner process. For
+root-owned macOS `--all-users` runs, use `source_file` or `project_path` to
+attribute a package to a specific user home.
+
+## Operational edge cases
+
+- **Empty complete run** — valid state. It means no parseable inventory for
+  that profile.
+- **Duplicate upload** — deduplicate by `(endpoint_id, run_id, record_id)`.
+- **Late records** — make derivations rerunnable when a summary arrives.
+- **Scanner upgrade** — watch for population-wide changes correlated with
+  `scanner_version`; parser changes can alter normalized names or coverage.
+- **Stale endpoints** — absence of recent complete runs means stale, not clean.
+  Use a TTL matched to the profile cadence.
+- **Changed roots** — package counts can shift when roots change. Use
+  `scan_summary.roots` as the audit trail.
+
+---
+
+# Transport
+
+Source: https://github.com/perplexityai/bumblebee/blob/main/docs/transport.md
+
+# Transport
+
+`bumblebee` writes NDJSON to one of three sinks:
+
+1. `stdout`
+2. local file (`--output file --output-file PATH`)
+3. HTTP(S) POST (`--output http --http-url URL`)
+
+The collector does not spool, retry in the background, or keep an on-disk
+queue. One invocation runs, writes, emits diagnostics and an optional
+`scan_summary`, then exits.
+
+## Choosing a sink
+
+### stdout
+
+Best for local testing and one-off remote execution:
+
+```sh
+bumblebee scan --profile deep --root "$HOME" > inventory.ndjson
+```
+
+Diagnostics are written to stderr as NDJSON.
+
+### file
+
+Use this when the endpoint already has a log shipper:
+
+```sh
+bumblebee scan \
+  --profile baseline \
+  --output file \
+  --output-file /var/log/bumblebee/inventory.ndjson \
+  --append
+```
+
+The file sink is plain NDJSON. Compress or ship downstream if needed.
+
+### http
+
+Use this when there is no existing endpoint log pipeline:
+
+```sh
+bumblebee scan \
+  --profile deep \
+  --root "$HOME" \
+  --exposure-catalog ./catalog.json \
+  --output http \
+  --http-url https://inventory.example.com/v1/ingest \
+  --http-auth bearer \
+  --http-token-env BUMBLEBEE_TOKEN \
+  --http-gzip \
+  --device-id-env BUMBLEBEE_DEVICE_ID
+```
+
+HTTP behavior:
+
+- Each POST body is NDJSON with `Content-Type: application/x-ndjson`.
+- Batching is line-count based. `--http-batch-size` controls records per POST.
+- HTTPS is required for non-loopback hosts unless `--http-allow-insecure` is set.
+- Bearer tokens and HMAC keys are read from environment variables, not CLI literals.
+- Non-2xx responses fail the run immediately.
+- `scan_summary.http_batches_attempted`, `http_batches_succeeded`,
+  `http_batches_failed`, and `http_last_status` report delivery results seen
+  by the sink.
+
+## Exact HTTP wire contract
+
+Every request uses:
+
+- Method: `POST`
+- Header: `Content-Type: application/x-ndjson`
+- Header: `User-Agent: bumblebee/<scanner_version>` when available
+- Body: one JSON object per line, no wrapper object, no JSON array
+
+Optional auth headers:
+
+- Bearer mode: `Authorization: Bearer <token>`
+- HMAC mode: `X-Inventory-Signature: sha256=<hex>`
+- HMAC mode with timestamp: `X-Inventory-Timestamp: <unix-seconds>`
+
+HMAC signing rules:
+
+- Without `X-Inventory-Timestamp`, the signature input is the raw POST body.
+- With `X-Inventory-Timestamp`, the signature input is
+  `<timestamp>.<raw-post-body>`.
+- The signature is hex-encoded SHA-256 HMAC and is sent as
+  `sha256=<hex>`.
+
+Gzip rules:
+
+- When `--http-gzip` is set, the request also carries
+  `Content-Encoding: gzip`.
+- Compression happens before HMAC signing.
+- Receivers that verify HMAC must verify the signature against the exact raw
+  received bytes, then decompress if `Content-Encoding: gzip` is present.
+
+## Receiver behavior
+
+A receiver should:
+
+1. Accept `POST` requests whose `Content-Type` is `application/x-ndjson`.
+2. Read the raw request body exactly as received.
+3. If HMAC is enabled, verify the signature before decompression.
+4. If `Content-Encoding: gzip` is present, decompress only after signature
+   verification.
+5. Treat the payload as newline-delimited JSON objects.
+6. Return `2xx` only after the full batch is durably accepted.
+7. Return non-2xx for any batch that was not durably accepted in full.
+
+Partial acceptance is not part of the protocol. One request is one batch:
+either the entire batch is accepted and acknowledged with `2xx`, or the
+sender treats it as failed.
+
+## Record stream semantics
+
+The stream can contain these `record_type` values:
+
+- `package`
+- `finding`
+- `scan_summary`
+- `diagnostic` on stderr only, not in the records sink
+
+`record_id` is stable for the record's canonical identity within a run and is
+intended for receiver-side dedupe. `run_id` stays separate and identifies the
+invocation.
+
+`--findings-only` suppresses only `record_type=package`. Findings,
+`scan_summary`, and diagnostics still flow.
+
+## `scan_summary` completion semantics
+
+Receivers should promote a run to current state only after a matching
+`scan_summary` with `status=complete`.
+
+Interpretation of summary status:
+
+- `complete`: the run completed and the sender observed no terminal scan or
+  sink errors.
+- `partial`: the run emitted some records but also hit a terminal scan error
+  or sink delivery failure.
+- `error`: the run failed before producing usable package state.
+
+Important sink nuance:
+
+- Failed HTTP POST batches must not be treated as a successful complete run.
+- If the HTTP sink reports failed batches, the run is not a trustworthy
+  complete snapshot even if package parsing otherwise succeeded.
+- `http_last_status=0` means the last batch failed before an HTTP response was
+  received.
+
+For `--findings-only` runs, `scan_summary.package_records_emitted` can be `0`
+while `package_records_suppressed` is positive. That still reflects a valid
+run shape; it simply means package records were intentionally withheld from the
+records sink.
+
+## Why no direct object-storage sink
+
+Direct S3/GCS/Azure Blob upload from endpoints is intentionally out of scope
+for v0.1. It would push cloud credentials or presigned URL management onto
+every endpoint and create one object per endpoint run.
+
+If object storage is the final destination, send to a small internal HTTP
+relay and let the relay batch and write centrally.
+
+---
+
+# Security Policy
+
+Source: https://github.com/perplexityai/bumblebee/blob/main/SECURITY.md
+
+# Security Policy
+
+## Reporting a vulnerability
+
+Please report security issues using GitHub's private vulnerability
+reporting for this repository:
+
+<https://github.com/perplexityai/bumblebee/security/advisories/new>
+
+Do not file public issues for security-sensitive findings.
+
+## Supported versions
+
+Only the most recent minor release receives security fixes.
+
+## Threat model
+
+`bumblebee` is a read-only filesystem walker. It:
+
+- does not execute discovered packages,
+- does not download package contents or fetch threat intelligence at
+  runtime,
+- does not parse source code,
+- does not require elevated privileges.
+
+Scans run with the privileges of the invoking user. Exposure catalogs
+supplied via `--exposure-catalog` are treated as trusted operator input;
+the operator is responsible for the integrity of the catalog file.
+
+---
