@@ -1,0 +1,243 @@
+# Kysely
+
+> The most powerful type-safe SQL query builder for TypeScript
+
+- [Kysely](https://kysely.dev/index.md)
+
+## search
+
+Kysely is the most powerful type-safe SQL query builder for TypeScript. Get unparalleled autocompletion and compile-time type safety for complex queries, joins, and subqueries. Used in production by Deno, Maersk, and Cal.com. Modern TypeScript, zero runtime overhead.
+
+- [Search the documentation](https://kysely.dev/search.md): Kysely is the most powerful type-safe SQL query builder for TypeScript. Get unparalleled autocompletion and compile-time type safety for complex queries, joins, and subqueries. Used in production by Deno, Maersk, and Cal.com. Modern TypeScript, zero runtime overhead.
+
+## docs
+
+
+### dialects
+
+A dialect is the glue between Kysely and the underlying database engine. Check the API docs to learn how to build your own.
+
+- [Dialects](https://kysely.dev/docs/dialects.md): A dialect is the glue between Kysely and the underlying database engine. Check the API docs to learn how to build your own.
+
+### examples
+
+
+#### cte
+
+- [Inserts, updates and deletions](https://kysely.dev/docs/examples/cte/inserts-updates-and-deletions.md): Some databases like postgres also allow you to run other queries than selects
+- [Simple selects](https://kysely.dev/docs/examples/cte/simple-selects.md): Common table expressions (CTE) are a great way to modularize complex queries.
+
+#### delete
+
+- [Single row](https://kysely.dev/docs/examples/delete/single-row.md): Delete a single row:
+
+#### insert
+
+- [Complex values](https://kysely.dev/docs/examples/insert/complex-values.md): In addition to primitives, the values can also be arbitrary expressions.
+- [Insert subquery](https://kysely.dev/docs/examples/insert/insert-subquery.md): You can create an INSERT INTO SELECT FROM query using the expression method.
+- [Multiple rows](https://kysely.dev/docs/examples/insert/multiple-rows.md): On dialects that support it (for example PostgreSQL) you can insert multiple
+- [Returning data](https://kysely.dev/docs/examples/insert/returning-data.md): On supported dialects like PostgreSQL you need to chain returning to the query to get
+- [Single row](https://kysely.dev/docs/examples/insert/single-row.md): Insert a single row:
+
+#### join
+
+- [Aliased inner join](https://kysely.dev/docs/examples/join/aliased-inner-join.md): You can give an alias for the joined table like this:
+- [Complex join](https://kysely.dev/docs/examples/join/complex-join.md): You can provide a function as the second argument to get a join
+- [Simple inner join](https://kysely.dev/docs/examples/join/simple-inner-join.md): Simple inner joins can be done by providing a table name and two columns to join:
+- [Subquery join](https://kysely.dev/docs/examples/join/subquery-join.md): You can join a subquery by providing two callbacks:
+
+#### merge
+
+- [Source row existence](https://kysely.dev/docs/examples/merge/source-row-existence.md): Update a target column based on the existence of a source row:
+- [Temporary changes table](https://kysely.dev/docs/examples/merge/temporary-changes-table.md): Merge new entries from a temporary changes table:
+
+#### select
+
+- [A single column](https://kysely.dev/docs/examples/select/a-single-column.md): Select a single column:
+- [Aliases](https://kysely.dev/docs/examples/select/aliases.md): You can give an alias for selections and tables by appending as the_alias to the name:
+- [All columns](https://kysely.dev/docs/examples/select/all-columns.md): The selectAll method generates SELECT *:
+- [All columns of a table](https://kysely.dev/docs/examples/select/all-columns-of-a-table.md): Select all columns of a table:
+- [Column with a table](https://kysely.dev/docs/examples/select/column-with-a-table.md): Select a single column and specify a table:
+- [Complex selections](https://kysely.dev/docs/examples/select/complex-selections.md): You can select arbitrary expression including subqueries and raw sql snippets.
+- [Distinct](https://kysely.dev/docs/examples/select/distinct.md): The API documentation is packed with examples. The API docs are hosted here,
+- [Distinct on](https://kysely.dev/docs/examples/select/distinct-on.md): The API documentation is packed with examples. The API docs are hosted here,
+- [Function calls](https://kysely.dev/docs/examples/select/function-calls.md): This example shows how to create function calls. These examples also work in any
+- [Generic find query](https://kysely.dev/docs/examples/select/generic-find-query.md): A generic type-safe helper function for finding a row by a column value:
+- [Multiple columns](https://kysely.dev/docs/examples/select/multiple-columns.md): Select multiple columns:
+- [Nested array](https://kysely.dev/docs/examples/select/nested-array.md): While kysely is not an ORM and it doesn't have the concept of relations, we do provide
+- [Nested object](https://kysely.dev/docs/examples/select/nested-object.md): While kysely is not an ORM and it doesn't have the concept of relations, we do provide
+- [Not null](https://kysely.dev/docs/examples/select/not-null.md): Sometimes you can be sure something's not null, but Kysely isn't able to infer
+
+#### transactions
+
+- [Controlled transaction](https://kysely.dev/docs/examples/transactions/controlled-transaction.md): A controlled transaction allows you to commit and rollback manually, execute
+- [Controlled transaction /w savepoints](https://kysely.dev/docs/examples/transactions/controlled-transaction-w-savepoints.md): A controlled transaction allows you to commit and rollback manually, execute
+- [Simple transaction](https://kysely.dev/docs/examples/transactions/simple-transaction.md): This example inserts two rows in a transaction. If an exception is thrown inside
+
+#### update
+
+- [Complex values](https://kysely.dev/docs/examples/update/complex-values.md): As always, you can provide a callback to the set method to get access
+- [MySQL joins](https://kysely.dev/docs/examples/update/my-sql-joins.md): MySQL allows you to join tables directly to the "main" table and update
+- [Single row](https://kysely.dev/docs/examples/update/single-row.md): Update a row in person table:
+
+#### where
+
+- [Complex where clause](https://kysely.dev/docs/examples/where/complex-where-clause.md): For complex where expressions you can pass in a single callback and
+- [Conditional where calls](https://kysely.dev/docs/examples/where/conditional-where-calls.md): You can add expressions conditionally like this:
+- [Object filter](https://kysely.dev/docs/examples/where/object-filter.md): You can use the and function to create a simple equality
+- [OR where](https://kysely.dev/docs/examples/where/or-where.md): To combine conditions using OR, you can use the expression builder.
+- [Simple where clause](https://kysely.dev/docs/examples/where/simple-where-clause.md): where method calls are combined with AND:
+- [Where in](https://kysely.dev/docs/examples/where/where-in.md): Find multiple items using a list of identifiers:
+
+### execution
+
+The following page gives a simplified overview of Kysely's execution flow, from query
+
+- [Execution flow](https://kysely.dev/docs/execution.md): The following page gives a simplified overview of Kysely's execution flow, from query
+
+### generating-types
+
+To work with Kysely, you're required to provide a database schema type definition to the Kysely constructor.
+
+- [Generating types](https://kysely.dev/docs/generating-types.md): To work with Kysely, you're required to provide a database schema type definition to the Kysely constructor.
+
+### getting-started
+
+Prerequisites
+
+- [Getting started](https://kysely.dev/docs/getting-started.md): Prerequisites
+
+### integrations
+
+
+#### llms
+
+Kysely provides LLM-friendly documentation to help AI tools like Cursor, Windsurf, GitHub Copilot, ChatGPT, Claude, and Claude Code understand and work with it.
+
+- [LLMs](https://kysely.dev/docs/integrations/llms.md): Kysely provides LLM-friendly documentation to help AI tools like Cursor, Windsurf, GitHub Copilot, ChatGPT, Claude, and Claude Code understand and work with it.
+
+#### supabase
+
+Supabase is an open-source Firebase alternative that provides a suite of tools
+
+- [Supabase](https://kysely.dev/docs/integrations/supabase.md): Supabase is an open-source Firebase alternative that provides a suite of tools
+
+### intro
+
+Kysely (pronounced “Key-Seh-Lee”) is a type-safe and autocompletion-friendly TypeScript SQL query builder. Inspired by Knex. Mainly developed for node.js but also
+
+- [Introduction](https://kysely.dev/docs/intro.md): Kysely (pronounced “Key-Seh-Lee”) is a type-safe and autocompletion-friendly TypeScript SQL query builder. Inspired by Knex. Mainly developed for node.js but also
+
+### migrations
+
+Migration files
+
+- [Migrations](https://kysely.dev/docs/migrations.md): Migration files
+
+### playground
+
+@wirekang has created a playground for Kysely. You can use it to quickly test stuff out and for creating code examples for your issues, PRs and Discord messages.
+
+- [Playground](https://kysely.dev/docs/playground.md): @wirekang has created a playground for Kysely. You can use it to quickly test stuff out and for creating code examples for your issues, PRs and Discord messages.
+
+### plugins
+
+Plugins are classes that implement KyselyPlugin. Plugins are then added to the Kysely instance as follows:
+
+- [Plugin system](https://kysely.dev/docs/plugins.md): Plugins are classes that implement KyselyPlugin. Plugins are then added to the Kysely instance as follows:
+
+### recipes
+
+
+#### conditional-selects
+
+Sometimes you may want to select some fields based on a runtime condition.
+
+- [Conditional selects](https://kysely.dev/docs/recipes/conditional-selects.md): Sometimes you may want to select some fields based on a runtime condition.
+
+#### data-types
+
+When talking about data types in Kysely we need to make a distinction between the two kinds of types:
+
+- [Data types](https://kysely.dev/docs/recipes/data-types.md): When talking about data types in Kysely we need to make a distinction between the two kinds of types:
+
+#### deduplicate-joins
+
+When building dynamic queries, you sometimes end up in situations where the same join
+
+- [Deduplicate joins](https://kysely.dev/docs/recipes/deduplicate-joins.md): When building dynamic queries, you sometimes end up in situations where the same join
+
+#### excessively-deep-types
+
+Kysely uses complex type magic to achieve its type safety. This complexity is sometimes
+
+- [Dealing with the Type instantiation is excessively deep and possibly infinite error](https://kysely.dev/docs/recipes/excessively-deep-types.md): Kysely uses complex type magic to achieve its type safety. This complexity is sometimes
+
+#### expressions
+
+An Expression is the basic type-safe query building block in Kysely. Pretty much all methods accept expressions as inputs. Most internal classes like SelectQueryBuilder and RawBuilder (the return value of the sql tag) are expressions themselves.
+
+- [Expressions](https://kysely.dev/docs/recipes/expressions.md): An Expression is the basic type-safe query building block in Kysely. Pretty much all methods accept expressions as inputs. Most internal classes like SelectQueryBuilder and RawBuilder (the return value of the sql tag) are expressions themselves.
+
+#### extending-kysely
+
+In many cases, Kysely doesn't provide a built-in type-safe method for a feature. It's often because adding
+
+- [Extending kysely](https://kysely.dev/docs/recipes/extending-kysely.md): In many cases, Kysely doesn't provide a built-in type-safe method for a feature. It's often because adding
+
+#### introspecting-relation-metadata
+
+Extracting metadata about tables and views from your database schema in runtime is possible using the methods in the instrospection property of a Kysely instance.
+
+- [Introspecting relation metadata](https://kysely.dev/docs/recipes/introspecting-relation-metadata.md): Extracting metadata about tables and views from your database schema in runtime is possible using the methods in the instrospection property of a Kysely instance.
+
+#### logging
+
+It is possible to set up logs for all queries using the log property when instantiating Kysely.
+
+- [Logging](https://kysely.dev/docs/recipes/logging.md): It is possible to set up logs for all queries using the log property when instantiating Kysely.
+
+#### raw-sql
+
+You can execute raw SQL strings and pass raw SQL snippets to pretty much any method or function
+
+- [Raw SQL](https://kysely.dev/docs/recipes/raw-sql.md): You can execute raw SQL strings and pass raw SQL snippets to pretty much any method or function
+
+#### relations
+
+Kysely IS NOT an ORM. Kysely DOES NOT have the concept of relations.
+
+- [Relations](https://kysely.dev/docs/recipes/relations.md): Kysely IS NOT an ORM. Kysely DOES NOT have the concept of relations.
+
+#### reusable-helpers
+
+Here's a playground link containing all the code in this recipe.
+
+- [Reusable helpers](https://kysely.dev/docs/recipes/reusable-helpers.md): Here's a playground link containing all the code in this recipe.
+
+#### schemas
+
+First of all, when we talk about schemas in this document, we mean custom
+
+- [Working with schemas](https://kysely.dev/docs/recipes/schemas.md): First of all, when we talk about schemas in this document, we mean custom
+
+#### splitting-query-building-and-execution
+
+Kysely is primarily a type-safe sql query builder.
+
+- [Splitting query building and execution](https://kysely.dev/docs/recipes/splitting-query-building-and-execution.md): Kysely is primarily a type-safe sql query builder.
+
+### runtimes
+
+
+#### browser
+
+Kysely also runs in the browser. Here's a minimal example:
+
+- [Browser](https://kysely.dev/docs/runtimes/browser.md): Kysely also runs in the browser. Here's a minimal example:
+
+#### deno
+
+Kysely doesn't include drivers for Deno, but you can still use Kysely as a query builder or implement your own driver:
+
+- [Running on Deno](https://kysely.dev/docs/runtimes/deno.md): Kysely doesn't include drivers for Deno, but you can still use Kysely as a query builder or implement your own driver:

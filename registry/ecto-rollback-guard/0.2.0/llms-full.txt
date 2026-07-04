@@ -1,0 +1,585 @@
+# EctoRollbackGuard
+
+Source: https://ecto-rollback-guard.hexdocs.pm/readme.md
+
+# EctoRollbackGuard
+
+[![Hex.pm](https://img.shields.io/hexpm/v/ecto_rollback_guard.svg)](https://hex.pm/packages/ecto_rollback_guard)
+[![CI](https://github.com/tommeier/ecto_rollback_guard/actions/workflows/ci.yml/badge.svg)](https://github.com/tommeier/ecto_rollback_guard/actions/workflows/ci.yml)
+
+**Know what you'll lose before you rollback.**
+
+EctoRollbackGuard analyzes Ecto migration source files to detect destructive
+rollback operations — table drops, column removals, irreversible migrations —
+before you execute them. Optionally enriches results with live row counts from
+PostgreSQL.
+
+## Why
+
+You deploy. Something goes wrong. You need to rollback.
+
+Ecto's `change/0` migrations are reversible by design — but "reversible" doesn't
+mean "safe". When you roll back a `create table(:users)` migration, Ecto drops
+the table and every row in it. There's no confirmation, no warning, and no
+indication of how much data you're about to lose.
+
+In a production incident, that's exactly the moment you're least equipped to
+manually review migration files. You need tooling that tells you **what will
+happen** before it happens.
+
+EctoRollbackGuard answers one question: **"What will I lose if I revert to
+version X?"**
+
+### Real-world deployment integration
+
+EctoRollbackGuard is designed to plug into your deployment pipeline at multiple
+points:
+
+**1. Before rollback — in your Release module**
+
+Log a full impact report with row counts before executing the rollback. This
+gives operators visibility in production logs:
+
+```
+🔴 20260318_create_email_signups — DROP TABLE email_signups (~1,847 rows)
+🟢 20260315_add_email_index — DROP INDEX (safe)
+```
+
+**2. At deploy time — in CI/CD**
+
+Use the mix task or programmatic API to analyze migrations as part of your
+rollback pipeline. Feed the results into Slack alerts, Buildkite annotations,
+or PagerDuty:
+
+```bash
+# In your rollback script
+mix ecto_rollback_guard.preview --to $ROLLBACK_VERSION --format json
+```
+
+**3. During development — in your terminal**
+
+Preview what a rollback would do before you run it:
+
+```bash
+mix ecto_rollback_guard.preview --to 20230101120000
+```
+
+### Ecosystem position
+
+[excellent_migrations](https://hex.pm/packages/excellent_migrations) guards the
+**forward** path — "is this migration safe to deploy?"
+
+EctoRollbackGuard guards the **reverse** path — "what will I lose if I revert?"
+
+They're complementary. Use both.
+
+## Installation
+
+Add to your `mix.exs`:
+
+```elixir
+def deps do
+  [
+    {:ecto_rollback_guard, "~> 0.2"}
+  ]
+end
+```
+
+## Usage
+
+### Mix task
+
+```bash
+$ mix ecto_rollback_guard.preview --to 20230101120000
+
+Rollback Impact Preview
+=======================
+
+[destructive] 20260318_create_email_signups
+  DROP TABLE email_signups (~1,847 rows)
+
+[safe] 20260315_add_email_index
+  DROP INDEX on users(email) (safe)
+
+1 destructive operation(s). ~1,847 rows at risk.
+```
+
+Options:
+- `--to VERSION` — target migration version (required)
+- `--repo MyApp.Repo` — specify repo (defaults to configured repo)
+- `--no-enrich` — skip DB row count queries (useful in CI without a DB)
+- `--format json` — machine-readable output for pipeline integration
+
+### In a Release module
+
+```elixir
+defmodule MyApp.Release do
+  def rollback(repo, version) do
+    load_app()
+
+    {:ok, _, _} =
+      Ecto.Migrator.with_repo(repo, fn repo ->
+        EctoRollbackGuard.log_preview(repo, version)
+        Ecto.Migrator.run(repo, :down, to: version)
+      end)
+  end
+
+  defp load_app do
+    Application.load(:my_app)
+  end
+end
+```
+
+### Programmatic API
+
+```elixir
+# Detect from source text (pure function, no DB needed)
+EctoRollbackGuard.detect(source)
+#=> [{:drop_table, :users}, {:drop_column, :entities, :mobile_number}]
+
+# Check if any operations are destructive
+EctoRollbackGuard.destructive?(operations)
+#=> true
+
+# Enrich with approximate row counts
+EctoRollbackGuard.enrich(operations, MyApp.Repo)
+#=> [{:drop_table, :users, 1847}, {:drop_column, :entities, :mobile_number}]
+
+# Full preview — discovers migrations, detects, enriches
+{:ok, impacts} = EctoRollbackGuard.preview(MyApp.Repo, 20230101120000)
+```
+
+## What it detects
+
+### In `change/0` (reversed on rollback)
+
+| Migration code | Detected rollback operation |
+|---|---|
+| `create table(:users)` | `{:drop_table, :users}` |
+| `create_if_not_exists table(:users)` | `{:drop_table, :users}` |
+| `alter table(:users) do add :col` | `{:drop_column, :users, :col}` |
+| `alter table(:users) do remove :col` (no type) | `{:non_reversible_remove, ...}` |
+| `alter table(:users) do modify :col, :type` (no `:from`) | `{:non_reversible_modify, ...}` |
+| `alter table(:users) do modify :col, :bigint, from: :integer` | `{:type_narrowing_risk, ...}` |
+| `execute("up_sql", "DROP TABLE users")` | `{:drop_table, "users"}` |
+| `execute("single_arg_sql")` | `{:non_reversible_execute}` |
+
+### In `down/0` (executed directly)
+
+| Migration code | Detected operation |
+|---|---|
+| `drop table(:users)` | `{:drop_table, :users}` |
+| `alter table(:users) do remove :col` | `{:drop_column, :users, :col}` |
+| `execute "DROP TABLE users"` | `{:drop_table, "users"}` |
+| `execute "some sql"` (unrecognized) | `{:raw_sql}` |
+| `def down, do: :ok` | `{:irreversible}` |
+
+Safe operations (indexes, renames, reversible removes) are detected but not
+flagged as destructive.
+
+When both `down/0` and `change/0` exist, `down/0` takes priority — matching
+Ecto's behavior.
+
+## How it works
+
+EctoRollbackGuard parses migration source with `Code.string_to_quoted/1` and
+pattern-matches on the Elixir AST. This is more reliable than regex:
+
+- Multi-line expressions handled naturally by tree structure
+- `execute("one_arg")` vs `execute("up", "down")` distinguished by arity
+- No false positives from comments or string contents
+- Conditional branches (`if`/`case`) walked to find all possible operations
+
+Row count enrichment queries `pg_class.reltuples` for speed, with a bounded
+`count(*)` fallback for small tables. PostgreSQL only for v0.1.
+
+## Limitations
+
+- Static analysis is heuristic — dynamic table names from variables or function
+  calls are flagged as "unresolved" for manual review
+- Macros that generate migration DSL calls are detected but not expanded
+- Row count enrichment is PostgreSQL-only (MySQL/SQLite planned for future)
+- `execute` with non-string arguments is flagged for review but cannot be
+  analyzed
+
+## Contributing
+
+```bash
+# Clone and setup
+git clone https://github.com/tommeier/ecto_rollback_guard.git
+cd ecto_rollback_guard
+
+# Install dependencies
+mix deps.get
+
+# Create test database (requires PostgreSQL running)
+mix ecto.create
+
+# Run the full suite
+mix test              # 112 tests
+mix credo --strict    # static analysis
+mix format --check-formatted
+mix dialyzer          # type checking (slow on first run)
+```
+
+PRs welcome. Please include tests for new detection patterns.
+
+## Releasing
+
+1. Update version in `mix.exs`
+2. Update `CHANGELOG.md` with a new `## vX.Y.Z` section
+3. Update the version in the installation section of this README
+4. Commit: `git commit -am "Bump version to X.Y.Z"`
+5. Tag and push:
+   ```bash
+   git tag vX.Y.Z
+   git push origin main --tags
+   ```
+6. GitHub Actions will auto-create a GitHub release from the changelog
+7. Publish to Hex:
+   ```bash
+   mix hex.publish
+   mix hex.publish docs
+   ```
+
+## License
+
+MIT — see [LICENSE](LICENSE).
+
+---
+
+# Changelog
+
+Source: https://ecto-rollback-guard.hexdocs.pm/changelog.md
+
+# Changelog
+
+## v0.2.0
+
+### Bug Fixes
+
+- Fix `log_preview/3` crash when preview returns an error
+- Fix SQL regex to capture schema-qualified table names (e.g., `DROP TABLE public.users`)
+- Fix detector missing `def down, do: nil` as irreversible (nil body detection)
+- `preview/3` now returns `{:error, reason}` instead of crashing on failures
+
+### Improvements
+
+- Comprehensive test suite: 112 tests covering all public API, detector branches,
+  reporter operation types, enricher edge cases, mix task, and preview paths
+
+## v0.1.0
+
+- Initial release
+- AST-based detection of destructive rollback operations
+- PostgreSQL row count enrichment
+- `mix ecto_rollback_guard.preview` task
+- Terminal and JSON output formats
+
+---
+
+# EctoRollbackGuard
+
+Source: https://ecto-rollback-guard.hexdocs.pm/EctoRollbackGuard.md
+
+# `EctoRollbackGuard`
+[🔗](https://github.com/tommeier/ecto_rollback_guard/blob/v0.2.0/lib/ecto_rollback_guard.ex#L1)
+
+Detect destructive operations before rolling back Ecto migrations.
+
+Analyzes migration source files via AST to identify operations that would
+cause data loss when reverted — table drops, column removals, irreversible
+migrations — and optionally enriches results with live row counts from
+PostgreSQL.
+
+## Usage
+
+### In a Release module
+
+    defmodule MyApp.Release do
+      def rollback(repo, version) do
+        EctoRollbackGuard.log_preview(repo, version)
+        {:ok, _, _} = Ecto.Migrator.with_repo(repo, &Ecto.Migrator.run(&1, :down, to: version))
+      end
+    end
+
+### Programmatic
+
+    EctoRollbackGuard.detect(source)
+    #=> [{:drop_table, :users}, {:drop_column, :entities, :mobile_number}]
+
+    EctoRollbackGuard.preview(MyApp.Repo, 20230101120000)
+    #=> {:ok, [%EctoRollbackGuard.Impact{...}]}
+
+### Mix task
+
+    mix ecto_rollback_guard.preview --to 20230101120000
+
+# `destructive?`
+
+```elixir
+@spec destructive?([EctoRollbackGuard.Impact.operation()]) :: boolean()
+```
+
+Returns `true` if any operation in the list is destructive.
+
+# `detect`
+
+```elixir
+@spec detect(String.t()) :: [EctoRollbackGuard.Impact.operation()] | {:error, term()}
+```
+
+Detect rollback operations from migration source text.
+
+Returns a list of operation tuples, or `{:error, reason}` if the source
+cannot be parsed.
+
+# `enrich`
+
+```elixir
+@spec enrich([EctoRollbackGuard.Impact.operation()], Ecto.Repo.t()) :: [
+  EctoRollbackGuard.Impact.operation()
+]
+```
+
+Enrich operations with approximate row counts from PostgreSQL.
+
+# `log_preview`
+
+```elixir
+@spec log_preview(Ecto.Repo.t(), non_neg_integer(), keyword()) ::
+  :ok | {:error, term()}
+```
+
+Log a formatted rollback impact preview to stdout.
+
+Designed for use in Release modules before executing a rollback.
+
+# `preview`
+
+```elixir
+@spec preview(Ecto.Repo.t(), non_neg_integer(), keyword()) ::
+  {:ok, [EctoRollbackGuard.Impact.t()]} | {:error, term()}
+```
+
+Preview the impact of rolling back to `target_version`.
+
+Returns `{:ok, [%Impact{}]}`.
+
+## Options
+
+- `:enrich` — query DB for row counts (default: `true`)
+- `:migrations_path` — override migration directory
+
+---
+
+*Consult [api-reference.md](api-reference.md) for complete listing*
+
+---
+
+# EctoRollbackGuard.Detector
+
+Source: https://ecto-rollback-guard.hexdocs.pm/EctoRollbackGuard.Detector.md
+
+# `EctoRollbackGuard.Detector`
+[🔗](https://github.com/tommeier/ecto_rollback_guard/blob/v0.2.0/lib/ecto_rollback_guard/detector.ex#L1)
+
+AST-based detection of destructive rollback operations in Ecto migrations.
+
+Parses migration source with `Code.string_to_quoted/1` and pattern-matches
+on Ecto migration DSL nodes to identify operations that would cause data
+loss on rollback.
+
+# `detect`
+
+```elixir
+@spec detect(String.t()) :: [EctoRollbackGuard.Impact.operation()] | {:error, term()}
+```
+
+---
+
+*Consult [api-reference.md](api-reference.md) for complete listing*
+
+---
+
+# EctoRollbackGuard.Enricher
+
+Source: https://ecto-rollback-guard.hexdocs.pm/EctoRollbackGuard.Enricher.md
+
+# `EctoRollbackGuard.Enricher`
+[🔗](https://github.com/tommeier/ecto_rollback_guard/blob/v0.2.0/lib/ecto_rollback_guard/enricher.ex#L1)
+
+Enriches detected operations with approximate row counts from PostgreSQL.
+
+Uses `pg_class.reltuples` for fast approximate counts. Runs `ANALYZE` only
+when statistics are unavailable. Falls back to a bounded `count(*)`.
+
+# `enrich`
+
+```elixir
+@spec enrich([EctoRollbackGuard.Impact.operation()], Ecto.Repo.t()) :: [
+  EctoRollbackGuard.Impact.operation()
+]
+```
+
+# `query_row_count`
+
+```elixir
+@spec query_row_count(Ecto.Repo.t(), String.t()) :: non_neg_integer()
+```
+
+---
+
+*Consult [api-reference.md](api-reference.md) for complete listing*
+
+---
+
+# EctoRollbackGuard.Impact
+
+Source: https://ecto-rollback-guard.hexdocs.pm/EctoRollbackGuard.Impact.md
+
+# `EctoRollbackGuard.Impact`
+[🔗](https://github.com/tommeier/ecto_rollback_guard/blob/v0.2.0/lib/ecto_rollback_guard/impact.ex#L1)
+
+Represents the rollback impact of a single migration.
+
+An `Impact` struct holds the migration version, name, detected operations,
+and whether any of those operations are destructive.
+
+# `operation`
+
+```elixir
+@type operation() ::
+  {:drop_table, atom() | String.t()}
+  | {:drop_table, atom() | String.t(), non_neg_integer()}
+  | {:drop_table, {:unresolved, String.t()}}
+  | {:drop_column, atom(), atom()}
+  | {:irreversible}
+  | {:raw_sql}
+  | {:non_reversible_execute}
+  | {:non_reversible_remove, atom(), atom()}
+  | {:non_reversible_modify, atom(), atom()}
+  | {:type_narrowing_risk, atom(), atom(), atom(), atom()}
+  | {:drop_index, atom(), list()}
+  | {:rename, atom(), atom()}
+  | {:raw_macro, atom()}
+```
+
+A detected rollback operation.
+
+# `t`
+
+```elixir
+@type t() :: %EctoRollbackGuard.Impact{
+  destructive?: boolean(),
+  name: String.t(),
+  operations: [operation()],
+  source_path: String.t() | nil,
+  version: non_neg_integer()
+}
+```
+
+# `from_operations`
+
+```elixir
+@spec from_operations(non_neg_integer(), String.t(), [operation()], keyword()) :: t()
+```
+
+Build an Impact struct from a version, name, and list of operations.
+
+Automatically sets `destructive?` based on the operation types.
+
+## Options
+
+- `:source_path` — path to the migration source file
+
+---
+
+*Consult [api-reference.md](api-reference.md) for complete listing*
+
+---
+
+# EctoRollbackGuard.Preview
+
+Source: https://ecto-rollback-guard.hexdocs.pm/EctoRollbackGuard.Preview.md
+
+# `EctoRollbackGuard.Preview`
+[🔗](https://github.com/tommeier/ecto_rollback_guard/blob/v0.2.0/lib/ecto_rollback_guard/preview.ex#L1)
+
+Orchestrates rollback impact preview: discovers migrations, detects
+operations, and optionally enriches with row counts.
+
+# `preview`
+
+```elixir
+@spec preview(Ecto.Repo.t(), non_neg_integer(), keyword()) ::
+  {:ok, [EctoRollbackGuard.Impact.t()]} | {:error, term()}
+```
+
+Preview the impact of rolling back to `target_version`.
+
+Returns `{:ok, [%Impact{}]}` with one entry per migration that would be
+reverted.
+
+## Options
+
+- `:enrich` — query DB for row counts (default: `true`)
+- `:migrations_path` — override migration directory
+
+---
+
+*Consult [api-reference.md](api-reference.md) for complete listing*
+
+---
+
+# EctoRollbackGuard.Reporter
+
+Source: https://ecto-rollback-guard.hexdocs.pm/EctoRollbackGuard.Reporter.md
+
+# `EctoRollbackGuard.Reporter`
+[🔗](https://github.com/tommeier/ecto_rollback_guard/blob/v0.2.0/lib/ecto_rollback_guard/reporter.ex#L1)
+
+Formats rollback impact results for terminal and JSON output.
+
+# `format_json`
+
+```elixir
+@spec format_json([EctoRollbackGuard.Impact.t()]) :: String.t()
+```
+
+# `format_terminal`
+
+```elixir
+@spec format_terminal([EctoRollbackGuard.Impact.t()]) :: String.t()
+```
+
+---
+
+*Consult [api-reference.md](api-reference.md) for complete listing*
+
+---
+
+# mix ecto_rollback_guard.preview
+
+Source: https://ecto-rollback-guard.hexdocs.pm/Mix.Tasks.EctoRollbackGuard.Preview.md
+
+# `mix ecto_rollback_guard.preview`
+[🔗](https://github.com/tommeier/ecto_rollback_guard/blob/v0.2.0/lib/mix/tasks/ecto_rollback_guard.preview.ex#L1)
+
+Preview which operations would execute and what data would be lost
+when rolling back to a target migration version.
+
+    $ mix ecto_rollback_guard.preview --to 20230101120000
+
+## Options
+
+- `--to VERSION` — target migration version (required)
+- `--repo MyApp.Repo` — repo module (defaults to app's configured repo)
+- `--no-enrich` — skip database row count queries
+- `--format FORMAT` — output format: `terminal` (default) or `json`
+
+---
+
+*Consult [api-reference.md](api-reference.md) for complete listing*
+
+---
