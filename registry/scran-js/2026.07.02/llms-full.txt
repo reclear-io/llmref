@@ -1,0 +1,864 @@
+# Single cell RNA-seq analysis in Javascript
+
+Source: https://github.com/kanaverse/scran.js/blob/master/README.md
+
+# Single cell RNA-seq analysis in Javascript
+
+
+## Overview
+
+This repository contains **scran.js**, a Javascript library for single-cell RNA-seq (scRNA-seq) analysis in the browser.
+The various calculations are performed directly by the client, allowing us to take advantage of the ubiquity of the browser as a standalone analysis platform.
+Users can then directly analyze their data without needing to manage any dependencies or pay for access to a backend.
+**scran.js** is heavily inspired by the [**scran** R package](https://bioconductor.org/packages/scran) and contains most of its related methods.
+Indeed, much of the implementation in this repository is taken directly from **scran** and its related R packages.
+
+## Analysis overview
+
+**scran.js** implements key steps in a typical scRNA-seq analysis:
+
+- Quality control (QC) to remove low-quality cells.
+This is done based on detection of outliers on QC metrics like the number of detected genes.
+- Normalization and log-transformation, to remove biases and mitigate the mean-variance trend.
+We use scaling normalization with size factors defined from the library size for each cell.
+- Feature selection to identify highly variable genes.
+This is based on residuals from a trend fitted to the means and variances of the log-normalized data for each gene.
+- Principal components analysis (PCA) on the highly variable genes, to compress and denoise the data.
+We use an approximate method to quickly obtain the top few PCs.
+- Clustering on the cells using the top PCs.
+This can either use k-means or community detection on a shared nearest neighbor graph.
+- Dimensionality reduction with t-stochastic neighbor embedding (t-SNE), again using the top PCs.
+- Marker detection using a variety of effect sizes such as Cohen's d and the area under the curve (AUC).
+- Cell type annotation with a port of the [**SingleR**](https://bioconductor.org/packages/SingleR) algorithm.
+- Batch correction via the mutual nearest neighbors method.
+- Gene set enrichment tests and calculation of per-cell gene set activity scores.
+
+The theory behind these methods is described in more detail in the [**Orchestrating Single Cell Analysis with Bioconductor**](https://bioconductor.org/books/release/OSCA/) book. 
+All steps are implemented in C++ and compiled to WebAssembly for near-native performance - see the [developer notes](docs/related/developer_notes.md) for details.
+
+> [!IMPORTANT]
+> **scran.js** v4.1.0 and higher use WebAssembly in 64-bit mode, which makes it possible to process larger datasets.
+> However, this is only supported in more recent versions of Chrome, Firefox and Node.js (24+), and is currently not supported in Safari at all.
+
+## Quick start
+
+**scran.js** is available as an [npm package](https://www.npmjs.com/package/scran.js), so installation can be performed via the usual commands:
+
+```sh
+npm install scran.js
+```
+
+Then you can import and initialize the library using the standard ES6 notation.
+Before any actual analysis steps are performed, the `initialize()` function must be run and its promise resolved;
+we suggest using a top-level `await` for convenience.
+
+```js
+import * as scran from "scran.js";
+await scran.initialize({ numberOfThreads: 4 }); // for old Node versions, set localFile: true
+```
+
+After that, you can run the remaining steps synchronously - for example, using the Node.js API:
+
+```js
+// Reading in the count matrix.
+import * as fs from "fs";
+let buffer = fs.readFileSync("matrix.mtx.gz");
+let mat = scran.initializeSparseMatrixFromMatrixMarket(buffer);
+```
+
+## Basic analyses
+
+The code chunk below implements a basic analysis, starting from count matrix loading and terminating at the markers for each cluster.
+This uses the Node.js API to read in one of our example [Matrix Market files](https://github.com/kanaverse/random-test-files),
+but the same approach can be used on the buffer created from a `File` input in the browser.
+
+```js
+import * as scran from "scran.js";
+await scran.initialize({ numberOfThreads: 4 });
+
+// Reading in the count matrix.
+let mat = scran.initializeSparseMatrixFromMatrixMarket("matrix.mtx.gz");
+
+// Performing QC.
+let qc_metrics = scran.perCellRnaQcMetrics(mat, [ /* specify mito subset here */ ]);
+let qc_thresholds = scran.suggestRnaQcFilters(qc_metrics);
+let filtered = scran.filterCells(mat, qc_thresholds.filter(qc_metrics));
+
+// Log-normalizing.
+let normalized = scran.normalizeCounts(filtered);
+
+// Modelling per-gene variance and selecting top HVGs. 
+let varmodel = scran.modelGeneVariances(normalized);
+let hvgs = scran.chooseHvgs(varmodel, { number: 4000 });
+
+// Performing the PCA.
+let pcs = scran.runPca(normalized, { features: hvgs });
+
+// Building the neighbor search index on the PCs.
+let index = scran.buildNeighborSearchIndex(pcs);
+
+// Performing the clustering. 
+let cluster_graph = scran.buildSnnGraph(index, { neighbors: 10 });
+let clustering = scran.clusterGraph(cluster_graph);
+
+// Performing the t-SNE and UMAP.
+let tsne_res = scran.runTsne(index);
+let umap_res = scran.runUmap(index);
+
+// Detecting some markers.
+let markers = scran.scoreMarkers(normalized, clustering.membership());
+```
+
+## More documentation
+
+Reference documentation for the Javascript API is available [here](https://kanaverse.github.io/scran.js).
+
+Specific topics are discussed in more detail below:
+
+- [Manually free memory](docs/related/memory_management.md)
+- [Use k-means clustering](docs/related/kmeans_clustering.md)
+- [Annotate cell types against references](docs/related/cell_type_annotation.md)
+
+Developer notes are also available [here](docs/related/developer_notes.md).
+
+## Links
+
+Check out [kana](https://github.com/kanaverse/kana) to see how **scran.js** is used in an interactive scRNA-seq analysis application.
+
+The [**scrapper**](https://github.com/libscran/scrapper) R package and [**scran**](https://github.com/LTLA/scran-cli) executable 
+are based on the same C++ libraries and allow the same analysis to be performed in different environments.
+
+---
+
+# Annotating cell types
+
+Source: https://github.com/kanaverse/scran.js/blob/master/docs/related/cell_type_annotation.md
+
+# Annotating cell types
+
+## Overview
+
+We use the same algorithm as **SingleR** for cell type classification from reference datasets.
+This assumes that we have several files describing each reference dataset:
+
+1. A matrix of ranks as a Gzipped CSV file.
+2. Markers from pairwise comparisons as a Gzipped GMT file.
+3. Labels for each reference sample as a Gzipped CSV file.
+4. Feature names for the matrix as a Gzipped CSV file.
+5. Names for all labels as a Gzipped CSV file.
+
+Several datasets have been processed and made available [here](https://github.com/clusterfork/singlepp-references).
+
+## Basic usage
+
+Assuming the files have been downloaded and are available as `ArrayBuffer`s, we load the reference:
+
+```js
+let loaded = scran.loadLabelCellsReferenceFromBuffers(rankbuf, markbuf, labbuf); // files 1, 2 and 3, respectively.
+```
+
+We then build the reference given `testfeatures`, an array with the names of the features in our test dataset;
+and `reffeatures`, an array with the names of the features in our reference (extracted from file **4**).
+
+```js
+let built = scran.trainLabelCellsReference(testfeatures, loaded, reffeatures);
+```
+
+Finally, we can generate labels from our input matrix.
+This returns indices that can be cross-referenced to the actual names of the labels in file **5**.
+
+```js
+let labels = scran.labelCells(mat, built);
+```
+
+For interactive use, we may prefer to generate per-cluster labels rather than per-cell labels, as the former is much faster.
+This is easily done by computing the cluster means, storing them in a dense column-major array and passing that array to `labelCells`.
+
+## Integrated analyses
+
+Advanced users can integrate cell labels from multiple references with the `integrateCellLabels` function.
+Firstly, we classify our test dataset against each of the references individually:
+
+```js
+let loaded_A = scran.loadLabelCellsReferenceFromBuffers(rankbuf_A, markbuf_A, labbuf_A); 
+let built_A = scran.trainLabelCellsReference(testfeatures, loaded_A, reffeatures_A);
+let labels_A = scran.labelCells(mat, built_A);
+
+let loaded_B = scran.loadLabelCellsReferenceFromBuffers(rankbuf_B, markbuf_B, labbuf_B); 
+let built_B = scran.trainLabelCellsReference(testfeatures, loaded_B, reffeatures_B);
+let labels_B = scran.labelCells(mat, built_B);
+```
+
+We then integrate the references and the associated labels to obtain a single set of cell type calls across all references.
+More specifically, this chooses the best reference for each cell, based on each reference's best cell type call for that cell. 
+
+```js
+let interbuilt = scran.integrateLabelCellsReferences(
+    testfeatures, 
+    [loaded_A, loaded_B], 
+    [reffeatures_A, reffeatures_B], 
+    [built_A, built_B]
+);
+
+let interlabels = scran.integrateLabelCells(mat, [labels_A, labels_B], inter);
+```
+
+---
+
+# Developer notes
+
+Source: https://github.com/kanaverse/scran.js/blob/master/docs/related/developer_notes.md
+
+# Developer notes
+
+## Overview 
+
+We use WebAssembly (Wasm) to enable efficient client-side execution of common steps in a scRNA-seq analysis.
+Code to perform each step is written in C++ and compiled to Wasm using the [Emscripten toolchain](https://emscripten.org/).
+Some of the relevant C++ libraries are listed below:
+
+- [libscran](https://github.com/libscran) provides C++ implementations of key functions in **scran** and its fellow packages **scater** and **scuttle**.
+This includes quality control, normalization, feature selection, PCA, clustering and dimensionality reduction.
+- [tatami](https://github.com/tatami-inc/tatami) provides an abstract interface to different matrix classes, focusing on row and column extraction.
+- [knncolle](https://github.com/knncolle-inc/knncolle) wraps a number of nearest neighbor detection methods in a consistent interface.
+- [CppIrlba](https://github.com/LTLA/CppIrlba) contains a C++ port of the IRLBA algorithm for approximate PCA.
+- [CppKmeans](https://github.com/LTLA/CppKmeans) contains C++ ports of the Hartigan-Wong and Lloyd algorithms for k-means clustering.
+- [qdtsne](https://github.com/libscran/qdtsne) contains a refactored C++ implementation of the Barnes-Hut t-SNE dimensionality reduction algorithm.
+- [umappp](https://github.com/libscran/umappp) contains a refactored C++ implementation of the UMAP dimensionality reduction algorithm.
+
+For each step, we use Emscripten to compile the associated C++ functions into Wasm and generate Javascript-visible bindings.
+We can then load the Wasm binary into a web application and call the desired functions on user-supplied data.
+
+## Pre-requisites
+
+Install the most recent versions of the following tools.
+
+- [Emscripten](https://emscripten.org/docs/getting_started/downloads.html).
+- [CMake](https://cmake.org/download/). 
+  Avoid 4.2.0 though, see https://gitlab.kitware.com/cmake/cmake/-/issues/27421.
+- [Node.js](https://nodejs.org/en/download).
+  This requires 24.0.0 or higher to support Wasm64.
+
+Alternatively, developers can use the [Docker image](https://github.com/kanaverse/emcmake-docker) for building and test.
+This image is also used by our [GitHub actions](../../.github/workflows/run-tests.yaml), so it will probably work.
+
+## Build
+
+Running the `build.sh` script will generate browser or Node.js-compatible builds.
+
+```sh
+# For Node.js:
+./build.sh main
+
+# For the browser:
+./build.sh browser 
+```
+
+These calls will create the `main` and `browser` directories respectively.
+Each directory will contain its corresponding Wasm file in the `wasm` subdirectory.
+All relevant Javascript files will also be copied into each subdirectory.
+
+## Tests
+
+```sh
+npm install --include=dev
+npm run test
+```
+
+To test the RDS reading functions, use a recent version of [R](https://cran.r-project.org/) to run [generate.R](../../tests/rds/generate.R) inside the `tests/rds` directory.
+
+```sh
+CHECK_RDS=1 npm run test -- tests/rds
+```
+
+## Documentation
+
+```sh
+npm run jsdoc
+```
+
+This creates an index file at `docs/built/index.html`.
+
+---
+
+# Using k-means for clustering
+
+Source: https://github.com/kanaverse/scran.js/blob/master/docs/related/kmeans_clustering.md
+
+# Using k-means for clustering
+
+For a faster alternative to the graph-based clustering algorithms, we can try using the k-means method.
+We perform k-means clustering on the PC matrix, so the output of `scran.runPCA()` can be directly passed to the function.
+We need to specify the number of clusters - in this case, 20.
+
+```js
+let clustering = scran.clusterKmeans(pcs, 20);
+```
+
+We use PCA partitioning as the default initialization approach, which is more-or-less deterministic.
+However, advanced users can play around with other initialization methods and seeds:
+
+```js
+let clustpp = scran.clusterKmeans(pcs, 20, { initMethod: "kmeans++", initSeed: 42 });
+```
+
+---
+
+# Manual memory management
+
+Source: https://github.com/kanaverse/scran.js/blob/master/docs/related/memory_management.md
+
+# Manual memory management
+
+Several objects returned by **scran.js** functions (any `*Results`, the `ScranMatrix`) contain allocations on the Wasm heap.
+These allocations will be automatically freed when the object is garbage-collected via callbacks in the `FinalizationRegistry`.
+Thus, strictly speaking, it is not necessary to `free()` them manually to release the heap memory.
+
+That said, high-performance applications will benefit from manual `free()` once the object is no longer needed.
+The Javascript garbage collector is not guaranteed to run in a predictable manner and may not release memory in the most efficient manner.
+Calling `free()` directly will avoid any performance fluctuations due to untimely garbage collection.
+
+We often use the `try`/`finally` pattern below to free memory on an object as soon as it is not needed.
+This avoids memory leaks when the functions throw an error before the final result is obtained.
+The `scran.free()` function will free any allocated object and skip `null` or undefined values.
+
+```js
+// The result of interest, not on the Wasm heap.
+let result;
+
+{
+    // Temporary object that needs to be freed.
+    let temp_obj;
+
+    try {
+        temp_obj = scran.initializeSparseMatrixFromMatrixMarketBuffer(buffer);
+
+        // Do something to get the result of interest.
+        result = temp_obj.row(10);
+    } finally {
+        scran.free(temp_obj);
+    }
+}
+
+// Continue work with 'result'.
+```
+
+---
+
+# scran.js news
+
+Source: https://github.com/kanaverse/scran.js/blob/master/NEWS.md
+
+# scran.js news
+
+## 4.1.0
+
+- Switch to 64-bit Wasm builds, which allows memory usage up to 16 GB.
+  These only work with Node.js 24 or higher, and are currently not supported on Safari at all.
+- Updated to the latest version of the **mnncorrect** library, which uses a new algorithm -
+  see https://github.com/libscran/mnncorrect/releases/tag/v3.0.0 for details.
+- Updated **igraph** to v1.0.0, which may yield different results for graph-based clustering.
+- Updated **hdf5** to v2.0.0, to support files produced in the new formats.
+- Updated to the latest version of the **tatami_hdf5** library,
+  which improves performance for several types of non-contiguous reads from the HDF5 file.
+
+## 4.0.9
+
+- Updated the **phyper** library for more accurate p-value calculations in `hypergeometricTest()`.
+
+## 4.0.8
+
+- Bugfix to the `rotation()` method in `RunPcaResults`.
+- Bugfix to exported methods in the browser build of the Wasm module.
+
+## 4.0.7
+
+- Soft-deprecated use of an array as input to `labelCells()`, `integrateLabelCells()`.
+  Callers should construct and pass a `ScranMatrix` instead.
+- Support custom names for component datasets in `initializeSparseMatrixFromHdf5Group()`.
+- Soft-deprecated `initializeMatrixFromHdf5()` and `extractHdf5MatrixDetails()`.
+  Callers should be more explicit about how the layout and shape is determined for each HDF5-based format.
+
+## 4.0.6
+
+- Added `transposeMatrix()` to quickly transpose a matrix stored in a contiguous TypedArray.
+
+## 4.0.5
+
+- Added `rowSums()` and `columnSums()` to compute the row and column sums, respectively, of a `ScranMatrix`.
+- Added `chooseTopMarkers()` to get a array of the top markers from the `ScoreMarkersResults` statistics.
+
+## 4.0.4
+
+- Fixed a performance regression for `readRds()`.
+
+## 4.0.3
+
+- Bugfix to avoid a dangling memory view when retrieving statistics from a `ScoreMarkersResults` object.
+
+## 4.0.2
+
+- Added more options to `writeSparseMatrixToHdf5()`.
+  - Setting `saveShape=false` will skip saving of the shape dataset/attribute.
+  - Setting `overwrite=false` will add matrix contents to an existing HDF5 file.
+
+## 4.0.1
+
+- Bugfix to actually return sparse matrices from the various `initializeMatrixFromHdf5()` functions.
+
+## 4.0.0
+
+- Overhauled the HDF5 bindings:
+  - HDF5 readers and writers can now handle compound data types.
+  - Introduced the `H5StringType` and `H5EnumType` classes to better represent their associated HDF5 types.
+  - `H5DataSet::type()` will now report `H5StringType` and `H5EnumType` instead of `"String"` and `"Enum"`. 
+  - `readAttribute()` will now report the type of the attribute for `H5Group` and `H5DataSet` objects.
+- Updated the ADT normalization code:
+  - Added the `computeClrm1Factors()` function to implement the CLRm1 method.
+  - Removed the `median/groupedSizeFactors()` functions.
+- Renamed `logNormCounts()` to `normalizeCounts()` with a new `log=true` option.
+- Renamed `testFeatureSetEnrichment()` to `testGeneSetEnrichment()`.
+- Rotation matrices are now reported from `runPca()`.
+- Block weighting is supported in `modelGeneVariances()`.
+- Renamed `clusterSnnGraph()` to `clusterGraph()`.
+- Added a `truncateNearestNeighbors()` utility to truncate the neighbor search results.
+- Emit warnings if the requested and observed number of neighbors are different in functions that accept existing neighbor search results.
+- Renamed `scoreFeatureSet()` to `scoreGsdecon()`.
+- Updated the k-means clustering code in `clusterKmeans()`.
+  - Replaced PCA-partitioning with variance partitioning for k-means initialization.
+  - Exposed options for choosing the refinement algorithm and number of iterations.
+- Updated the filtering during quality control.
+  - All `Suggest*FilterResults::filter()` methods now return the cells to **keep**.
+  - `filterCells()` now accepts a vector of cells to **keep**.
+- Use single-precision floats in `runUmap()`, for speed and consistency with R.
+- Renamed some methods to avoid unnecessary plurals, e.g., `sum()` instead of `sums()`.
+- Added `isBlocked()` methods to `*Results` classes with methods that accept block IDs.
+- Renamed all of the SingleR-related functions, for consistency with the underlying C++ library.
+- Added an `asTypedArray=` option to various methods/functions to allow users to choose between returning a TypedArray or TypedWasmArray.
+- Added a `columnMajor=` option for dense array initialization in `initializeDenseMatrixFromDenseArray()`, replacing `ScranMatrix::createDenseMatrix()`.
+- Updated the matrix initialization from HDF5 datasets:
+  - Renamed `initializeSparseMatrixFromHdf5()` to `initializeMatrixFromHdf5()`, with a new `forceSparse=` option to indicate whether the matrix should be sparse.
+  - Renamed `initializeSparseMatrixFromHdf5DataSet()` to `initializeMatrixFromHdf5DataSet()`, with a new `forceSparse=` option to indicate whether the matrix should be sparse.
+
+## 3.0.2
+
+**New**
+
+- Added the `initializeSparseMatrixFromHdf5DenseArray()` and `initializeSparseMatrixFromHdf5SparseMatrix()` functions,
+  which exposes the internals used by the `initializeSparseMatrixFromHdf5()` function.
+  These new functions give the user more control over the construction of sparse matrices from HDF5 files.
+
+**Changes**
+
+- Protected `cbindWithNames()` from weird names.
+  Null names are ignored, allowing us to safely handle missing gene symbols.
+  When names are duplicated, we explicitly keep only the first occurrence;
+  this is more intuitive than the old (and undocumented) behavior of keeping only the last occurrence.
+  The order of names from the first matrix is preserved in the final intersection, which should reduce the amount of reordering. 
+
+## 3.0.1
+
+**Changes**
+
+- Updated to a more recent version of the underlying **tatami** library for some bugfixes and improvements.
+
+## 3.0.0
+
+**Changes**
+
+- Setting `layered=true` in the various `initializeSparseMatrix*()` functions no longer reorders the rows, due to the use of the new [**tatami_layered**](https://github.com/tatami-inc/tatami_layered) library.
+  As a result, all `initializeSparseMatrix*()` functions no longer need to return an array of `row_ids` and instead return the `ScranMatrix` directly where the rows are in the same order as defined in the file.
+  This greatly simplifies downstream management of the row order.
+- Renamed all functions to use PascalCase for acronyms, e.g., `HDF5` is now `Hdf5`, `PCA` is now `Pca`, `SNN` is now `Snn`.
+  This gives us a consistent naming scheme across the package that aligns with the underlying C++ code.
+- Renamed `modelGeneVar` to `modelGeneVariances` (similarly for its `*Results` class) for easier reading.
+  - Also changed the weighting scheme so that we do not allow equal contributions from very small blocks (< 1000 cells) with less stable statistics.
+    Large blocks will still be equally weighted, regardless of their actual size.
+- Modified `scoreMarkers()` in response to **libscran** changes.
+  - Added a weighting scheme identical to the one used by `modelGeneVariances()`.
+    This now equalizes contributions from large blocks to each per-cluster statistics (> 1000 cells in the relevant cluster). 
+  - Removed the `block=` option from the methods of the corresponding `Results` object, as averages are now automatically returned for the means and detected proportions. 
+- Changed how blocking is handled in `runPca()`:
+  - Added `blockMethod="project"` to enable projection of cells onto rotation vectors defined from residuals.
+  - Added `blockWeights=` to determine whether to equalize the contribution of large blocks of different size, using the same scheme in `scoreMarkers()` and `modelGeneVariances()`.
+    Equal weighting only applies once blocks reach a certain size (1000 cells), otherwise the weight of each block is proportional to its size.
+  - Removed `blockMethod = "weight"`, which is replaced by `blockMethod = "none"` with `blockWeights = true`.
+- Overhauled the interface for t-SNE and UMAP calculations:
+  - Renamed the output of `initializeTsne()` and `initializeUmap()` to `TsneStatus` and `UmapStatus`, respectively.
+  - Added a `run()` method to the status objects, which runs them for the specified time/number of iterations.
+    This is more ergonomic than initializing the status objects and passing them to `runTsne()` or `runUmap()`.
+  - Changed `runTsne()` and `runUmap()` to directly return the final t-SNE and UMAP coordinates, respectively, from the nearest neighbor input.
+    This avoids exposing the status objects for basic use cases.
+- Removed many of the `empty*Results()` functions, as these are not necessary for regular uses of this package.
+  The exception is that of the `emptySuggest*QcFiltersResults()` as this can be used to perform filtering with custom thresholds.
+- Removed the `consume=` option from `initializeSparseMatrixFromRds()`, as the potential damage from pass-by-reference mutations is too high for the minor improvement in performance.
+- Added `allowNonFinite=` option to the `logNormCounts()` function to handle infinite and missing size factors.
+- Added `allowZeros=` and `allowNonFinite=` options to the `groupedSizeFactors()` function to handle infinite and missing size factors.
+  Both options are automatically set to `true` when calling `groupedSizeFactors()` from the `quickAdtSizeFactors()` function.
+
+## 2.1.8
+
+**Changes**
+
+- Added a `cacheSize=` option to `initializeSparseMatrixFromHDF5()`, mostly to increase the cache size for awkward chunk sizes in dense HDF5 datasets.
+
+## 2.1.7
+
+**Changes**
+
+- Ignore all MGI identifiers in `guessFeatures()` to avoid confusing them with human gene symbols.
+
+## 2.1.6
+
+**Changes**
+
+- Ignore all VEGA identifiers in `guessFeatures()` to avoid confusing them with human gene symbols.
+
+## 2.1.5
+
+**Changes**
+
+- Added the `subsetRow=` and `subsetColumn=` options to enable loading of a subset of rows/columns from `initializeSparseMatrixFromHDF5()`.
+
+## 2.1.4
+
+**Changes**
+
+- Ignore non-string values in the `features=` for `guessFeatures()`.
+
+## 2.1.3
+
+**Changes**
+
+- Preserve placeholder entries for factor indices in `resetLevels()`.
+
+## 2.1.2
+
+**New**
+
+- Added a `resetLevels()` function to change the levels of an existing factor.
+
+**Changes**
+
+- Improved the predictability of level ordering in `convertToFactor()`.
+  All-string/all-number levels that are inferred from the array are now sorted.
+  Users may also pass in their own `levels`.
+
+## 2.1.1
+
+**Changes**
+
+- Improved the intersection of feature identifiers in `labelCells()` and `integrateCellLabels()`.
+  Reference features may now contain synonyms, and if feature identifiers are duplicated, only the first occurrence is used.
+
+## 2.1.0
+
+**New**
+
+- Added an `aggregateAcrossCells()` function to aggregate expression values across groups of cells.
+  This is typically used to obtain cluster-level summaries for plotting or per-cluster analyses. 
+
+**Changes**
+
+- Provide more details (scores, fine-tuning deltas) in `labelCells()` and `integrateCellLabels()`.
+  These functions now return full-fledged objects that need to be explicitly freed after use.
+
+## 2.0.3
+
+**New**
+
+- Added a `factorize()` function to convert an arbitrary array into an R-style factor.
+  This provides a superset of the functionality of the `convertBlock()` function. 
+
+**Changes**
+
+- `convertBlock()` now raises a warning upon detecting `null` or `NaN` values.
+
+## 2.0.2
+
+**Changes**
+
+- Reduce the impact of duplicated feature identifiers in `guessFeatures()`.
+  This avoids treating strings like "Chr1" as mouse identifiers.
+
+## 2.0.1
+
+**Changes**
+
+- Greatly expanded the range of species that can be guessed in `guessFeatures()`.
+  Also added the ability to force the function to report taxonomy IDs instead of common names for human/mouse.
+
+## 2.0.0
+
+**New**
+
+- Added `perCellCrisprQcMetrics()` and `suggestCrisprQcFilters()`,
+  to compute the QC metrics and filters for CRISPR guide count data.
+- Added `scoreFeatureSet()` to compute per-cell scores for a feature set's activity.
+- Added `hypergeometricTest()`, `testFeatureSetEnrichment()` and `remapFeatureSets()`,
+  to compute simple enrichment p-values for the top markers in each feature set.
+- Added `computeTopThreshold()` to more easily identify the top markers for 
+- Added `writeSparseMatrixToHdf5()` to dump a `ScranMatrix` back into a HDF5 file.
+- Added `centerSizeFactors()` to allow users to center the size factors manually.
+
+**Changes**
+
+- Renamed `perCell*QcFilters()` functions to `suggest*QcFilters()`.
+  These now return a `Suggest*QcFiltersResults` object containing filter thresholds but not the discard vector itself.
+  Instead, the `filter()` method can be called with a `PerCell*QcMetricsResults()` object to generate a discard vector,
+  either for the same dataset or for a related set of cells.
+  The filter thresholds themselves can also be adjusted by the application before calling `filter()`.
+  All in all, this provides greater flexibility for applications to perform quality control.
+- Renamed `perCellQCMetrics()` to `perCellRnaQcMetrics()` (similarly for the name of the corresponding result class).
+  This is more consistent with the namings of the QC functions for the other modalities.
+- Getters for empty results will now return `null` if the corresponding field has not been filled,
+  either using a dedicated setter or by extracting a memory view with `fillable: true`.
+  This allows applications to fail gracefully upon encountering an object where the required fields have not been filled.
+- Added a `leidenModularityObjective` option to `clusterSNNGraph()`, to use the modularity as the objective function.
+  This allows for a more stable interpretation of the magnitude of the resolution.
+- Separated resolution arguments to `multiLevelResolution` and `leidenResolution` for `clusterSNNGraph()`,
+  allowing them to have different defaults.
+  This is especially relevant when `leidenModularityObjective = false`.
+- Removed the `updateRowIdentities()` function, as this has little relation with other functions in **scran.js**.
+- Updated to the latest version of **libscran** (and thus **igraph**, which changes some of the clustering outputs).
+- Added a `minimum=` argument to `chooseHVGs()` to avoid choosing HVGs with negative residuals.
+- Modified `summary=` argument to accept a string in `ScoreMarkerResults`, which is more interpretable.
+- Support calculation of median and maximum effect sizes in `scoreMarkers()`.
+- Pass along `block=` to the internal PCA in `quickAdtSizeFactors()`. 
+- Allow size factor centering to turned off in `logNormCounts()`, in case the input size factors are already centered.
+- Ignore `null`s in the feature ID vectors in `buildLabelledReference()`.
+- Removed deprecated functionality from previous version:
+  - Removed `ScranMatrix.isPermuted()`.
+  - `clusterSNNGraph()` no longer accepts integer arguments for `scheme=`.
+  - Removed `initializeSparseMatrixFromMatrixMarketBuffer()`.
+  - `runPCA()` no longer accepts `blockMethod="block"`.
+  - Removed `safeFree()`.
+
+## 1.2.1
+
+**New**
+
+- Added more `empty*()` functions to construct empty instances of various result objects.
+  This is useful for mimicking the output of functions without actually running them.
+
+**Changes**
+
+- Added more methods and options for the `ClusterSNNGraph*Results` classes,
+  mostly to facilitate filling of empty objects.
+
+## 1.2.0
+
+**Changes**
+
+- Added the `lfcThreshold` and `computeAuc` options to the `scoreMarkers()` function.
+  In particular, skipping the AUCs can improve speed and memory efficiency if they are not required.
+- Switched the default `referencePolicy` to `"max-rss"` in the `mnnCorrect()` function.
+  This favors the use of more heterogeneous batches as the initial reference.
+- Actually exported the `ScranMatrix` class.
+
+## 1.1.0
+
+**Changes**
+
+- Added a `forceInteger` option to (almost) all matrix initialization functions.
+  Setting this to `false` will preserve any floating-point representations, e.g., for normalized expression data.
+  This defaults to `true` for back-compatibility, where floats are coerced to integer by truncation.
+
+## 1.0.2
+
+**Changes**
+
+- Fixed `readFile()` to actually return content in the browser.
+- Removed the not-to-be-used virtual file system utilities.
+
+## 1.0.1
+
+**New**
+
+- Added `chooseTemporaryPath()` to obtain a temporary file path on both browsers and Node.js.
+
+**Changes**
+
+- All file-related utilities (`writeFile()`, `removeFile()`, `readFile()` and `fileExists()`) now operate as expected on Node.js.
+
+## 1.0.0
+
+**New**
+
+- Added `realizeFile()` to prepare a file for reading into other functions, regardless of whether the call is in a Node.js or browser context.
+  For browsers, this creates a file on the virtual file system; for Node.js, it either uses the supplied path or it creates a temporary file.
+- Added `extractHdf5MatrixDetails()` to preview the format and dimensions of a HDF5-based matrix.
+
+**Changes**
+
+- Removed `quickSliceArray()`.
+  Users should instead use the `SLICE()` function from the [**bioconductor**](https://npmjs.org/package/bioconductor) package.
+- Removed all array collection-related functions. 
+  Users should instead use the `DataFrame` class and related methods from the **bioconductor** package.
+- Removed `splitByFactor()`.
+  Users should instead use the `presplitFactor()` function from the **bioconductor** package.
+
+## 0.6.0
+
+**New**
+
+- Support parsing and inspection data in RDS files (generated by R's `saveRDS()` function) via the new `readRds()` function.
+- Added the `initializeSparseMatrixFromRds()` function, which does exactly as advertised.
+
+## 0.5.1
+
+**Changes**
+
+- Updated the underlying C++ libraries to their latest versions.
+  This should improve memory efficiency.
+
+## 0.5.0
+
+**New**
+
+- HDF5 handles now support reading and writing of attributes via `readAttribute()` and `writeAttribute()` methods.
+  An extra `attributes` member is available for listing the available attributes. 
+- ScranMatrix objects can be used in more delayed operations via the new `delayedArithmetic()`, `delayedMath()`, `rbind()` and `transpose()` functions.
+  All of these operations can be performed in place or can generate a new ScranMatrix.
+- Subsetting of a ScranMatrix via `subsetRows()` or `subsetColumns()` can now be done in place with the new `inPlace=` option.
+- Added a `quickSliceArray()` function to slice a (Typed)Array while preserving its type.
+
+**Changes**
+
+- The `initializeSparseMatrix*()` functions now return an object with a `row_ids=` array.
+  This makes it more explicit that a reorganization of the row identities was performed.
+- The `identities()` and `isReorganized()` methods for a ScranMatrix have been soft-deprecated; the latter will now always return `false`.
+  This simplifies downstream operations, which no longer need to preserve consistency in the identities to produce a valid ScranMatrix.
+- `updateRowIdentities()` now requires a row identity vector instead of a ScranMatrix in its first argument.
+- `matchVectorToRowIdentities()` has been removed, along with other deprecated functions based on manipulation of row identities.
+
+## 0.4.2
+
+**New**
+
+- Added a `maximumThreads()` function to query the maximum number of threads specified at module initialization.
+- All parallelizable functions now accept a `numberOfThreads=` option to control the number of threads.
+
+## 0.4.1
+
+**New**
+
+- Added a `layered=` option in various `initializeSparseMatrix*()` functions.
+  This enables direct loading of sparse matrices without row reorganization, for simplicity at the cost of memory efficiency.
+
+## 0.4.0
+
+**New**
+
+- Added the `extractMatrixMarketDimensions()` function to easily get dimensions without loading the entire file.
+
+**Changes**
+
+- Renamed the MatrixMarket reader to `initializeSparseMatrixFromMatrixMarket()`.
+  This function now supports file path inputs, which avoids the need to buffer the entire file in Node.js.
+- Functions that accept an optional `buffer =` argument will now return it directly if `buffer` is non-`null` and the output type is a WasmArray.
+  Otherwise, if the output type is a TypedArray, functions will now return a TypedArray view on a non-null input `buffer`.
+  This aims to provide some kind of sensible output value rather than just `undefined`.
+
+## 0.3.0
+
+**New**
+
+- Exported the `free()` function as a replacement for `safeFree()`.
+- Added the `subsetBlock()` function for general subsetting of the blocking factor.
+- Added a `allowZeros=` option to gracefully handle size factors of zero in `logNormCounts()`.
+
+**Changes**
+
+- Renamed some classes for consistency with the `*Results` naming scheme.
+- All `*Results` and `*Matrix` instances will automatically free their memory upon garbage collection if `free()` has not already been called.
+- `subsetArrayCollection()` will now check for correct array length before subsetting.
+
+## 0.2.5
+
+**New**
+
+- Exported the `safeFree()` function for fail-safe freeing of **scran.js** objects.
+- Added a `listMito()` function to list mitochondrial genes in mouse or human.
+- Added a `validateArrayCollection()` function to validate equilength array collections.
+- `subsetArrayCollection()` can now be used to subset based on a filtering vector.
+
+**Changes**
+
+- Functions involving the **scran.js** virtual filesystem (e.g., `writeFile()`) now throw errors when attempted in a Node context.
+- The setting of `localFile=` in `initialize()` is ignored outside of a Node context.
+- `combineArrayCollections()` will attempt to preserve TypedArray types across input collections.
+
+## 0.2.4
+
+**New**
+
+- Added a MultiMatrix class to handle memory management in multi-modal scenarios. 
+
+**Changes**
+
+- `subsetRows()` can now directly return a MultiMatrix.
+
+## 0.2.3
+
+**Changes**
+
+- Updated **libscran** dependency for `scoreMarkers()` bugfix when group and block are confounded.
+
+## 0.2.2
+
+**Changes**
+
+- `blockMethod: "block"` has been renamed to `blockMethod: "regress"` in `runPCA()`, for clarity.
+- More checks for valid `blockMethod=` being passed to `runPCA()`.
+
+## 0.2.1
+
+**New**
+
+- Exposed a reference policy option in `mnnCorrect()` for choosing the reference batch.
+- Support more community detection methods in `clusterSNNGraph()`.
+
+**Changes**
+
+- Any attempt to save `null`s via the HDF5 writers will now raise an error.
+- Any attempt to save non-strings as strings in the HDF5 writers will raise an error.
+
+## 0.2.0
+
+**New**
+
+- Added `scaleByNeighbors()` for combining embeddings across multiple modalities.
+- Added `computePerCellAdtQcMetrics()` and `computePerCellAdtQcFilters()` for quality control on the ADT count matrix.
+- Added `quickAdtSizeFactors()` to support normalization of ADT counts.
+- Added `splitRows()` to split a ScranMatrix along its rows.
+- Added `subsetArrayCollection()`, `splitArrayCollection()` and `combineArrayCollections()` for working with collections of parallel arrays.
+- Added `createBlock()`, `convertBlock()`, `filterBlock()` and `dropUnusedBlock()` for creating and manipulating the blocking factor.
+
+**Changes**
+
+- `runPCA()` will automatically adjust the number of requested PCs to be no greater than the number of available PCs.
+- Added a `numberOfDims()` method to retrieve the number of dimensions from a NeighborIndex object.
+- `computePerCellQcMetrics()` now accepts an array of Uint8WasmArrays in `subsets=` rather than a single concatenated array.
+
+## 0.1.1
+
+**Changes**
+
+- Deprecated `ScranMatrix::isPermuted()` for `ScranMatrix::isReorganized()`.
+- Deprecated `permuteVector()` for `matchVectorToRowIdentities()`.
+- Deprecated `updatePermutation()` for `updateRowIdentities()`.
+- Deprecated `permuteFeatures()` for `matchFeatureAnnotationToRowIdentities()`.
+
+## 0.1.0
+
+- Switched to `identities()` to keep track of the identities of the rows in the in-memory `ScranMatrix`.
+This is an improvement over `permutation()` as the `identities()` can naturally accommodate subsetting.
+
+## Pre-0.1.0
+
+First series of releases.
+Didn't keep track of all the changes here, so let's just treat these releases as prehistory.
+Check out the commit history for more details.
+
+---
