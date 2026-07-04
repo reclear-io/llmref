@@ -1,0 +1,1240 @@
+# Differential Dataflow
+
+Source: https://github.com/timelydataflow/differential-dataflow/blob/master/README.md
+
+# Differential Dataflow
+An implementation of [differential dataflow](https://github.com/timelydataflow/differential-dataflow/blob/master/differentialdataflow.pdf) over [timely dataflow](https://github.com/timelydataflow/timely-dataflow) on [Rust](http://www.rust-lang.org).
+
+## Background
+
+Differential dataflow is a data-parallel programming framework designed to efficiently process large volumes of data and to quickly respond to arbitrary changes in input collections. You can read more in the [differential dataflow mdbook](https://timelydataflow.github.io/differential-dataflow/) and in the [differential dataflow documentation](https://docs.rs/differential-dataflow/).
+
+Differential dataflow programs are written as functional transformations of collections of data, using familiar operators like `map`, `filter`, `join`, and `reduce`. Differential dataflow also includes more exotic operators such as `iterate`, which repeatedly applies a differential dataflow fragment to a collection. The programs are compiled down to [timely dataflow](https://github.com/timelydataflow/timely-dataflow) computations.
+
+For example, here is a differential dataflow fragment to compute the out-degree distribution of a directed graph (for each degree, the number of nodes with that many outgoing edges):
+
+```rust
+let out_degr_dist =
+edges.map(|(src, _dst)| src)    // extract source
+     .count()                   // count occurrences of source
+     .map(|(_src, deg)| deg)    // extract degree
+     .count();                  // count occurrences of degree
+```
+
+Alternately, here is a fragment that computes the set of nodes reachable from a set `roots` of starting nodes:
+
+```rust
+let reachable =
+roots.iterate(|scope, reach|
+    edges.enter(scope)
+         .semijoin(reach)
+         .map(|(src, dst)| dst)
+         .concat(reach)
+         .distinct()
+)
+```
+
+Once written, a differential dataflow responds to arbitrary changes to its initially empty input collections, reporting the corresponding changes to each of its output collections. Differential dataflow can react quickly because it only acts where changes in collections occur, and does no work elsewhere.
+
+In the examples above, we can add to and remove from `edges`, dynamically altering the graph, and get immediate feedback on how the results change: if the degree distribution shifts we'll see the changes, and if nodes are now (or no longer) reachable we'll hear about that too. We could also add to and remove from `roots`, more fundamentally altering the reachability query itself.
+
+Be sure to check out the [differential dataflow documentation](https://docs.rs/differential-dataflow), which is continually improving.
+
+## An example: counting degrees in a graph.
+
+Let's check out that out-degree distribution computation, to get a sense for how differential dataflow actually works. This example is [examples/hello.rs](https://github.com/TimelyDataflow/differential-dataflow/blob/master/differential-dataflow/examples/hello.rs) in this repository, if you'd like to follow along.
+
+A graph is a collection of pairs `(Node, Node)`, and one standard analysis is to determine the number of times each `Node` occurs in the first position, its "degree". The number of nodes with each degree is a helpful graph statistic.
+
+To determine the out-degree distribution, we create a new timely dataflow scope in which we describe our computation and how we plan to interact with it.
+
+```rust
+// create a degree counting differential dataflow
+let (mut input, probe) = worker.dataflow(|scope| {
+
+    // create edge input, count a few ways.
+    let (input, edges) = scope.new_collection();
+
+    let out_degr_distr =
+    edges.map(|(src, _dst)| src)    // extract source
+         .count()                   // count occurrences of source
+         .map(|(_src, deg)| deg)    // extract degree
+         .count();                  // count occurrences of degree
+
+    // show us something about the collection, notice when done.
+    let probe =
+    out_degr_distr
+        .inspect(|x| println!("observed: {:?}", x))
+        .probe();
+
+    (input, probe)
+});
+```
+
+The `input` and `probe` we return are how we get data into the dataflow, and how we notice when some amount of computation is complete. These are timely dataflow idioms, and we won't get in to them in more detail here (check out [the timely dataflow repository](https://github.com/timelydataflow/timely-dataflow)).
+
+If we feed this computation with some random graph data, say fifty random edges among ten nodes, we get output like
+
+    Echidnatron% cargo run --release --example hello -- 10 50 1 inspect
+        Finished release [optimized + debuginfo] target(s) in 0.05s
+        Running `target/release/examples/hello 10 50 1 inspect`
+    observed: ((3, 1), 0, 1)
+    observed: ((4, 2), 0, 1)
+    observed: ((5, 4), 0, 1)
+    observed: ((6, 2), 0, 1)
+    observed: ((7, 1), 0, 1)
+    round 0 finished after 772.464µs (loading)
+
+This shows us the records that passed the `inspect` operator, revealing the contents of the collection: there are five distinct degrees, three through seven. The records have the form `((degree, count), time, delta)` where the `time` field says this is the first round of data, and the `delta` field tells us that each record is coming into existence. If the corresponding record were departing the collection, it would be a negative number.
+
+Let's update the input by removing one edge and adding a new random edge:
+
+    observed: ((2, 1), 1, 1)
+    observed: ((3, 1), 1, -1)
+    observed: ((7, 1), 1, -1)
+    observed: ((8, 1), 1, 1)
+    round 1 finished after 149.701µs
+
+We see here some changes! Those degree three and seven nodes have been replaced by degree two and eight nodes; looks like one node lost an edge and gave it to the other!
+
+How about a few more changes?
+
+    round 2 finished after 127.444µs
+    round 3 finished after 100.628µs
+    round 4 finished after 130.609µs
+    observed: ((5, 3), 5, 1)
+    observed: ((5, 4), 5, -1)
+    observed: ((6, 2), 5, -1)
+    observed: ((6, 3), 5, 1)
+    observed: ((7, 1), 5, 1)
+    observed: ((8, 1), 5, -1)
+    round 5 finished after 161.82µs
+
+Well a few weird things happen here. First, rounds 2, 3, and 4 don't print anything. Seriously? It turns out that the random changes we made didn't affect any of the degree counts, we moved edges between nodes, preserving degrees. It can happen.
+
+The second weird thing is that in round 5, with only two edge changes we have six changes in the output! It turns out we can have up to eight. The degree eight gets turned back into a seven, and a five gets turned into a six. But: going from five to six *changes* the count for each, and each change requires two record differences. Eight and seven were more concise because their counts were only one, meaning just arrival and departure of records rather than changes.
+
+### Scaling up
+
+The appealing thing about differential dataflow is that it only does work where changes occur, so even if there is a lot of data, if not much changes it can still go quite fast. Let's scale our 10 nodes and 50 edges up by a factor of one million:
+
+    Echidnatron% cargo run --release --example hello -- 10000000 50000000 1 inspect
+        Finished release [optimized + debuginfo] target(s) in 0.04s
+        Running `target/release/examples/hello 10000000 50000000 1 inspect`
+    observed: ((1, 336908), 0, 1)
+    observed: ((2, 843854), 0, 1)
+    observed: ((3, 1404462), 0, 1)
+    observed: ((4, 1751921), 0, 1)
+    observed: ((5, 1757099), 0, 1)
+    observed: ((6, 1459805), 0, 1)
+    observed: ((7, 1042894), 0, 1)
+    observed: ((8, 653178), 0, 1)
+    observed: ((9, 363983), 0, 1)
+    observed: ((10, 181423), 0, 1)
+    observed: ((11, 82478), 0, 1)
+    observed: ((12, 34407), 0, 1)
+    observed: ((13, 13216), 0, 1)
+    observed: ((14, 4842), 0, 1)
+    observed: ((15, 1561), 0, 1)
+    observed: ((16, 483), 0, 1)
+    observed: ((17, 143), 0, 1)
+    observed: ((18, 38), 0, 1)
+    observed: ((19, 8), 0, 1)
+    observed: ((20, 3), 0, 1)
+    observed: ((22, 1), 0, 1)
+    round 0 finished after 15.470465014s (loading)
+
+There are a lot more distinct degrees here. I sorted them because it was too painful to look at the unsorted data. You would normally get to see the output unsorted, because they are just changes to values in a collection.
+
+Let's perform a single change again.
+
+    observed: ((5, 1757098), 1, 1)
+    observed: ((5, 1757099), 1, -1)
+    observed: ((6, 1459805), 1, -1)
+    observed: ((6, 1459807), 1, 1)
+    observed: ((7, 1042893), 1, 1)
+    observed: ((7, 1042894), 1, -1)
+    round 1 finished after 228.451µs
+
+Although the initial computation took about fifteen seconds, we get our changes in about 230 microseconds; that's about one hundred thousand times faster than re-running the computation. That's pretty nice. Actually, it is small enough that the time to print things to the screen is a bit expensive, so let's stop doing that.
+
+Now we can just watch as changes roll past and look at the times.
+
+    Echidnatron% cargo run --release --example hello -- 10000000 50000000 1 no_inspect
+        Finished release [optimized + debuginfo] target(s) in 0.04s
+        Running `target/release/examples/hello 10000000 50000000 1 no_inspect`
+    round 0 finished after 15.586969662s (loading)
+    round 1 finished after 1.070239ms
+    round 2 finished after 2.303187ms
+    round 3 finished after 208.45µs
+    round 4 finished after 163.224µs
+    round 5 finished after 118.792µs
+    ...
+
+Nice. This is some hundreds of microseconds per update, which means maybe ten thousand updates per second. It's not a horrible number for my laptop, but it isn't the right answer yet.
+
+### Scaling .. "along"?
+
+Differential dataflow is designed for throughput in addition to latency. We can increase the number of rounds of updates it works on concurrently, which can increase its effective throughput. This does not change the output of the computation, except that we see larger batches of output changes at once.
+
+Notice that those times above are a few hundred microseconds for each single update. If we work on ten rounds of updates at once, we get times that look like this:
+
+    Echidnatron% cargo run --release --example hello -- 10000000 50000000 10 no_inspect
+        Finished release [optimized + debuginfo] target(s) in 0.04s
+        Running `target/release/examples/hello 10000000 50000000 10 no_inspect`
+    round 0 finished after 15.556475008s (loading)
+    round 10 finished after 421.219µs
+    round 20 finished after 1.56369ms
+    round 30 finished after 338.54µs
+    round 40 finished after 351.843µs
+    round 50 finished after 339.608µs
+    ...
+
+This is appealing in that rounds of ten aren't much more expensive than single updates, and we finish the first ten rounds in much less time than it takes to perform the first ten updates one at a time. Every round after that is just bonus time.
+
+As we turn up the batching, performance improves. Here we work on one hundred rounds of updates at once:
+
+    Echidnatron% cargo run --release --example hello -- 10000000 50000000 100 no_inspect
+        Finished release [optimized + debuginfo] target(s) in 0.04s
+        Running `target/release/examples/hello 10000000 50000000 100 no_inspect`
+    round 0 finished after 15.528724145s (loading)
+    round 100 finished after 2.567577ms
+    round 200 finished after 1.861168ms
+    round 300 finished after 1.753794ms
+    round 400 finished after 1.528285ms
+    round 500 finished after 1.416605ms
+    ...
+
+We are still improving, and continue to do so as we increase the batch sizes. When processing 100,000 updates at a time we take about half a second for each batch. This is less "interactive" but a higher throughput.
+
+    Echidnatron% cargo run --release --example hello -- 10000000 50000000 100000 no_inspect
+        Finished release [optimized + debuginfo] target(s) in 0.04s
+        Running `target/release/examples/hello 10000000 50000000 100000 no_inspect`
+    round 0 finished after 15.65053789s (loading)
+    round 100000 finished after 505.210924ms
+    round 200000 finished after 524.069497ms
+    round 300000 finished after 470.77752ms
+    round 400000 finished after 621.325393ms
+    round 500000 finished after 472.791742ms
+    ...
+
+This averages to about five microseconds on average; a fair bit faster than the hundred microseconds for individual updates! And now that I think about it each update was actually two changes, wasn't it. Good for you, differential dataflow!
+
+### Scaling out
+
+Differential dataflow is built on top of [timely dataflow](https://github.com/timelydataflow/timely-dataflow), a distributed data-parallel runtime. Timely dataflow scales out to multiple independent workers, increasing the capacity of the system (at the cost of some coordination that cuts into latency).
+
+If we bring two workers to bear, our 10 million node, 50 million edge computation drops down from fifteen seconds to just over eight seconds.
+
+    Echidnatron% cargo run --release --example hello -- 10000000 50000000 1 no_inspect -w2
+        Finished release [optimized + debuginfo] target(s) in 0.04s
+        Running `target/release/examples/hello 10000000 50000000 1 no_inspect -w2`
+    round 0 finished after 8.065386177s (loading)
+    round 1 finished after 275.373µs
+    round 2 finished after 759.632µs
+    round 3 finished after 171.671µs
+    round 4 finished after 745.078µs
+    round 5 finished after 213.146µs
+    ...
+
+That is a so-so reduction. You might notice that the times *increased* for the subsequent rounds. It turns out that multiple workers just get in each other's way when there isn't much work to do.
+
+Fortunately, as we work on more and more rounds of updates at the same time, the benefit of multiple workers increases. Here are the numbers for ten rounds at a time:
+
+    Echidnatron% cargo run --release --example hello -- 10000000 50000000 10 no_inspect -w2
+        Finished release [optimized + debuginfo] target(s) in 0.04s
+        Running `target/release/examples/hello 10000000 50000000 10 no_inspect -w2`
+    round 0 finished after 8.083000954s (loading)
+    round 10 finished after 1.901946ms
+    round 20 finished after 3.092976ms
+    round 30 finished after 889.63µs
+    round 40 finished after 409.001µs
+    round 50 finished after 320.248µs
+    ...
+
+One hundred rounds at a time:
+
+    Echidnatron% cargo run --release --example hello -- 10000000 50000000 100 no_inspect -w2
+        Finished release [optimized + debuginfo] target(s) in 0.04s
+        Running `target/release/examples/hello 10000000 50000000 100 no_inspect -w2`
+    round 0 finished after 8.121800831s (loading)
+    round 100 finished after 2.52821ms
+    round 200 finished after 3.119036ms
+    round 300 finished after 1.63147ms
+    round 400 finished after 1.008668ms
+    round 500 finished after 941.426µs
+    ...
+
+One hundred thousand rounds at a time:
+
+    Echidnatron% cargo run --release --example hello -- 10000000 50000000 100000 no_inspect -w2
+        Finished release [optimized + debuginfo] target(s) in 0.04s
+        Running `target/release/examples/hello 10000000 50000000 100000 no_inspect -w2`
+    round 0 finished after 8.200755198s (loading)
+    round 100000 finished after 275.262419ms
+    round 200000 finished after 279.291957ms
+    round 300000 finished after 259.137138ms
+    round 400000 finished after 340.624124ms
+    round 500000 finished after 259.870938ms
+    ...
+
+These last numbers were about half a second with one worker, and are decently improved with the second worker.
+
+### Going even faster
+
+There are several performance optimizations in differential dataflow designed to make the underlying operators as close to what you would expect to write, when possible. Additionally, by building on timely dataflow, you can drop in your own implementations a la carte where you know best.
+
+For example, we also know in this case that the underlying collections go through a *sequence* of changes, meaning their timestamps are totally ordered. In this case we can use a much simpler implementation, `count_total`. The reduces the update times substantially, for each batch size:
+
+    Echidnatron% cargo run --release --example hello -- 10000000 50000000 10 no_inspect -w2
+        Finished release [optimized + debuginfo] target(s) in 0.04s
+        Running `target/release/examples/hello 10000000 50000000 10 no_inspect -w2`
+    round 0 finished after 5.985084002s (loading)
+    round 10 finished after 1.802729ms
+    round 20 finished after 2.202838ms
+    round 30 finished after 192.902µs
+    round 40 finished after 198.342µs
+    round 50 finished after 187.725µs
+    ...
+
+    Echidnatron% cargo run --release --example hello -- 10000000 50000000 100 no_inspect -w2
+        Finished release [optimized + debuginfo] target(s) in 0.04s
+        Running `target/release/examples/hello 10000000 50000000 100 no_inspect -w2`
+    round 0 finished after 5.588270073s (loading)
+    round 100 finished after 3.114716ms
+    round 200 finished after 2.657691ms
+    round 300 finished after 890.972µs
+    round 400 finished after 448.537µs
+    round 500 finished after 384.565µs
+    ...
+
+    Echidnatron% cargo run --release --example hello -- 10000000 50000000 100000 no_inspect -w2
+        Finished release [optimized + debuginfo] target(s) in 0.04s
+        Running `target/release/examples/hello 10000000 50000000 100000 no_inspect -w2`
+    round 0 finished after 6.486550581s (loading)
+    round 100000 finished after 89.096615ms
+    round 200000 finished after 79.469464ms
+    round 300000 finished after 72.568018ms
+    round 400000 finished after 93.456272ms
+    round 500000 finished after 73.954886ms
+    ...
+
+These times have now dropped quite a bit from where we started; we now absorb over one million rounds of updates per second, and produce correct (not just consistent) answers even while distributed across multiple workers.
+
+## A second example: k-core computation
+
+The k-core of a graph is the largest subset of its edges so that all vertices with any incident edges have degree at least k. One way to find the k-core is to repeatedly delete all edges incident on vertices with degree less than k. Those edges going away might lower the degrees of other vertices, so we need to *iteratively* throwing away edges on vertices with degree less than k until we stop. Maybe we throw away all the edges, maybe we stop with some left over.
+
+Here is a direct implementation, in which we repeatedly take determine the set of active nodes (those with at least
+`k` edges point to or from them), and restrict the set `edges` to those with both `src` and `dst` present in `active`.
+
+```rust
+let k = 5;
+
+// iteratively thin edges.
+edges.iterate(|scope, inner| {
+
+    // determine the active vertices        /-- this is a lie --\
+    let active = inner.flat_map(|(src,dst)| [src,dst].into_iter())
+                      .map(|node| (node, ()))
+                      .group(|_node, s, t| if s[0].1 > k { t.push(((), 1)); })
+                      .map(|(node,_)| node);
+
+    // keep edges between active vertices
+    edges.enter(scope)
+         .semijoin(active)
+         .map(|(src,dst)| (dst,src))
+         .semijoin(active)
+         .map(|(dst,src)| (src,dst))
+});
+```
+
+To be totally clear, the syntax with `into_iter()` doesn't work, because Rust, and instead there is a more horrible syntax needed to get a non-heap allocated iterator over two elements. But, it works, and
+
+    Running `target/release/examples/degrees 10000000 50000000 1 5 kcore1`
+    Loading finished after 72204416910
+
+Well that is a thing. Who knows if 72 seconds is any good? (*ed:* it is worse than the numbers in the previous version of this readme).
+
+The amazing thing, though is what happens next:
+
+    worker 0, round 1 finished after Duration { secs: 0, nanos: 567171 }
+    worker 0, round 2 finished after Duration { secs: 0, nanos: 449687 }
+    worker 0, round 3 finished after Duration { secs: 0, nanos: 467143 }
+    worker 0, round 4 finished after Duration { secs: 0, nanos: 480019 }
+    worker 0, round 5 finished after Duration { secs: 0, nanos: 404831 }
+
+We are taking about half a millisecond to *update* the k-core computation. Each edge addition and deletion could cause other edges to drop out of or more confusingly *return* to the k-core, and differential dataflow is correctly updating all of that for you. And it is doing it in sub-millisecond timescales.
+
+If we crank the batching up by one thousand, we improve the throughput a fair bit:
+
+    Running `target/release/examples/degrees 10000000 50000000 1000 5 kcore1`
+    Loading finished after Duration { secs: 73, nanos: 507094824 }
+    worker 0, round 1000 finished after Duration { secs: 0, nanos: 55649900 }
+    worker 0, round 2000 finished after Duration { secs: 0, nanos: 51793416 }
+    worker 0, round 3000 finished after Duration { secs: 0, nanos: 57733231 }
+    worker 0, round 4000 finished after Duration { secs: 0, nanos: 50438934 }
+    worker 0, round 5000 finished after Duration { secs: 0, nanos: 55020469 }
+
+Each batch is doing one thousand rounds of updates in just over 50 milliseconds, averaging out to about 50 microseconds for each update, and corresponding to roughly 20,000 distinct updates per second.
+
+I think this is all great, both that it works at all and that it even seems to work pretty well.
+
+## Roadmap
+
+The [issue tracker](https://github.com/timelydataflow/differential-dataflow/issues) has several open issues relating to current performance defects or missing features. If you are interested in contributing, that would be great! If you have other questions, don't hesitate to get in touch.
+
+## Acknowledgements
+
+In addition to contributions to this repository, differential dataflow is based on work at the now defunct Microsoft Research lab in Silicon Valley, and continued at the Systems Group of ETH Zürich. Numerous collaborators at each institution (among others) have contributed both ideas and implementations.
+
+---
+
+# CONTRIBUTING.md
+
+Source: https://github.com/timelydataflow/differential-dataflow/blob/master/CONTRIBUTING.md
+
+Thank you for your interest in contributing! 
+
+Here is some legal stuff that will make you regret clicking on this link.
+
+By submitting a pull request for this project, you are agreeing to license your contribution under the terms of the project's LICENSE file at the time of your submission (in case it changes or something). You are also certifying that you are in a position to make this agreement, in that you didn't nick your code from someone else, or some project with conflicting licensing requirements.
+
+If you would like to put explicit copyright notices somewhere, please leave them in the repository's COPYRIGHT file rather than in each file.
+
+---
+
+# osdi2018-reviews.md
+
+Source: https://github.com/timelydataflow/differential-dataflow/blob/master/osdi2018-reviews.md
+
+Reviews, author response, and PC comments as available in the system. Review #86F is post-response, and none of the other reviews changed from their initial state.
+
+|             | Overall Merit | Novelty | Experimental Methodology | Writing Quality | Reviewer Expertise |
+|:------------|-------:|----:|-------:|-------:|-------:|
+| Review #86A |      2 |   2 |     3  |      2 |      2 |
+| Review #86B |      3 |   2 |     3  |      2 |      2 |
+| Review #86C |      2 |   2 |     3  |      2 |      2 |
+| Review #86D |      3 |   3 |     4  |      4 |      2 |
+| Review #86E |      3 |   2 |     4  |      2 |      2 |
+| Review #86F |      3 |   3 |     3  |      4 |      2 |
+
+## Review #86A
+
+### Paper summary
+This paper describes a new differential dataflow system which supports shared state among operators. It proposes a novel “arrange” operator to maintain the shared indexed state to achieve high throughput and low latency. The system is motivated by the demand to support different types of big data workloads in a unified system. The evaluation shows that the proposed system can achieve comparable performance for workloads on the corresponding alternative specialized systems.
+
+### Strengths
+Moved the state-of-the-art of the differential dataflow with shared state support.
+
+The system has many types of workloads built and evaluated.
+
+### Areas for improvement
+The writing can be improved by describing the key techniques and challenges with running example.
+
+### Comments for author
+This work looks like an extension of Naiad, from the design wise, to achieve higher generality and performance. The benefit of the system hinges on the design of “arrange” operator. However, this paper does not do a good job on elaborating why the design of “arrange” operator is challenging and why it cannot be easily achieved through a simple revision of Naiad. The answer might be straightforward if the reader is an expert of Naiad, but this assumption seems to be too strong. It could be very helpful to describe the “arrange” operator design and challenges with a running example. This weakness of the paper makes me feel the innovation is incremental.
+
+I think this work shares the similar motivation as Naiad. It is kind of disappointing that the evaluation does not has comparison with Naiad system. It also does not have experiments that clearly help understand how much benefit the optimizations in “arrange” operator design can bring.
+
+This work seems to mainly advocate the high-level design principles of “arrange” operator. Wouldn’t be the design of data structure for the shared indexed state important and critical for the performance improvement? If so, it will be helpful to elaborate it.
+
+Although I buy the point that a unified system for different types of workloads is useful, I think it is only critical in the scenarios where there are needs for those workloads to cooperatively run. In another word, if two applications are commonly used in separate scenarios, it is more reasonable to use different specialized systems to support them, respectively. I would appreciate more if the paper can illustrate an example scenario where multiple types of workloads that the system targets to support need to run in a cooperative way.
+
+
+## Review #86B
+
+### Paper summary
+The paper presents a design of adding indexes to timely differential dataflow systems.
+
+### Strengths
+The work adds indexes to timely differential dataflow systems, which are very interesting streaming computing engines. If indexes can improve performance and simplify the writing of timely dataflow programs, that's a great win.
+
+### Areas for improvement
+Explain in plainer terms the specific problems of existing dataflow designs that this paper deals with. The current description of these problems is overreaching and confusing.
+Clarify what properties you get from your design vs. you inherit from Naiad. For example, is "generality" something you largely inherit from Naiad?
+Why is there no performance comparison with Naiad w/o indexes on the real workloads?
+
+### Comments for author
+I was excited to read this paper, because the differential data flow model is very interesting and worth exploring more. Unfortunately, this paper was very confusing to me. I couldn't grasp what new properties the indexes added, beyond potential performance improvements, which is indeed what indexes typically provide. You make many arguments about several other properties they supposedly add, but these arguments seem overreaching. For example, the "generality" property: is that something the indexes buy you, or is this a property your system inherits from the differential dataflow model? I understand that the indexes add a bit more uniformity between how one interfaces with historical data vs. streaming data, but beyond that, I don't see why the indexes add to the "generality" property of differential data flow systems. As another example, you argue that because the indexes improve performance, indexed differential dataflow systems obviate the need for specialized systems. This seems like an overreaching argument. Maybe the conclusion that your system is as fast as some specialized system designs is worth pointing out in your evaluation, but motivating your index with this argument -- that no one will need to specialize system designs now -- seems overreaching.
+
+In my opinion, the question of how one integrates indexes into differential dataflow is interesting, even if the only motivation for it is improved performance. You could then reflect upon other benefits the indexes bring, perhaps toward the end of the paper.
+
+A few more comments I jotted down while reading the paper (some are redundant to the points I'm making above to summarize my overall concern with the paper):
+
+Abstract
+
+* "general, scalable, responsive" are these properties inherited from Naiad or newly added by indexes? Also, what does "responsive" mean here -- is it high availability, low latency, something else? Please use more standard or define what you mean.
+Would be good to give intuition of your technical contribution here: you add shared index support.
+
+Intro
+
+* You are motivating your contribution with many problems -- lots of data compute models, none of them "general" enough, often systems are specialized for good performance, etc. Yet, the contribution you bring -- adding indexes to dataflow graphs -- does not seem to resolve all of these problems, at least not completely. I understand that the design offers benefits along many of these dimensions, but I wouldn't consider it as the ultimate solution to this problem. Describing a more focused problem -- e.g., differential dataflow systems present substantial promise but they are not as efficient as they could be because they lack indexing capabilities -- and then irrefutably addressing that one challenge, seems more appropriate. You can then extend the discussion to the additional benefits the indexes buy you, e.g., with them, differential dataflows can support workloads.
+* "nonetheless re-use common principles." Is this ever supported in the body of the paper? What are these commonly reused principles? Is that what you are leveraging for the design? This statement makes me think that there will be an analysis of the "commonly reused principles" in narrow-functionality, performant systems, and those commonly reused principles would then be leveraged as part of your general design. But I didn't find that point addressed anywhere in the paper.
+* "K-Pg exposes and shares indexed state between operators" - indexes of what and for what purpose? Why is it expected that indexes would help/increase performance in the case of streaming systems?
+* "K-Pg's adherence to a specific data and computational model brings structure and meaning to its shared state..." -- yes, but why doesn't that constrain applicability?
+* Paragraph starting with "Several changes are required..." is very abstract. I didn't get much out of it. Explaining your functionality more concretely would be very useful.
+* "We evaluate K-Pg on benchmark tasks in relational analytics, graph processing, and datalog evaluation" -- what about ML? I guess such workloads aren't supported, would be good to explicitly carve out.
+* "K-Pg is our attempt to provide a computational framework that is general, scalable, and responsive." As in the abstract, this claim struck me as overreaching for what you are actually contributing over Naiad. Some of these properties are inherited from Naiad/differential dataflow, and perhaps boosted further by your design. But the specific contribution appears to be improving performance of differential dataflow systems with indexes.
+
+Section 2
+
+* "preclude cycles along with timestamps do not strictly increase" -- seems like a bit limitation for generality. It means essentially, no looping over the data (as is often needed for ML workloads for example). Is that what you are addressing with indexing from a generality perspective?
+* Section 2.3: It's good to have this diffing section, but it was still too abstract for me. Maybe you could continue the example in Figure 1 and show how it would be executed with indexes vs. without?
+
+Sections 3 and 4
+
+* These two sections cover a lot of material and techniques fairly abstractly. It would be good to have one or a few running examples to illustrate how the indexes work in various contexts.
+* You argue that the implementation for some of the operators can be simplified with indexes. It was hard to keep track of where you simplified things vs. where they complicated them. Might be good to include side-by-side algorithms for some of the operators' implementations.
+
+Section 5
+
+* Why are there no evaluation results comparing Naiad (or other differential dataflow implementation without indexes) on realistic workloads? Are some of your configurations equivalent to differential dataflow w/o indexes? From what I understood, the value of indexes is only illustrated on microbenchmarks.
+* Figure 4: what's DBpaster (as used in label) vs. DBToaster (as used in caption)?
+* I appreciate the thoroughness of evaluating on multiple different application domains! It does give support to your "generality" claim. I would have liked to understand whether it is the indexes or the differential dataflow model, or a combination of the two that provide general support. My guess is that it's the latter, but I would have wanted to see that in the graph: no indexes in differential dataflow is worse than specialized systems, which are worse than differential dataflow with indexes.
+
+Related work:
+
+* I liked the way you compared particularly with Stream processors. Very concrete and clear.
+
+
+## Review #86C
+
+### Paper summary
+K-Pg is a re-implementation of differential dataflow system. K-Pg introduces a new dataflow operator arrange to maintain shared index within a worker. Operating on pre-indexed input batches is more efficient. Evaluations on relational analytics, graph processing, and program analysis tasks show that the new dataflow engine achieves lower latency and higher throughput.
+### Strengths
+The re-implementation of the differential dataflow system has achieved good performance gains.
+### Areas for improvement
+This paper is not really self-contained and thus very difficult to understand. One must already know and believe in the design of differential dataflow in order to have any appreciation of the current re-implementation.
+### Comments for author
+This paper is very hard to understand. There is no clear motivation and problem definition. The solution is also hard to decipher and appreciate. As a result, the paper might as well contain some good idea, but as a reviewer, I completely failed to grasp it.
+
+I do not really agree with the high-level motivation outlined in the paper's abstract and introduction. It is said that existing frameworks are limited in generality. This claim is too general (there is no mentioning of specific systems and there is no discussion of any concrete example that the specific existing systems fail to address). Later, Figure 1 shows a graph reachability example for the K-Pg system. However, this example would work perfectly well in Spark. I read the "Different dataflow" paper. There, the motivation is on performance rather than generality. I think the performance motivation is much more convincing.
+
+The paper's discussion on differential dataflow is not sufficient for readers to understand the rest of the paper. I'm not sure what is the best way to summarize differential dataflow without too much text. Perhaps one could illustrate the workings of differential dataflow with Figure 1 and explain what are the "difference streams" being passed between the operators. How does each operator process these difference? etc. Crucially, it's important to explain what is being indexed of the data, why it is so important to maintain the index, and why sharing these indexes across operators within a worker is beneficial. In the paper's current form, I don't know such important questions are answered. As a result, it is very difficult to read Sec 3. I have to read the differential dataflow paper to get some idea what these indexes are, assuming the indexes in that paper mean the same thing as this paper.
+
+I would also appreciate the authors consolidate all the built-in operators and their semantics in a single Table and explicitly list it somewhere. Currently, the operators are sprinkled througout the paper. It's sometimes hard to tell whether a term in sans-serif font is a built-in operator or user-defined one.
+
+Since arrange is a crucial new operator supported by K-Pg, it would be good to see an example application using it. For example, it would be nice if Figure 1 is shown to use this arrange operator. Or, is this operator automatically added to the dataflow graph and hidden from the end user?
+
+I do not understand what the phrase "downgrade the frontier capability" means (Sec 3). Similarly, what is an "opposing trace" or an "exchange edge" (Sec 4.3.1)?
+
+In Sec 5, last paragraph, "K-Pg outperforms ... while supporting more general computation". Which of these tasks being evaluated cannot be supported by Spark?
+
+For the evaluation's experiment setup, do you run a worker on each CPU core for a maximum of 40 total workers in the single machine setup?
+
+Microbenchmark. How often does the frontier advance? what is the effective (physical) batch size created in these microbenchmarks? In general, I am not sure what to make of these performance number, since I do not have a good idea what creating an index entails for the arrangement operator.
+
+What are query modifications like in interatctive queries in Sec 5.3?
+
+The description of experimental results in Sec 5.4. feels very casual and not quite helpful. For example, it's said for 4 out of the 6 reference problems, K-Pg... was comparable to DeALS on one core but scaled less well with increasing cores. What happened to the rest of the 2 problems? Later, it is said that DeALS permits racy code? What kind of racy code? Does it compromise application correctness?
+
+## Review #86D
+
+### Paper summary
+K-PG is a distributed data processor that aims to support a generic set of workloads including graph processing, analytics, and Datalog. K-PG adopts the abstraction of differential data flows, and enables shared state that supports a high rate of logical updates. The evaluation shows that K-PG performs comparably to specialized data processors.
+### Strengths
+A generic data processing system enables programmers to write hybrid applications with varying workloads.
+
+A well-thought system design, synthesizing existing elements in an interesting new way.
+
+Evaluation results show that K-PG performs comparably to specialized data processors.
+
+The paper is clear and well-written.
+
+### Areas for improvement
+The building blocks have been previously designed and are not novel by themselves — yet the overall system design is new and the choice of the building blocks is interesting.
+
+I felt that the paper was missing a characterization of the limitations of K-PG.
+
+### Comments for author
+I have enjoyed reading this paper. While I believe in the power of specialization to achieve good performance, a system like K-PG that can provide comparable performance while enabling a set of workloads is appealing. Developers often write applications that need to exercise more than one type of computation, and such a system makes it easier for them.
+
+I have enjoyed the design of K-PG based on differential dataflows: the choice and rationale for the building blocks and their composition in the overall system is elegant. Even though each building block exists, as the authors acknowledge, the overall design is interesting.
+
+However, I felt that the paper portrays too much of a perfect view on K-PG with almost no limitations exposed, which makes it harder to believe. What are some limitations or shortcomings of K-PG? I have a hard time believing that K-PG will always perform comparably to the specialized solutions. In what situations will it or will it not perform comparably?
+
+The abstract sounded too vague and generic, to the point that I was skeptical of the work at the end of the abstract.
+
+The paper is mostly well written, with only a few issues such as:
+
+“effecient” -> “efficient”
+grammar “eliminate the cost all subsequent uses of the arrangement.”
+
+## Review #86E
+
+### Paper summary
+This paper re-implementation of differential dataflow based on the concepts of indexed shared state. Such state can be shared between operators in multiple dataflows. Shared states can reduce the memory consumption and communication. The modified operators can have higher throughput for computation. K-Pg is a general computing framework supporting a wide range of workloads. Evaluation shows that K-Pg can be as capable as specialized data processing systems in target domains.
+### Strengths
+K-Pg is a data-processing framework that is general, scalable and responsive. Also, the performance is comparable with and occasionally better than specialized existing systems on a variety of tasks.
+### Areas for improvement
+The paper is very abstract for the readers who are not familiar with differential dataflow. It would be better to use examples to show the design and implementation of operators.
+
+Is there any comparison between the K-Pg and previous implementation of differential dataflow? Since K-Pg is complete re-implementation of differential dataflow, it would be better to show the performance improvement over existing implementation.
+
+### Comments for author
+This paper is well motivated and organized. The system design and implementation are reasonable and quite different from the existing general framework of data processing systems. Despite the comments mentioned previously, here are a few more comments for the paper.
+
+The paper talks about the design and implementation of K-Pg. However, it does not explicitly discuss the exact improvement that can brought by K-Pg. Despite the reduced memory consumption(evaluated) and network communication (not evaluated), it is not clear how K-Pg can reduce the computation. One is that the other workflow does not need to re-arrange again i.e. reduce the computation. The other is by using batch, the operator programming interfaces are changed. And the computation will be performed in a batched way. Are these the computation improvements? What other kinds improvements can be gotten? Some discussions can help.
+
+Not quite sure about the evaluation setup. It seems that a single machine is used. It is okay sometimes. However, it will be unclear about the effects of the current method working in the distributed environment. Will the efforts be erased by introducing network overhead? Some discussions can help.
+
+There should be more explanations and results related to the evaluation in section 5.3. It would be better to provide some information about the implementation of the applications. No detailed performance results are provided. K-Pg's performance is supposed to be comparable to specialized systems, but current comparison is not enough. For example, K-Pg is faster than existing systems including BigDatalog, Myria, SociaLite and GraphX on graph workloads. But there are many state-of-art works which can be much faster, such as Gemini(OSDI 16).
+
+Still not clear about some details of indexed shared states. Section 3 can use more space to explain the organization of shared states. Since it is indexed and has multiple versions, what about the organization of data structures? Are the data indexed by time or data in <data, time, diff> triplets?
+
+Last paragraph Section 5.5 refers Figure 1, but it should be Table 1.
+
+## Review #86F
+
+### Paper summary
+There are a variety of scalable data processing systems: databases, timely dataflow, graph processing. The paper introduces a core concept called an "arrangement" whach carries along a log-structured index of a node's output that's easily sharable by subsequent dataflow input nodes. Index data are reference with handles that signal when old index data (or entire indices) can be garbage collected because no subsequent graph nodes will later reference it.
+
+This new structure is sufficient to reconstruct instances of many different types of specialized systems, and produce competetive performance.
+
+### Strengths
+An ambitious Grand Unified Theory that seems to pull it off: it subsumes problems from a spectrum of other systems, and often performs better BECAUSE of its cleanliness.
+
+### Areas for improvement
+The paper bites off such an enormous mouthful that nothing gets proper treatment. I wanted illustrations of all the the architectural ideas, and the evaluation elided way more than one would hope.
+This is is the sort of synthesis that organizes and advances the field; I'm not surprised it's difficult to exhaustively make the case in 12 pages! The writing is very tight; the problem isn't presentation as much as the page limit.
+
+The evaluation punts away distributed execution, excused because the improved constants allow K-pg to beat other systems that need multiple nodes. But it's a missed opportunity to show how it scales when data needs to be transported.
+
+The evaluation references published numbers for baselines, rather than comparing apples-to-apples; in some places, the evaluation only reports a qualitative result, not the actual data for the reader to compare.
+
+### Comments for author
+I was REALLY excited about the promise of a grand unified theory. But I had a hard time understanding this paper, in part because of my inexpertise, and partly because there are a LOT of ideas crammed into the paper. The writing is good, but the writing task is very demanding. I'm also concerned the evaluation is a little too summarized.
+
+p2 "nothing prevents the sharing of state within a worker (even across
+dataflows), other than a discipline for doing so."
+I think you mean "you definitely shouldn't do this sharing, because it'll be impossible to read about the semantics".
+
+p3 I think "associative group" and "these times may be only partially ordered" are somehow related, but couldn't quite make the connection. If that's true, spell it out?
+
+p3 "and would likely be new to other streaming systems"
+The literature is already published; is it new or not?
+
+p3 "as indexed batches"
+I wondered "do batches interfere with low latency?", but you later point out that there's a knob to turn to adjust the latency/throughput tradeoff.
+
+p3 "given their in- put as indexed batches rather than streams of indepen-
+dent updates."
+Why are batches easier to build for than independent updates? you can't exploit the batch, since the boundaries are arbitrary.
+
+p3 "and in all cases we view violations of any of these principles as
+problematic."
+Rather than assert they're problematic up here, better to explain at appropriate points in the text why each violation would be problematic.
+
+p3 "Principle 3: Bounded memory footprint."
+I think you mean "memory proportional to the working set size, not the complete collection including quiescent records." Is that right?
+
+p4 "(i) a stream of shared indexed batches of updates and (ii) a shared,
+com- pactly maintained index of all produced updates."
+Shared across what scope?
+
+p4 "in that it can be understood ...  An independent timely dataflow
+can ... correctly understand the collection history."
+What do you mean by understand?
+
+p4 "the number of distinct (data, time) pairs (the longest list
+contains only distinct pairs, and all other lists accumulate
+to at most a constant multiple of its length)."
+Can duplicate data be created anywhere along the pipeline, or only at the input?
+
+p4 "This decouples the logical update rate from the physical batching"
+This physical/logical decoupling remains slippery to me. Work an example?
+
+p5 "the arrange operator will con- tinue to produce indexed batches, but it
+will not ..."
+Why wouldn't you want to also garbage collect the arrange operator as well?
+
+p5 "Consolidation."
+Thin paragraph left me confused.
+
+p5 "Full historical information means that computations do not require
+special logic or modes to ac- commodate attaching to incomplete in-progress
+streams"
+Sounds awesome but I still don't quite get it.
+
+p6 "A user can filter an ar- rangement, or first reduce the arrangement to
+a stream of updates and then filter it."
+Aaaugh, I still don't intuit the distinction between an arrangement and a reduced stream of updates
+
+p6 "Amortized work."
+Illustration here, too?
+
+p6 "and subtracts the accumulated output."
+Confused.
+
+p7 "without extensive re-invocation"
+Costly? Because the next sentence would be relevant even if it were just a little reinvocation.
+
+p7 "At the tail of the body, the result is merged with the negation of the
+initial input collection"
+Confused.
+
+p7 "We have made two minor modifications. First, ar-
+rangements external to the iteration can be introduced (as
+can un-arranged collections) with the enter operator,
+whose implementation for arrangements only wraps cur-
+sors with logic that introduces a zero coordinate to the
+timestamp; indices and batches remain shared."
+Confused. Maybe this section needs an illustration.
+
+p7 "K-Pg distributes across multiple machines, but our
+evaluation here is restricted to multiprocessors, which
+have been sufficient to reproduce computation that re-
+quire more resources for less expressive frameworks."
+That's awesome, but a missed opportunity for the evaluation. Better to also show the system scaling to a distributed implementation, and show that it can tackle bigger problems as a result.
+
+p7 "(with 64bit timestamp and signed difference)."
+Confused.
+
+p8, fig 3 and others: Sort the legends to match the dominant order of the curves in the figure, to make it easier for the reader to dereference.
+
+p8 "As the number of workers increases the latency-throughput trade-off
+swings in favor of latency."
+At the expense of throughput? "swings" is a misleading metaphor
+
+p8 "Figure 4b reports the relative throughput increases ..."
+Relative to DBToaster?
+
+Fig 4 has "query number" on the X axis, which isn't an interpolatable quantity. Don't connect the points with lines, because it's not meaningful to infer the y-axis value for query #10.5.
+
+p9 "Worker Scaling": Am I reading this correctly: Kp-g admits batching and parallelization opportunities that allow 10-100x improvements over state of the art? If not, clarify the graphs. If so, call that claim out explicitly, because it's kinda important.
+
+p9 "Our measurements indicate that K-Pg is consistently faster than systems
+like BigDatalog, Myria, SociaLite,"
+Where's the data?
+
+p10 "The throughput greatly exceeds that observed in [21]"
+By what factor? Where's the data?
+
+p10 "was comparable to the best shared memory systems (DeALS) on one core
+(three out of five problems) but scaled less well with increasing cores
+(one out of five problems on 64 cores)."
+Where's the data plot?
+
+p10 "K-Pg prevents racy access and imposes synchronization be- tween rounds
+of derivation, which can limit performance but also allows it to
+efficiently update such computations when base facts are added or removed."
+I wish you could set up experiments that showed both sides of this story.
+
+p11 "This appears to be more a limitation of the query transformation
+rather than K-Pg."
+Do other systems do better? Not enough detail in this paragraph for me to follow the argument and evaluate it.
+
+p11 "substantial improvement, due in some part to our ability
+to re-use operators from an optimized system rather than
+implement and optimize an entirely new system."
+Cool!
+
+nits
+
+p2 "K-Pg is our attempt to provide a computational framework..."
+Suggest: 'K-Pg is a computational framework...' That you wrote it down means you provided it, and that it's under submission means it's an attempt. :v) Just make your assertions without apology, and let the paper's content defend them.
+
+p4 "and eliminate the cost all subsequent uses of the arrange-"
+missing 'of'
+
+p6 "across otherwise independent workers,"
+delete otherwise? I'm not sure what it meant here.
+
+p6 "even if this violates the timestamp order."
+s/violates/disregards/ -- violates seems too strong here, since the behavior is preserving semantics.
+
+p6 "when the cur- sor keys match we perform work, and the keys do not match"
+insert "when" after "and"
+
+p11 "Figure 1"
+-> "Table 1"
+
+Review by Jon Howell www.jonh.net/unblind ; intentionally unblinded.
+
+## Author response
+
+*ed: precedes Reveiw #86F*
+
+Thank you for the helpful comments! We address three cross-cutting concerns, then answer specific questions.
+
+1.  Why are there no comparisons with Naiad?
+
+    For two reasons: (1) our high-rate experiments cannot run on Naiad because its progress tracking logic is quadratic in the number of concurrent timestamps; and (2) we wanted to decouple measurement of the benefits of shared indexed state from less interesting advantages K-Pg has over Naiad (Rust vs C#: compiled vs. JITed, GC vs non).
+
+    We have baselines of K-Pg configured as Naiad’s differential dataflow implementation would be, without shared indices. “No sharing” in Figures 5b, 5c, and Table 2 represents how we believe Naiad would perform. These improvements may carry over to Naiad, but Naiad’s overheads (above) may mask the benefits (or amplify them; we don’t know). Our experience suggests that K-Pg is substantially faster and uses less memory than Naiad, in addition to catering to classes of algorithms that are impossible to run efficiently on Naiad (viz., those requiring random access, shared state, and high-rate updates). The text should make this clearer, and we will label the baselines appropriately.
+
+2.  Are claims of generality justified?
+
+    We agree that the generality claim in the abstract and intro will benefit from more context.
+
+    This claim is rooted in the fact that neither Naiad, nor any other prior parallel data-processing system (plus RDBMs, GraphDBs, stream processors) natively supports all of (i) random access reads, (ii) random access writes, and (iii) iteration, without substantial overheads. Unfortunately, many non-trivial algorithms require all three. Consider bidirectional search, an iterative graph search algorithm. On K-Pg, the algorithm touches only an asymptotically vanishing fraction of graph edges, while other systems (e.g, Hadoop, Spark, Flink, Naiad) must perform at least one full edge scan; most perform several scans.
+
+    K-Pg can emulate the PRAM model using at most a logarithmic factor more compute. Other systems’ computational models (including Naiad’s, without sharing) don’t have this property. On big data, a quadratic-time implementation of a linear-time algorithm is fundamentally troubling! Hence, we take “generality” to refer to the breadth of algorithms that K-Pg can support with faithful performance.
+
+    We certainly didn’t mean to claim that K-Pg obviates all existing systems. K-Pg is not great on several domains; we’ll discuss these. For example, a specialized relational database (e.g., Vertica) and a batch graph processor (e.g., Gemini) win if no streaming updates are required (§5.3). For tasks with a known, limited scope, existing specialized tools may be preferable; for tasks that may benefit from algorithmic sophistication and flexibility, we believe that K-Pg constitutes a platform with relatively few efficiency-constraining limitations. If a workload needs only specific sophistication (e.g., tensor operators, temporal roll-ups), developing a new, specialized system may be best.
+
+    We have focused on problems based on discrete/combinatorial algorithms, and ones in which time matters. Machine learning applications haven’t been our focus, but are an interesting avenue for future work, since e.g., updating ML parameters requires iteration over shared, indexed state.
+
+3.  The paper is hard to read; can you better explain DD?
+
+    Sorry! The writing can be improved, and running examples should illustrate what’s going on. It’s challenging to fully explain differential dataflow as background for this paper, but we’ll try to improve the intuition. All reviewers ask for more examples, measurements, discussion; we think this is a great sign and will act on their suggestions.
+
+4. Questions answered
+
+    We are now at 558 words. Below, we answer specific questions from the reviews if you’re happy to keep reading beyond the 800 word limit.
+
+    [B] "preclude cycles along with timestamps do not strictly increase" -- seems like a bit limitation for generality. It means essentially, no looping over the data [...]
+
+    K-Pg can absolutely loop over data (indeed, this is crucial for iterative graph processing). Like Naiad, K-Pg uses timestamps that extend "real time" with additional coordinates.
+
+    [B] Section 2.3 is good to have, but still too abstract. How would the example in Figure 1 be executed with indexes vs. without?
+
+    Good idea! If you executed Fig1 without shared indices, you would need to re-scan and re-index the graph input, even if the reachability query touched only a dozen vertices. If the index already exists, the computation completes in milliseconds instead (cf. Figure 3f).
+
+    [C] Is the arrange operator automatically added and hidden from the end user?
+
+    The operator can be called explicitly by the user (cf. §3) and chained with e.g., join and group operators. If the user calls join or group on unarranged data (a stream), K-Pg invokes the arrange method for them, but does not share results.
+
+    [C] §5: "K-Pg outperforms ... while supporting more general computation". Which of these tasks [...] cannot be supported by Spark?
+
+    For Spark to execute computations that involve iteration or streaming, the Spark driver program needs to repeatedly deploy Spark DAG computations. Each time this happens, the RDD abstraction (which doesn’t support random access) requires a re-scan of each of the potentially large inputs. Frameworks in the Spark ecosystem (e.g., GraphX) use various techniques to achieve random-access-like behavior for specific tasks, but don’t support arbitrary iteration and random access reads and writes.
+
+    For example, Spark Streaming can only distinguish the effects of input records by launching them in independent batch computations. To process the sequence of 60M input records for TPC-H, or the 200k/s interleaved reads and writes for streaming graph processing (with consistent reads), Spark would need to launch a batch computation for each input record.
+
+    [C] How often does the frontier advance [in the microbenchmark]? what is the effective (physical) batch size created?
+
+    Open loop measurements run at the fastest rate they can manage, consuming and retiring data as quickly as possible. The reported measurements indicate the distributions of these latencies. The effective batch sizes result from multiplying the reported latencies with the offered load (which varies by experiment).
+
+    [C] What are query modifications like in interactive queries in Sec 5.3?
+
+    Changing the arguments to a query; when we add or remove a query node from e.g., the query set for 2-hop reachability.
+
+    [C] §5.4 sounds casual. What happened to the rest of the 2 problems? What kind of racy code does DeALS permit, and does it compromise correctness?
+
+    The two other measurements were 148s (DeALS) vs. 155s (K-Pg) and 1309s vs. 1471s. We had to cut the detailed measurements for space, but will improve the text. DeALS takes advantage of benign races; this explains why DeALS scales better than K-Pg on a multicore. DeALS finds correct results; however, by performing more synchronous updates, K-Pg retains enough information to incrementally update the computation (tricky with racy updates).
+
+    [E] Will the efforts be erased by introducing network overhead?
+
+    We don't expect so, but we haven’t evaluated it. RDMA latencies are substantially smaller than the latencies we currently see.
+
+    [E] Since [shared state] is indexed and has multiple versions, what about the organization of data structures? Are the data indexed by time or data in <data, time, diff> triplets?
+
+    The data are stored sorted by (data, time, diff), so first by data and then by time. Our incremental operators usually want random access to the history of a particular key (which is part of data), rather than a cross-cutting view of a collection at some time, so this indexing makes sense for our operator implementations.
+
+## PC Summary
+
+Most of us were enthusiastic about the premise of this paper, but nobody understood it well enough to confidently accept it. Our advice:
+
+(1) Writing. You have a challenging writing problem ahead of you. The writing is good, but the challenge is great.
+
+(2) Evaluation. The exciting claim of this paper is "a generic framework that subsumes diverse specific data processing strategies, while retaining performance in each case." Here's the evaluation that would support that hypothesis really well:
+
+Our system subsumes 3 types of general framework: batch, stream, graph. (Feel free to add some of the specific frameworks too, with some allowance to not be quite so exhaustive in the matrix below.) Here are a few familiar (e.g. cited) workloads typically processed by each framework: {B1, B2, S1, S2, S3, G1, G2}. We run each workload against a state of the art batch system, a state of the art graph system, and a state of the art graph system, and K-Pg. Notice that every prior system does a terrible job on some workloads, because they're not good fits. (Let's drill down on each of the failures to understand how the existing design fails.) Notice that K-Pg is competitive (and sometimes better) on every workload. (Drill down on some cases to show how K-Pg resolves the failure mode of the existing systems.)
+
+Such an evaluation would support the ambitious thesis. And in producing it, you're likely to discover clearer ways to clarify the explanation in the body of the paper.
+
+The PC is excited about this direction, and we strongly encourage you to push farther on this work.
+
+---
+
+# sigmod2019-reviews.md
+
+Source: https://github.com/timelydataflow/differential-dataflow/blob/master/sigmod2019-reviews.md
+
+**Paper ID** 286
+
+**Paper Title** K-Pg: Shared State in Differential Dataflows
+
+**Track Name** Research Paper Second-Round
+
+## Reviewer #1
+
+1. **Overall Evaluation** Weak Reject
+2. **Reviewer's confidence** Some Familiarity
+3. **Originality** Medium
+4. **Importance** Medium
+5. **Summary of the contribution (in a few sentences)**
+
+    The paper described the design and implementation of K-pg a novel data analytics engine built on top of a timely data flow execution engine. Like prior work Naiad, K-pg is based on the differential data flows paradigm, but differs by introducing shared state in the form of indexes across all workers, temporally as well as across iterations. K-pg models updates to data as streams and computations as operations on updates or batches of updates. The key innovation in the system seems to be the concept of arrangements that takes in a set of updates and outputs shared indexes.
+
+6. **List 3 or more strong points, labelled S1, S2, S3, etc.**
+
+    S1: A general framework and implementation for large scale data analytics that subsumes relational, stream and iterative processing pipelines.
+
+    S2: The design based on differential data flows includes novel abstractions like the arrange operator.
+
+    S3: The system outperforms the best of breed systems for relational, streaming and iterative tasks.
+
+7. **List 3 or more weak points, labelled W1, W2, W3, etc.**
+
+    W1: The paper needs to be better written.
+
+    W2: It is not clear how the implementation of the system conforms to the principles laid out in section 3.3
+
+    W3: It is not clear what are all the ways arrangements are used, and which operators use arrangements.
+
+8. **Detailed evaluation. Number the paragraphs (D1, D2, D3, ...)**
+
+    D1: I think the paper would definitely benefit with a running example that is taken throughout the paper to explain the design of the system.
+
+    D2: While the data structures (or indexes) generated by arrangement operators are shared, some language suggests that when another data flow gets a trace handle, the arrangements are “copied over” during an import. Is that correct?
+
+    D3: What is the batch size in figure 4c? And what is w in 4b?
+
+    D4: The term relative throughput is not defined. Throughput is relative to what?
+
+9. **Candidate for a Revision? (Answer yes only if an acceptable revision is possible within one month.)**
+
+    Yes
+
+10. **Required changes for a revision, if applicable. Labelled R1, R2, R3, etc.**
+
+    The paper needs a significant rewrite. See weak points.
+
+## Reviewer #2
+
+1. **Overall Evaluation** Reject
+2. **Reviewer's confidence** No Familiarity
+3. **Originality** Medium
+4. **Importance** Medium
+5. **Summary of the contribution (in a few sentences)**
+
+    The paper presents K-Pg, a system that enhances data parallel operators with the ability to process shared indexes.
+
+6. **List 3 or more strong points, labelled S1, S2, S3, etc.**
+
+    S1. The implementation is modular
+
+    S2. The authors compare against specialised systems
+
+    S3. K-Pg can be used in diverse workflows
+
+7. **List 3 or more weak points, labelled W1, W2, W3, etc.**
+
+    W1. The paper is difficult to follow.
+
+    W2. The plots are not easy to read.
+
+    W3. Latency plots are often omitted.
+
+8. **Detailed evaluation. Number the paragraphs (D1, D2, D3, ...)**
+
+    The paper introduces shared indexes in order to efficiently implement data parallel workflows in various domains. The experimental evaluation shows that their approach achieves good results.
+
+    Timely dataflows are the central concept of the paper but they are not explained well in Section 3.1
+    In section 3.3 it is not clear why the principles are that important
+    Section 4 is difficult to follow
+    The plots are difficult to read
+
+    In general the paper is not well written and it seems that K-Pg is a small extension of Naiad
+
+9. **Candidate for a Revision? (Answer yes only if an acceptable revision is possible within one month.)**
+
+    No
+
+## Reviewer #3
+
+1. **Overall Evaluation** Reject
+2. **Reviewer's confidence** Expert
+3. **Originality** Low
+4. **Importance** Low
+5. **Summary of the contribution (in a few sentences)**
+
+    The authors propose a new system for doing analytics with recursive queries (online and offline). As part of this, they propose a novel operator for indexing and sharing stream data.
+
+6. **List 3 or more strong points, labelled S1, S2, S3, etc.**
+
+    1) A reasonable problem to work on
+    2) Indexing and sharing stream history has some novelty
+    3) Real implementation and experiments with TPCH
+
+7. **List 3 or more weak points, labelled W1, W2, W3, etc.**
+
+    1) Writeup need major improving
+    2) Missing key references
+    3) Comparisons in the paper with similar systems needs major improving, and probably rethinking.
+
+8. **Detailed evaluation. Number the paragraphs (D1, D2, D3, ...)**
+
+    First, much of the paper is incomprehensible, filled with vague unsupported claims. For instance, there is a whole paragraph after the first table in the intro that I found incomprehensible. I have no idea what is meant. Why the word 'holistic'?
+
+    Section 3.3 also made no sense to me. Is exchange supposed to be a shuffle? Nobody implements this as part of a count operator, including Naiad. If I understood what arrange is suppose to be, it keeps a stream history. Count operators don't typically do this. Why is it part of count? Maybe a clear example would help clear some of this up.
+
+    In terms of unsupported claims there are many cases of this throughout the paper. For instance, sticking with section 3.3, there is the statement (relative to Naiad) "executes robustly despite the absence of frustrating systems knobs". What knobs? Robust w.r.t. what?
+
+    While some aspects of the experiments are good (full TPCH, real implementation etc...) The authors didn't actually run the competition. Rather, in some cases (they don't say which), they just use numbers published in other papers. How do we know the queries were run the same way. Were they run warm? cold?
+
+    Also significant discussion is spent talking about performance improvements using batching and careful memory layout. The first streaming system do this, resulting in significantly higher performance, was Trill, which can also be used for offline analytics, and which I think the authors are unaware of. Much of the performance related effort is less novel than the authors imply.
+
+    Finally, there is a significant body of work on recursive streaming queries, of which Naiad is one (e.g. "On-the-fly Progress Detection in Iterative Stream Queries"). It is really unclear to me what the value is of the proposed system over these approaches. Perhaps a clear example would help? This paper needs a complete rewrite, and possibly significantly more research in the experimental section, which is why I didn't give it a revise.
+
+9. **Candidate for a Revision? (Answer yes only if an acceptable revision is possible within one month.)**
+
+    No
+
+## META-REVIEWER #1
+
+    Not submitted.
+
+---
+
+# sosp2019-reviews.md
+
+Source: https://github.com/timelydataflow/differential-dataflow/blob/master/sosp2019-reviews.md
+
+Reviews, author response, and PC comments as available in the system.
+
+|              | Overall Merit | Originality | Validation | Clarity | Reviewer Expertise |
+|:-------------|-------:|----:|-------:|-------:|-------:|
+| Review #314A |      2 |   2 |     3  |      3 |      3 |
+| Review #314B |      3 |   2 |     3  |      3 |      2 |
+| Review #314C |      3 |   2 |     3  |      2 |      2 |
+| Review #314D |      2 |   3 |     1  |      2 |      4 |
+| Review #314E |      4 |   3 |     3  |      2 |      2 |
+| Review #314F |      3 |   2 |     3  |      3 |      2 |
+
+## Review #314A
+
+### Paper summary
+The paper proposes and implements a model for sharing computation in a distributed streaming processing system (e.g., Naiad, a successor of Dryad). The proposed system (named SysX for anonymity, I guess) stores data in batches. Each batch is indexed by "data" (e.g., some key identifying the data) and it returns the updates for that data for a particular time range. As the data flows through the computation graph, SysX keeps generating batches for new sets of time frontiers. Old batches are aggregated to represent larger intervals.
+
+SysX also introduces an "arrange" operator to query indexed time-sharded batches of data.
+
+### Comments for author
+The reason for my less than enthusiastic score should not be taken as a message that your work is unimportant or poorly done. Quite the opposite: I got a sense of thoughtfulness and care that you put into building this system. I think that, in order to be ready for publication, your paper needs to do a better job of motivating itself and positioning itself with respect to related work:
+
+* Nectar has done a very similar thing. It caches intermediate results of the computation, but to index those results, Nectar uses a hash of data and code. Your system uses a key of data and receives back batches of update organized by time. It seems to me that Nectar can give equivalent results back. A batch is determined by its input records. If a Nectar user hashes a set of input records for a particular time frame and looks up the Nectar has by that key, they would get cached updates for that time frame for the data stream of interest. So does Nectar offer the same functionality as your system? Seems so from a birds-eye view... I could be missing something, but the paper did not do a good enough job convincing me (and perhaps other readers).
+
+* Being a devil's advocate, I could say: "Nectar does the same thing as SysX, but using a much simpler API." Nectar is transparent to programmers. SysX requires reasoning about time intervals and using new operators, which seems awfully complicated. Which brings my second point:
+
+* Could you motivate with several concrete example when a programmer would need to reason about specific time intervals (e.g., query specific time intervals) and show more examples about how they can do this in SysX (vs. how they currently do this). I need more convincing that the API provided by SysX is called for and that it is not overly complicated to use.
+
+* Unlike Nectar, you don't keep track of the code version (or code hash, to be more precise). What if the code version has changed, and the update at time t is not the same as the update at time t1? It seems that operators in SysX are not opaque (unlike in Nectar). Is my understanding correct?
+
+Other comments:
+
+What’s your model security and isolation? Do you support users with different access capabilities for parts of the dataset? E.g., someone is allowed to access the aggregate, but not see individual records (as often happens with medical data, for example).
+
+What about data loss and recovery? What about “holes” in the data? E.g. if some part of the batch is missing for a particular range of timestamps, does this hold up the advancement of the entire batch?
+
+## Review #314B
+
+### Paper summary
+This paper presents Shared Arrangements, a new abstraction for sharing indexes across streaming data flows. Sharing indexes across workloads is shown to benefit cases where multiple queries need to lookup or join data from a base input stream and this new abstraction is used to implement differential dataflow on top of timely dataflow. Experiments on streaming TPC-H and graph workload are presented.
+
+### Comments for author
+Thanks for you submission to SOSP. The paper is well written and presents an interesting new abstraction for streaming dataflows. Some high level comments followed by detailed comments
+
+- The paper would benefit from presenting a motivation example early on that clearly explains what are the shortcomings from existing dataflow systems like timely or Naiad. Connecting this example to a real-world workload scenario would be better and provide the reader with more context on where such a solution might be useful.
+
+- The abstraction presented here is quite simple and I think that is a positive as this leads to some defined semantics on how multiple streaming data flows can share an index. However there are some lingering questions here that would be good to address: For example right now the assumption is that a single writer, multiple reader setup is good enough. Are there scenarios where this is insufficient?
+
+- The idea of partitioning all the operators by the same key is again very good. But could this lead to scenarios where say one of the dataflows is really large and is starving the other colocated operators because they are sharing the same index? And would there be a situation where there are too many dataflows that share an index and how would the system handle such a situation?
+
+- It would be good to present more details on the trace maintenance section of the paper. It looks to me that this is the key technical area for the paper but right now there are too few details on how the merge works and how work is split to ensure that there is work proportional to the batch size
+
+Detailed comments
+
+- Sec 3.1: A natural question to consider when discussing batching of logical times is whether that leads to increase in latency.
+- Sec 4.1: The description of the trace handle and how it is initialized is not very clear
+- Sec 4.2: It would be good to give an example to show why group and join only need access for times in advance of input frontiers
+- Sec 4.2: Is it desirable for the imported collection to produce consolidated batches? Are there scenarios where this isn't necessary?
+- 5.3.1: variations -> differences?
+- 5.3.1: It would be good to compare this proposal to Eddies http://db.cs.berkeley.edu/papers/sigmod00-eddy.pdf
+- 5.3.1: Can you comment on how garbage collection happens for the join operator? Does having futures delay that? -
+
+## Review #314C
+
+### Paper summary
+Shared arrangement (SysX) is a stream processing system that can shared indices maintained at individual workers across multiple concurrent data-parallel streaming dataflows. Doing so avoids re-building indices for each new query and reduces query latency.
+
+### Comments for author
+The paper argues that indices should be shared across multiple data streams. I agree with this sentiment. However, the paper's writing did not point out why sharing indices is a difficult problem. Both the interface and realization seem somewhat straightforward. It's very likely that I miss something, but it would be good if the paper can explicitly point out the challenges so I don't have to second guess them.
+
+The evaluation is done only on a single computer, but the discussion makes it seem that SysX designed for a distributed setting. If you've already implemented the distributed functionalities as you claimed, why not evaluate them?
+
+It would be helpful if the paper can use a more detailed and better example to motivate the technical challenges of implementing shared arrangements. Figure 1. is an example, but it does not illustrate the system's technical challenges. First, the interface is simple, just save the indices and load it from another data stream! Second, this query seems very simplistic for graph analytics. Why pick this specific query, and not a more realistic queries? e.g. counting triangles with double joins? If graph analytics do not present good examples, why not pick some query from TPC-H? Third, there is no discussion on the subtleties or behind-the-scenes stuff done for this example. Are the nodes/edges shared based on vertices? If so, how is the join performed (across the workers)? Perhaps there's no subtlety and the behind-the-scenes operations are straightforward? If so, then you need a better example.
+
+I cannot help but think the authors assume readers are very familar with timely dataflow (or the specific open source implementation of timely dataflow).
+For example, in the last paragraph of Sec 3, the "exchange" operator is brought up abruptly for the first time without any explanation.
+
+## Review #314D
+
+### Paper summary
+This paper proposes the abstraction of shared arrangements to allow multiple queries to share indexed views of maintained state in streaming dataflows. A shared arrangement is essentially a shared, multi-versioned index of updates maintained for a streaming dataflow, often sharded for data-parallel processing. In addition, the paper discusses the design of operators that are optimized to leverage shared arrangements. Shared arrangements have been designed and implemented on top of Differential Dataflow (which builds on the Timely Data flow model). Evaluations show end-to-end benefits of shared arrangements with standard relational analytics (TPC-H) and interactive graph query. Experiments have also been conducted to evaluate various aspects of design.
+
+### Comments for author
+
++ Shared arrangements are a nice abstraction for cross-query sharing of sharded index in streaming dataflows.
+
++ The overall design is elegantly laid out with clean abstractions and operator design.
+
++ Shared arrangements can be highly effective, as shown in some of the evaluations.
+
+- The paper remains of theoretical interest, as it ignores a large number of hard problems that would arise in practice.
+
+- The evaluation is insufficient and too simplistic due to its choice of baseline and workload.
+
+Sharing sharded, multiversioned index across queries of the same streaming dataflows sounds like a good idea, at least in theory. There are clear cases where maintaining such an index is hugely profitable. I like the principled approach the paper takes in defining the abstraction of shared arrangements and framing the design and implementation using operators. The resulting solution is elegant and easy to understand.
+
+But in practice, there seem to be many challenges and hard design decisions to make. For example, when is building a sharded mulltiversioned index beneficial? Which set of queries should we group together for a shared arrangement? How do we balance the benefits of shared arrangements against performance interference, coordination between multiple queries, overall memory pressure, and the lack of failure isolation? What is the fault tolerance story of shared arrangements? None of those issues are addressed in the paper.
+
+Shared arrangements are neatly presented in the context of Differential Dataflow and Timely Dataflow. The paper claims that the approach is general and can be applied to other streaming systems. It would be desirable to abstract out the properties that shared arrangements depend on from Differential DataFlow and Timely DataFlow (e.g., the notion of frontiers), to show how they can be done on other streaming systems.
+
+No real streaming scenarios (e.g., with windowing operators) are used in the evaluation, which is surprising. The benchmarks used are relatively simple and do not expose any interesting complications. For example, in a real streaming scenario, where multiple queries (processing logic) can benefit from sharing an in-memory index. But there are often timing constraints and coordination cost to be considered. For example, different streaming queries might use different windowing operations, making it significantly more challenging for shared arrangements to be effective.
+
+For interactive graph query, the case is even less convincing. Shared arrangements seem just to be an in-memory evolving graph representation. Maintaining such an in-memory structure seems to be the obvious and natural choice. No one really builds multiple in-memory graph representations for different queries on evolving graphs.
+
+For TPC-H, it sounds like the main benefits comes from a better in-memory index. Would it be better to use STREAM (which supports synopses) as the baseline?
+
+## Review #314E
+
+### Paper summary
+Existing modern stream processing systems based on the dataflow paradigm support efficient incremental updates by maintaining indexes of operator state. This state and its index is private to each dataflow operator, removing issues of coordinating concurrent updates to the state, but leading to duplication of effort and wasted memory when multiple operators need to maintain the same indexed state. The authors introduce the "shared arrangements" abstraction to allow multiversioned indexed state to be shared by multiple operators. The key challenge is how to support this without excessive coordination overhead. Their solution builds on the frontiers provided by Timely Dataflow for coordination, and the collection traces from Differential Dataflow, to allow collection traces to be shared by multiple dataflow operators. Their new dataflow operator, arrange(), maintains the traces by constructing batches of updates when the Timely Dataflow frontier advances. Each batch contains updates between its lower and upper frontier times, indexed by a key derived from the update's data item. Other operators can share the indexed trace by importing it, which yields a trace handle used to access the trace. The trace handle also has a time frontier, which advances as the operator processes its inputs, and which determines the view of the shared trace that this operator can access. These per-trace-handle frontiers allow multiple operators to share access to the trace without additional coordination between trace updates and accesses. To take advantage of this, operators such as filter, join, and group, need to implemented in an "arrangment-aware" manner. The evaluation shows that the solution improves throughput, latency and memory utilization, meeting its goals.
+
+### Comments for author
+The shared arrangements abstraction is a nice solution to the problem of wasted work and memory when multiple operators construct essentially the same indexed state for their own needs. The discussion of the background and related work in Section 2 does a really good job of showing how other data processing systems (including relational databases, batch processing and stream processing) deal with issues of sharing state, incorporating updates, and coordination. Similarly, the context in Section 3 shows how Timely Dataflow and Differential Dataflow provide the tools needed to build shared arrangements. Taking these building blocks and designing the new abstraction, including the arrange() operator, batched indexed updates in traces, trace handles to allow operators to proceed through the shared index at their own pace, and the compaction of trace batches requires innovation. The evaluation shows that the resulting system achieves its goals and improves performance in multiple dimensions.
+
+While the paper is well-written, I downgraded the "Presentation and clarity" score because some concepts did not come across clearly. At times, the full explanations appear long after they would have been useful. At other times, familiarity with concepts from prior work (such as time frontiers from Timely) is assumed. And in some places, the writing is just not clear. Examples follow:
+
+- Section 4 and 4.1 (and Figure 2) refer to the batches of updates that make up a collection trace. How the arrange() operator produces batches isn't revealed until 4.2 however. It would be helpful to move the first 2 sentences of the second paragraph of 4.2 ("At a high level...") to the end of the first paragaraph of 4.1 (i.e., right after mentioning that the advance operator and the advance of the Timely Dataflow input frontier).
+
+- Section 4.1 "Each reader of a trace holds a trace handle, which acts as a cursor that can navigate the multiversioned index as of any time in advance of a frontier the trace handle holds." This sentence is a bit convoluted, but aside from that, I found it hard to grasp the idea that an operator would navigate the index at times that are logically ahead of its own time. Wouldn't that mean it can view updates that have not logically happened yet from its own time frontier? Section 4.3 helps a bit by saying that many operators only need access to accumulated input collections for time in advance of their input frontiers, but it isn't clear to me why that is true. Either a separate illustration of these frontiers with respect to a particular operator and its trace handle, or an enhanced version of Figure 2 that illustrates the time frontiers, along with a more detailed explanation, could help greatly.
+- Section 4 "Logically, an arrangement is a pair of (i) a stream of shared indexed batches of updates and (ii) a shared, compactly maintained index of all updates." It is not clear at this point in the paper (or ever, really) what the distinction is between (i) and (ii), or when you would use each of them. After reading 4.3, I suspect it relates to the "consolidated historical batches" vs the "newly minted batches."
+- Section 4.2, Consolidaton: "... but the mathematics of compaction have not been reported previously." This submission does not remedy that - it contains none of the mathematics of compaction. It also doesn't really explain what it means for times to be indistinguishable, or how updates to the same data are coalesced.
+
+I think the evaluation does a good job exploring the benefits of shared arrangements in a variety of settings, and of explaining the results. This section has a few more typos than earlier parts of the paper, but I am sure they are easily fixed in proofreading. My comments here are very minor:
+
+- Section 3 ends by mentioning a tradeoff involving reduced granularity of parallelism in exchange for co-locating operators for shared processing. It says the tradeoff is "nearly always worthwhile" in the authors' experience. If this tradeoff is explored in the evaluation, I couldn't identify it. I would love to see some data backing up the statement from Section 3.
+- In Section 7.1.1, Memory footprint, you say wihtout shared arrangements memory varies between 60-120 GB. With the log-scale y-axis it is hard to say exactly what the range is, but this seems overstated. It doesn't get up to 120 GB and the 60 GB point is only seen early in the run. Most of the time is spent fluctuating around the 90 GB line. There is still much more memory consumed, and more variability than with shared arrangements, but you can make a more precise statement about it.
+- In Section 7.1.2, Update throughput, last sentence, "We note ... further illustrating the benefits of parallel dataflow computation with shared arrangements." The orders of magnitude higher best throughput compared to Pacaci et al. also occurs for your SysX without shared arrangements.
+- In Section 7.3.1, Top-down (interactive) evaluation, "... due to a known problem with the magic set transform." Can you cite something for this known problem?
+- In Section 7.3.1, Bottom-up (batch) evaluation, "... and is comparable to the best shared-memory engine (DeALS). "
+
+## Review #314F
+
+### Paper summary
+This paper presents shared arrangements, a streaming dataflow mechanism that shares indexes between different queries. Classical streaming systems build indices separately on every query. Sharing indices among queries saves index update time as well as space. Whereas the existing work STREAM already shares indices across queries, shared arrangements provides a data-parallel multiversioned version of STREAM. The paper provides changes to the dataflow model, the arrange operator which builds the shared arrangements, and update operator implementations which take advantage of the shared indices. The evaluation shows that this approach reduces the interactive query latency by orders of magnitude as compared to approaches that cannot share indices.
+
+### Comments for author
+The paper is well written and provides a useful improvement over the shared indices in STREAM, by providing data-parallel and multiversioned shared indices. The performance improvement is undoubtedly significant over the classical streaming approaches (which do not share indices across queries) and the evaluation does a convincing job of proving this point.
+
+My main concern with this paper is that its contribution is incremental over STREAM and Naiad. I was also a bit disappointed to see that the introduction, which positions shared arragements, compares the system to primarily classical streaming approaches, which do not have indexing. I think it would have been more upfront to admit in the introduction that the idea of sharing indices across queries already existed in STREAM and then discuss the limitations with that and improvements your approach brings. Also, in the evaluation, a key demonstration I wanted to see is how shared arrangements improve over an approach as in STREAM, yet the system is primarily compared again with non-shared index approaches. There is a mention of a full paper that might contain something relevant to this, but I wanted to see this evaluation in the paper as a key aspect. I recommend the authors to update their positioning in the introduction and the evaluation.
+
+I didn’t get much insight from reading the design sections: what were the challenges in designing the protocol? What were the main insights? It would be great to distill these insights for the reader.
+
+I was wondering if there is any way to automatically infer optimal arrangements given the data and a list of queries? Right now, the programmer has to call the arrange function.
+
+The language in the paper is generally polished, with only a few typos: “its has received” -> “it has received"
+
+## Author Response
+
+Thank you for your reviews! We clarify factual errors and cross-cutting concerns, then respond to other questions.
+
+### Policy questions with shared arrangements (SAs)
+[B,D,F] We agree that interesting questions come with a powerful new primitive like SAs! Our paper is primarily about this new primitive. In practice, policy questions are addressed at higher layers: e.g., an automated query optimizer decides when to use an SA, and how many operators to co-locate. Two industrial SysX users wrote query compilers on top of SysX, and anecdotally report that “[TOOL1] works hard to identify those sharing opportunities” and found that “every single [TOOL2] query [makes] use of shared base arrangements”. We’ll add this context.
+
+### Related work
+[A] Nectar identifies previously-computed collections to avoid whole-collection recomputation. It presents each collection as a sequence of records, rather than as a structured index. SysX’s harnesses the tremendous benefit from sharing index-structured views of these collections, rather than the sequences Nectar would present. These are complementary contributions: Nectar identifies what to share, and SysX how to share it. While one could imagine treating the contents of a collection as many tiny Nectar “collections”, Nectar wouldn’t provide the microseconds latencies and update throughput SysX targets.
+
+[D,F] STREAM lacks data-parallelism and doesn’t index batches: each operator remains tuple-at-a-time, and so doesn’t recoup shareable computation. A STREAM evaluation baseline would measure the benefits of data parallelism in SysX, as opposed to benefits brought by sharing. As all current scalable stream processors employ data-parallelism and none employ sharing, which SysX proposes to [re-]introduce, we measured the impact of sharing on a data-parallel system. We’ll frame the evaluation this way. (Additionally, the final STREAM release (February 2005) doesn't compile for us.)
+
+[B] Eddies [SIGMOD’00] dynamically reorder operators in a relational query plan for long-running one-shot queries on static data. SysX supports sharing of maintained indices among multiple incrementally-updated, not necessarily relational, standing queries.
+
+Fault tolerance
+[A,D] SysX’s underlying timely dataflow model is fault-tolerant (see Naiad [SOSP’13], Falkirk Wheel [arXiv:1503.08877]). SAs potentially simplify this further, as their representation as LSMs of immutable batches is relatively easy to checkpoint and recover.
+
+### Evaluation
+[D] SysX supports windowed operators. The sequence of changes in §7.1.2 is a continuously sliding window, where random edges are overwritten in the same order they were introduced. SysX supports arbitrary retractions, making windows an idiom that drives one retraction pattern. It is absolutely correct that differently windowed collections are semantically different and cannot be trivially shared; we’ll clarify this.
+
+[D] SAs for graphs are indeed an in-memory evolving graph representation. Most academic graph processing projects and industrial graph databases don’t maintain sharded, multiversioned indices (exception: Tegra, mentioned in §2). E.g., the Neo4j advice is to set up read replicas for analytic queries, as it lacks multiversioned indices and queries would either block the write stream or produce inconsistent results.
+
+[C] The sharing of arrangements is purely intra-thread, and SysX’s inherits its distributed functionality from timely dataflow. We felt that a single-machine evaluation isolates the benefit of SAs without other confounding factors.
+
+### Extended responses to specific points
+
+> [D] It would be desirable to abstract out the properties that shared arrangements depend on from Differential DataFlow and Timely DataFlow (e.g., the notion of frontiers).
+
+SAs use timely dataflow’s logical timestamps for versioning, but this dependency isn’t fundamental: watermarks (e.g., in Flink) could also provide a notion of frontier. However, SysX’s performance relies on the ability to co-locate dataflows, which Flink does not currently support.
+
+> [F]: I didnʼt get much insight from reading the design sections: what were the challenges in designing the protocol? What were the main insights?
+
+The primary challenges were in finding a mechanism for fine-grained shared, indexed state that supports high read and write throughput, low read and write latency, and a compact footprint. Our LSM-tree-style design provides a mechanism with sufficiently clear semantics to function in a concurrent environment, and integrates well with data-parallel processing. In particular, a crucial insight was that, in the context of data-parallel stream processing, the hierarchical merging of batches (similar to an LSM tree) allows for amortized processing, so that no single batch incurs a high latency, and that a trace consisting of indexed batches does not require fine-grained coordination with downstream operators.
+
+> [B]: [R]ight now the assumption is that a single writer, multiple reader setup is good enough. Are there scenarios where this is insufficient?
+
+For performance, no: one main structural benefit of dataflow models is the pre-resolution of concurrency issues through sharding and logical timestamps. A single-writer per shard works quite well and additional workers offer better data-parallelism than having multiple writers to a particular shared arrangement.
+
+For mutably sharing an arrangement across multiple subsequent operators, the complexity and overheads likely exceed the benefit. Multi-writer sharing introduces the need to coordinate (or multiversion) their writes, and makes for a much more involved data-structure closer to distributed shared or transactional memory. The high-performance DB community seems to be moving in this direction as well (thread based ownership, rather than locks).
+
+> [B]: Is it desirable for the imported collection to produce consolidated batches? Are there scenarios where this isn't necessary?
+
+Yes, and yes. The imported collection should be maintained and presented in a compact representation, rather than as the full stream of historical events (which could be unboundedly large), and consolidated batches are a natural representation for that. Some restrictive streaming computations, like tumbling windows, do not require access to historical data and may not require consolidated batches, although they could still benefit from them if their first action is to join or reduce on the arranged key.
+
+> [B]: A natural question to consider when discussing batching of logical times is whether that leads to increase in latency.
+
+Batching in SysX occurs when there is more than a single input record enqueued for processing. In this context, batching increases the latency for the first record in the queue, but reduces latency by substantially more for the records at the tail end of the queue. QoS guarantees might motivate using smaller batches based on priority or arrival times to better service earlier records, but this isn’t something we’ve investigated.
+
+> [A]: [What] if some part of the batch is missing for a particular range of timestamps, does this hold up the advancement of the entire batch?
+
+Yes. SysX has a strong commitment to computing the "correct answer", and only exposes complete results for a given timestamp. A higher layer could attempt to address this by re-ordering late data and communicating the changed semantics on to downstream consumers, but at this point there is an important policy decision to make (e.g. this could be fine for ad click monitoring, but not for security audits).
+
+> [B]: But could [partitioning all operators by the same key] lead to scenarios where say one of the dataflows is really large and is starving the other colocated operators because they are sharing the same index? And would there be a situation where there are too many dataflows that share an index and how would the system handle such a situation?
+
+This is a trade-off we are delighted to have access to! One always retains the ability to not share the state, and we believe that a higher-level optimizer can automate reasonable approximations of this decision. Note, however, that in the Naiad/timely dataflow design with a fixed set of workers, computation will be co-located even if it does not share state (operators are implemented as fibers with cooperative multithreading, to avoid starvation). In the limit, one can start a new system instance to host additional queries if they overwhelm the provisioned system, but sharing delays the moment at which this needs to happen (and reduces the load on other systems, such as a Kafka source, which will need to feed fewer instances).
+
+> [A]: What’s your model security and isolation? [...] E.g., someone is allowed to access the aggregate, but not see individual records.
+
+This authentication is the responsibility of a higher layer, but we view it as out of scope for the compute plane.
+
+> [B]: Can you comment on how garbage collection happens for the join operator? Does having futures delay that?
+
+Not exactly, no. Futures capture reference-counted references to the shared immutable batches they require, but they do not maintain trace handles themselves and so do not block trace maintenance and garbage collection. They do block the release of the memory backing the shared batches they hold until the future completes.
+
+> [C]: [Fig. 1] seems very simplistic for graph analytics. Why pick this specific query, and not a more realistic queries? e.g. counting triangles with double joins? If graph analytics do not present good examples, why not pick some query from TPC-H?
+
+We picked a simple query to avoid overloading the reader early in the paper; this specific query is representative of TPC-H queries that performs two joins on primary keys. Counting triangles would make for a more complex example if done efficiently (SysX and its sharing supports worst-case optimal joins); doing it with two binary joins is a very inefficient way to go about the problem and we did not want to present an inefficient implementation.
+
+> [C]: Are the nodes/edges shared based on vertices? If so, how is the join performed (across the workers)? Perhaps there's no subtlety and the behind-the-scenes operations are straightforward?
+
+The example is primarily intended to give a flavor of how the API for shared arrangements looks like, and relies on operator APIs similar to differential dataflow’s. In particular, the join operator joins tuples (x, y) and (x, z) into (x, y, z), using the first coordinate as its key. In the example, tuples represent edges, so x refers to a vertex. The system partitions the collections by this key, so exchanges (shuffles) happen between the map() calls and the subsequent join() calls. Hence, the large data stay put, but the records produced by the joins need to be shuffled.
+
+> [D]: For TPC-H, it sounds like the main benefits comes from a better in-memory index. Would it be better to use STREAM (which supports synopses) as the baseline?
+
+Our goal was to evaluate the benefits of shared state, as this is the feature currently absent from scalable data processors. STREAM doesn't support data parallelism or iterative computation or the more general operator vocabulary of SysX. If we were to compare to it, results would like be dominated by the benefits of these features, rather than the systems’ shared indexes.
+
+> [E]: In Section 7.3.1, Top-down (interactive) evaluation, "... due to a known problem with the magic set transform." Can you cite something for this known problem?
+
+Not that we are aware, unfortunately. It is a negative result, and it may have been challenging to publish.
+
+## PC Response
+
+The PC discussed this paper extensively. We enjoyed a number of things about the paper such as the new abstraction as well as the performance gain over a classical setting of no-sharing indices. At the same time, the PC members felt that the contribution was not sufficiently motivated. It would help to motivate the API and the contribution via concrete examples and demonstrate the shortcomings of existing dataflow systems on these and why the new API is called for. The PC members also felt that the choice of baseline in the evaluation was not convincing, as detailed in the reviews. While the rebuttal helped address a number of smaller points, it did not assuage these high level concerns of the reviewers.
+
+---
+
+# TODO.md
+
+Source: https://github.com/timelydataflow/differential-dataflow/blob/master/TODO.md
+
+## Differential dataflow to-do list:
+
+1. Batch builders need an "ordered" option where the keys and vals are already sorted (cf group.output).
+2. Several trace implementations need to be fleshed out (e.g. `time` and `constant`).
+	- Consider ConstantCollection type which can only be construct from known data, arranged to `constant`.
+3. Several trace implementations could benefit from a RHH `keys` field; prototype and test!
+	- Probably wants a Uniform<T: Unsigned> struct for "node identifiers"; needs tweaks to `Data` trait.
+4. Lots of sorting, but no radix-sorting. Historically a big improvement.
+	- Connects to U: Unsigned output of `hashed`; no point radix-sorting u32 keys as if u64s.
+5. Several operators need revision: distinct, threshold, cogroup.
+6. The `keys` trace implementation has had zero testing. Important!
+7. Progressive merging under-explored; trade-offs in rate of work? (yes, but worth?)
+
+8. High-resolution times aren't too far away. 
+	- Think up alternate Collection type with new data bits.
+	- Uncomment `group` implementation and get to work.
+
+9. Join now has "deferred work"; check it out to see if it helps on large graphs.
+
+---
