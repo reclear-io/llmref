@@ -1,0 +1,1963 @@
+# tiycore
+
+Source: https://github.com/tiyagents/tiy-core/blob/master/README.md
+
+<div align="center">
+
+# tiycore
+
+**Unified LLM API and stateful Agent runtime in Rust**
+
+[English](./README.md) | [中文](./README-ZH.md)
+
+</div>
+
+tiycore is a Rust library that provides a single, provider-agnostic interface for streaming LLM completions and running agentic tool-use loops. Write your application logic once, then swap between OpenAI, Anthropic, Google, Ollama, and 8+ other providers by changing a config value.
+
+<img width="2752" height="1536" alt="image" src="https://github.com/user-attachments/assets/f3d29f85-0ef0-4674-a159-4760e1876780" />
+
+## Highlights
+
+- **One interface, many providers** — 5 protocol-level implementations (OpenAI Completions, OpenAI Responses, Anthropic Messages, Google Generative AI / Vertex AI, Ollama) and 10 delegation providers (OpenAI-Compatible, xAI, Groq, OpenRouter, DeepSeek, MiniMax, Kimi Coding, ZAI, Zenmux, OpenCode Go) behind a single `LLMProtocol` trait.
+- **Streaming-first** — `EventStream<T, R>` backed by `parking_lot::Mutex<VecDeque>` + `tokio::sync::Notify` implements `futures::Stream`. Every provider returns an `AssistantMessageEventStream` with fine-grained deltas: text, thinking, tool call arguments, and completion events.
+- **Tool / Function calling** — Define tools via JSON Schema, validate arguments with the `jsonschema` crate, and execute tools in parallel or sequentially within the agent loop.
+- **Stateful Agent runtime** — `Agent` manages a full conversation loop: stream LLM → detect tool calls → execute tools → re-prompt → repeat. Supports steering (interrupt mid-turn), follow-up queues, event subscription (observer pattern), abort, configurable max turns (default 25), and standalone loop helpers when you want the same runtime without a long-lived `Agent` instance.
+- **Extended Thinking** — Provider-specific thinking/reasoning support with a unified `ThinkingLevel` enum (Off → XHigh, supporting OpenAI GPT-5 and Anthropic Opus 4.7+) and `ThinkingDisplay` enum (`Summarized` / `Omitted`) controlling whether thinking content is included in responses. Cross-provider thinking block conversion is handled automatically during message transformation.
+- **Thread-safe by default** — All mutable state uses `parking_lot` locks and `AtomicBool` for non-poisoning concurrency.
+
+## Architecture
+
+```mermaid
+graph TD
+    A[Your Application] --> B[Agent]
+    A --> C[LLMProtocol trait]
+    B --> C
+    C --> D[Protocol Providers]
+    C --> E[Delegation Providers]
+    D --> D1[OpenAI Completions]
+    D --> D2[OpenAI Responses]
+    D --> D3[Anthropic Messages]
+    D --> D4[Google GenAI / Vertex]
+    D --> D5[Ollama]
+    E --> E1[OpenAI-Compatible → OpenAI Completions]
+    E --> E2[xAI → OpenAI Completions]
+    E --> E3[Groq → OpenAI Completions]
+    E --> E4[OpenRouter → OpenAI Completions]
+    E --> E5[ZAI → OpenAI Completions]
+    E --> E6[DeepSeek → OpenAI Completions]
+    E --> E7[MiniMax → Anthropic]
+    E --> E8[Kimi Coding → Anthropic]
+    E --> E9[Zenmux → adaptive routing]
+    E --> E10[OpenCode Go → adaptive routing]
+```
+
+### Core Layers
+
+| Layer | Path | Purpose |
+|---|---|---|
+| **Types** | `src/types/` | Provider-agnostic data model: `Message`, `ContentBlock`, `Model`, `Tool`, `Context`, `SecurityConfig` |
+| **Protocol** | `src/protocol/` | Wire-format implementations ([full docs](./src/protocol/README.md)) |
+| **Provider** | `src/provider/` | Service vendor facades ([full docs](./src/provider/README.md)) |
+| **Stream** | `src/stream/` | Generic `EventStream<T, R>` implementing `futures::Stream` |
+| **Agent** | `src/agent/` | Stateful conversation manager with tool execution loop ([full docs](./src/agent/README.md)) |
+| **Transform** | `src/transform/` | Cross-provider message transformation (thinking blocks, tool call IDs, orphan resolution) |
+| **Thinking** | `src/thinking/` | `ThinkingLevel` enum, `ThinkingDisplay` enum, and provider-specific thinking options |
+| **Validation** | `src/validation/` | JSON Schema validation for tool parameters |
+| **Models** | `src/models/` | `ModelRegistry` with predefined models (GPT-4o, Claude Sonnet 4, Gemini 2.5 Flash, etc.) |
+| **Catalog** | `src/catalog/` | Native model listing, snapshot refresh, scheduled snapshot generation, and optional metadata enrichment for display ([full docs](./src/catalog/README.md)) |
+
+## Catalog Snapshot Generation
+
+The repository publishes a catalog snapshot through a scheduled GitHub Actions workflow defined in `.github/workflows/catalog-pages.yml`. That workflow runs `cargo run --bin tiy-catalog-sync -- ...`, fetches upstream model metadata, builds a normalized snapshot, and writes the generated files to `dist/catalog/`.
+
+Before the snapshot is written, `tiy-catalog-sync` loads `catalog/patches.json` and applies repository-managed data fixes to the fetched `CatalogModelMetadata` records. This patch layer is intended for correcting known upstream metadata errors in the generated catalog artifact itself rather than exposing a runtime override API to downstream applications.
+
+For example, if an upstream provider reports an incorrect context window for a model, the patch file can override that value during snapshot generation so the published `catalog.json` already contains the corrected metadata. The repository currently uses this mechanism to fix OpenRouter's `z-ai/glm-5` context window from `80_000` to `200_000`.
+
+## Quick Start
+
+Add the dependency to your `Cargo.toml`:
+
+```toml
+[dependencies]
+tiycore = "0.1.0"
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+```
+
+For local development before publishing, you can still use:
+
+```toml
+[dependencies]
+tiycore = { path = "../tiycore" }
+```
+
+### Streaming Completion
+
+```rust
+use futures::StreamExt;
+use tiycore::{
+    provider::get_provider,
+    types::*,
+};
+
+#[tokio::main]
+async fn main() {
+    // Build a model
+    let model = Model::builder()
+        .id("gpt-4o-mini")
+        .name("GPT-4o Mini")
+        .provider(Provider::OpenAI)
+        .context_window(128000)
+        .max_tokens(16384)
+        .build()
+        .unwrap();
+
+    // Create a context with messages
+    let context = Context {
+        system_prompt: Some("You are a helpful assistant.".to_string()),
+        messages: vec![Message::User(UserMessage::text("What is the capital of France?"))],
+        tools: None,
+    };
+
+    // Resolve provider from model and stream the response
+    // (providers are auto-registered on first access — no manual setup needed)
+    let provider = get_provider(&model.provider).unwrap();
+    let options = StreamOptions {
+        api_key: Some(std::env::var("OPENAI_API_KEY").unwrap()),
+        ..Default::default()
+    };
+    let mut stream = provider.stream(&model, &context, options);
+
+    while let Some(event) = stream.next().await {
+        match event {
+            AssistantMessageEvent::TextDelta { delta, .. } => print!("{delta}"),
+            AssistantMessageEvent::Done { message, .. } => {
+                println!("\n--- {} input, {} output tokens ---",
+                    message.usage.input, message.usage.output);
+            }
+            AssistantMessageEvent::Error { error, .. } => {
+                eprintln!("Error: {:?}", error.error_message);
+            }
+            _ => {}
+        }
+    }
+}
+```
+
+### Agent with Tool Calling
+
+```rust
+use tiycore::{
+    agent::{Agent, AgentTool, AgentToolResult},
+    types::*,
+};
+
+#[tokio::main]
+async fn main() {
+    let agent = Agent::with_model(
+        Model::builder()
+            .id("gpt-4o-mini").name("GPT-4o Mini")
+            .provider(Provider::OpenAI)
+            .context_window(128000).max_tokens(16384)
+            .build().unwrap(),
+    );
+
+    agent.set_api_key(std::env::var("OPENAI_API_KEY").unwrap());
+    agent.set_system_prompt("You are a helpful assistant with access to tools.");
+    agent.set_tools(vec![AgentTool::new(
+        "get_weather", "Get Weather", "Get current weather for a city",
+        serde_json::json!({
+            "type": "object",
+            "properties": { "city": { "type": "string" } },
+            "required": ["city"]
+        }),
+    )]);
+    agent.set_tool_executor_simple(|name, _id, args| {
+        let name = name.to_string();
+        let args = args.clone();
+        async move {
+            match name.as_str() {
+                "get_weather" => {
+                    let city = args["city"].as_str().unwrap_or("unknown");
+                    AgentToolResult::text(format!("Weather in {city}: 22°C, sunny"))
+                }
+                _ => AgentToolResult::error(format!("Unknown tool: {name}")),
+            }
+        }
+    });
+
+    // The agent loops automatically: LLM → tool calls → execute → re-prompt → done
+    let messages = agent.prompt("What's the weather in Tokyo?").await.unwrap();
+    println!("Agent produced {} messages", messages.len());
+}
+```
+
+The Agent also supports hooks (beforeToolCall / afterToolCall / onPayload), context pipeline (transformContext / convertToLlm), preserved tool-result `details` overrides, event subscription with prompt/tool-result lifecycle events, steering & follow-up queues, thinking budgets, custom HTTP headers (`custom_headers` on `AgentConfig`), standalone loop helpers, custom messages, and more. See the full **[Agent Module Documentation](./src/agent/README.md)** for details.
+
+## Supported Providers
+
+| Provider | Type | Env Var |
+|---|---|---|
+| OpenAI | Direct | `OPENAI_API_KEY` |
+| Anthropic | Direct | `ANTHROPIC_API_KEY` |
+| Google | Direct | `GOOGLE_API_KEY` |
+| Ollama | Direct | — |
+| OpenAI-Compatible | Delegation → OpenAI Completions | `OPENAI_API_KEY` |
+| xAI | Delegation → OpenAI Completions | `XAI_API_KEY` |
+| Groq | Delegation → OpenAI Completions | `GROQ_API_KEY` |
+| OpenRouter | Delegation → OpenAI Completions | `OPENROUTER_API_KEY` |
+| ZAI | Delegation → OpenAI Completions | `ZAI_API_KEY` |
+| DeepSeek | Delegation → OpenAI Completions | `DEEPSEEK_API_KEY` |
+| MiniMax | Delegation → Anthropic | `MINIMAX_API_KEY` |
+| Kimi Coding | Delegation → Anthropic | `KIMI_API_KEY` |
+| Zenmux | Adaptive multi-protocol | `ZENMUX_API_KEY` |
+| OpenCode Go | Adaptive multi-protocol | `OPENCODE_GO_API_KEY` |
+
+For detailed provider configuration, compat flags, Zenmux adaptive routing, and how to add new providers, see the **[Provider Documentation](./src/provider/README.md)**.
+
+For wire-format protocol internals (SSE parsing, request building, delegation macros), see the **[Protocol Documentation](./src/protocol/README.md)**.
+
+## Publishing
+
+To make downstream projects depend on `tiycore` without a Git URL, publish the crate to crates.io and then depend on it by version:
+
+```bash
+cargo login
+cargo package
+cargo publish
+```
+
+After publishing, consumers can keep using:
+
+```toml
+[dependencies]
+tiycore = "0.1.0"
+```
+
+## API Key Resolution
+
+Keys are resolved in priority order:
+
+1. `StreamOptions.api_key` (per-request override)
+2. Provider's `default_api_key()` method
+3. Environment variable (e.g. `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`)
+
+Base URLs follow the same pattern: `StreamOptions.base_url` > `model.base_url` > provider's `DEFAULT_BASE_URL`.
+
+## Request Retry Behavior
+
+Protocol-layer retries are enabled for transient failures before the stream has emitted any semantic output. By default, the library retries `408`, `429`, `500`, `502`, `503`, and `504`, as well as transport errors reported by `reqwest` as `is_timeout()` or `is_connect()`.
+
+When a provider returns `Retry-After`, the retry delay respects that value. `max_retry_delay_ms` acts as a cap for server-requested or computed backoff delays, and `Some(0)` disables the cap entirely.
+
+Once a stream has already emitted semantic events such as text deltas, thinking deltas, or tool-call deltas, the protocol layer stops retrying transparently and terminates the stream with an error instead. This avoids duplicating partial output or replaying tool side effects.
+
+You can control retries per request using `StreamOptions.max_retries` and `StreamOptions.max_retry_delay_ms`, or at the Agent level using `Agent::set_max_retries` and `Agent::set_max_retry_delay_ms`.
+
+## Security Configuration
+
+tiycore ships with a centralized `SecurityConfig` struct that controls all security limits and policies. Every field has a safe default value — you only need to override what you want to change.
+
+### Enabling Security Config
+
+**In code (programmatic):**
+
+```rust
+use tiycore::types::{SecurityConfig, HttpLimits, AgentLimits, StreamOptions};
+
+// Method 1: Use defaults (zero-config)
+let options = StreamOptions::default();
+// options.security is None → all defaults apply automatically
+
+// Method 2: Override specific values
+let security = SecurityConfig::default()
+    .with_http(HttpLimits {
+        connect_timeout_secs: 10,
+        request_timeout_secs: 600,
+        ..Default::default()
+    })
+    .with_agent(AgentLimits {
+        max_messages: 500,
+        max_parallel_tool_calls: 8,
+        ..Default::default()
+    });
+
+let options = StreamOptions {
+    api_key: Some("sk-...".to_string()),
+    security: Some(security),
+    ..Default::default()
+};
+```
+
+**From a JSON config file:**
+
+```rust
+use tiycore::types::SecurityConfig;
+
+// Load from file — only specified fields are overridden, rest use defaults
+let json = std::fs::read_to_string("security.json").unwrap();
+let security: SecurityConfig = serde_json::from_str(&json).unwrap();
+```
+
+**From a TOML config file (requires `toml` crate):**
+
+```rust
+let toml_str = std::fs::read_to_string("security.toml").unwrap();
+let security: SecurityConfig = toml::from_str(&toml_str).unwrap();
+```
+
+### JSON Configuration Reference
+
+A full `security.json` with all fields and their defaults:
+
+```jsonc
+{
+  // HTTP client and SSE stream parsing limits (applied per provider request)
+  "http": {
+    "connect_timeout_secs": 30,           // TCP connect timeout
+    "request_timeout_secs": 1800,         // Total request timeout including streaming (30 min)
+    "max_sse_line_buffer_bytes": 2097152, // SSE line buffer cap, prevents OOM (2 MiB)
+    "max_error_body_bytes": 65536,        // Max error response body to read (64 KiB)
+    "max_error_message_chars": 4096       // Max error message length stored in events
+  },
+
+  // Agent runtime limits
+  "agent": {
+    "max_messages": 1000,                 // Conversation history cap (0 = unlimited, FIFO eviction)
+    "max_parallel_tool_calls": 16,        // Concurrent tool execution limit
+    "tool_execution_timeout_secs": 120,   // Per-tool execution timeout (2 min)
+    "validate_tool_calls": true,          // Validate tool args against JSON Schema before execution
+    "max_subscriber_slots": 128           // Max event subscriber slots
+  },
+
+  // EventStream infrastructure limits
+  "stream": {
+    "max_event_queue_size": 10000,        // Event buffer cap (0 = unlimited)
+    "result_timeout_secs": 600            // EventStream::result() blocking timeout (10 min)
+  },
+
+  // Header security policy — prevents custom headers from overriding auth headers
+  "headers": {
+    "protected_headers": [
+      "authorization",
+      "x-api-key",
+      "x-goog-api-key",
+      "anthropic-version",
+      "anthropic-beta"
+    ]
+  },
+
+  // Base URL validation policy (SSRF protection)
+  "url": {
+    "require_https": true,                // Enforce HTTPS (localhost/127.0.0.1 exempted)
+    "block_private_ips": false,           // Block private/loopback IPs (off for local dev)
+    "allowed_schemes": ["https", "http"], // Allowed URL schemes
+    "https_exempt_hosts": []              // Hosts exempt from HTTPS requirement (e.g. [".oa.com", "llm.internal"])
+  }
+}
+```
+
+> **Partial overrides:** You only need to include the fields you want to change. Omitted fields and entire sections fall back to their defaults. For example, `{}` gives you all defaults, and `{"http": {"connect_timeout_secs": 10}}` only changes the connect timeout.
+
+### TOML Configuration Reference
+
+The same config in TOML format:
+
+```toml
+[http]
+connect_timeout_secs = 30
+request_timeout_secs = 1800
+max_sse_line_buffer_bytes = 2097152
+max_error_body_bytes = 65536
+max_error_message_chars = 4096
+
+[agent]
+max_messages = 1000
+max_parallel_tool_calls = 16
+tool_execution_timeout_secs = 120
+validate_tool_calls = true
+max_subscriber_slots = 128
+
+[stream]
+max_event_queue_size = 10000
+result_timeout_secs = 600
+
+[headers]
+protected_headers = [
+  "authorization",
+  "x-api-key",
+  "x-goog-api-key",
+  "anthropic-version",
+  "anthropic-beta",
+]
+
+[url]
+require_https = true
+block_private_ips = false
+allowed_schemes = ["https", "http"]
+https_exempt_hosts = []
+```
+
+### Default Values Quick Reference
+
+| Section | Field | Default | Description |
+|---|---|---|---|
+| **http** | `connect_timeout_secs` | `30` | TCP connect timeout |
+| | `request_timeout_secs` | `1800` | Total request timeout (30 min) |
+| | `max_sse_line_buffer_bytes` | `2097152` | SSE buffer cap (2 MiB) |
+| | `max_error_body_bytes` | `65536` | Error body read cap (64 KiB) |
+| | `max_error_message_chars` | `4096` | Error message truncation |
+| **agent** | `max_messages` | `1000` | History cap (0 = unlimited) |
+| | `max_parallel_tool_calls` | `16` | Parallel tool exec limit |
+| | `tool_execution_timeout_secs` | `120` | Per-tool timeout (2 min) |
+| | `validate_tool_calls` | `true` | JSON Schema validation |
+| | `max_subscriber_slots` | `128` | Subscriber slots |
+| **stream** | `max_event_queue_size` | `10000` | Event queue cap (0 = unlimited) |
+| | `result_timeout_secs` | `600` | Result blocking timeout (10 min) |
+| **headers** | `protected_headers` | `["authorization", ...]` | Cannot be overridden |
+| **url** | `require_https` | `true` | HTTPS enforced (localhost exempt) |
+| | `block_private_ips` | `false` | Private IP blocking |
+| | `allowed_schemes` | `["https", "http"]` | Allowed URL schemes |
+| | `https_exempt_hosts` | `[]` | Hosts exempt from HTTPS (supports suffix match with leading dot) |
+
+## Build & Test
+
+```bash
+cargo build                          # Build the library
+cargo test                           # Run all tests
+cargo test test_agent_state_new      # Run a single test by name
+cargo test -- --nocapture            # Show test output
+cargo fmt                            # Format code
+cargo clippy                         # Lint
+
+# Run examples (requires API keys)
+cargo run --example basic_usage
+cargo run --example agent_example
+```
+
+## Project Structure
+
+```
+src/
+├── lib.rs              # Crate root, public re-exports
+├── types/              # Provider-agnostic data model
+│   ├── model.rs        # Model, Provider, Api (via define_string_enum! macro), Cost, OpenAICompletionsCompat (CompatCapabilities, CompatThinking, CompatMessageFormat)
+│   ├── message.rs      # Message (User/Assistant/ToolResult), StopReason
+│   ├── content.rs      # ContentBlock (Text/Thinking/ToolCall/Image)
+│   ├── context.rs      # Context, Tool, StreamOptions
+│   ├── limits.rs       # SecurityConfig, HttpLimits, AgentLimits, StreamLimits, UrlPolicy, HeaderPolicy
+│   ├── events.rs       # AssistantMessageEvent (streaming events)
+│   └── usage.rs        # Token usage tracking
+├── protocol/           # Wire-format protocol implementations (README.md)
+│   ├── traits.rs       # LLMProtocol trait
+│   ├── registry.rs     # Global ProtocolRegistry
+│   ├── common.rs       # Shared infrastructure (URL resolution, payload hooks, error handling)
+│   ├── delegation.rs   # Macros for generating delegation providers
+│   ├── openai_completions.rs  # OpenAI Chat Completions protocol
+│   ├── openai_responses.rs    # OpenAI Responses API protocol
+│   ├── anthropic.rs    # Anthropic Messages protocol
+│   └── google.rs       # Google GenAI + Vertex AI (dual-mode)
+├── provider/           # Service vendor facades (README.md)
+│   ├── openai.rs       # OpenAI → protocol::openai_responses
+│   ├── anthropic.rs    # Anthropic → protocol::anthropic
+│   ├── google.rs       # Google → protocol::google
+│   ├── ollama.rs       # Ollama → protocol::openai_completions
+│   ├── xai.rs          # Delegation → OpenAI Completions
+│   ├── groq.rs         # Delegation → OpenAI Completions
+│   ├── openrouter.rs   # Delegation → OpenAI Completions
+│   ├── zai.rs          # Delegation → OpenAI Completions
+│   ├── minimax.rs      # Delegation → Anthropic
+│   ├── kimi_coding.rs  # Delegation → Anthropic
+│   ├── zenmux.rs       # Adaptive 3-way routing
+│   └── opencode_go.rs # Adaptive multi-protocol routing
+├── catalog/
+│   ├── README.md       # Catalog fetch/enrichment/snapshot documentation
+│   └── mod.rs          # Native model listing + snapshot refresh + metadata stores
+├── stream/
+│   └── event_stream.rs # Generic EventStream<T, R> + AssistantMessageEventStream
+├── agent/
+│   ├── README.md      # Full Agent module documentation
+│   ├── agent.rs        # Agent loop: stream → tools → re-prompt
+│   ├── state.rs        # Thread-safe AgentState
+│   └── types.rs        # AgentConfig, AgentEvent, AgentTool, AgentHooks, ToolExecutor, ToolExecutionMode
+├── transform/
+│   ├── messages.rs     # Thinking block conversion, orphan tool call handling
+│   └── tool_calls.rs   # Tool call ID normalization
+├── thinking/
+│   └── config.rs       # ThinkingLevel, provider-specific options
+├── validation/
+│   └── tool_validation.rs # JSON Schema validation for tool args
+└── models/
+    ├── mod.rs           # ModelRegistry + global predefined models
+    └── predefined.rs
+```
+
+## License
+
+[MIT](https://opensource.org/licenses/MIT)
+
+---
+
+# AGENTS.md
+
+Source: https://github.com/tiyagents/tiy-core/blob/master/AGENTS.md
+
+# AGENTS.md
+
+This file provides guidance to Codex (Codex.ai/code) when working with code in this repository.
+
+## Project Overview
+
+**tiycore** is a Rust library providing a unified LLM API and stateful Agent runtime. It abstracts over multiple LLM providers (OpenAI, Anthropic, Google, Ollama, xAI, Groq, OpenRouter, MiniMax, Kimi Coding, ZAI, Zenmux) with a common streaming interface, tool/function calling, and an agentic conversation loop.
+
+## Build & Test Commands
+
+```bash
+cargo build                          # Build
+cargo test                           # Run all tests
+cargo test test_agent_state_new      # Run a single test by name
+cargo test --test test_agent         # Run tests in a specific file
+cargo test -- --nocapture            # Run tests with output visible
+cargo check                          # Check without building
+cargo fmt                            # Format code
+cargo clippy                         # Lint
+cargo run --example basic_usage      # Run example (requires API keys)
+```
+
+## Architecture
+
+### Core Layers
+
+1. **Types** (`src/types/`) — Provider-agnostic data model.
+   - `Message` is a tagged enum: `User` / `Assistant` / `ToolResult`
+   - `ContentBlock` enum: `Text`, `Thinking`, `ToolCall`, `Image`
+   - `Model` uses builder pattern; `base_url: Option<String>` (providers supply defaults when None); `api: Option<Api>` selects wire protocol; `compat: Option<OpenAICompletionsCompat>` controls protocol-level compatibility flags (split into three semantic sub-structs: `CompatCapabilities`, `CompatThinking`, `CompatMessageFormat`, flattened via serde for JSON compat)
+   - `Api` and `Provider` enums are generated by the `define_string_enum!` macro (in `model.rs`), which produces the enum definition with `serde(rename)`, `as_str()`, `Display`, and `From<String>` from a single declaration. `Api` identifies wire protocol (e.g., `OpenAICompletions`, `OpenAIResponses`, `AnthropicMessages`, `GoogleGenerativeAi`, `GoogleVertex`, `Ollama`). `Provider` identifies the service/company (e.g., `OpenAI`, `Anthropic`, `Google`, `XAI`, `Groq`, `Zenmux`). Both have a `Custom(String)` catch-all. Many `Provider` variants exist as type data without a corresponding provider module.
+
+2. **Protocol** (`src/protocol/`) — Wire-format implementations (4 base protocols + shared infrastructure):
+   - `traits.rs` — `LLMProtocol` trait (3 methods: `provider_type`, `stream`, `stream_simple`)
+   - `common.rs` — Shared infrastructure: `resolve_base_url`, `apply_on_payload`, `validate_url_or_error`, `handle_error_response`, `apply_custom_headers`, `check_sse_buffer_limit`, `debug_preview`
+   - `openai_completions` — OpenAI Chat Completions (`/chat/completions`)
+   - `openai_responses` — OpenAI Responses API (`/responses`)
+   - `anthropic` — Anthropic Messages API (`/messages`)
+   - `google` — Google Generative AI + Vertex AI (dual-mode, single module)
+   - `mod.rs` re-exports registry symbols from `provider/` for backward compatibility
+
+3. **Provider** (`src/provider/`) — Service vendor facades. Each provider is a thin wrapper that selects and delegates to a protocol implementation:
+
+   **Direct providers** (facade → protocol):
+   - `openai` → `protocol::openai_responses` (OpenAI uses Responses API natively)
+   - `anthropic` → `protocol::anthropic`
+   - `google` → `protocol::google`
+   - `ollama` → `protocol::openai_completions` (OpenAI-compatible, defaults to `localhost:11434`)
+
+   **Delegation providers** (inject API key/compat, then call a protocol provider):
+   | Module | Delegates To | Env Var |
+   |---|---|---|
+   | `xai` | `protocol::openai_completions` | `XAI_API_KEY` |
+   | `groq` | `protocol::openai_completions` | `GROQ_API_KEY` |
+   | `openrouter` | `protocol::openai_completions` | `OPENROUTER_API_KEY` |
+   | `zai` | `protocol::openai_completions` | `ZAI_API_KEY` |
+   | `deepseek` | `protocol::openai_completions` | `DEEPSEEK_API_KEY` |
+   | `openai_compatible` | `protocol::openai_completions` | `OPENAI_API_KEY` |
+   | `xiaomi_mimo` | `protocol::openai_completions` | — |
+   | `bai` | `protocol::openai_completions` | — |
+   | `opencode_go` | `protocol::openai_completions` | — |
+   | `minimax` | `protocol::anthropic` | `MINIMAX_API_KEY` |
+   | `kimi_coding` | `protocol::anthropic` | `KIMI_API_KEY` |
+   | `zenmux` | adaptive (see below) | `ZENMUX_API_KEY` |
+
+   Delegation providers expose `default_compat()` static methods (for OpenAI-compatible ones) that return provider-specific `OpenAICompletionsCompat` values (constructed from `CompatCapabilities`, `CompatThinking`, `CompatMessageFormat` sub-structs). These are injected onto the model when `model.compat.is_none()`. Most delegation providers are generated via macros in `src/provider/delegation.rs`.
+
+   The provider layer also owns:
+   - `registry.rs` — Global `ProtocolRegistry` (register/get providers by `Provider::as_str()` key), with lazy auto-registration of built-in providers
+   - `delegation.rs` — Macros (`define_openai_delegation_provider!`, `define_anthropic_delegation_provider!`) for generating delegation providers
+
+   `provider/mod.rs` re-exports `LLMProtocol`, `ArcProtocol`, `register_provider`, `get_provider` etc. `protocol/mod.rs` re-exports registry symbols from `provider/` for backward compatibility.
+
+4. **Stream** (`src/stream/`) — `EventStream<T, R>` is a generic async stream backed by `parking_lot::Mutex<VecDeque>` + `tokio::sync::Notify`. Implements `futures::Stream` with a separate `result()` future (zero-cost `Notify`-based wakeup) for the final message. `AssistantMessageEventStream` emits `AssistantMessageEvent` variants: `Start`, `TextDelta`, `ThinkingDelta`, `ToolCallDelta`, `Done`, `Error`, etc.
+
+5. **Agent** (`src/agent/`) — Stateful conversation manager. `Agent` wraps `AgentState` (thread-safe with `parking_lot::RwLock`/`AtomicBool`) and `AgentConfig` (model, thinking_level as single source of truth) and runs an autonomous loop: stream LLM → check tool calls → execute via `ToolExecutor` callback → loop. All hook callbacks are aggregated in `AgentHooks`. Supports steering (interrupt), follow-up message queues, event subscription (observer pattern), abort, and configurable max turns (default 25). Tool execution can be parallel (default) or sequential. The module also exports standalone loop helpers (`agent_loop`, `agent_loop_continue`, `run_agent_loop`, `run_agent_loop_continue`) for callers that want the same runtime without holding a long-lived `Agent`.
+
+### Supporting Modules
+
+- **Transform** (`src/transform/`) — Cross-provider message transformation: thinking block conversion (thinking→text when switching providers, no prefix added), tool call ID normalization, orphan tool call resolution (inserts synthetic error results).
+- **Thinking** (`src/thinking/`) — `ThinkingLevel` enum (Off/Minimal/Low/Medium/High/XHigh) and provider-specific thinking option structs.
+- **Validation** (`src/validation/`) — Tool parameter JSON Schema validation via `jsonschema` crate.
+- **Models** (`src/models/`) — `ModelRegistry` with predefined models and a global static instance. Use `get_model("openai", "gpt-4o")` to look up. Predefined models are a small stub set (a few models per provider for OpenAI, Anthropic, Google).
+- **Catalog** (`src/catalog/`) — Library-level model listing flow for providers with native list-models endpoints. Fetches provider-native availability, extracts a shared intermediate shape (`raw_id`, `display_name`, `context_window`, `max_output_tokens`, etc.), optionally enriches from a local snapshot-backed metadata store, and supports stale-while-revalidate snapshot refresh from a published remote manifest.
+
+### Key Design Patterns
+
+- **Provider registry**: `ProtocolRegistry` is keyed by `Provider::as_str()` string (e.g., `"openai"`, `"xai"`, `"zenmux"`). Global static accessed via `get_provider()` / `register_provider()` / `get_registered_providers()`. Built-in providers are **auto-registered on first access** — no manual `register_provider()` calls needed. Manual registration is still supported for overriding defaults (e.g., `with_api_key()`).
+- **Base URL resolution**: 3-level fallback: `StreamOptions.base_url` > `model.base_url` > provider's `DEFAULT_BASE_URL` constant.
+- **API key resolution**: `StreamOptions.api_key` → provider's `default_api_key` → environment variable (e.g., `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`).
+- **SSE parsing**: Provider modules parse Server-Sent Events manually from HTTP byte streams, buffering incomplete lines. The OpenAI Responses provider extracts event type from the JSON `type` field (not SSE `event:` line) to handle proxies that strip SSE event headers.
+- **Thread safety**: All mutable state uses `parking_lot` locks (not `std::sync`) for non-poisoning behavior.
+- **Builders**: `Model::builder()`, `AssistantMessage::builder()`, `Tool::builder()` with required-field validation in `build()`.
+
+### Zenmux Adaptive Routing
+
+Zenmux is a unique multi-protocol proxy provider. When `base_url` is None, empty, or starts with `https://zenmux.ai`, it routes based on model ID:
+- `"google"` or `"gemini"` in ID → `protocol::google::GoogleProtocol` with `Api::GoogleVertex`, base `https://zenmux.ai/api/vertex-ai`
+- `"openai"` or `"gpt"` in ID → `protocol::openai_responses::OpenAIResponsesProtocol` with `Api::OpenAIResponses`, base `https://zenmux.ai/api/v1`
+- anything else → `protocol::anthropic::AnthropicProtocol` with `Api::AnthropicMessages`, base `https://zenmux.ai/api/anthropic/v1`
+
+When a custom (non-zenmux) base URL is provided, it forces `OpenAICompletions` protocol.
+
+### Google Dual-Mode URL Format
+
+The `protocol::google` module handles two URL formats based on `model.api`:
+- `GoogleGenerativeAi` (default): `{base}/models/{id}:streamGenerateContent?alt=sse` with `x-goog-api-key` header
+- `GoogleVertex`: `{base}/v1/publishers/google/models/{id}:streamGenerateContent?alt=sse` with `Authorization: Bearer` header
+
+### Type Relationships
+
+```
+Agent → AgentState (Arc-wrapped, thread-safe runtime state: messages, tools, streaming)
+      → AgentConfig (model, thinking_level, tool_execution mode — single source of truth)
+      → AgentHooks (tool_executor, before/after hooks, pipeline fns, stream_fn)
+
+LLMProtocol.stream() → AssistantMessageEventStream
+
+ProtocolRegistry: HashMap<String, ArcProtocol> keyed by Provider::as_str()
+ModelRegistry: HashMap<provider, HashMap<model_id, Model>>
+```
+
+### Catalog Module
+
+The Catalog module (`src/catalog/`) manages model listing and metadata enrichment:
+- Fetches native model lists from provider APIs
+- Extracts a shared intermediate model shape (`raw_id`, `display_name`, `context_window`, `max_output_tokens`, etc.)
+- Enriches from a local snapshot-backed metadata store (`CatalogSnapshot`)
+- Supports stale-while-revalidate snapshot refresh from a published remote manifest
+
+**Patching Catalog Model Metadata**
+
+When a model is missing from the upstream source (e.g., OpenRouter) or its metadata needs correction, add an entry to `catalog/patches.json` rather than modifying Rust source code.
+
+The patches file has two sections:
+
+- **`patches`**: Overrides fields for existing catalog entries matched by `source` + `alias` or `canonical_model_key`.
+- **`injections`**: Injects entirely new models that do not exist in the upstream source. Injected entries are deduplicated by `canonical_model_key`.
+
+Example injection for a missing model:
+
+```json
+{
+  "canonical_model_key": "minimax:minimax-m2.7-highspeed",
+  "aliases": [
+    "minimax/minimax-m2.7-highspeed",
+    "minimax-m2.7-highspeed",
+    "MiniMax-M2.7-highspeed"
+  ],
+  "display_name": "MiniMax: MiniMax M2.7 highspeed",
+  "description": "MiniMax M2.7 highspeed reasoning model",
+  "context_window": 2048000,
+  "max_output_tokens": 131070,
+  "modalities": ["text"],
+  "capabilities": ["reasoning"],
+  "source": "catalog-injection:minimax:minimax-m2.7-highspeed",
+  "raw": {}
+}
+```
+
+The `source` field for injections should follow the convention `catalog-injection:<provider>:<model-key>`.
+
+The `tiy-catalog-sync` binary (`src/bin/tiy-catalog-sync.rs`) reads `catalog/patches.json`, applies patches and injections, and publishes the resulting `catalog.json` + `manifest.json`.
+
+## Adding a New Provider
+
+**New wire-format protocol** (rare — only if a completely new HTTP/SSE wire format is needed):
+1. Create `src/protocol/<name>.rs` implementing `LLMProtocol` trait (3 methods: `provider_type`, `stream`, `stream_simple`)
+2. Add `pub mod <name>;` to `src/protocol/mod.rs`
+3. Add wire-format request/response structs (private to the module)
+4. Implement SSE stream parsing in a `run_stream` async function spawned via `tokio::spawn`
+5. Push events to `AssistantMessageEventStream` (Start → deltas → Done/Error)
+6. Add integration test in `tests/test_provider_<name>.rs` using `wiremock` for HTTP mocking
+
+**New service vendor** (facade wrapping an existing protocol):
+1. Create `src/provider/<name>.rs` as a thin facade struct that wraps a `protocol::*` provider
+2. Implement `LLMProtocol` by delegating all methods to the inner protocol provider
+3. Add `pub mod <name>;` to `src/provider/mod.rs`
+4. Add integration test in `tests/`
+
+**Delegation provider** (wraps existing protocol, generated by macro):
+1. Use the `define_openai_delegation_provider!` or `define_anthropic_delegation_provider!` macro in `src/provider/delegation.rs` to generate the struct, constructors, and `LLMProtocol` impl
+2. Add a `default_compat()` function if the provider needs OpenAI-compatible overrides
+3. Add `pub mod <name>;` to `src/provider/mod.rs`
+4. Add tests in `tests/test_delegation_providers.rs`
+5. For providers with unique logic (e.g., Ollama's no-API-key model), hand-write instead of using the macro
+
+## Codebase Reference Documents
+
+The `docs/` directory contains four auto-generated reference documents for navigating the codebase. Use these to orient before diving into source code:
+
+| Document | Size | Best For |
+|----------|------|----------|
+| **[docs/CODEBASE_README.md](./docs/CODEBASE_README.md)** | Navigation guide | **Start here.** Quick facts, module reference, core type overview, architecture patterns, getting started paths. |
+| **[docs/CODEBASE_MAP.md](./docs/CODEBASE_MAP.md)** | Deep reference | Detailed module breakdown with line counts, full type specifications (Context, Message, ContentBlock, Model, etc.), API signatures, reading recommendations. |
+| **[docs/CODEBASE_SUMMARY.txt](./docs/CODEBASE_SUMMARY.txt)** | Quick reference | ASCII directory tree, all Rust files listed with descriptions, key types by module, data flow diagram, quick navigation table. |
+| **[docs/CODEBASE_MODULES.txt](./docs/CODEBASE_MODULES.txt)** | Architecture | Visual module relationship diagram (ASCII box art), dependency flow, type hierarchies within each module, key design patterns. |
+
+**When to use which:**
+- **"Where is X defined?"** → CODEBASE_MAP.md (Key Types section) or CODEBASE_SUMMARY.txt (Quick Navigation)
+- **"How do modules relate?"** → CODEBASE_MODULES.txt (dependency diagram)
+- **"I'm new, where do I start?"** → CODEBASE_README.md (Getting Started section)
+- **"What files exist in module Y?"** → CODEBASE_SUMMARY.txt (Directory Tree section)
+
+---
+
+# 📦 TiYCore Codebase - Complete Comprehensive Map
+
+Source: https://github.com/tiyagents/tiy-core/blob/master/docs/CODEBASE_MAP.md
+
+# 📦 TiYCore Codebase - Complete Comprehensive Map
+
+## Quick Facts
+- **Project**: Unified LLM API and stateful Agent runtime (Rust)
+- **Version**: 0.1.0 | **Edition**: Rust 2021 | **License**: MIT
+- **Size**: ~21,000 lines of code across 54 Rust files
+- **Providers**: 18+ LLM providers supported
+- **Main Purpose**: Unified interface for multiple LLM APIs + stateful agent runtime
+
+## 🏗️ Architecture Overview
+
+```
+                        ┌─────────────────────┐
+                        │   Application Code  │
+                        └──────────┬──────────┘
+                                   │
+        ┌──────────────────────────┴──────────────────────┐
+        │                                                  │
+        ▼                                                  ▼
+   ┌─────────────────┐                         ┌──────────────────┐
+   │   Agent Loop    │                         │ Direct Protocol  │
+   │  (high-level)   │                         │   Usage          │
+   └────────┬────────┘                         └────────┬─────────┘
+            │                                           │
+            └──────────────┬────────────────────────────┘
+                           ▼
+                  ┌──────────────────────┐
+                  │ Provider Registry &  │
+                  │ Facades (18+ options)│
+                  └────────────┬─────────┘
+                               ▼
+                  ┌──────────────────────┐
+                  │ Protocol Layer       │
+                  │ (OpenAI, Anthropic,  │
+                  │  Google, etc.)       │
+                  └────────────┬─────────┘
+                               │
+        ┌──────────────────────┼──────────────────────┐
+        │                      │                      │
+        ▼                      ▼                      ▼
+    [OpenAI]          [Anthropic]             [Google]
+    API Servers       API Servers             API Servers
+
+Supporting Modules:
+├── transform/ ───── Message/Context conversion
+├── stream/ ─────── Streaming & event parsing
+├── validation/ ── Parameter & schema validation
+├── thinking/ ───── Extended reasoning support
+└── types/ ──────── Unified data structures
+```
+
+## 📂 Directory Structure
+
+### Root Level Files
+- **Cargo.toml** — Project manifest with ~25 dependencies
+- **Cargo.lock** — Reproducible build lock file
+- **README.md** — Main documentation
+- **README-ZH.md** — Chinese documentation
+- **AGENTS.md** — Agent framework documentation
+- **LICENSE** — MIT License
+- **CHANGELOG.md** — Version history
+
+### Main Source Directory: src/
+
+```
+src/
+├── lib.rs ····················· Main crate entry (47 lines)
+│
+├── types/ ···················· Core type definitions (8 files)
+│   ├── context.rs ·········· Context, Tool types
+│   ├── message.rs ·········· Message hierarchy (User, Assistant, ToolResult)
+│   ├── content.rs ·········· ContentBlock (Text, Image, Thinking, ToolCall)
+│   ├── model.rs ············ Model, Provider, Api (via define_string_enum! macro), Cost, OpenAICompletionsCompat (CompatCapabilities, CompatThinking, CompatMessageFormat)
+│   ├── usage.rs ············ Token usage metrics
+│   ├── events.rs ··········· Event stream types
+│   └── limits.rs ··········· Rate limiting configs
+│
+├── protocol/ ·················· Wire protocol implementations (7 files)
+│   ├── traits.rs ············ LLMProtocol trait
+│   ├── common.rs ··········· Shared utilities
+│   ├── openai_completions.rs
+│   ├── openai_responses.rs ·· OpenAI Responses API (beta)
+│   ├── anthropic.rs ········· Anthropic Messages API
+│   └── google.rs ··········· Google Generative AI
+│
+├── provider/ ················· Provider facades & registry (20 files)
+│   ├── registry.rs ········· Global provider registry
+│   ├── delegation.rs ······· Delegation macros
+│   ├── openai.rs ··········· OpenAI facade
+│   ├── openai_compatible.rs · Ollama, Mistral, etc.
+│   ├── anthropic.rs ········· Anthropic facade
+│   ├── google.rs ··········· Google facade
+│   ├── ollama.rs ··········· Ollama facade
+│   ├── xai.rs ·············· X.AI / Grok
+│   ├── groq.rs ·············· Groq
+│   ├── openrouter.rs ········ OpenRouter
+│   ├── minimax.rs ·········· MiniMax (Chinese)
+│   ├── kimi_coding.rs ······· Kimi Coding
+│   ├── zai.rs ·············· ZAI (Chinese)
+│   ├── deepseek.rs ········· DeepSeek (Chinese)
+│   ├── xiaomi_mimo.rs ······· Xiaomi MIMO
+│   ├── zenmux.rs ··········· Zenmux (image gen)
+│   ├── bai.rs ·············· BAI provider
+│   └── opencode_go.rs ······· OpenCodeGo
+│
+├── agent/ ····················· Stateful agent runtime (5 files)
+│   ├── agent.rs ············ Main Agent impl & agent_loop()
+│   ├── queue.rs ············ Unified message queue (MessageQueue, DrainStrategy, BackpressureConfig)
+│   ├── state.rs ············ AgentState & snapshots
+│   └── types.rs ············ Agent-specific types (QueueMode, QueueEvent, SupplierContext, etc.)
+│
+├── stream/ ····················· Streaming utilities (3 files)
+│   ├── event_stream.rs ····· EventStream type
+│   └── json_parser.rs ····· JSON parsing for streams
+│
+├── transform/ ················· Message transformation (3 files)
+│   ├── messages.rs ········· Message transformations
+│   └── tool_calls.rs ······· Tool call extraction
+│
+├── validation/ ················ Input validation (2 files)
+│   └── tool_validation.rs ··· JSON Schema validation
+│
+├── thinking/ ················· Extended thinking (2 files)
+│   └── config.rs ··········· Thinking config
+│
+├── models/ ··················· Predefined models (2 files)
+│   └── predefined.rs ······· 100+ model definitions
+│
+├── catalog/ ··················· Model catalog system (2 files)
+│   └── README.md ··········· Catalog documentation
+│
+└── bin/ ······················ CLI tools (1 file)
+    └── tiy-catalog-sync.rs · Catalog sync tool
+```
+
+## 📊 Module Breakdown
+
+### types/ (8 files) — Core Data Structures
+**Responsibility**: Unified types for all LLM communication
+
+- `context.rs` — Context struct with system prompt, messages, tools
+- `message.rs` — Message types (User, Assistant, ToolResult) and roles
+- `content.rs` — ContentBlock enum (Text, Thinking, Image, ToolCall)
+- `model.rs` — Model metadata, Provider and Api enums (generated by `define_string_enum!` macro), Cost types, OpenAICompletionsCompat (split into CompatCapabilities, CompatThinking, CompatMessageFormat sub-structs)
+- `usage.rs` — Token usage tracking
+- `events.rs` — Streaming event types
+- `limits.rs` — Rate limiting and stream limiting configs
+
+### protocol/ (7 files) — Wire Protocol Implementations
+**Responsibility**: Low-level API protocol adapters
+
+- `traits.rs` — LLMProtocol trait (abstract interface for all protocols)
+- `common.rs` — Shared utilities across protocols
+- `openai_completions.rs` — OpenAI Chat Completions API
+- `openai_responses.rs` — OpenAI Responses API (new beta)
+- `anthropic.rs` — Anthropic Messages API
+- `google.rs` — Google Generative AI & Vertex AI
+
+### provider/ (20 files) — Provider Facades & Registry
+**Responsibility**: High-level provider interfaces + auto-registry
+
+**Core Infrastructure:**
+- `registry.rs` — ProtocolRegistry with auto-registration
+- `delegation.rs` — Delegation macros
+
+**Provider Facades:**
+- `openai.rs`, `openai_compatible.rs`, `openai_responses.rs`
+- `anthropic.rs`, `google.rs`, `ollama.rs`, `xai.rs`, `groq.rs`
+- `openrouter.rs`, `minimax.rs`, `kimi_coding.rs`, `zai.rs`
+- `deepseek.rs`, `xiaomi_mimo.rs`, `zenmux.rs`, `bai.rs`, `opencode_go.rs`
+
+### agent/ (5 files) — Stateful Agent Runtime
+**Responsibility**: Multi-turn conversations with tool execution, steering/follow-up queues
+
+- `agent.rs` — Agent struct, agent_loop(), event streaming, steering/follow-up consumption
+- `queue.rs` — MessageQueue (unified FIFO buffer + supplier), DrainStrategy trait, BackpressureConfig
+- `state.rs` — AgentState, AgentStateSnapshot (for persistence)
+- `types.rs` — Agent-specific event types, QueueMode, QueueEvent, QueueKind, QueueStats, SupplierContext
+
+### stream/ (3 files) — Streaming Utilities
+**Responsibility**: SSE parsing and event buffering
+
+- `event_stream.rs` — EventStream type for streaming responses (backed by `parking_lot::Mutex<VecDeque>` + `tokio::sync::Notify`)
+- `json_parser.rs` — Incremental JSON parsing
+
+### transform/ (3 files) — Message Transformation
+**Responsibility**: Convert between tiycore types and provider formats
+
+- `messages.rs` — Context → request, response → Message
+- `tool_calls.rs` — Tool call extraction and formatting
+
+### validation/ (2 files) — Input Validation
+**Responsibility**: JSON Schema validation for tools
+
+- `tool_validation.rs` — Tool definition and parameter validation
+
+### thinking/ (2 files) — Extended Thinking Support
+**Responsibility**: Configuration for reasoning models
+
+- `config.rs` — Thinking behavior config (Claude Opus 4, OpenAI o1, etc.)
+
+### models/ (2 files) — Predefined Models
+**Responsibility**: Model metadata catalog
+
+- `predefined.rs` — 100+ hardcoded model definitions with costs and limits
+
+### catalog/ (2 files) — Model Catalog System
+**Responsibility**: Dynamic catalog management
+
+- `mod.rs` — Catalog snapshots, manifests, remote updates, enrichment
+
+## 🔌 Key APIs
+
+### Core Types
+```rust
+// Context & Tools
+pub struct Context {
+    pub system_prompt: Option<String>,
+    pub messages: Vec<Message>,
+    pub tools: Option<Vec<Tool>>,
+}
+
+pub struct Tool {
+    pub name: String,
+    pub description: String,
+    pub parameters: serde_json::Value,  // JSON Schema
+}
+
+// Messages
+pub enum Message {
+    User(UserMessage),
+    Assistant(AssistantMessage),
+    ToolResult(ToolResultMessage),
+}
+
+// Content Blocks
+pub enum ContentBlock {
+    Text(TextContent),
+    Thinking(ThinkingContent),
+    Image(ImageContent),
+    ToolCall(ToolCall),
+}
+
+// Model Configuration
+pub struct Model {
+    pub id: String,
+    pub name: String,
+    pub provider: Provider,
+    pub context_window: usize,
+    pub max_tokens: usize,
+    // ... more fields
+}
+```
+
+### Protocol Trait
+```rust
+pub trait LLMProtocol: Send + Sync {
+    fn build_request(&self, context: &Context, model: &Model) 
+        -> Result<Request>;
+    fn parse_response(&self, body: &str) 
+        -> Result<Response>;
+    fn parse_streaming(&self, chunk: &str) 
+        -> Result<Vec<Event>>;
+    fn get_name(&self) -> &str;
+}
+```
+
+### Provider Registry
+```rust
+pub fn register_provider(provider: Arc<dyn LLMProtocol>);
+pub fn get_provider(model: &Model) -> Result<ArcProtocol>;
+pub fn get_registered_providers() -> Vec<String>;
+pub fn register_all_providers();  // Auto-register all built-in providers
+```
+
+### Agent API
+```rust
+pub async fn agent_loop(
+    model: Model,
+    context: Context,
+) -> Result<AgentEventStream>;
+
+pub async fn agent_loop_continue(
+    agent_state: AgentStateSnapshot,
+) -> Result<AgentEventStream>;
+
+pub struct AgentEventStream {
+    // Streaming iterator of agent events
+}
+
+// Steering & Follow-up (runtime message injection)
+impl Agent {
+    pub fn steer(&self, msg: AgentMessage);              // Mid-stream interrupt
+    pub fn follow_up(&self, msg: AgentMessage);          // Post-turn append
+    pub fn try_steer(&self, msg: AgentMessage) -> Result<(), QueueFullError>;
+    pub fn has_queued_messages(&self) -> bool;            // Sync local check
+    pub async fn has_queued_messages_async(&self) -> bool; // Async with supplier probe
+    pub fn queue_stats(&self) -> QueueStats;
+    pub fn set_steering_mode(&self, mode: QueueMode);
+    pub fn set_on_queue_event<F>(&self, handler: F);
+    pub fn set_steering_supplier<F, Fut>(&self, supplier: F); // V2 with SupplierContext
+    pub fn set_steering_backpressure(&self, config: BackpressureConfig);
+}
+```
+
+## 📈 Statistics
+
+| Category | Count | Details |
+|----------|-------|---------|
+| **Total .rs Files** | 55 | Including lib.rs, bin, src/types/protocol/provider/agent/etc |
+| **Total Lines of Code** | ~21,000 | Across all Rust source files |
+| **Main Modules** | 11 | types, protocol, provider, agent, stream, transform, validation, thinking, models, catalog, bin |
+| **Supported Providers** | 18+ | OpenAI, Anthropic, Google, Ollama, Groq, etc. |
+| **Protocol Implementations** | 4 | OpenAI Completions, OpenAI Responses, Anthropic, Google |
+| **Dependencies** | ~25 | tokio, reqwest, serde, futures, jsonschema, etc. |
+| **Predefined Models** | 100+ | Model metadata with costs, limits, capabilities |
+
+## 🚀 Usage Examples
+
+### High-Level: Agent Loop
+```rust
+use tiycore::agent::agent_loop;
+use tiycore::types::{Model, Context, Provider};
+
+let model = Model {
+    id: "gpt-4o-mini".to_string(),
+    name: "GPT-4o Mini".to_string(),
+    provider: Provider::OpenAI,
+    // ... more config
+};
+
+let mut context = Context::with_system_prompt("You are helpful");
+context.user("What is 2+2?");
+
+let mut stream = agent_loop(model, context).await?;
+while let Some(event) = stream.next().await {
+    println!("{:?}", event);
+}
+```
+
+### Mid-Level: Provider Facade
+```rust
+use tiycore::provider::get_provider;
+
+let provider = get_provider(&model)?;
+let request = provider.build_request(&context)?;
+// Make HTTP request with your own client
+```
+
+### Low-Level: Protocol
+```rust
+use tiycore::protocol::{openai_completions::*, LLMProtocol};
+
+let protocol = OpenAICompletionsProtocol::new();
+let request = protocol.build_request(&context, &model)?;
+let response = protocol.parse_response(&response_body)?;
+```
+
+## 🎯 Reading Recommendations
+
+### To Understand Architecture
+1. src/lib.rs — Public API surface
+2. src/types/context.rs — Core Context type
+3. src/protocol/traits.rs — Abstract LLMProtocol trait
+4. src/provider/registry.rs — Provider registration system
+5. src/agent/agent.rs — Agent event loop
+
+### To Add a New Provider
+1. src/provider/openai.rs — Example implementation
+2. src/protocol/traits.rs — Protocol trait
+3. src/protocol/openai_completions.rs — Example protocol
+4. src/provider/mod.rs — How to register
+
+### For Tool Integration
+1. src/types/content.rs — ToolCall definition
+2. src/validation/tool_validation.rs — Validation
+3. src/agent/agent.rs — Tool call handling
+4. src/transform/tool_calls.rs — Tool extraction
+
+### For Streaming
+1. src/stream/mod.rs — Stream utilities
+2. src/stream/event_stream.rs — EventStream type
+3. src/protocol/* — Protocol streaming implementations
+4. src/agent/agent.rs — Agent streaming integration
+
+## 🏆 Key Strengths
+
+1. ✅ **Unified API** — Single codebase supports 18+ providers
+2. ✅ **Protocol Abstraction** — Add new APIs without modifying core logic
+3. ✅ **Type Safety** — Strong typing prevents runtime errors
+4. ✅ **Async Native** — All I/O is non-blocking with tokio
+5. ✅ **Streaming First** — Built-in streaming event support
+6. ✅ **Tool Support** — JSON Schema validation + execution
+7. ✅ **Extended Thinking** — Support for reasoning models
+8. ✅ **Persistence Ready** — Agent state snapshots for recovery
+
+## 💻 Dependencies
+
+**Key Crates:**
+- tokio (async runtime)
+- reqwest (HTTP client)
+- serde/serde_json (serialization)
+- jsonschema (validation)
+- futures (async utilities)
+- parking_lot (concurrency)
+- chrono (date/time)
+- uuid (ID generation)
+- tracing (logging)
+- anyhow/thiserror (error handling)
+
+## 📄 File Count Summary
+
+- **src/lib.rs** — 1 file
+- **src/types/** — 8 files
+- **src/protocol/** — 7 files
+- **src/provider/** — 20 files
+- **src/agent/** — 5 files
+- **src/stream/** — 3 files
+- **src/transform/** — 3 files
+- **src/validation/** — 2 files
+- **src/thinking/** — 2 files
+- **src/models/** — 2 files
+- **src/catalog/** — 2 files
+- **src/bin/** — 1 file
+
+**Total: 54 Rust source files, ~21,000 lines of code**
+
+*This map was generated on 2026-05-12 for TiYCore v0.1.0*
+*A unified LLM API and stateful Agent runtime in Rust*
+
+---
+
+# Tiycore Codebase Comprehensive Map
+
+Source: https://github.com/tiyagents/tiy-core/blob/master/docs/CODEBASE_README.md
+
+# Tiycore Codebase Comprehensive Map
+
+> A complete, detailed map of the Tiycore project structure, architecture, and key components.
+
+## 📖 Documentation Files
+
+This directory contains three comprehensive reference documents:
+
+### 1. **CODEBASE_MAP.md** (18KB) - Deep Dive Reference
+The most detailed and comprehensive guide. Includes:
+- Complete module descriptions with line counts
+- Detailed type specifications for all key structs/enums
+- Full file organization by concern
+- Architecture patterns explanation
+- Code statistics table
+- Quick navigation guide
+
+**Use this when:** You need to understand how types work, find specific functionality, or understand design patterns.
+
+### 2. **CODEBASE_SUMMARY.txt** (20KB) - Quick Reference
+A structured text format with ASCII formatting. Includes:
+- Directory tree visualization
+- All 51 Rust files listed with descriptions
+- Key types organized by module
+- Architecture patterns summary
+- Data flow diagram
+- Quick navigation table
+
+**Use this when:** You want a printable reference or quick visual scan of the codebase.
+
+### 3. **CODEBASE_MODULES.txt** (21KB) - Module Relationships
+Visual diagram showing how modules relate and depend on each other. Includes:
+- Library interface overview
+- Module dependency graph
+- Type hierarchies within each module
+- Key patterns and design insights
+- Dependency flow explanation
+
+**Use this when:** You're learning the overall architecture or tracing data flow.
+
+## 🎯 Quick Facts
+
+| Metric | Value |
+|--------|-------|
+| **Total Lines of Code** | ~21,000 Rust LOC |
+| **Source Files** | 55 .rs files |
+| **Main Modules** | 10 (types, agent, protocol, provider, stream, transform, catalog, models, thinking, validation) |
+| **Supported Providers** | 17+ LLM providers |
+| **Language** | Rust 2021 Edition |
+| **Dependencies** | 20+ production crates |
+| **Test Files** | 20+ integration tests |
+
+## 📁 Module Quick Reference
+
+```
+src/
+├── lib.rs (82 LOC)              ← Library root
+├── types/ (7 files, 1,800 LOC)  ← Core data model: Context, Message, ContentBlock, Tool
+├── agent/ (5 files, 3,200 LOC)  ← Stateful agent runtime + queue system
+├── protocol/ (7 files, 2,000 LOC) ← Wire format implementations (OpenAI, Anthropic, Google)
+├── provider/ (18 files, 3,000 LOC) ← Provider facades + registry
+├── stream/ (3 files, 500 LOC)   ← Event streaming (SSE/WebSocket)
+├── transform/ (3 files, 400 LOC) ← Message transformation
+├── catalog/ (1 file, 1,000 LOC) ← Model catalog management
+├── thinking/ (2 files, 300 LOC) ← Extended thinking support
+├── validation/ (2 files, 200 LOC) ← JSON Schema validation
+└── models/ (2 files, 500 LOC)   ← Predefined model configurations
+```
+
+## 🔑 Core Type System
+
+### Foundation: `types/context.rs`
+- **Context** - Conversation state (system prompt, messages, tools)
+- **Tool** - Tool definition with JSON Schema parameters
+- **StreamOptions** - Configuration (temperature, max_tokens, api_key, etc.)
+
+### Messages: `types/message.rs`
+- **UserMessage** - User input with timestamp
+- **AssistantMessage** - LLM response with metadata
+- **ToolResultMessage** - Tool execution result
+- **Message** - Enum union of all message types
+
+### Content: `types/content.rs`
+- **TextContent** - Text response
+- **ThinkingContent** - Extended thinking/reasoning
+- **ImageContent** - Image data (base64)
+- **ToolCall** - Tool invocation
+- **ContentBlock** - Enum union of content types
+
+## 🏗️ Architecture Patterns
+
+### 1. Protocol-Provider Separation
+```
+protocol/openai_completions.rs ────┐
+protocol/anthropic.rs              ├─→ Implements LLMProtocol trait
+protocol/google.rs                 │
+protocol/openai_responses.rs ──────┘
+
+provider/openai.rs ────────┐
+provider/anthropic.rs      ├─→ Wraps protocol, provides facade + registry
+provider/google.rs ────────┘
+```
+
+### 2. Type-Driven Design
+All modules build around the core type system:
+- Types define the contract
+- Protocols transform wire formats to types
+- Providers expose type-based APIs
+- Agent orchestrates with types
+
+### 3. Streaming Pipeline
+```
+HTTP/WebSocket ──→ EventStream ──→ JSON Parser ──→ Transform ──→ Types ──→ Agent
+```
+
+### 4. Auto-Registration Registry
+```
+get_provider("openai") ──→ Provider Registry ──→ [cached or created on demand]
+```
+
+## 📍 Navigation Guide
+
+### If you need to...
+
+**Understand conversation state**
+→ See `src/types/context.rs` for Context and Tool types
+
+**Handle messages**
+→ See `src/types/message.rs` for all message types
+
+**Work with content**
+→ See `src/types/content.rs` for ContentBlock and variants
+
+**Add a new LLM provider**
+→ Implement LLMProtocol trait in `src/protocol/`
+→ Create facade in `src/provider/`
+
+**Build an agent**
+→ See `src/agent/agent.rs` for Agent type and functions
+
+**Stream events**
+→ See `src/stream/event_stream.rs` for EventStream<T>
+
+**Transform data formats**
+→ See `src/transform/messages.rs` and `tool_calls.rs`
+
+**Validate tool calls**
+→ See `src/validation/tool_validation.rs` for JSON Schema validation
+
+**Query model catalog**
+→ See `src/catalog/mod.rs` for catalog management
+
+**Configure extended thinking**
+→ See `src/thinking/config.rs` for ThinkingLevel and ThinkingDisplay
+
+## 🔄 Data Flow Example
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      User Code                              │
+└────────────────┬────────────────────────────────────────────┘
+                 │
+                 ▼
+┌─────────────────────────────────────────────────────────────┐
+│  Create StreamOptions (config)                              │
+│  provider::openai::OpenAIProvider::new()                    │
+└────────────────┬────────────────────────────────────────────┘
+                 │
+                 ▼
+┌─────────────────────────────────────────────────────────────┐
+│  Provider facade delegates to:                              │
+│  protocol::openai_completions::OpenAICompletionsProtocol   │
+└────────────────┬────────────────────────────────────────────┘
+                 │
+                 ▼
+┌─────────────────────────────────────────────────────────────┐
+│  HTTP Request via reqwest                                   │
+│  OpenAI API /chat/completions endpoint                      │
+└────────────────┬────────────────────────────────────────────┘
+                 │
+                 ▼
+┌─────────────────────────────────────────────────────────────┐
+│  EventStream (SSE or WebSocket)                             │
+│  stream::event_stream::EventStream<T>                       │
+└────────────────┬────────────────────────────────────────────┘
+                 │
+                 ▼
+┌─────────────────────────────────────────────────────────────┐
+│  JSON Parser & Transform                                    │
+│  stream::json_parser + transform::messages                  │
+└────────────────┬────────────────────────────────────────────┘
+                 │
+                 ▼
+┌─────────────────────────────────────────────────────────────┐
+│  Unified Types                                              │
+│  Message, AssistantMessage, ContentBlock, ToolCall         │
+└────────────────┬────────────────────────────────────────────┘
+                 │
+                 ▼
+┌─────────────────────────────────────────────────────────────┐
+│  Agent Loop                                                 │
+│  agent::agent::Agent + tool execution                       │
+└────────────────┬────────────────────────────────────────────┘
+                 │
+                 ▼
+┌─────────────────────────────────────────────────────────────┐
+│  Tool Validation & Execution                                │
+│  validation::tool_validation + custom tool handlers         │
+└────────────────┬────────────────────────────────────────────┘
+                 │
+                 ▼
+┌─────────────────────────────────────────────────────────────┐
+│  Response/Callback to User                                  │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## 🔌 Dependencies Overview
+
+**Async Runtime:**
+- `tokio` - Full async runtime with I/O, timers, sync primitives
+
+**HTTP:**
+- `reqwest` - HTTP client with streaming support
+- `reqwest-eventsource` - SSE support
+
+**Serialization:**
+- `serde` + `serde_json` - Serialization framework
+
+**Schema & Validation:**
+- `jsonschema` - JSON Schema validation
+- `schemars` - Schema generation from types
+
+**Streaming:**
+- `futures` - Async utilities
+- `async-stream` - Async stream macros
+- `pin-project-lite` - Pin utilities
+
+**Concurrency:**
+- `parking_lot` - Efficient synchronization
+- `arc-swap` - Atomic reference swap
+
+**Error Handling:**
+- `thiserror` - Error type derivation
+- `anyhow` - Error context
+
+**Utilities:**
+- `chrono` - DateTime handling
+- `uuid` - UUID generation
+- `url` - URL parsing
+- `sha2` - Hashing
+
+## 💡 Key Design Insights
+
+1. **Unified API** - Single interface abstracts 17+ LLM providers
+2. **Streaming-First** - Built for real-time, event-based responses
+3. **Type-Safe** - Strong typing with comprehensive enums prevents errors
+4. **Extensible** - Easy to add new providers via `LLMProtocol` trait
+5. **Agent-Ready** - Built-in support for stateful agent loops
+6. **Tool-Aware** - First-class support for function calling with validation
+7. **Extended Thinking** - Support for reasoning/thinking models
+8. **Multi-Transport** - Both SSE and WebSocket support
+9. **Error-Rich** - Detailed error types with context
+10. **Performance** - Efficient async/await and streaming processing
+
+## 🧪 Testing & Examples
+
+**Test Coverage:**
+- 20+ integration tests in `tests/` directory
+- Provider-specific tests for each LLM service
+- Stream, transform, type, validation, thinking tests
+
+**Examples:**
+- `examples/basic_usage.rs` - Basic API usage
+- `examples/agent_example.rs` - Agent loop example
+
+## 🚀 Getting Started
+
+### To understand the basics:
+1. Read **CODEBASE_SUMMARY.txt** for directory overview
+2. Look at `src/types/context.rs`, `message.rs`, `content.rs`
+3. Read `src/agent/agent.rs` for agent patterns
+
+### To add a new provider:
+1. Implement `LLMProtocol` trait in `src/protocol/{name}.rs`
+2. Create facade in `src/provider/{name}.rs`
+3. Add to provider registration in `src/provider/mod.rs`
+
+### To extend message handling:
+1. Add new `ContentBlock` variant in `src/types/content.rs`
+2. Update transform logic in `src/transform/`
+3. Update protocol implementations
+
+## 📚 Document Map
+
+| File | Purpose | Best For |
+|------|---------|----------|
+| CODEBASE_MAP.md | Detailed reference | Understanding types, finding code |
+| CODEBASE_SUMMARY.txt | Quick reference | Printing, quick lookup |
+| CODEBASE_MODULES.txt | Architecture | Understanding relationships |
+| This file (CODEBASE_README.md) | Navigation guide | Getting started |
+
+## 📊 File Statistics
+
+- **Main Library:** ~21,000 Rust LOC across 51 files
+- **Tests:** ~20 integration test files
+- **Examples:** 2 example files
+- **Documentation:** This codebase map + README.md + AGENTS.md + CHANGELOG.md
+
+## ✨ Key Takeaways
+
+Tiycore is a **well-architected, type-safe Rust library** for building LLM applications with:
+- A unified API for 17+ providers
+- Streaming-first event-based responses
+- Strong type system for compile-time safety
+- Built-in agent runtime for stateful loops
+- First-class tool/function calling support
+- Extensible protocol system for adding providers
+
+The codebase demonstrates **excellent Rust patterns**:
+- Trait-based abstraction (LLMProtocol)
+- Registry pattern for extensibility
+- Builder pattern for complex types
+- Strong error handling with thiserror
+- Async/await throughout
+
+Generated: May 12, 2026
+Total Map Size: ~60KB of comprehensive documentation
+
+---
+
+# tiycore
+
+Source: https://github.com/tiyagents/tiy-core/blob/master/README-ZH.md
+
+<div align="center">
+
+# tiycore
+
+**统一 LLM API 与有状态 Agent 运行时 (Rust)**
+
+[English](./README.md) | [中文](./README-ZH.md)
+
+</div>
+
+tiycore 是一个 Rust 库，提供统一的、与提供商无关的流式 LLM 补全接口，以及自主的 Agent 工具调用循环。只需编写一次应用逻辑，即可通过修改配置在 OpenAI、Anthropic、Google、Ollama 及 9+ 个其他提供商之间自由切换。
+
+<img width="2752" height="1536" alt="image" src="https://github.com/user-attachments/assets/f3d29f85-0ef0-4674-a159-4760e1876780" />
+
+## 核心特性
+
+- **一套接口，多个提供商** — 5 个协议级实现（OpenAI Completions、OpenAI Responses、Anthropic Messages、Google Generative AI / Vertex AI、Ollama）和 10 个代理提供商（OpenAI-Compatible、xAI、Groq、OpenRouter、DeepSeek、MiniMax、Kimi Coding、ZAI、Zenmux、OpenCode Go），统一在单一 `LLMProtocol` trait 之下。
+- **流式优先** — `EventStream<T, R>` 基于 `parking_lot::Mutex<VecDeque>` + `tokio::sync::Notify` 实现 `futures::Stream`。每个提供商返回 `AssistantMessageEventStream`，包含细粒度的增量事件：文本、思维链、工具调用参数和完成事件。
+- **工具 / 函数调用** — 通过 JSON Schema 定义工具，使用 `jsonschema` crate 验证参数，支持在 Agent 循环中并行或串行执行工具。
+- **有状态 Agent 运行时** — `Agent` 管理完整对话循环：流式 LLM → 检测工具调用 → 执行工具 → 重新请求 → 循环。支持引导中断（steering）、后续消息队列、事件订阅（观察者模式）、中止操作，以及可配置的最大轮次（默认 25）。
+- **扩展思维链** — 提供商特定的思维/推理支持，统一的 `ThinkingLevel` 枚举（Off → XHigh，支持 OpenAI GPT-5 和 Anthropic Opus 4.7+）以及 `ThinkingDisplay` 枚举（`Summarized` / `Omitted`）用于控制是否在响应中包含思维内容。跨提供商的思维块转换在消息变换中自动处理。
+- **默认线程安全** — 所有可变状态使用 `parking_lot` 锁和 `AtomicBool`，无中毒语义的并发设计。
+
+## 架构
+
+```mermaid
+graph TD
+    A[你的应用] --> B[Agent]
+    A --> C[LLMProtocol trait]
+    B --> C
+    C --> D[协议提供商]
+    C --> E[代理提供商]
+    D --> D1[OpenAI Completions]
+    D --> D2[OpenAI Responses]
+    D --> D3[Anthropic Messages]
+    D --> D4[Google GenAI / Vertex]
+    D --> D5[Ollama]
+    E --> E1[OpenAI-Compatible → OpenAI Completions]
+    E --> E2[xAI → OpenAI Completions]
+    E --> E3[Groq → OpenAI Completions]
+    E --> E4[OpenRouter → OpenAI Completions]
+    E --> E5[ZAI → OpenAI Completions]
+    E --> E6[DeepSeek → OpenAI Completions]
+    E --> E7[MiniMax → Anthropic]
+    E --> E8[Kimi Coding → Anthropic]
+    E --> E9[Zenmux → 自适应路由]
+    E --> E10[OpenCode Go → 自适应路由]
+```
+
+### 核心层
+
+| 层 | 路径 | 职责 |
+|---|---|---|
+| **Types** | `src/types/` | 与提供商无关的数据模型：`Message`、`ContentBlock`、`Model`、`Tool`、`Context`、`SecurityConfig` |
+| **Protocol** | `src/protocol/` | 线路格式实现（[完整文档](./src/protocol/README.md)） |
+| **Provider** | `src/provider/` | 服务商门面（[完整文档](./src/provider/README.md)） |
+| **Stream** | `src/stream/` | 通用 `EventStream<T, R>`，实现 `futures::Stream` |
+| **Agent** | `src/agent/` | 有状态对话管理器，含工具执行循环（[完整文档](./src/agent/README.md)） |
+| **Transform** | `src/transform/` | 跨提供商消息变换（思维块转换、工具调用 ID 规范化、孤儿工具调用处理） |
+| **Thinking** | `src/thinking/` | `ThinkingLevel` 枚举、`ThinkingDisplay` 枚举及提供商特定的思维选项 |
+| **Validation** | `src/validation/` | 工具参数 JSON Schema 验证 |
+| **Models** | `src/models/` | `ModelRegistry`，内置预定义模型（GPT-4o、Claude Sonnet 4、Gemini 2.5 Flash 等） |
+| **Catalog** | `src/catalog/` | 原生模型列表抓取、快照刷新，以及面向展示的元数据补全（[完整文档](./src/catalog/README.md)） |
+
+## 快速开始
+
+在 `Cargo.toml` 中添加依赖：
+
+```toml
+[dependencies]
+tiycore = "0.1.0"
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+```
+
+在正式发布前，本地联调仍可使用：
+
+```toml
+[dependencies]
+tiycore = { path = "../tiycore" }
+```
+
+### 流式补全
+
+```rust
+use futures::StreamExt;
+use tiycore::{
+    provider::get_provider,
+    types::*,
+};
+
+#[tokio::main]
+async fn main() {
+    // 构建模型
+    let model = Model::builder()
+        .id("gpt-4o-mini")
+        .name("GPT-4o Mini")
+        .provider(Provider::OpenAI)
+        .context_window(128000)
+        .max_tokens(16384)
+        .build()
+        .unwrap();
+
+    // 创建包含消息的上下文
+    let context = Context {
+        system_prompt: Some("You are a helpful assistant.".to_string()),
+        messages: vec![Message::User(UserMessage::text("法国的首都是什么？"))],
+        tools: None,
+    };
+
+    // 从 model 解析提供商并流式获取响应
+    // （提供商在首次访问时自动注册 — 无需手动设置）
+    let provider = get_provider(&model.provider).unwrap();
+    let options = StreamOptions {
+        api_key: Some(std::env::var("OPENAI_API_KEY").unwrap()),
+        ..Default::default()
+    };
+    let mut stream = provider.stream(&model, &context, options);
+
+    while let Some(event) = stream.next().await {
+        match event {
+            AssistantMessageEvent::TextDelta { delta, .. } => print!("{delta}"),
+            AssistantMessageEvent::Done { message, .. } => {
+                println!("\n--- 输入 {} tokens，输出 {} tokens ---",
+                    message.usage.input, message.usage.output);
+            }
+            AssistantMessageEvent::Error { error, .. } => {
+                eprintln!("错误: {:?}", error.error_message);
+            }
+            _ => {}
+        }
+    }
+}
+```
+
+### Agent 工具调用
+
+```rust
+use tiycore::{
+    agent::{Agent, AgentTool, AgentToolResult},
+    types::*,
+};
+
+#[tokio::main]
+async fn main() {
+    let agent = Agent::with_model(
+        Model::builder()
+            .id("gpt-4o-mini").name("GPT-4o Mini")
+            .provider(Provider::OpenAI)
+            .context_window(128000).max_tokens(16384)
+            .build().unwrap(),
+    );
+
+    agent.set_api_key(std::env::var("OPENAI_API_KEY").unwrap());
+    agent.set_system_prompt("你是一个有工具访问权限的助手。");
+    agent.set_tools(vec![AgentTool::new(
+        "get_weather", "获取天气", "获取指定城市的当前天气",
+        serde_json::json!({
+            "type": "object",
+            "properties": { "city": { "type": "string", "description": "城市名称" } },
+            "required": ["city"]
+        }),
+    )]);
+    agent.set_tool_executor_simple(|name, _id, args| {
+        let name = name.to_string();
+        let args = args.clone();
+        async move {
+            match name.as_str() {
+                "get_weather" => {
+                    let city = args["city"].as_str().unwrap_or("未知");
+                    AgentToolResult::text(format!("{city} 的天气：22°C，晴"))
+                }
+                _ => AgentToolResult::error(format!("未知工具: {name}")),
+            }
+        }
+    });
+
+    // Agent 自动循环：LLM → 工具调用 → 执行 → 重新请求 → 直至完成
+    let messages = agent.prompt("东京的天气怎么样？").await.unwrap();
+    println!("Agent 产生了 {} 条消息", messages.len());
+}
+```
+
+Agent 还支持钩子（beforeToolCall / afterToolCall / onPayload）、上下文管道（transformContext / convertToLlm）、事件订阅、引导 / 后续消息队列、思维链预算、自定义 HTTP 头（`AgentConfig` 的 `custom_headers` 字段）、自定义消息等更多能力。详见 **[Agent 模块完整文档](./src/agent/README.md)**。
+
+## 支持的提供商
+
+| 提供商 | 类型 | 环境变量 |
+|---|---|---|
+| OpenAI | 直接 | `OPENAI_API_KEY` |
+| Anthropic | 直接 | `ANTHROPIC_API_KEY` |
+| Google | 直接 | `GOOGLE_API_KEY` |
+| Ollama | 直接 | — |
+| OpenAI-Compatible | 委托 → OpenAI Completions | `OPENAI_API_KEY` |
+| xAI | 委托 → OpenAI Completions | `XAI_API_KEY` |
+| Groq | 委托 → OpenAI Completions | `GROQ_API_KEY` |
+| OpenRouter | 委托 → OpenAI Completions | `OPENROUTER_API_KEY` |
+| ZAI | 委托 → OpenAI Completions | `ZAI_API_KEY` |
+| DeepSeek | 委托 → OpenAI Completions | `DEEPSEEK_API_KEY` |
+| MiniMax | 委托 → Anthropic | `MINIMAX_API_KEY` |
+| Kimi Coding | 委托 → Anthropic | `KIMI_API_KEY` |
+| Zenmux | 自适应多协议 | `ZENMUX_API_KEY` |
+| OpenCode Go | 自适应多协议 | `OPENCODE_GO_API_KEY` |
+
+关于提供商配置详情、兼容性标志、Zenmux 自适应路由及如何添加新提供商，请参见 **[Provider 完整文档](./src/provider/README.md)**。
+
+关于线路格式协议内部原理（SSE 解析、请求构建、委托宏），请参见 **[Protocol 完整文档](./src/protocol/README.md)**。
+
+## 发布
+
+如果希望其他项目通过版本号依赖 `tiycore`，而不是填写 Git 仓库地址，需要先将该 crate 发布到 crates.io：
+
+```bash
+cargo login
+cargo package
+cargo publish
+```
+
+发布完成后，使用方即可直接这样写：
+
+```toml
+[dependencies]
+tiycore = "0.1.0"
+```
+
+## API Key 解析优先级
+
+Key 按以下优先级解析：
+
+1. `StreamOptions.api_key`（逐请求覆盖）
+2. 提供商的 `default_api_key()` 方法
+3. 环境变量（如 `OPENAI_API_KEY`、`ANTHROPIC_API_KEY`）
+
+Base URL 遵循相同模式：`StreamOptions.base_url` > `model.base_url` > 提供商的 `DEFAULT_BASE_URL`。
+
+## 安全配置
+
+tiycore 内置了集中式 `SecurityConfig` 结构体，统一管理所有安全限制和策略。每个字段都有安全的默认值 — 你只需覆盖想要修改的部分。
+
+### 启用安全配置
+
+**代码中使用（编程方式）：**
+
+```rust
+use tiycore::types::{SecurityConfig, HttpLimits, AgentLimits, StreamOptions};
+
+// 方式一：使用默认值（零配置）
+let options = StreamOptions::default();
+// options.security 为 None → 自动使用所有默认值
+
+// 方式二：覆盖特定值
+let security = SecurityConfig::default()
+    .with_http(HttpLimits {
+        connect_timeout_secs: 10,
+        request_timeout_secs: 600,
+        ..Default::default()
+    })
+    .with_agent(AgentLimits {
+        max_messages: 500,
+        max_parallel_tool_calls: 8,
+        ..Default::default()
+    });
+
+let options = StreamOptions {
+    api_key: Some("sk-...".to_string()),
+    security: Some(security),
+    ..Default::default()
+};
+```
+
+**从 JSON 配置文件加载：**
+
+```rust
+use tiycore::types::SecurityConfig;
+
+// 从文件加载 — 仅覆盖指定字段，其余使用默认值
+let json = std::fs::read_to_string("security.json").unwrap();
+let security: SecurityConfig = serde_json::from_str(&json).unwrap();
+```
+
+**从 TOML 配置文件加载（需要 `toml` crate）：**
+
+```rust
+let toml_str = std::fs::read_to_string("security.toml").unwrap();
+let security: SecurityConfig = toml::from_str(&toml_str).unwrap();
+```
+
+### JSON 配置参考
+
+完整的 `security.json`，包含所有字段及其默认值：
+
+```jsonc
+{
+  // HTTP 客户端和 SSE 流解析限制（每次 Provider 请求时生效）
+  "http": {
+    "connect_timeout_secs": 30,           // TCP 连接超时（秒）
+    "request_timeout_secs": 1800,         // 请求总超时，含流式传输（30 分钟）
+    "max_sse_line_buffer_bytes": 2097152, // SSE 行缓冲区上限，防止 OOM（2 MiB）
+    "max_error_body_bytes": 65536,        // 错误响应体最大读取字节数（64 KiB）
+    "max_error_message_chars": 4096       // 存入事件的错误消息最大字符数
+  },
+
+  // Agent 运行时限制
+  "agent": {
+    "max_messages": 1000,                 // 对话历史上限（0 = 无限，超出后 FIFO 丢弃最旧消息）
+    "max_parallel_tool_calls": 16,        // 并行工具执行上限
+    "tool_execution_timeout_secs": 120,   // 单次工具执行超时（2 分钟）
+    "validate_tool_calls": true,          // 执行前是否校验工具参数的 JSON Schema
+    "max_subscriber_slots": 128           // 最大事件订阅者槽位数
+  },
+
+  // EventStream 基础设施限制
+  "stream": {
+    "max_event_queue_size": 10000,        // 事件队列缓冲上限（0 = 无限）
+    "result_timeout_secs": 600            // EventStream::result() 阻塞超时（10 分钟）
+  },
+
+  // 请求头安全策略 — 防止自定义 Header 覆盖认证头
+  "headers": {
+    "protected_headers": [
+      "authorization",
+      "x-api-key",
+      "x-goog-api-key",
+      "anthropic-version",
+      "anthropic-beta"
+    ]
+  },
+
+  // Base URL 验证策略（SSRF 防护）
+  "url": {
+    "require_https": true,                // 强制 HTTPS（localhost/127.0.0.1 豁免）
+    "block_private_ips": false,           // 是否阻止私有/回环 IP（默认关闭，方便本地开发）
+    "allowed_schemes": ["https", "http"], // 允许的 URL scheme
+    "https_exempt_hosts": []              // 豁免 HTTPS 要求的主机名（如 [".oa.com", "llm.internal"]）
+  }
+}
+```
+
+> **部分覆盖：** 你只需包含想要修改的字段，省略的字段和整个 section 会自动使用默认值。例如 `{}` 表示全部使用默认值，`{"http": {"connect_timeout_secs": 10}}` 只修改连接超时。
+
+### TOML 配置参考
+
+同样的配置，TOML 格式：
+
+```toml
+[http]
+connect_timeout_secs = 30
+request_timeout_secs = 1800
+max_sse_line_buffer_bytes = 2097152
+max_error_body_bytes = 65536
+max_error_message_chars = 4096
+
+[agent]
+max_messages = 1000
+max_parallel_tool_calls = 16
+tool_execution_timeout_secs = 120
+validate_tool_calls = true
+max_subscriber_slots = 128
+
+[stream]
+max_event_queue_size = 10000
+result_timeout_secs = 600
+
+[headers]
+protected_headers = [
+  "authorization",
+  "x-api-key",
+  "x-goog-api-key",
+  "anthropic-version",
+  "anthropic-beta",
+]
+
+[url]
+require_https = true
+block_private_ips = false
+allowed_schemes = ["https", "http"]
+https_exempt_hosts = []
+```
+
+### 默认值速查表
+
+| 分组 | 字段 | 默认值 | 说明 |
+|---|---|---|---|
+| **http** | `connect_timeout_secs` | `30` | TCP 连接超时 |
+| | `request_timeout_secs` | `1800` | 请求总超时（30 分钟） |
+| | `max_sse_line_buffer_bytes` | `2097152` | SSE 缓冲区上限（2 MiB） |
+| | `max_error_body_bytes` | `65536` | 错误响应体读取上限（64 KiB） |
+| | `max_error_message_chars` | `4096` | 错误消息截断长度 |
+| **agent** | `max_messages` | `1000` | 历史消息上限（0 = 无限） |
+| | `max_parallel_tool_calls` | `16` | 并行工具执行上限 |
+| | `tool_execution_timeout_secs` | `120` | 单工具超时（2 分钟） |
+| | `validate_tool_calls` | `true` | JSON Schema 校验 |
+| | `max_subscriber_slots` | `128` | 订阅者槽位 |
+| **stream** | `max_event_queue_size` | `10000` | 事件队列上限（0 = 无限） |
+| | `result_timeout_secs` | `600` | Result 阻塞超时（10 分钟） |
+| **headers** | `protected_headers` | `["authorization", ...]` | 不可被覆盖 |
+| **url** | `require_https` | `true` | 强制 HTTPS（localhost 豁免） |
+| | `block_private_ips` | `false` | 私有 IP 阻断 |
+| | `allowed_schemes` | `["https", "http"]` | 允许的 URL scheme |
+| | `https_exempt_hosts` | `[]` | 豁免 HTTPS 的主机名（支持前缀点号后缀匹配） |
+
+## 构建与测试
+
+```bash
+cargo build                          # 构建库
+cargo test                           # 运行所有测试
+cargo test test_agent_state_new      # 按名称运行单个测试
+cargo test -- --nocapture            # 显示测试输出
+cargo fmt                            # 格式化代码
+cargo clippy                         # 代码检查
+
+# 运行示例（需要 API Key）
+cargo run --example basic_usage
+cargo run --example agent_example
+```
+
+## 项目结构
+
+```
+src/
+├── lib.rs              # Crate 根，公共 re-exports
+├── types/              # 与提供商无关的数据模型
+│   ├── model.rs        # Model, Provider, Api（通过 define_string_enum! 宏生成）, Cost, OpenAICompletionsCompat（CompatCapabilities, CompatThinking, CompatMessageFormat）
+│   ├── message.rs      # Message (User/Assistant/ToolResult), StopReason
+│   ├── content.rs      # ContentBlock (Text/Thinking/ToolCall/Image)
+│   ├── context.rs      # Context, Tool, StreamOptions
+│   ├── limits.rs       # SecurityConfig, HttpLimits, AgentLimits, StreamLimits, UrlPolicy, HeaderPolicy
+│   ├── events.rs       # AssistantMessageEvent（流式事件）
+│   └── usage.rs        # Token 用量追踪
+├── protocol/           # 线路格式协议实现（README.md）
+│   ├── traits.rs       # LLMProtocol trait
+│   ├── registry.rs     # 全局 ProtocolRegistry
+│   ├── common.rs       # 共享基础设施（URL 解析、payload hook、错误处理）
+│   ├── delegation.rs   # 代理提供商生成宏
+│   ├── openai_completions.rs  # OpenAI Chat Completions 协议
+│   ├── openai_responses.rs    # OpenAI Responses API 协议
+│   ├── anthropic.rs    # Anthropic Messages 协议
+│   └── google.rs       # Google GenAI + Vertex AI（双模式）
+├── provider/           # 服务商门面（README.md）
+│   ├── openai.rs       # OpenAI → protocol::openai_responses
+│   ├── anthropic.rs    # Anthropic → protocol::anthropic
+│   ├── google.rs       # Google → protocol::google
+│   ├── ollama.rs       # Ollama → protocol::openai_completions
+│   ├── xai.rs          # 代理 → OpenAI Completions
+│   ├── groq.rs         # 代理 → OpenAI Completions
+│   ├── openrouter.rs   # 代理 → OpenAI Completions
+│   ├── zai.rs          # 代理 → OpenAI Completions
+│   ├── minimax.rs      # 代理 → Anthropic
+│   ├── kimi_coding.rs  # 代理 → Anthropic
+│   ├── zenmux.rs       # 自适应三路路由
+│   └── opencode_go.rs # 自适应多协议路由
+├── catalog/
+│   ├── README.md       # Catalog 抓取/补全/快照文档
+│   └── mod.rs          # 原生模型列表 + 快照刷新 + metadata stores
+├── stream/
+│   └── event_stream.rs # 通用 EventStream<T, R> + AssistantMessageEventStream
+├── agent/
+│   ├── README.md      # Agent 模块完整文档
+│   ├── agent.rs        # Agent 循环：流式 → 工具 → 重新请求
+│   ├── state.rs        # 线程安全的 AgentState
+│   └── types.rs        # AgentConfig, AgentEvent, AgentTool, AgentHooks, ToolExecutor, ToolExecutionMode
+├── transform/
+│   ├── messages.rs     # 思维块转换、孤儿工具调用处理
+│   └── tool_calls.rs   # 工具调用 ID 规范化
+├── thinking/
+│   └── config.rs       # ThinkingLevel, 提供商特定选项
+├── validation/
+│   └── tool_validation.rs # 工具参数 JSON Schema 验证
+└── models/
+    ├── mod.rs           # ModelRegistry + 全局预定义模型
+    └── predefined.rs
+```
+
+## 许可证
+
+[MIT](https://opensource.org/licenses/MIT)
+
+---
