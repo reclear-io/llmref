@@ -1,0 +1,1997 @@
+# animedb
+
+Source: https://github.com/enrell/animedb/blob/main/README.md
+
+# animedb
+
+`animedb` is a Rust-first metadata project for local media servers.
+
+> **Advisory**: `animedb` stores and normalizes public metadata, but it does not override
+> provider Terms of Service, attribution requirements, authentication rules, rate limits or
+> mature-content restrictions. Before enabling bulk sync for a source, verify that your
+> intended usage is allowed by that source and configure conservative sync budgets.
+
+It has two consumption modes that can be used separately or together:
+
+- **local-first**: manage a local SQLite catalog with schema, downloads, sync, FTS5 search and
+  JSON source payloads
+- **remote-first**: query normalized metadata from remote providers without forcing client
+  applications to manage persistence or provider-specific normalization
+
+The project also ships a Rust GraphQL API on top of the same crate.
+
+See [REFERENCE.md](REFERENCE.md) for the current library and API reference.
+
+## Supported providers
+
+| Provider | Media kinds | Data source | Episodes | Licensed under |
+|----------|-------------|-------------|----------|---------------|
+| AniList | Anime, Manga | GraphQL API | N | [AniList Terms](https://anilist.co/terms) |
+| Jikan (MyAnimeList) | Anime, Manga | REST API | Y | Jikan MIT |
+| Kitsu | Anime, Manga | REST API | Y | [Kitsu API Policy](https://kitsu.io/terms) |
+| TVmaze | Shows | REST API | Y | CC BY-SA 4.0 |
+| IMDb | Movies, Shows | Official TSV datasets | Y | [IMDb Conditions](https://www.imdb.com/conditions) |
+
+## Workspace
+
+- `crates/animedb` — library crate with SQLite schema management, sync and query APIs
+- `crates/animedb-api` — GraphQL API binary built on top of `animedb`
+
+## Feature flags
+
+```toml
+# Full featured (local SQLite + all providers) — default
+animedb = "0.6.2"
+
+# Remote-only, no SQLite dependency (safe for sqlx-based projects)
+animedb = { version = "0.6.2", default-features = false, features = ["remote"] }
+```
+
+- `local-db` (default): local SQLite storage, sync state persistence, and the [`AnimeDb`] type.
+  This feature pulls in `rusqlite` with a bundled SQLite.
+- `remote` (default): remote provider clients and the normalized data model. Zero native
+  dependencies.
+
+**Why feature gates?** `local-db` requires `rusqlite` (bundled SQLite). Many Rust projects
+already use `sqlx` with its own SQLite linkage, and Cargo rejects putting both in the same
+dependency graph. If your project uses `sqlx`, depend on animedb with only `features = ["remote"]`
+to get all provider clients, normalization types, and sync data structures without any SQLite
+conflict.
+
+## Current Rust surface
+
+### Local-first
+
+```rust
+use animedb::{AnimeDb, SourceName};
+
+let (db, report) = AnimeDb::generate_database_with_report("/tmp/animedb.sqlite")?;
+println!("downloaded {} records", report.total_upserted_records);
+
+let updated = AnimeDb::sync_database("/tmp/animedb.sqlite")?;
+println!("synced {} records", updated.total_upserted_records);
+
+let monster = db.anime_metadata().by_external_id(SourceName::AniList, "19")?;
+println!("{}", monster.name());
+
+let show = db.show_metadata().search("breaking bad")?;
+let show = db.get_by_external_id(SourceName::Imdb, "tt0903747")?;
+
+let movies = db.movie_metadata().search("spirited away")?;
+println!("movie hits: {}", movies.len());
+
+# Ok::<(), animedb::Error>(())
+```
+
+### Remote-first
+
+```rust
+use animedb::AnimeDb;
+
+let remote = AnimeDb::remote_anilist();
+let results = remote.anime_metadata().search("monster")?;
+let media = remote.anime_metadata().by_id("19")?;
+# Ok::<(), animedb::Error>(())
+```
+
+Or choose the provider dynamically:
+
+```rust
+use animedb::{AnimeDb, RemoteSource};
+
+let remote = AnimeDb::remote(RemoteSource::Tvmaze);
+let results = remote.show_metadata().search("breaking bad")?;
+# Ok::<(), animedb::Error>(())
+```
+
+## Media kinds
+
+All providers map to one of four supported kinds:
+
+```rust
+pub enum MediaKind {
+    Anime,  // Japanese animation
+    Manga,  // Japanese comics
+    Show,   // TV series (from TVmaze / IMDb)
+    Movie,  // Films (from IMDb)
+}
+```
+
+## SQLite schema
+
+The SQLite catalog is created and migrated by the crate itself. The current schema includes:
+
+- `media` — canonical normalized records
+- `media_alias` — normalized aliases and synonyms
+- `media_external_id` — source-specific identifiers
+- `source_record` — raw per-source JSON payloads and source update metadata
+- `field_provenance` — winner-per-field audit trail for canonical merge decisions
+- `sync_state` — persisted sync checkpoints/cursors
+- `media_fts` — `FTS5` index for title, alias and synopsis search
+- `episode` — episode metadata for anime and shows
+
+### Episodes
+
+The `episode` table stores enriched episode data fetched from providers. Key fields:
+
+- `season_number`, `episode_number`, `absolute_number` — episode numbering
+- `title_display`, `title_original` — localized titles
+- `synopsis`, `air_date`, `runtime_minutes`, `thumbnail_url` — metadata
+
+#### Single Media Sync
+
+Query and merge episodes for a media record:
+
+```rust
+use animedb::{AnimeDb, SourceName};
+
+let mut db = AnimeDb::open("/tmp/animedb.sqlite")?;
+
+// Finds the stored media by Kitsu ID, then tries every episode-capable
+// external ID attached to that merged media record (Jikan/MAL, Kitsu, TVmaze).
+db.fetch_and_store_episodes_by_external_id(SourceName::Kitsu, "1")?;
+
+// Retrieve the media document with its episode list
+let doc = db.media_document_by_external_id(SourceName::Kitsu, "1")?;
+println!("{} has {} episodes", doc.media.title_display, doc.episodes.len());
+```
+
+For remote-only callers that want one merged episode record per flat episode number, use the
+merged aggregation helper. It fetches from every episode-capable external ID, groups by
+`absolute_number.or(episode_number)`, skips records with no episode number, and selects each
+field from the highest-priority provider that supplied a value. For anime episode data, Jikan
+wins over Kitsu when both have a value, while Kitsu can still fill fields missing from Jikan.
+
+```rust
+use animedb::{MediaKind, RemoteApi};
+
+let media = RemoteApi::jikan().anime_metadata().by_id("19")?.unwrap();
+let episodes = RemoteApi::fetch_merged_episodes_from_external_ids(
+    MediaKind::Anime,
+    &media.external_ids,
+)?;
+println!("fetched {} merged episode records", episodes.len());
+```
+
+If you need the raw per-provider records instead, call the lower-level aggregation API directly:
+
+```rust
+use animedb::{MediaKind, RemoteApi};
+
+let media = RemoteApi::jikan().anime_metadata().by_id("19")?.unwrap();
+let provider_records = RemoteApi::fetch_episodes_from_external_ids(
+    MediaKind::Anime,
+    &media.external_ids,
+)?;
+println!("fetched {} provider episode records", provider_records.len());
+```
+
+If you intentionally want one provider only, call the provider facade directly:
+
+```rust
+let episodes = RemoteApi::jikan().anime_metadata().episodes("19")?;
+```
+
+#### Bulk Seeding
+
+To seed the entire database with episode metadata (including high-performance IMDb bulk dump ingestion):
+
+```rust
+use animedb::AnimeDb;
+
+let mut db = AnimeDb::open("/tmp/animedb.sqlite")?;
+
+// Ingest IMDb episode dumps and query APIs for all other providers
+let total = db.sync_service().sync_all_episodes()?;
+println!("Synced {total} episode records across all providers");
+```
+
+Note: `media.episodes` is the total episode count from provider metadata.
+`MediaDocument.episodes` is the enriched list of persisted episode records
+fetched from a specific provider.
+
+The connection is configured with:
+
+- `PRAGMA journal_mode=WAL`
+- `PRAGMA synchronous=NORMAL`
+- `PRAGMA foreign_keys=ON`
+- `PRAGMA busy_timeout=5000`
+- `PRAGMA temp_store=MEMORY`
+
+## GraphQL API
+
+The GraphQL API is provided by `animedb-api`. Run it locally:
+
+```bash
+cargo run -p animedb-api
+```
+
+Environment variables:
+
+- `ANIMEDB_DATABASE_PATH` — SQLite file path, default `/data/animedb.sqlite`
+- `ANIMEDB_LISTEN_ADDR` — bind address, default `0.0.0.0:8080`
+
+Query example (search shows and movies):
+
+```graphql
+{
+  search(query: "breaking bad", options: { limit: 5, mediaKind: SHOW }) {
+    mediaId
+    titleDisplay
+    mediaKind
+    genres
+    externalIds { source sourceId }
+  }
+}
+```
+
+## Docker
+
+Build and run the Rust GraphQL API:
+
+```bash
+docker build -t animedb .
+docker run --rm -p 8080:8080 -v $(pwd)/data:/data animedb
+```
+
+## Make targets
+
+The repository includes a `Makefile` for common workflows:
+
+- `make build` — compile the workspace
+- `make test` — run the Rust test suite
+- `make test-e2e` — run the end-to-end integration test (`scripts/e2e_test.sh`)
+- `make docker-build` — build the API image
+- `make docker-run` — run the API image locally
+- `make debug-api` — run the GraphQL API directly with `cargo run`
+
+---
+
+# AGENTS.md
+
+Source: https://github.com/enrell/animedb/blob/main/AGENTS.md
+
+# AGENTS.md
+
+Agent guidance for animedb development.
+
+## Project Overview
+
+`animedb` is a Rust workspace for anime/manga metadata — local SQLite catalog + remote provider clients + a GraphQL API. Two crates:
+
+- `crates/animedb` — core library (local-first + remote-first)
+- `crates/animedb-api` — GraphQL API binary
+
+## Workspace Structure
+
+```
+crates/animedb/src/
+├── lib.rs                    # Public exports + feature-gated modules
+├── main.rs                   # Binary entry (unused; animedb-api is the binary)
+├── catalog.rs                # RemoteCatalog, RemoteMetadataCollection
+├── db.rs                     # AnimeDb facade, MetadataCollection
+├── error.rs                  # Error enum (thiserror)
+├── merge.rs                  # Merge engine (merge_media, MergeDecision, etc.)
+├── model.rs                  # Canonical types (CanonicalMedia, SearchOptions, etc.)
+├── remote.rs                 # RemoteApi, RemoteCollection, RemoteSource
+├── schema.rs                 # SQLite migrations
+├── provider/                 # HTTP provider clients
+│   ├── mod.rs               # Provider trait + default_registry
+│   ├── http.rs              # HttpClient (lazy reqwest::blocking::Client)
+│   ├── anilist.rs           # AniList GraphQL client
+│   ├── jikan.rs             # Jikan (MyAnimeList) REST client
+│   ├── kitsu.rs             # Kitsu REST client
+│   ├── tvmaze.rs            # TVmaze REST client
+│   ├── imdb.rs              # IMDb TSV client
+│   ├── registry.rs          # ProviderRegistry
+│   └── service.rs           # FetchPage trait
+├── repository/              # SQLite persistence
+│   ├── media.rs            # MediaRepository
+│   ├── episodes.rs          # EpisodeRepository
+│   ├── search.rs            # FTS5 search
+│   ├── sync_state.rs       # SyncStateRepository
+│   └── mod.rs
+└── sync/                    # Sync orchestration
+    ├── common.rs            # SyncReport, SyncOutcome, SyncRequest
+    ├── episodes.rs         # Episode sync logic
+    ├── media.rs            # Media sync logic
+    └── mod.rs
+
+crates/animedb-api/src/
+├── lib.rs                   # GraphQL schema + Axum server
+└── main.rs                  # Binary entry point
+```
+
+## Key Conventions
+
+### Feature Flags
+
+- `local-db` (default): SQLite storage via rusqlite.
+- `remote` (default): provider clients and normalized types.
+
+Both are on by default. Many `#[cfg(feature = "local-db")]` guards throughout the codebase.
+
+### Error Handling
+
+All errors flow through `animedb::Error` (from `error.rs`, derived via `thiserror::Error`). Variants:
+- `Http(reqwest::Error)` — HTTP client errors
+- `Sql(rusqlite::Error)` — SQLite errors
+- `Provider(String)` — provider logic errors
+- `Sync(String)` — mutex poisoning / sync state errors
+
+### Provider HTTP Clients
+
+`HttpClient` in `provider/http.rs` uses lazy initialization — the `reqwest::blocking::Client` is constructed on first HTTP call, not in `new()`. This prevents panics when `HttpClient` is constructed inside a `#[tokio::test]` runtime (which does not support blocking operations). Always use `.client()` to get the client.
+
+### Merge Engine
+
+`merge/` is pure domain logic — no SQLite, no async. Key public exports from `lib.rs`:
+
+```rust
+pub use merge::{merge_media, merge_episode_source_records, provider_weight, MergeDecision};
+#[cfg(feature = "local-db")]
+pub use merge::make_provenance;
+```
+
+### SQLite Schema
+
+Schema migrations live in `schema.rs`. The DB version is tracked via SQLite `user_version`. Migrations run automatically on `AnimeDb::open`.
+
+### Test Conventions
+
+- `#[tokio::test]` uses `CurrentThread` runtime — no blocking operations allowed.
+- Regression tests for `HttpClient` live inside `#[cfg(test)]` in `provider/http.rs`.
+- `tokio` is a dev-dependency (added for regression tests).
+
+## Version & Changelog
+
+- **Quality Gates:** Before creating a PR, pushing to a remote, or publishing a release, you **must** run `rustquty` to verify code quality. Any issues reported by `rustquty` must be fixed before proceeding.
+- Version is set in `[workspace.package]` in `Cargo.toml` (`version = "0.3.5"`).
+- Each crate has its own `CHANGELOG.md` (Keep a Changelog format).
+- On version bump: bump `workspace.package.version`, update both `CHANGELOG.md` files, then `cargo publish` each crate.
+
+## Common Tasks
+
+### Run tests
+```bash
+cargo test
+```
+
+### Run the GraphQL API locally
+```bash
+cargo run -p animedb-api
+```
+
+### Build Docker image
+```bash
+docker build -t animedb .
+docker run --rm -p 8080:8080 -v $(pwd)/data:/data animedb
+```
+
+### Publish to crates.io
+```bash
+cargo publish -p animedb
+cargo publish -p animedb-api
+```
+
+### Add a new provider
+1. Add provider struct in `provider/` (e.g., `provider/foo.rs`).
+2. Implement `Provider` trait from `provider/mod.rs`.
+3. Register in `provider/registry.rs` (`default_registry()`).
+4. Add module to `provider/mod.rs`.
+5. Add `FooProvider` export to `lib.rs` `provider/` re-exports.
+
+## Provider-Specific Notes
+
+- **AniList**: GraphQL API. Uses `post_with_retry` for mutations. Rate-limited (90 req/min).
+- **Jikan**: REST (MyAnimeList). Free, no auth. Rate-limited (3 req/sec).
+- **Kitsu**: REST. Requires auth token for some endpoints. Uses JSON:API format.
+- **TVmaze**: REST. Free, no auth. Good for show/movie metadata.
+- **IMDb**: TSV datasets. Requires download + periodic refresh. Not real-time.
+
+See `docs/` for provider-specific behavior and data coverage notes.
+
+---
+
+# AniList API Implementation Status
+
+Source: https://github.com/enrell/animedb/blob/main/docs/anilist.md
+
+# AniList API Implementation Status
+
+**Base URL:** `https://graphql.anilist.co`
+**API Type:** GraphQL (POST only)
+
+This document tracks the implementation status of all AniList GraphQL API
+operations in `crates/animedb/src/provider.rs`.
+
+## Overview
+
+The `AniListProvider` struct implements the `RemoteProvider` trait with three core methods:
+
+- `fetch_page()` — paginated listing via `Page { media }` query
+- `search()` — text search via `Page { media(search: ...) }` query
+- `get_by_id()` — fetch single resource via `Media(id: ...)` query
+
+**Currently implemented operations:**
+
+| Operation | GraphQL Path | Status |
+|-----------|--------------|--------|
+| `Page media` (paginated listing) | `Page(page, perPage) { media }` | ✅ Full |
+| `Page media` + `search` filter | `Page { media(search: ...) }` | ✅ Full |
+| `Media(id)` (single by ID) | `Media(id: ..., type: ...)` | ✅ Full |
+
+## Group: Media (Anime/Manga)
+
+### Page.media
+
+| Operation | GraphQL Type | Arguments | Status |
+|-----------|--------------|-----------|--------|
+| Paginated listing | `Page` | `page`, `perPage`, `type`, `sort` | ✅ Full |
+| Text search | `Page` | `search`, `type` | ✅ Full |
+| Filter by format | `Page` | `format_in` | ❌ Not Implemented |
+| Filter by status | `Page` | `status` | ❌ Not Implemented |
+| Filter by season | `Page` | `season`, `seasonYear` | ❌ Not Implemented |
+| Filter by genres | `Page` | `genre_in`, `genre_not_in` | ❌ Not Implemented |
+| Filter by tags | `Page` | `tag_in`, `tag_not_in` | ❌ Not Implemented |
+| Filter by year | `Page` | `startDate_lesser`, `startDate_greater` | ❌ Not Implemented |
+| Filter by episodes | `Page` | `episodes_lesser`, `episodes_greater` | ❌ Not Implemented |
+| Filter by duration | `Page` | `duration_lesser`, `duration_greater` | ❌ Not Implemented |
+| Filter by country | `Page` | `countryOfOrigin` | ❌ Not Implemented |
+| Filter by source | `Page` | `source` | ❌ Not Implemented |
+| Filter by licensing | `Page` | `licensedById_in`, `isLicensed` | ❌ Not Implemented |
+| Sort options | `Page` | `sort` (many values) | ❌ Not Implemented |
+| Adult content filter | `Page` | `isAdult` | ❌ Not Implemented |
+
+### Media (single resource)
+
+| Operation | GraphQL Type | Arguments | Status |
+|-----------|--------------|-----------|--------|
+| Fetch by ID | `Media` | `id`, `type` | ✅ Full |
+| Full details with relations | `Media` | `id`, type`, include` | ❌ Not Implemented |
+| Characters | `Media` | `id`, `type` + characters query | ❌ Not Implemented |
+| Staff | `Media` | `id`, `type` + staff query | ❌ Not Implemented |
+| Studios | `Media` | `id`, `type` + studios query | ❌ Not Implemented |
+| Trends | `Media` | `id` + `MediaTrend` query | ❌ Not Implemented |
+| Airing schedule | `Media` | `id` + `AiringSchedule` query | ❌ Not Implemented |
+| External links | `Media` | `id` + `externalLinks` | ❌ Not Implemented |
+| Streaming episodes | `Media` | `id` + `streamingEpisodes` | ❌ Not Implemented |
+| Reviews | `Media` | `id` + `reviews` query | ❌ Not Implemented |
+| Recommendations | `Media` | `id` + `recommendations` query | ❌ Not Implemented |
+
+## Group: Characters
+
+### Character queries
+
+| Operation | GraphQL Type | Arguments | Status |
+|-----------|--------------|-----------|--------|
+| Fetch character by ID | `Character` | `id` | ❌ Not Implemented |
+| Character page listing | `Page` | `page`, `perPage` + `characters` | ❌ Not Implemented |
+| Character search | `Page` | `search`, type filter | ❌ Not Implemented |
+| Character media | `Character` | `id` + `media` | ❌ Not Implemented |
+| Character voice actors | `Character` | `id` + `voiceActors` | ❌ Not Implemented |
+| Character images | `Character` | `id` + `image` | ❌ Not Implemented |
+
+## Group: Staff (People)
+
+### Staff queries
+
+| Operation | GraphQL Type | Arguments | Status |
+|-----------|--------------|-----------|--------|
+| Fetch staff by ID | `Staff` | `id` | ❌ Not Implemented |
+| Staff page listing | `Page` | `page`, `perPage` + `staff` | ❌ Not Implemented |
+| Staff search | `Page` | `search` + `staff` | ❌ Not Implemented |
+| Staff media | `Staff` | `id` + `media` | ❌ Not Implemented |
+| Staff voice roles | `Staff` | `id` + `voiceActors` | ❌ Not Implemented |
+| Staff images | `Staff` | `id` + `image` | ❌ Not Implemented |
+
+## Group: Studios
+
+### Studio queries
+
+| Operation | GraphQL Type | Arguments | Status |
+|-----------|--------------|-----------|--------|
+| Fetch studio by ID | `Studio` | `id` | ❌ Not Implemented |
+| Studio page listing | `Page` | `page`, `perPage` + `studios` | ❌ Not Implemented |
+| Studio media | `Studio` | `id` + `media` | ❌ Not Implemented |
+
+## Group: Users
+
+### User queries
+
+| Operation | GraphQL Type | Arguments | Status |
+|-----------|--------------|-----------|--------|
+| Current viewer (auth) | `Viewer` | — | ❌ Not Implemented |
+| User profile by name | `User` | `name` | ❌ Not Implemented |
+| User by ID | `User` | `id` | ❌ Not Implemented |
+| User favourites | `User` | `id` + `favourites` | ❌ Not Implemented |
+| User statistics | `User` | `id` + `statistics` | ❌ Not Implemented |
+| User anime list | `User` | `id` + `animeStatistics` | ❌ Not Implemented |
+| User manga list | `User` | `id` + `mangaStatistics` | ❌ Not Implemented |
+| User activity | `User` | `id` + `activities` | ❌ Not Implemented |
+| User followers | `User` | `id` + `followers` | ❌ Not Implemented |
+| User following | `User` | `id` + `following` | ❌ Not Implemented |
+| User statistics (site) | SiteStatistics | — | ❌ Not Implemented |
+
+## Group: MediaList (User Lists)
+
+### MediaList queries
+
+| Operation | GraphQL Type | Arguments | Status |
+|-----------|--------------|-----------|--------|
+| User's anime list | `MediaList` | `userId`, `type`, `status` | ❌ Not Implemented |
+| User's manga list | `MediaList` | `userId`, `type`, `status` | ❌ Not Implemented |
+| List entry by ID | `MediaList` | `id` | ❌ Not Implemented |
+| List entries for media | `Page` | `mediaId` | ❌ Not Implemented |
+
+## Group: Reviews
+
+### Review queries
+
+| Operation | GraphQL Type | Arguments | Status |
+|-----------|--------------|-----------|--------|
+| All reviews page | `Page` | `page`, `perPage` + `reviews` | ❌ Not Implemented |
+| Reviews for media | `Media` | `id` + `reviews` | ❌ Not Implemented |
+| Review by ID | `Review` | `id` | ❌ Not Implemented |
+| User reviews | `User` | `id` + `reviews` | ❌ Not Implemented |
+
+## Group: Recommendations
+
+### Recommendation queries
+
+| Operation | GraphQL Type | Arguments | Status |
+|-----------|--------------|-----------|--------|
+| All recommendations page | `Page` | `page`, `perPage` + `recommendations` | ❌ Not Implemented |
+| Recommendations for media | `Media` | `id` + `recommendations` | ❌ Not Implemented |
+| Recommendation by ID | `Recommendation` | `id` | ❌ Not Implemented |
+
+## Group: Airing Schedule
+
+### AiringSchedule queries
+
+| Operation | GraphQL Type | Arguments | Status |
+|-----------|--------------|-----------|--------|
+| Airing schedules page | `Page` | `page`, `perPage` + `airingSchedules` | ❌ Not Implemented |
+| Filter by media | `Page` | `mediaId` | ❌ Not Implemented |
+| Filter by episode | `Page` | `episode` | ❌ Not Implemented |
+| Filter by time range | `Page` | `airingAt_lesser`, `airingAt_greater` | ❌ Not Implemented |
+| Notifcation query | `Notification` | — | ❌ Not Implemented |
+
+## Group: Trends
+
+### Trend queries
+
+| Operation | GraphQL Type | Arguments | Status |
+|-----------|--------------|-----------|--------|
+| Media trends | `MediaTrend` | `mediaId`, `sort` | ❌ Not Implemented |
+| Site trends | SiteStatistics | — | ❌ Not Implemented |
+
+## Group: Mutations
+
+### Write operations
+
+| Operation | GraphQL Mutation | Status |
+|-----------|-----------------|--------|
+| Save media list entry | `SaveMediaListEntry` | ❌ Not Implemented |
+| Delete media list entry | `DeleteMediaListEntry` | ❌ Not Implemented |
+| Update media list entries (batch) | `UpdateMediaListEntries` | ❌ Not Implemented |
+| Add anime to list | `SaveMediaListEntry` | ❌ Not Implemented |
+| Add manga to list | `SaveMediaListEntry` | ❌ Not Implemented |
+| Toggle favourite | `ToggleFavourite` | ❌ Not Implemented |
+| Rate review | `RateReview` | ❌ Not Implemented |
+| Delete review | `DeleteReview` | ❌ Not Implemented |
+
+## Notes
+
+- **Rate Limit:** AniList allows 90 requests per minute. The `min_interval()` is set to 700ms.
+- **API Type:** AniList is a GraphQL API. All requests are POST to
+  `https://graphql.anilist.co` with a JSON body containing `query` and `variables`.
+- **Auth:** Currently no authentication is implemented (public queries only).
+- **Pagination:** Cursor-based pagination via `Page.pageInfo.hasNextPage`.
+- **MediaType enum:** Values are `ANIME`, `MANGA`.
+- **MediaSort enum:** Values include `ID`, `TITLE_ROMAJI`, `TITLE_ENGLISH`,
+  `START_DATE`, `POPULARITY_DESC`, `SCORE_DESC`, `TRENDING_DESC`, etc.
+
+---
+
+# IMDb Dataset (Dump) Implementation Status
+
+Source: https://github.com/enrell/animedb/blob/main/docs/imdb.md
+
+# IMDb Dataset (Dump) Implementation Status
+
+**Source:** IMDb plain text dataset files (TSV)
+**Download:** `https://datasets.imdbws.com/`
+
+This document tracks the implementation status of all IMDb dataset operations in
+`crates/animedb/src/provider.rs`.
+
+## Overview
+
+The `ImdbProvider` does **not** use a traditional REST API. Instead, it downloads
+and parses IMDb's publicly available dataset files (TSV format, gzip-compressed).
+These files are published by IMDb and updated regularly.
+
+The `RemoteProvider` trait is implemented with:
+
+- `fetch_page()` — scans the `title.basics.tsv.gz` dataset sequentially with page/offset pagination
+- `search()` — scans the same file matching against primary title
+- `get_by_id()` — looks up by `tconst` (IMDb ID) in the dataset
+
+**Currently implemented operations:**
+
+| Operation | Method | Status |
+|-----------|--------|--------|
+| Sequential scan of title.basics | `fetch_page()` | ✅ Full |
+| Text search in title.basics | `search()` | ✅ Full |
+| Direct ID lookup by tconst | `get_by_id()` | ✅ Full |
+
+## Available Dataset Files
+
+IMDb publishes several dataset files. Only a subset is currently used.
+
+### Currently Used
+
+| File | Contents | Status |
+|------|----------|--------|
+| `title.basics.tsv.gz` | Primary title data: type, title, year, runtime, genres | ✅ Parsed |
+| `title.ratings.tsv.gz` | Average rating and vote count per title | ✅ Parsed (ratings only) |
+
+### Not Yet Used
+
+| File | Contents | Status |
+|------|----------|--------|
+| `title.akas.tsv.gz` | Alternative titles and AKA entries | ❌ Not Implemented |
+| `title.crew.tsv.gz` | Director/writer information | ❌ Not Implemented |
+| `title.principals.tsv.gz` | Cast/crew principals (ordering, category, job) | ❌ Not Implemented |
+| `title.episode.tsv.gz` | Episode relationships (parent series, season, episode) | ❌ Not Implemented |
+| `name.basics.tsv.gz` | Person names and known titles | ❌ Not Implemented |
+
+## Title Types (Media Kinds)
+
+The `title.basics.tsv.gz` file contains multiple title types. Currently mapped to `MediaKind`:
+
+| titleType | MediaKind | Notes |
+|-----------|-----------|-------|
+| `movie` | `Movie` | Feature films |
+| `tvMovie` | `Movie` | TV movies |
+| `short` | `Movie` | Short films |
+| `tvSeries` | `Show` | TV series |
+| `tvMiniSeries` | `Show` | Mini series |
+| `tvSpecial` | `Show` | TV specials |
+| `video` | `Movie` | Videos |
+| `videoGame` | — | Not mapped (game entries) |
+
+The following types are **skipped** during import:
+
+- `tvEpisode` — Episodes are linked to parent series; stored as part of show data
+- `tvShort` — Short TV content
+- `radioEpisode`, `radioMix`, `radioRail` — Legacy/unsupported
+
+## Dataset Fields (title.basics.tsv)
+
+| Column | Field | Status |
+|--------|-------|--------|
+| `tconst` | IMDb ID / source_id | ✅ Full |
+| `titleType` | format (media kind hint) | ✅ Full |
+| `primaryTitle` | title_display / title_english | ✅ Full |
+| `originalTitle` | title_english (if different) | ✅ Full |
+| `isAdult` | nsfw flag | ✅ Full |
+| `startYear` | season_year | ✅ Full |
+| `endYear` | (not stored) | — |
+| `runtimeMinutes` | episodes (as proxy for runtime) | ✅ Full |
+| `genres` | genres array | ✅ Full |
+
+## Dataset Fields (title.ratings.tsv)
+
+| Column | Field | Status |
+|--------|-------|--------|
+| `tconst` | IMDb ID (join key) | ✅ Full |
+| `averageRating` | provider_rating (scaled 0-1) | ✅ Full |
+| `numVotes` | (not stored) | — |
+
+## Not Implemented Operations
+
+### title.akas.tsv (Alternative Titles)
+
+| Operation | Description | Status |
+|-----------|-------------|--------|
+| Parse AKA entries | Load alternative titles per title | ❌ Not Implemented |
+| Map language/country variants | Store as `aliases` or `title_native` | ❌ Not Implemented |
+
+### title.crew.tsv (Director/Writer)
+
+| Operation | Description | Status |
+|-----------|-------------|--------|
+| Parse director/writer | Extract `directors` and `writers` | ❌ Not Implemented |
+| Map to staff/people | Cross-reference with name.basics | ❌ Not Implemented |
+
+### title.principals.tsv (Cast/Crew Principals)
+
+| Operation | Description | Status |
+|-----------|-------------|--------|
+| Parse cast/crew principals | Load cast ordering and roles | ❌ Not Implemented |
+| Map characters | Map `characters` field to Character entries | ❌ Not Implemented |
+| Map job categories | Map `category` (actor, director, etc.) | ❌ Not Implemented |
+
+### title.episode.tsv (Episode Relationships)
+
+| Operation | Description | Status |
+|-----------|-------------|--------|
+| Parse episode data | Load parent series ID, season, episode number | ✅ Full |
+| Build episode hierarchy | Map episodes to parent show | ✅ Full |
+| Handle specials | Map `seasonNumber`, `episodeNumber` | ❌ Not Implemented |
+
+### name.basics.tsv (People)
+
+| Operation | Description | Status |
+|-----------|-------------|--------|
+| Parse person data | Load person names and known credits | ❌ Not Implemented |
+| Cross-reference with crew/cast | Link people to their credits | ❌ Not Implemented |
+
+## Notes
+
+- **No rate limit** — IMDb datasets are downloaded files, not an API. `min_interval()` is `ZERO`.
+- **Dataset refresh:** IMDb updates their dataset files daily. New downloads reflect current data.
+- **Pagination:** Sequential line-based pagination over the gzip-compressed TSV
+  file. No efficient seeking; each page re-downloads and re-scans from the
+  beginning of `title.basics.tsv.gz`.
+- **Search performance:** O(n) linear scan — search reads through the entire dataset for every query.
+- **Adult content filter:** The `isAdult` flag is mapped to the `nsfw` field.
+- **External IDs:** The `tconst` (e.g., `tt1234567`) is stored as the source ID,
+  with IMDb URL `https://www.imdb.com/title/{tconst}/`.
+- **Data freshness:** IMDb dataset files are refreshed daily but do not reflect real-time changes.
+
+---
+
+# Jikan API Implementation Status
+
+Source: https://github.com/enrell/animedb/blob/main/docs/jikan.md
+
+# Jikan API Implementation Status
+
+**Base URL:** `https://api.jikan.moe/v4`
+**Base API Path:** `/v4`
+
+This document tracks the implementation status of all Jikan API endpoints in
+`crates/animedb/src/provider.rs`.
+
+## Overview
+
+The `JikanProvider` struct implements the `RemoteProvider` trait with three core methods:
+
+- `fetch_page()` — paginated listing of anime/manga
+- `search()` — text search with `q` parameter
+- `get_by_id()` — fetch single resource by ID
+
+**Currently implemented endpoints:**
+
+| Method | Path | Status |
+|--------|------|--------|
+| GET | `/anime` | ✅ Full |
+| GET | `/manga` | ✅ Full |
+| GET | `/anime/{id}` | ✅ Full |
+| GET | `/manga/{id}` | ✅ Full |
+| GET | `/anime` + `q` | ✅ Full |
+| GET | `/manga` + `q` | ✅ Full |
+
+## Group: Anime
+
+### Anime [/anime/{id}]
+
+| Operation | Method | Path | Query Params | Status |
+|-----------|--------|------|--------------|--------|
+| Fetch Collection | GET | `/anime` | `page`, `limit`, `sfw`, `order_by`, `sort` | ✅ Full |
+| Fetch Resource | GET | `/anime/{id}` | `extension` | ✅ Full |
+| Full Details | GET | `/anime/{id}/full` | — | ❌ Not Implemented |
+| Character Cast | GET | `/anime/{id}/characters` | — | ❌ Not Implemented |
+| Staff List | GET | `/anime/{id}/staff` | — | ❌ Not Implemented |
+| Episode List | GET | `/anime/{id}/episodes` | `page` | ✅ Full |
+| Specific Episode | GET | `/anime/{id}/episodes/{episodeId}` | — | ❌ Not Implemented |
+| News Articles | GET | `/anime/{id}/news` | — | ❌ Not Implemented |
+| Forum Threads | GET | `/anime/{id}/forum` | — | ❌ Not Implemented |
+| Videos Page | GET | `/anime/{id}/videos` | — | ❌ Not Implemented |
+| Episode Videos | GET | `/anime/{id}/videos/episodes` | — | ❌ Not Implemented |
+| Image Gallery | GET | `/anime/{id}/pictures` | — | ❌ Not Implemented |
+| Viewing Statistics | GET | `/anime/{id}/statistics` | — | ❌ Not Implemented |
+| Additional Info | GET | `/anime/{id}/moreinfo` | — | ❌ Not Implemented |
+| Recommendations | GET | `/anime/{id}/recommendations` | — | ❌ Not Implemented |
+| User Updates | GET | `/anime/{id}/userupdates` | — | ❌ Not Implemented |
+| Reviews | GET | `/anime/{id}/reviews` | — | ❌ Not Implemented |
+| Related Anime/Manga | GET | `/anime/{id}/relations` | — | ❌ Not Implemented |
+| Opening/Ending Themes | GET | `/anime/{id}/themes` | — | ❌ Not Implemented |
+| External Links | GET | `/anime/{id}/external` | — | ❌ Not Implemented |
+| Streaming Sources | GET | `/anime/{id}/streaming` | — | ❌ Not Implemented |
+
+## Group: Manga
+
+### Manga [/manga/{id}]
+
+| Operation | Method | Path | Query Params | Status |
+|-----------|--------|------|--------------|--------|
+| Fetch Collection | GET | `/manga` | `page`, `limit`, `sfw`, `order_by`, `sort` | ✅ Full |
+| Fetch Resource | GET | `/manga/{id}` | `extension` | ✅ Full |
+| Full Details | GET | `/manga/{id}/full` | — | ❌ Not Implemented |
+| Character List | GET | `/manga/{id}/characters` | — | ❌ Not Implemented |
+| News Articles | GET | `/manga/{id}/news` | — | ❌ Not Implemented |
+| Forum Threads | GET | `/manga/{id}/forum` | — | ❌ Not Implemented |
+| Image Gallery | GET | `/manga/{id}/pictures` | — | ❌ Not Implemented |
+| Reading Statistics | GET | `/manga/{id}/statistics` | — | ❌ Not Implemented |
+| Additional Info | GET | `/manga/{id}/moreinfo` | — | ❌ Not Implemented |
+| Recommendations | GET | `/manga/{id}/recommendations` | — | ❌ Not Implemented |
+| User Updates | GET | `/manga/{id}/userupdates` | — | ❌ Not Implemented |
+| Reviews | GET | `/manga/{id}/reviews` | — | ❌ Not Implemented |
+| Related Works | GET | `/manga/{id}/relations` | — | ❌ Not Implemented |
+| External Links | GET | `/manga/{id}/external` | — | ❌ Not Implemented |
+
+## Group: Characters
+
+### Characters [/characters/{id}]
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Character Info | GET | `/characters/{id}` | ❌ Not Implemented |
+| Full Details | GET | `/characters/{id}/full` | ❌ Not Implemented |
+| Anime Appearances | GET | `/characters/{id}/anime` | ❌ Not Implemented |
+| Voice Actor Roles | GET | `/characters/{id}/voices` | ❌ Not Implemented |
+| Manga Appearances | GET | `/characters/{id}/manga` | ❌ Not Implemented |
+| Images | GET | `/characters/{id}/pictures` | ❌ Not Implemented |
+
+## Group: People
+
+### People [/people/{id}]
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Person Info | GET | `/people/{id}` | ❌ Not Implemented |
+| Full Details | GET | `/people/{id}/full` | ❌ Not Implemented |
+| Anime Work History | GET | `/people/{id}/anime` | ❌ Not Implemented |
+| Voice Roles | GET | `/people/{id}/voices` | ❌ Not Implemented |
+| Manga Work History | GET | `/people/{id}/manga` | ❌ Not Implemented |
+| Images | GET | `/people/{id}/pictures` | ❌ Not Implemented |
+
+## Group: Seasonal
+
+### Seasons [/seasons]
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Season Archive | GET | `/seasons` | ❌ Not Implemented |
+| Current Season | GET | `/seasons/now` | ❌ Not Implemented |
+| Upcoming Season | GET | `/seasons/upcoming` | ❌ Not Implemented |
+| Specific Season | GET | `/seasons/{year}/{season}` | ❌ Not Implemented |
+
+### Schedules [/schedules]
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Full Schedule | GET | `/schedules` | ❌ Not Implemented |
+| Filtered by Day | GET | `/schedules/{filter}` | ❌ Not Implemented |
+
+## Group: Top & Discovery
+
+### Top [/top]
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Top Anime | GET | `/top/anime` | ❌ Not Implemented |
+| Top Manga | GET | `/top/manga` | ❌ Not Implemented |
+| Top Characters | GET | `/top/characters` | ❌ Not Implemented |
+| Top People | GET | `/top/people` | ❌ Not Implemented |
+| Top Reviews | GET | `/top/reviews` | ❌ Not Implemented |
+
+### Genres [/genres]
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Anime Genre List | GET | `/genres/anime` | ❌ Not Implemented |
+| Manga Genre List | GET | `/genres/manga` | ❌ Not Implemented |
+
+## Group: Producers & Magazines
+
+### Producers [/producers]
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Search Producers | GET | `/producers` | ❌ Not Implemented |
+| Producer Info | GET | `/producers/{id}` | ❌ Not Implemented |
+| Full Producer Details | GET | `/producers/{id}/full` | ❌ Not Implemented |
+| External Links | GET | `/producers/{id}/external` | ❌ Not Implemented |
+
+### Magazines [/magazines]
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Magazine List | GET | `/magazines` | ❌ Not Implemented |
+
+## Group: Users
+
+### Users [/users]
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Search Users | GET | `/users` | ❌ Not Implemented |
+| Recently Online | GET | `/users/recentlyonline` | ❌ Not Implemented |
+| User by MAL ID | GET | `/users/userbyid/{id}` | ❌ Not Implemented |
+| Profile | GET | `/users/{username}` | ❌ Not Implemented |
+| Full Profile | GET | `/users/{username}/full` | ❌ Not Implemented |
+| Statistics | GET | `/users/{username}/statistics` | ❌ Not Implemented |
+| Favorites | GET | `/users/{username}/favorites` | ❌ Not Implemented |
+| Updates | GET | `/users/{username}/userupdates` | ❌ Not Implemented |
+| About Section | GET | `/users/{username}/about` | ❌ Not Implemented |
+| History (all) | GET | `/users/{username}/history` | ❌ Not Implemented |
+| Filtered History | GET | `/users/{username}/history/{type}` | ❌ Not Implemented |
+| Friends List | GET | `/users/{username}/friends` | ❌ Not Implemented |
+| Anime List | GET | `/users/{username}/animelist` | ❌ Not Implemented |
+| Anime List by Status | GET | `/users/{username}/animelist/{status}` | ❌ Not Implemented |
+| Manga List | GET | `/users/{username}/mangalist` | ❌ Not Implemented |
+| Manga List by Status | GET | `/users/{username}/mangalist/{status}` | ❌ Not Implemented |
+| Recommendations | GET | `/users/{username}/recommendations` | ❌ Not Implemented |
+| User Reviews | GET | `/users/{username}/reviews` | ❌ Not Implemented |
+| User Clubs | GET | `/users/{username}/clubs` | ❌ Not Implemented |
+| External Links | GET | `/users/{username}/external` | ❌ Not Implemented |
+
+## Group: Clubs
+
+### Clubs [/clubs]
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Search Clubs | GET | `/clubs` | ❌ Not Implemented |
+| Club Info | GET | `/clubs/{id}` | ❌ Not Implemented |
+| Member List | GET | `/clubs/{id}/members` | ❌ Not Implemented |
+| Staff List | GET | `/clubs/{id}/staff` | ❌ Not Implemented |
+| Related Clubs | GET | `/clubs/{id}/relations` | ❌ Not Implemented |
+
+## Group: Reviews & Recommendations
+
+### Reviews [/reviews]
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Anime Reviews | GET | `/reviews/anime` | ❌ Not Implemented |
+| Manga Reviews | GET | `/reviews/manga` | ❌ Not Implemented |
+
+### Recommendations [/recommendations]
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Anime Recommendations | GET | `/recommendations/anime` | ❌ Not Implemented |
+| Manga Recommendations | GET | `/recommendations/manga` | ❌ Not Implemented |
+
+## Group: Watch
+
+### Watch [/watch]
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Recent Episodes | GET | `/watch/episodes` | ❌ Not Implemented |
+| Popular Episodes | GET | `/watch/episodes/popular` | ❌ Not Implemented |
+| Recent Promos | GET | `/watch/promos` | ❌ Not Implemented |
+| Popular Promos | GET | `/watch/promos/popular` | ❌ Not Implemented |
+
+## Group: Random & Insights
+
+### Random [/random]
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Random Anime | GET | `/random/anime` | ❌ Not Implemented |
+| Random Manga | GET | `/random/manga` | ❌ Not Implemented |
+| Random Character | GET | `/random/characters` | ❌ Not Implemented |
+| Random Person | GET | `/random/people` | ❌ Not Implemented |
+| Random User | GET | `/random/users` | ❌ Not Implemented |
+
+### Insights [/insights]
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Site Insights | GET | `/insights` | ❌ Not Implemented |
+| Current Trends | GET | `/insights/trends` | ❌ Not Implemented |
+
+## Notes
+
+- **Rate Limit:** Jikan has a limit of 3 requests per second and 60 requests per
+  minute per IP. The `min_interval()` is set to 1100ms to respect this.
+- **sfw parameter:** The current implementation sets `sfw=false` to allow adult content. This should be configurable.
+- **Base URL:** The official public instance is `https://api.jikan.moe/v4`. Self-hosted instances are also available.
+
+---
+
+# Kitsu API Implementation Status
+
+Source: https://github.com/enrell/animedb/blob/main/docs/kitsu.md
+
+# Kitsu API Implementation Status
+
+**Base URL:** `https://kitsu.io/api/edge`
+**Base API Path:** `/api/edge`
+
+This document tracks the implementation status of all Kitsu API endpoints in `crates/animedb/src/provider.rs`.
+
+## Overview
+
+The `KitsuProvider` struct implements the `RemoteProvider` trait with three core methods:
+
+- `fetch_page()` — paginated listing of anime/manga
+- `search()` — text search with `filter[text]`
+- `get_by_id()` — fetch single resource by ID
+
+**Currently implemented endpoints:**
+
+| Method | Path | Status |
+|--------|------|--------|
+| GET | `/anime` | ✅ Full |
+| GET | `/manga` | ✅ Full |
+| GET | `/anime/{id}` | ✅ Full |
+| GET | `/manga/{id}` | ✅ Full |
+| GET | `/anime` + `filter[text]` | ✅ Full |
+| GET | `/manga` + `filter[text]` | ✅ Full |
+| GET | `/trending/anime` | ✅ Full |
+| GET | `/trending/manga` | ✅ Full |
+| GET | `/anime/{id}/episodes` | ✅ Full |
+| GET | `/episodes/{id}` | ✅ Full |
+| GET | `/manga/{id}/chapters` | ✅ Full |
+| GET | `/chapters/{id}` | ✅ Full |
+| GET | `/categories` | ✅ Full |
+| GET | `/categories/{id}` | ✅ Full |
+| GET | `/characters` | ✅ Full |
+| GET | `/characters/{id}` | ✅ Full |
+| GET | `/people` | ✅ Full |
+| GET | `/people/{id}` | ✅ Full |
+| GET | `/castings` | ✅ Full |
+| GET | `/castings/{id}` | ✅ Full |
+| GET | `/media-relationships` | ✅ Full |
+| GET | `/media-relationships/{id}` | ✅ Full |
+| GET | `/mappings` | ✅ Full |
+| GET | `/mappings/{id}` | ✅ Full |
+| GET | `/streamers` | ✅ Full |
+| GET | `/streamers/{id}` | ✅ Full |
+| GET | `/streaming-links` | ✅ Full |
+| GET | `/streaming-links/{id}` | ✅ Full |
+| GET | `/library-entries` | ✅ Full |
+| GET | `/library-entries/{id}` | ✅ Full |
+| GET | `/users/{id}/library-entries` | ✅ Full |
+
+## Group: Anime
+
+### Anime [/anime/{id}]
+
+| Operation | Method | Path | Query Params | Status |
+|-----------|--------|------|--------------|--------|
+| Fetch Collection | GET | `/anime` | `page[limit]`, `page[offset]`, `sort`, `include` | ✅ Full |
+| Fetch Resource | GET | `/anime/{id}` | `include` | ✅ Full |
+
+**Not Implemented:**
+
+- [ ] `POST /anime` — Create new anime entry
+- [ ] `PATCH /anime/{id}` — Update existing anime entry
+- [ ] `DELETE /anime/{id}` — Delete anime entry
+
+### Trending Anime [/trending/anime]
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Fetch Collection | GET | `/trending/anime` | ✅ Full |
+
+### Episodes [/episodes/{id}]
+
+| Operation | Method | Path | Query Params | Status |
+|-----------|--------|------|--------------|--------|
+| Fetch Collection | GET | `/episodes` | `page[limit]`, `page[offset]` | ✅ Full |
+| Fetch Resource | GET | `/episodes/{id}` | — | ✅ Full |
+
+**Not Implemented:**
+
+- [ ] `POST /episodes` — Create episode entry
+- [ ] `PATCH /episodes/{id}` — Update episode entry
+- [ ] `DELETE /episodes/{id}` — Delete episode entry
+
+## Group: Manga
+
+### Manga [/manga/{id}]
+
+| Operation | Method | Path | Query Params | Status |
+|-----------|--------|------|--------------|--------|
+| Fetch Collection | GET | `/manga` | `page[limit]`, `page[offset]`, `sort`, `include` | ✅ Full |
+| Fetch Resource | GET | `/manga/{id}` | `include` | ✅ Full |
+
+**Not Implemented:**
+
+- [ ] `POST /manga` — Create new manga entry
+- [ ] `PATCH /manga/{id}` — Update existing manga entry
+- [ ] `DELETE /manga/{id}` — Delete manga entry
+
+### Trending Manga [/trending/manga]
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Fetch Collection | GET | `/trending/manga` | ✅ Full |
+
+### Chapters [/chapters/{id}]
+
+| Operation | Method | Path | Query Params | Status |
+|-----------|--------|------|--------------|--------|
+| Fetch Collection | GET | `/chapters` | `page[limit]`, `page[offset]` | ✅ Full |
+| Fetch Resource | GET | `/chapters/{id}` | — | ✅ Full |
+
+**Not Implemented:**
+
+- [ ] `POST /chapters` — Create chapter entry
+- [ ] `PATCH /chapters/{id}` — Update chapter entry
+- [ ] `DELETE /chapters/{id}` — Delete chapter entry
+
+## Group: Categories
+
+### Categories [/categories/{id}]
+
+| Operation | Method | Path | Query Params | Status |
+|-----------|--------|------|--------------|--------|
+| Fetch Collection | GET | `/categories` | `page[limit]`, `page[offset]` | ✅ Full |
+| Fetch Resource | GET | `/categories/{id}` | — | ✅ Full |
+
+### Category Favorites [/category-favorites/{id}]
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Fetch Collection | GET | `/category-favorites` | ❌ Not Implemented |
+| Fetch Resource | GET | `/category-favorites/{id}` | ❌ Not Implemented |
+| Create Resource | POST | `/category-favorites` | ❌ Not Implemented |
+| Update Resource | PATCH | `/category-favorites/{id}` | ❌ Not Implemented |
+| Delete Resource | DELETE | `/category-favorites/{id}` | ❌ Not Implemented |
+
+### Category Recommendations [/category-recommendations/{id}]
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Fetch Collection | GET | `/category-recommendations` | ❌ Not Implemented |
+| Fetch Resource | GET | `/category-recommendations/{id}` | ❌ Not Implemented |
+
+## Group: Characters
+
+### Anime Characters [/anime-characters/{id}]
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Fetch Collection | GET | `/anime-characters` | ❌ Not Implemented |
+| Fetch Resource | GET | `/anime-characters/{id}` | ❌ Not Implemented |
+| Create Resource | POST | `/anime-characters` | ❌ Not Implemented |
+| Update Resource | PATCH | `/anime-characters/{id}` | ❌ Not Implemented |
+| Delete Resource | DELETE | `/anime-characters/{id}` | ❌ Not Implemented |
+
+### Manga Characters [/manga-characters/{id}]
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Fetch Collection | GET | `/manga-characters` | ❌ Not Implemented |
+| Fetch Resource | GET | `/manga-characters/{id}` | ❌ Not Implemented |
+| Create Resource | POST | `/manga-characters` | ❌ Not Implemented |
+| Update Resource | PATCH | `/manga-characters/{id}` | ❌ Not Implemented |
+| Delete Resource | DELETE | `/manga-characters/{id}` | ❌ Not Implemented |
+
+### Characters [/characters/{id}]
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Fetch Collection | GET | `/characters` | ✅ Full |
+| Fetch Resource | GET | `/characters/{id}` | ✅ Full |
+| Create Resource | POST | `/characters` | ❌ Not Implemented |
+| Update Resource | PATCH | `/characters/{id}` | ❌ Not Implemented |
+| Delete Resource | DELETE | `/characters/{id}` | ❌ Not Implemented |
+
+## Group: Producers & Staff
+
+### Anime Productions [/anime-productions/{id}]
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Fetch Collection | GET | `/anime-productions` | ❌ Not Implemented |
+| Fetch Resource | GET | `/anime-productions/{id}` | ❌ Not Implemented |
+| Create Resource | POST | `/anime-productions` | ❌ Not Implemented |
+| Update Resource | PATCH | `/anime-productions/{id}` | ❌ Not Implemented |
+| Delete Resource | DELETE | `/anime-productions/{id}` | ❌ Not Implemented |
+
+### Anime Staff [/anime-staff/{id}]
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Fetch Collection | GET | `/anime-staff` | ❌ Not Implemented |
+| Fetch Resource | GET | `/anime-staff/{id}` | ❌ Not Implemented |
+| Create Resource | POST | `/anime-staff` | ❌ Not Implemented |
+| Update Resource | PATCH | `/anime-staff/{id}` | ❌ Not Implemented |
+| Delete Resource | DELETE | `/anime-staff/{id}` | ❌ Not Implemented |
+
+### Manga Staff [/manga-staff/{id}]
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Fetch Collection | GET | `/manga-staff` | ❌ Not Implemented |
+| Fetch Resource | GET | `/manga-staff/{id}` | ❌ Not Implemented |
+| Create Resource | POST | `/manga-staff` | ❌ Not Implemented |
+| Update Resource | PATCH | `/manga-staff/{id}` | ❌ Not Implemented |
+| Delete Resource | DELETE | `/manga-staff/{id}` | ❌ Not Implemented |
+
+### Producers [/producers/{id}]
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Fetch Collection | GET | `/producers` | ❌ Not Implemented |
+| Fetch Resource | GET | `/producers/{id}` | ❌ Not Implemented |
+| Create Resource | POST | `/producers` | ❌ Not Implemented |
+| Update Resource | PATCH | `/producers/{id}` | ❌ Not Implemented |
+| Delete Resource | DELETE | `/producers/{id}` | ❌ Not Implemented |
+
+### People [/people/{id}]
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Fetch Collection | GET | `/people` | ✅ Full |
+| Fetch Resource | GET | `/people/{id}` | ✅ Full |
+| Create Resource | POST | `/people` | ❌ Not Implemented |
+| Update Resource | PATCH | `/people/{id}` | ❌ Not Implemented |
+| Delete Resource | DELETE | `/people/{id}` | ❌ Not Implemented |
+
+### Castings [/castings/{id}]
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Fetch Collection | GET | `/castings` | ✅ Full |
+| Fetch Resource | GET | `/castings/{id}` | ✅ Full |
+| Create Resource | POST | `/castings` | ❌ Not Implemented |
+| Update Resource | PATCH | `/castings/{id}` | ❌ Not Implemented |
+| Delete Resource | DELETE | `/castings/{id}` | ❌ Not Implemented |
+
+## Group: Media Relations
+
+### Media Relationships [/media-relationships/{id}]
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Fetch Collection | GET | `/media-relationships` | ✅ Full |
+| Fetch Resource | GET | `/media-relationships/{id}` | ✅ Full |
+| Create Resource | POST | `/media-relationships` | ❌ Not Implemented |
+| Update Resource | PATCH | `/media-relationships/{id}` | ❌ Not Implemented |
+| Delete Resource | DELETE | `/media-relationships/{id}` | ❌ Not Implemented |
+
+### Mappings [/mappings/{id}]
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Fetch Collection | GET | `/mappings` | ✅ Full |
+| Fetch Resource | GET | `/mappings/{id}` | ✅ Full |
+| Create Resource | POST | `/mappings` | ❌ Not Implemented |
+| Update Resource | PATCH | `/mappings/{id}` | ❌ Not Implemented |
+| Delete Resource | DELETE | `/mappings/{id}` | ❌ Not Implemented |
+
+### Franchises [/franchises/{id}] (Deprecated)
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Fetch Collection | GET | `/franchises` | ❌ Not Implemented |
+| Fetch Resource | GET | `/franchises/{id}` | ❌ Not Implemented |
+
+### Installments [/installments/{id}] (Deprecated)
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Fetch Collection | GET | `/installments` | ❌ Not Implemented |
+| Fetch Resource | GET | `/installments/{id}` | ❌ Not Implemented |
+
+## Group: Streamers
+
+### Streamers [/streamers/{id}]
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Fetch Collection | GET | `/streamers` | ✅ Full |
+| Fetch Resource | GET | `/streamers/{id}` | ✅ Full |
+| Create Resource | POST | `/streamers` | ❌ Not Implemented |
+| Update Resource | PATCH | `/streamers/{id}` | ❌ Not Implemented |
+| Delete Resource | DELETE | `/streamers/{id}` | ❌ Not Implemented |
+
+### Streaming Links [/streaming-links/{id}]
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Fetch Collection | GET | `/streaming-links` | ✅ Full |
+| Fetch Resource | GET | `/streaming-links/{id}` | ✅ Full |
+| Create Resource | POST | `/streaming-links` | ❌ Not Implemented |
+| Update Resource | PATCH | `/streaming-links/{id}` | ❌ Not Implemented |
+| Delete Resource | DELETE | `/streaming-links/{id}` | ❌ Not Implemented |
+
+## Group: Users
+
+### Users [/users/{id}]
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Fetch Collection | GET | `/users` | ✅ Full |
+| Fetch Resource | GET | `/users/{id}` | ✅ Full |
+| Create Resource | POST | `/users` | ❌ Not Implemented |
+| Update Resource | PATCH | `/users/{id}` | ❌ Not Implemented |
+| Delete Resource | DELETE | `/users/{id}` | ❌ Not Implemented |
+
+### Blocks [/blocks/{id}]
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Fetch Collection | GET | `/blocks` | ❌ Not Implemented |
+| Fetch Resource | GET | `/blocks/{id}` | ❌ Not Implemented |
+| Create Resource | POST | `/blocks` | ❌ Not Implemented |
+| Update Resource | PATCH | `/blocks/{id}` | ❌ Not Implemented |
+| Delete Resource | DELETE | `/blocks/{id}` | ❌ Not Implemented |
+
+### Favorites [/favorites/{id}]
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Fetch Collection | GET | `/favorites` | ✅ Full |
+| Fetch Resource | GET | `/favorites/{id}` | ✅ Full |
+| Fetch User Favorites | GET | `/favorites?filter[user_id]={id}` | ✅ Full |
+| Create Resource | POST | `/favorites` | ❌ Not Implemented |
+| Update Resource | PATCH | `/favorites/{id}` | ❌ Not Implemented |
+| Delete Resource | DELETE | `/favorites/{id}` | ❌ Not Implemented |
+
+### Follows [/follows/{id}]
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Fetch Collection | GET | `/follows` | ❌ Not Implemented |
+| Fetch Resource | GET | `/follows/{id}` | ❌ Not Implemented |
+| Create Resource | POST | `/follows` | ❌ Not Implemented |
+| Update Resource | PATCH | `/follows/{id}` | ❌ Not Implemented |
+| Delete Resource | DELETE | `/follows/{id}` | ❌ Not Implemented |
+
+### Linked Accounts [/linked-accounts/{id}]
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Fetch Collection | GET | `/linked-accounts` | ❌ Not Implemented |
+| Fetch Resource | GET | `/linked-accounts/{id}` | ❌ Not Implemented |
+| Create Resource | POST | `/linked-accounts` | ❌ Not Implemented |
+| Update Resource | PATCH | `/linked-accounts/{id}` | ❌ Not Implemented |
+| Delete Resource | DELETE | `/linked-accounts/{id}` | ❌ Not Implemented |
+
+### Profile Link Sites [/profile-link-sites/{id}]
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Fetch Collection | GET | `/profile-link-sites` | ❌ Not Implemented |
+| Fetch Resource | GET | `/profile-link-sites/{id}` | ❌ Not Implemented |
+
+### Profile Links [/profile-links/{id}]
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Fetch Collection | GET | `/profile-links` | ❌ Not Implemented |
+| Fetch Resource | GET | `/profile-links/{id}` | ❌ Not Implemented |
+| Create Resource | POST | `/profile-links` | ❌ Not Implemented |
+| Update Resource | PATCH | `/profile-links/{id}` | ❌ Not Implemented |
+| Delete Resource | DELETE | `/profile-links/{id}` | ❌ Not Implemented |
+
+### Roles [/roles/{id}]
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Fetch Collection | GET | `/roles` | ❌ Not Implemented |
+| Fetch Resource | GET | `/roles/{id}` | ❌ Not Implemented |
+| Create Resource | POST | `/roles` | ❌ Not Implemented |
+| Update Resource | PATCH | `/roles/{id}` | ❌ Not Implemented |
+| Delete Resource | DELETE | `/roles/{id}` | ❌ Not Implemented |
+
+### Stats [/stats/{id}] (In Development)
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Fetch Collection | GET | `/stats` | ❌ Not Implemented |
+| Fetch Resource | GET | `/stats/{id}` | ❌ Not Implemented |
+| Delete Resource | DELETE | `/stats/{id}` | ❌ Not Implemented |
+
+### User Roles [/user-roles/{id}]
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Fetch Collection | GET | `/user-roles` | ❌ Not Implemented |
+| Fetch Resource | GET | `/user-roles/{id}` | ❌ Not Implemented |
+| Create Resource | POST | `/user-roles` | ❌ Not Implemented |
+| Delete Resource | DELETE | `/user-roles/{id}` | ❌ Not Implemented |
+
+## Group: User Libraries
+
+### Library Entries [/library-entries/{id}]
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Fetch Collection | GET | `/library-entries` | ✅ Full |
+| Fetch Resource | GET | `/library-entries/{id}` | ✅ Full |
+| Create Resource | POST | `/library-entries` | ❌ Not Implemented |
+| Update Resource | PATCH | `/library-entries/{id}` | ❌ Not Implemented |
+| Delete Resource | DELETE | `/library-entries/{id}` | ❌ Not Implemented |
+| Fetch User Library | GET | `/users/{user_id}/library-entries` | ✅ Full |
+
+### Library Entry Logs [/library-entry-logs/{id}]
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Fetch Collection | GET | `/library-entry-logs` | ❌ Not Implemented |
+| Fetch Resource | GET | `/library-entry-logs/{id}` | ❌ Not Implemented |
+| Create Resource | POST | `/library-entry-logs` | ❌ Not Implemented |
+| Update Resource | PATCH | `/library-entry-logs/{id}` | ❌ Not Implemented |
+| Delete Resource | DELETE | `/library-entry-logs/{id}` | ❌ Not Implemented |
+
+### Library Events [/library-events/{id}] (In Development)
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Fetch Collection | GET | `/library-events` | ❌ Not Implemented |
+| Fetch Resource | GET | `/library-events/{id}` | ❌ Not Implemented |
+| Delete Resource | DELETE | `/library-events/{id}` | ❌ Not Implemented |
+
+### List Imports [/list-imports/{id}]
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Fetch Collection | GET | `/list-imports` | ❌ Not Implemented |
+| Fetch Resource | GET | `/list-imports/{id}` | ❌ Not Implemented |
+| Create Resource | POST | `/list-imports` | ❌ Not Implemented |
+
+## Group: Reactions
+
+### Media Reactions [/media-reactions/{id}]
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Fetch Collection | GET | `/media-reactions` | ✅ Full |
+| Fetch Resource | GET | `/media-reactions/{id}` | ✅ Full |
+| Fetch by Media | GET | `/media-reactions?filter[media_id]={id}` | ✅ Full |
+| Create Resource | POST | `/media-reactions` | ❌ Not Implemented |
+| Update Resource | PATCH | `/media-reactions/{id}` | ❌ Not Implemented |
+| Delete Resource | DELETE | `/media-reactions/{id}` | ❌ Not Implemented |
+
+### Media Reaction Votes [/media-reaction-votes/{id}]
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Fetch Collection | GET | `/media-reaction-votes` | ✅ Full |
+| Fetch Resource | GET | `/media-reaction-votes/{id}` | ✅ Full |
+| Create Resource | POST | `/media-reaction-votes` | ❌ Not Implemented |
+| Update Resource | PATCH | `/media-reaction-votes/{id}` | ❌ Not Implemented |
+| Delete Resource | DELETE | `/media-reaction-votes/{id}` | ❌ Not Implemented |
+
+### Reviews [/reviews/{id}] (Deprecated)
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Fetch Collection | GET | `/reviews` | ❌ Not Implemented |
+| Fetch Resource | GET | `/reviews/{id}` | ❌ Not Implemented |
+| Create Resource | POST | `/reviews` | ❌ Not Implemented |
+| Update Resource | PATCH | `/reviews/{id}` | ❌ Not Implemented |
+| Delete Resource | DELETE | `/reviews/{id}` | ❌ Not Implemented |
+
+### Review Likes [/review-likes/{id}] (Deprecated)
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Fetch Collection | GET | `/review-likes` | ❌ Not Implemented |
+| Fetch Resource | GET | `/review-likes/{id}` | ❌ Not Implemented |
+| Create Resource | POST | `/review-likes` | ❌ Not Implemented |
+| Update Resource | PATCH | `/review-likes/{id}` | ❌ Not Implemented |
+| Delete Resource | DELETE | `/review-likes/{id}` | ❌ Not Implemented |
+
+## Group: Posts
+
+### Posts [/posts/{id}]
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Fetch Collection | GET | `/posts` | ✅ Full |
+| Fetch Resource | GET | `/posts/{id}` | ✅ Full |
+| Create Resource | POST | `/posts` | ❌ Not Implemented |
+| Update Resource | PATCH | `/posts/{id}` | ❌ Not Implemented |
+| Delete Resource | DELETE | `/posts/{id}` | ❌ Not Implemented |
+
+### Post Likes [/post-likes/{id}]
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Fetch Collection | GET | `/post-likes` | ✅ Full |
+| Fetch Resource | GET | `/post-likes/{id}` | ✅ Full |
+| Create Resource | POST | `/post-likes` | ❌ Not Implemented |
+| Delete Resource | DELETE | `/post-likes/{id}` | ❌ Not Implemented |
+
+### Post Follows [/post-follows/{id}]
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Fetch Collection | GET | `/post-follows` | ❌ Not Implemented |
+| Fetch Resource | GET | `/post-follows/{id}` | ❌ Not Implemented |
+| Create Resource | POST | `/post-follows` | ❌ Not Implemented |
+| Delete Resource | DELETE | `/post-follows/{id}` | ❌ Not Implemented |
+
+## Group: Comments
+
+### Comments [/comments/{id}]
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Fetch Collection | GET | `/comments` | ✅ Full |
+| Fetch Resource | GET | `/comments/{id}` | ✅ Full |
+| Create Resource | POST | `/comments` | ❌ Not Implemented |
+| Update Resource | PATCH | `/comments/{id}` | ❌ Not Implemented |
+| Delete Resource | DELETE | `/comments/{id}` | ❌ Not Implemented |
+
+### Comment Likes [/comment-likes/{id}]
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Fetch Collection | GET | `/comment-likes` | ✅ Full |
+| Fetch Resource | GET | `/comment-likes/{id}` | ✅ Full |
+| Create Resource | POST | `/comment-likes` | ❌ Not Implemented |
+| Delete Resource | DELETE | `/comment-likes/{id}` | ❌ Not Implemented |
+
+## Group: Groups
+
+### Groups [/groups/{id}]
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Fetch Collection | GET | `/groups` | ❌ Not Implemented |
+| Fetch Resource | GET | `/groups/{id}` | ❌ Not Implemented |
+| Create Resource | POST | `/groups` | ❌ Not Implemented |
+| Update Resource | PATCH | `/groups/{id}` | ❌ Not Implemented |
+| Delete Resource | DELETE | `/groups/{id}` | ❌ Not Implemented |
+
+### Group Action Logs [/group-action-logs/{id}]
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Fetch Collection | GET | `/group-action-logs` | ❌ Not Implemented |
+| Fetch Resource | GET | `/group-action-logs/{id}` | ❌ Not Implemented |
+
+### Group Bans [/group-bans/{id}]
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Fetch Collection | GET | `/group-bans` | ❌ Not Implemented |
+| Fetch Resource | GET | `/group-bans/{id}` | ❌ Not Implemented |
+| Create Resource | POST | `/group-bans` | ❌ Not Implemented |
+| Delete Resource | DELETE | `/group-bans/{id}` | ❌ Not Implemented |
+
+### Group Categories [/group-categories/{id}]
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Fetch Collection | GET | `/group-categories` | ❌ Not Implemented |
+| Fetch Resource | GET | `/group-categories/{id}` | ❌ Not Implemented |
+| Create Resource | POST | `/group-categories` | ❌ Not Implemented |
+| Update Resource | PATCH | `/group-categories/{id}` | ❌ Not Implemented |
+| Delete Resource | DELETE | `/group-categories/{id}` | ❌ Not Implemented |
+
+### Group Invites [/group-invites/{id}]
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Fetch Collection | GET | `/group-invites` | ❌ Not Implemented |
+| Fetch Resource | GET | `/group-invites/{id}` | ❌ Not Implemented |
+| Create Resource | POST | `/group-invites` | ❌ Not Implemented |
+| Update Resource | PATCH | `/group-invites/{id}` | ❌ Not Implemented |
+| Delete Resource | DELETE | `/group-invites/{id}` | ❌ Not Implemented |
+
+### Group Member Notes [/group-member-notes/{id}]
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Fetch Collection | GET | `/group-member-notes` | ❌ Not Implemented |
+| Fetch Resource | GET | `/group-member-notes/{id}` | ❌ Not Implemented |
+| Create Resource | POST | `/group-member-notes` | ❌ Not Implemented |
+| Update Resource | PATCH | `/group-member-notes/{id}` | ❌ Not Implemented |
+| Delete Resource | DELETE | `/group-member-notes/{id}` | ❌ Not Implemented |
+
+### Group Members [/group-members/{id}]
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Fetch Collection | GET | `/group-members` | ❌ Not Implemented |
+| Fetch Resource | GET | `/group-members/{id}` | ❌ Not Implemented |
+| Create Resource | POST | `/group-members` | ❌ Not Implemented |
+| Update Resource | PATCH | `/group-members/{id}` | ❌ Not Implemented |
+| Delete Resource | DELETE | `/group-members/{id}` | ❌ Not Implemented |
+
+### Group Neighbors [/group-neighbors/{id}]
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Fetch Collection | GET | `/group-neighbors` | ❌ Not Implemented |
+| Fetch Resource | GET | `/group-neighbors/{id}` | ❌ Not Implemented |
+| Create Resource | POST | `/group-neighbors` | ❌ Not Implemented |
+| Delete Resource | DELETE | `/group-neighbors/{id}` | ❌ Not Implemented |
+
+### Group Permissions [/group-permissions/{id}]
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Fetch Collection | GET | `/group-permissions` | ❌ Not Implemented |
+| Fetch Resource | GET | `/group-permissions/{id}` | ❌ Not Implemented |
+| Create Resource | POST | `/group-permissions` | ❌ Not Implemented |
+| Delete Resource | DELETE | `/group-permissions/{id}` | ❌ Not Implemented |
+
+### Group Reports [/group-reports/{id}]
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Fetch Collection | GET | `/group-reports` | ❌ Not Implemented |
+| Fetch Resource | GET | `/group-reports/{id}` | ❌ Not Implemented |
+| Create Resource | POST | `/group-reports` | ❌ Not Implemented |
+| Update Resource | PATCH | `/group-reports/{id}` | ❌ Not Implemented |
+| Delete Resource | DELETE | `/group-reports/{id}` | ❌ Not Implemented |
+
+### Group Ticket Messages [/group-ticket-messages/{id}]
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Fetch Collection | GET | `/group-ticket-messages` | ❌ Not Implemented |
+| Fetch Resource | GET | `/group-ticket-messages/{id}` | ❌ Not Implemented |
+| Create Resource | POST | `/group-ticket-messages` | ❌ Not Implemented |
+| Update Resource | PATCH | `/group-ticket-messages/{id}` | ❌ Not Implemented |
+| Delete Resource | DELETE | `/group-ticket-messages/{id}` | ❌ Not Implemented |
+
+### Group Tickets [/group-tickets/{id}]
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Fetch Collection | GET | `/group-tickets` | ❌ Not Implemented |
+| Fetch Resource | GET | `/group-tickets/{id}` | ❌ Not Implemented |
+| Create Resource | POST | `/group-tickets` | ❌ Not Implemented |
+| Update Resource | PATCH | `/group-tickets/{id}` | ❌ Not Implemented |
+| Delete Resource | DELETE | `/group-tickets/{id}` | ❌ Not Implemented |
+
+### Leader Chat Messages [/leader-chat-messages/{id}]
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Fetch Collection | GET | `/leader-chat-messages` | ❌ Not Implemented |
+| Fetch Resource | GET | `/leader-chat-messages/{id}` | ❌ Not Implemented |
+| Create Resource | POST | `/leader-chat-messages` | ❌ Not Implemented |
+| Update Resource | PATCH | `/leader-chat-messages/{id}` | ❌ Not Implemented |
+| Delete Resource | DELETE | `/leader-chat-messages/{id}` | ❌ Not Implemented |
+
+## Group: Reports
+
+### Reports [/reports/{id}]
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Fetch Collection | GET | `/reports` | ❌ Not Implemented |
+| Fetch Resource | GET | `/reports/{id}` | ❌ Not Implemented |
+| Create Resource | POST | `/reports` | ❌ Not Implemented |
+| Update Resource | PATCH | `/reports/{id}` | ❌ Not Implemented |
+| Delete Resource | DELETE | `/reports/{id}` | ❌ Not Implemented |
+
+## Group: Site Announcements
+
+### Site Announcements [/site-announcements/{id}]
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Fetch Collection | GET | `/site-announcements` | ❌ Not Implemented |
+| Fetch Resource | GET | `/site-announcements/{id}` | ❌ Not Implemented |
+| Create Resource | POST | `/site-announcements` | ❌ Not Implemented |
+| Update Resource | PATCH | `/site-announcements/{id}` | ❌ Not Implemented |
+| Delete Resource | DELETE | `/site-announcements/{id}` | ❌ Not Implemented |
+
+## Group: Media Follows
+
+### Media Follows [/media-follows/{id}]
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Fetch Collection | GET | `/media-follows` | ❌ Not Implemented |
+| Fetch Resource | GET | `/media-follows/{id}` | ❌ Not Implemented |
+| Create Resource | POST | `/media-follows` | ❌ Not Implemented |
+| Update Resource | PATCH | `/media-follows/{id}` | ❌ Not Implemented |
+| Delete Resource | DELETE | `/media-follows/{id}` | ❌ Not Implemented |
+
+### Media Attributes [/media-attributes/{id}] (In Development)
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Fetch Collection | GET | `/media-attributes` | ❌ Not Implemented |
+| Fetch Resource | GET | `/media-attributes/{id}` | ❌ Not Implemented |
+
+### Media Attribute Votes [/media-attribute-votes/{id}] (In Development)
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Fetch Collection | GET | `/media-attribute-votes` | ❌ Not Implemented |
+| Fetch Resource | GET | `/media-attribute-votes/{id}` | ❌ Not Implemented |
+| Create Resource | POST | `/media-attribute-votes` | ❌ Not Implemented |
+| Update Resource | PATCH | `/media-attribute-votes/{id}` | ❌ Not Implemented |
+| Delete Resource | DELETE | `/media-attribute-votes/{id}` | ❌ Not Implemented |
+
+## Implementation Summary
+
+| Category | Total Endpoints | Implemented | Not Implemented |
+|----------|-----------------|-------------|-----------------|
+| Anime | 7 | 4 | 3 |
+| Manga | 7 | 4 | 3 |
+| Categories | 3 | 0 | 3 |
+| Characters | 3 groups | 0 | all |
+| Producers & Staff | 4 groups | 0 | all |
+| Media Relations | 3 | 0 | all |
+| Streamers | 2 | 0 | all |
+| Users | 8 groups | 0 | all |
+| User Libraries | 4 | 0 | all |
+| Reactions | 4 | 0 | all |
+| Posts | 3 | 0 | all |
+| Comments | 2 | 0 | all |
+| Groups | 13 groups | 0 | all |
+| Reports | 1 | 0 | all |
+| Site Announcements | 1 | 0 | all |
+| Media Follows | 3 | 0 | all |
+
+## Notes
+
+- The `KitsuProvider` only implements **GET** endpoints for anime/manga listing, search, and single-resource fetch.
+- All `POST`, `PATCH`, and `DELETE` operations are **not implemented**.
+- Authentication (OAuth2) is **not implemented** — all requests are anonymous.
+- Rate limiting is enforced at **900ms minimum interval**.
+- The project focuses on metadata aggregation for local anime/manga databases, not user-generated content.
+
+---
+
+# TVmaze API Implementation Status
+
+Source: https://github.com/enrell/animedb/blob/main/docs/tvmaze.md
+
+# TVmaze API Implementation Status
+
+**Base URL:** `https://api.tvmaze.com`
+**API Type:** REST (JSON)
+
+This document tracks the implementation status of all TVmaze API endpoints in
+`crates/animedb/src/provider.rs`.
+
+## Overview
+
+The `TvmazeProvider` struct implements the `RemoteProvider` trait with three core methods:
+
+- `fetch_page()` — paginated listing via `/shows?page=N`
+- `search()` — text search via `/search/shows?q=query`
+- `get_by_id()` — fetch single resource by ID via `/shows/{id}`
+
+**Currently implemented endpoints:**
+
+| Method | Path | Status |
+|--------|------|--------|
+| GET | `/shows` (paginated) | ✅ Full |
+| GET | `/search/shows` | ✅ Full |
+| GET | `/shows/{id}` | ✅ Full |
+
+## Group: Shows
+
+### Shows [/shows]
+
+| Operation | Method | Path | Query Params | Status |
+|-----------|--------|------|--------------|--------|
+| Paginated listing | GET | `/shows` | `page` | ✅ Full |
+| Fetch by ID | GET | `/shows/{id}` | — | ✅ Full |
+| Show full details | GET | `/shows/{id}?embed=*` | embed params | ❌ Not Implemented |
+| Show episodes | GET | `/shows/{id}/episodes` | `page`, `specials` | ✅ Full |
+| Episode by ID | GET | `/episodes/{id}` | — | ❌ Not Implemented |
+| Show cast | GET | `/shows/{id}/cast` | — | ❌ Not Implemented |
+| Show crew | GET | `/shows/{id}/crew` | — | ❌ Not Implemented |
+| Showakis (aka shows) | GET | `/shows/{id}/akas` | — | ❌ Not Implemented |
+| Show images | GET | `/shows/{id}/images` | — | ❌ Not Implemented |
+| Show schedule | GET | `/shows/{id}/schedule` | — | ❌ Not Implemented |
+| Show season list | GET | `/shows/{id}/seasons` | — | ❌ Not Implemented |
+
+### Episodes [/episodes]
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Fetch episode by ID | GET | `/episodes/{id}` | ❌ Not Implemented |
+| Episode main index | GET | `/episodes/{id}/main` | ❌ Not Implemented |
+
+## Group: Search
+
+### Search [/search]
+
+| Operation | Method | Path | Query Params | Status |
+|-----------|--------|------|--------------|--------|
+| Search shows | GET | `/search/shows` | `q`, `limit` | ✅ Full |
+| Search people | GET | `/search/people` | `q` | ❌ Not Implemented |
+| Search quotes | GET | `/search/quotes` | `q` | ❌ Not Implemented |
+
+## Group: Schedules
+
+### Schedule [/schedule]
+
+| Operation | Method | Path | Query Params | Status |
+|-----------|--------|------|--------------|--------|
+| Full schedule | GET | `/schedule` | `country`, `date` | ❌ Not Implemented |
+| Schedule by country | GET | `/schedule?country={code}` | `country`, `date` | ❌ Not Implemented |
+| Schedule by date | GET | `/schedule?date={YYYY-MM-DD}` | `country`, `date` | ❌ Not Implemented |
+| Schedule web only | GET | `/schedule?country=US&web=true` | `country`, `web` | ❌ Not Implemented |
+
+## Group: People
+
+### People [/people]
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Fetch person by ID | GET | `/people/{id}` | ❌ Not Implemented |
+| Person cast credits | GET | `/people/{id}/castcredits` | ❌ Not Implemented |
+| Person crew credits | GET | `/people/{id}/crewcredits` | ❌ Not Implemented |
+
+## Group: Boards (Clubs)
+
+### Boards (Clubs) [/boards]
+
+TVmaze's equivalent of forums/groups.
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Board by ID | GET | `/boards/{id}` | ❌ Not Implemented |
+| Board posts | GET | `/boards/{id}/posts` | ❌ Not Implemented |
+
+## Group: Updates
+
+### Updates [/updates]
+
+| Operation | Method | Path | Query Params | Status |
+|-----------|--------|------|--------------|--------|
+| Show updates | GET | `/updates/shows` | — | ❌ Not Implemented |
+
+## Group: Index
+
+### Index [/indexes]
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Web channels index | GET | `/indexes/webchannels` | ❌ Not Implemented |
+| Networks index | GET | `/indexes/networks` | ❌ Not Implemented |
+| Streaming scheduler index | GET | `/indexes/webstreaming` | ❌ Not Implemented |
+| Streaming shows index | GET | `/web-shows` | ❌ Not Implemented |
+
+## Group: Top
+
+### Top lists [/top]
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Top shows | GET | `/top/shows` | ❌ Not Implemented |
+
+## Group: Genres
+
+### Genres [/genres]
+
+| Operation | Method | Path | Status |
+|-----------|--------|------|--------|
+| Genre list | GET | `/genres` | ❌ Not Implemented |
+
+## Notes
+
+- **Rate Limit:** TVmaze has no official rate limit, but `min_interval()` is set to 500ms as a courtesy.
+- **Base URL:** Official public instance is `https://api.tvmaze.com`.
+- **Embedding:** TVmaze supports embedding related resources via
+  `?embed=cast,seasons,episodes` query params on show endpoints.
+- **External IDs:** TVmaze provides IMDb and TVRage IDs in the `externals` field of shows.
+- **Pagination:** TVmaze uses page-based pagination for `/shows` (not cursor-based).
+- **Adult content:** No built-in SFW filter — all content is returned as-is.
+
+---
+
+# AnimeDB Reference
+
+Source: https://github.com/enrell/animedb/blob/main/REFERENCE.md
+
+# AnimeDB Reference
+
+Reference for the Rust workspace, the library crates, and the GraphQL service
+that ships with this repository.
+
+## Workspace
+
+- `crates/animedb`: Local-first and remote-first metadata library.
+- `crates/animedb-api`: GraphQL API built on top of `animedb`.
+
+## Crate `animedb`
+
+`animedb` is the core library. It now follows a layered architecture:
+
+- **Facade**: `AnimeDb` acts as the stable public facade.
+- **Repositories**: `repository/` handles all SQLite persistence.
+- **Merge Engine**: `merge/` contains pure domain logic for normalizing and merging metadata.
+- **Sync Service**: `sync/` orchestrates provider-to-catalog data flow.
+- **Provider Registry**: Dynamic registry for managing metadata sources.
+
+### Local-first API
+
+The `AnimeDb` struct remains your primary entry point:
+
+```rust
+use animedb::AnimeDb;
+
+let mut db = AnimeDb::open("/tmp/animedb.sqlite")?;
+```
+
+The catalog provides access to repositories for granular control:
+
+```rust
+// Access media catalog
+let media = db.media().get_media(id)?;
+
+// Access episode storage
+let episodes = db.episodes().episodes_for_media(media_id)?;
+
+// Access sync and orchestration
+db.sync_anilist(MediaKind::Anime)?;
+
+// Use the specialized SyncService for advanced operations
+let stats = db.sync_service().sync_all_episodes()?;
+```
+
+### Remote-first API
+
+Use the `ProviderRegistry` or the `AnimeDb::remote` facade:
+
+```rust
+use animedb::{AnimeDb, SourceName};
+use animedb::provider::default_registry;
+
+let registry = default_registry();
+let provider = registry.get(SourceName::AniList)?;
+let results = provider.search("monster", Default::default())?;
+```
+
+Episode metadata can be fetched through one provider or aggregated from the
+external IDs on a merged media record:
+
+```rust
+use animedb::{AnimeDb, MediaKind, RemoteApi};
+
+let media = RemoteApi::jikan().anime_metadata().by_id("19")?.unwrap();
+let provider_records =
+    RemoteApi::fetch_episodes_from_external_ids(MediaKind::Anime, &media.external_ids)?;
+
+let direct = RemoteApi::jikan().anime_metadata().episodes("19")?;
+```
+
+For local catalogs, use the unified storage path to fetch all episode-capable
+sources and merge them into canonical `StoredEpisode` rows:
+
+```rust
+use animedb::{AnimeDb, SourceName};
+
+let mut db = AnimeDb::open("/tmp/animedb.sqlite")?;
+let episodes =
+    db.fetch_and_store_episodes_by_external_id(SourceName::Jikan, "19")?;
+```
+
+## Migration Note
+
+The library handles SQLite migrations automatically in `AnimeDb::open`.
+The database version is tracked via `user_version` in the SQLite file.
+Migrations are now encapsulated in `crates/animedb/src/schema.rs`.
+
+---
