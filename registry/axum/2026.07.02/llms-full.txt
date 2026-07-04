@@ -1,0 +1,3472 @@
+# README.md
+
+Source: https://github.com/tokio-rs/axum/blob/main/README.md
+
+axum/README.md
+
+---
+
+# debugging_handler_type_errors.md
+
+Source: https://github.com/tokio-rs/axum/blob/main/axum/src/docs/debugging_handler_type_errors.md
+
+## Debugging handler type errors
+
+For a function to be used as a handler it must implement the [`Handler`] trait.
+axum provides blanket implementations for functions that:
+
+- Are `async fn`s.
+- Take no more than 16 arguments that all implement `Send`.
+  - All except the last argument implement [`FromRequestParts`].
+  - The last argument implements [`FromRequest`].
+- Returns something that implements [`IntoResponse`].
+- If a closure is used it must implement `Clone + Send` and be
+`'static`.
+- Returns a future that is `Send`. The most common way to accidentally make a
+future `!Send` is to hold a `!Send` type across an await.
+
+Unfortunately Rust gives poor error messages if you try to use a function
+that doesn't quite match what's required by [`Handler`].
+
+You might get an error like this:
+
+```not_rust
+error[E0277]: the trait bound `fn(bool) -> impl Future {handler}: Handler<_, _>` is not satisfied
+   --> src/main.rs:13:44
+    |
+13  |     let app = Router::new().route("/", get(handler));
+    |                                            ^^^^^^^ the trait `Handler<_, _>` is not implemented for `fn(bool) -> impl Future {handler}`
+    |
+   ::: axum/src/handler/mod.rs:116:8
+    |
+116 |     H: Handler<T, B>,
+    |        ------------- required by this bound in `axum::routing::get`
+```
+
+This error doesn't tell you _why_ your function doesn't implement
+[`Handler`]. It's possible to improve the error with the [`debug_handler`]
+proc-macro from the [axum-macros] crate.
+
+[axum-macros]: https://docs.rs/axum-macros
+[`debug_handler`]: https://docs.rs/axum-macros/latest/axum_macros/attr.debug_handler.html
+
+---
+
+# axum's error handling model
+
+Source: https://github.com/tokio-rs/axum/blob/main/axum/src/docs/error_handling.md
+
+Error handling model and utilities
+
+# axum's error handling model
+
+axum is based on [`tower::Service`] which bundles errors through its associated
+`Error` type. If you have a [`Service`] that produces an error and that error
+makes it all the way up to hyper, the connection will be terminated _without_
+sending a response. This is generally not desirable so axum makes sure you
+always produce a response by relying on the type system.
+
+axum does this by requiring all services have [`Infallible`] as their error
+type. `Infallible` is the error type for errors that can never happen.
+
+This means if you define a handler like:
+
+```rust
+use axum::http::StatusCode;
+
+async fn handler() -> Result<String, StatusCode> {
+    # todo!()
+    // ...
+}
+```
+
+While it looks like it might fail with a `StatusCode` this actually isn't an
+"error". If this handler returns `Err(some_status_code)` that will still be
+converted into a [`Response`] and sent back to the client. This is done
+through `StatusCode`'s [`IntoResponse`] implementation.
+
+It doesn't matter whether you return `Err(StatusCode::NOT_FOUND)` or
+`Err(StatusCode::INTERNAL_SERVER_ERROR)`. These are not considered errors in
+axum.
+
+Instead of a direct `StatusCode`, it makes sense to use intermediate error type
+that can ultimately be converted to `Response`. This allows using `?` operator
+in handlers. See those examples:
+
+* [`anyhow-error-response`][anyhow] for generic boxed errors
+* [`error-handling`][error-handling] for application-specific detailed errors
+
+[anyhow]: https://github.com/tokio-rs/axum/blob/main/examples/anyhow-error-response/src/main.rs
+[error-handling]: https://github.com/tokio-rs/axum/blob/main/examples/error-handling/src/main.rs
+
+This also applies to extractors. If an extractor doesn't match the request the
+request will be rejected and a response will be returned without calling your
+handler. See [`extract`](crate::extract) to learn more about handling extractor
+failures.
+
+# Routing to fallible services
+
+You generally don't have to think about errors if you're only using async
+functions as handlers. However if you're embedding general `Service`s or
+applying middleware, which might produce errors you have to tell axum how to
+convert those errors into responses.
+
+```rust
+use axum::{
+    Router,
+    body::Body,
+    http::{Request, Response, StatusCode},
+    error_handling::HandleError,
+};
+
+async fn thing_that_might_fail() -> Result<(), anyhow::Error> {
+    # Ok(())
+    // ...
+}
+
+// this service might fail with `anyhow::Error`
+let some_fallible_service = tower::service_fn(|_req| async {
+    thing_that_might_fail().await?;
+    Ok::<_, anyhow::Error>(Response::new(Body::empty()))
+});
+
+let app = Router::new().route_service(
+    "/",
+    // we cannot route to `some_fallible_service` directly since it might fail.
+    // we have to use `handle_error` which converts its errors into responses
+    // and changes its error type from `anyhow::Error` to `Infallible`.
+    HandleError::new(some_fallible_service, handle_anyhow_error),
+);
+
+// handle errors by converting them into something that implements
+// `IntoResponse`
+async fn handle_anyhow_error(err: anyhow::Error) -> (StatusCode, String) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        format!("Something went wrong: {err}"),
+    )
+}
+# let _: Router = app;
+```
+
+# Applying fallible middleware
+
+Similarly axum requires you to handle errors from middleware. That is done with
+[`HandleErrorLayer`]:
+
+```rust
+use axum::{
+    Router,
+    BoxError,
+    routing::get,
+    http::StatusCode,
+    error_handling::HandleErrorLayer,
+};
+use std::time::Duration;
+use tower::ServiceBuilder;
+
+let app = Router::new()
+    .route("/", get(|| async {}))
+    .layer(
+        ServiceBuilder::new()
+            // `timeout` will produce an error if the handler takes
+            // too long so we must handle those
+            .layer(HandleErrorLayer::new(handle_timeout_error))
+            .timeout(Duration::from_secs(30))
+    );
+
+async fn handle_timeout_error(err: BoxError) -> (StatusCode, String) {
+    if err.is::<tower::timeout::error::Elapsed>() {
+        (
+            StatusCode::REQUEST_TIMEOUT,
+            "Request took too long".to_string(),
+        )
+    } else {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Unhandled internal error: {err}"),
+        )
+    }
+}
+# let _: Router = app;
+```
+
+# Running extractors for error handling
+
+`HandleErrorLayer` also supports running extractors:
+
+```rust
+use axum::{
+    Router,
+    BoxError,
+    routing::get,
+    http::{StatusCode, Method, Uri},
+    error_handling::HandleErrorLayer,
+};
+use std::time::Duration;
+use tower::ServiceBuilder;
+
+let app = Router::new()
+    .route("/", get(|| async {}))
+    .layer(
+        ServiceBuilder::new()
+            // `timeout` will produce an error if the handler takes
+            // too long so we must handle those
+            .layer(HandleErrorLayer::new(handle_timeout_error))
+            .timeout(Duration::from_secs(30))
+    );
+
+async fn handle_timeout_error(
+    // `Method` and `Uri` are extractors so they can be used here
+    method: Method,
+    uri: Uri,
+    // the last argument must be the error itself
+    err: BoxError,
+) -> (StatusCode, String) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        format!("`{method} {uri}` failed with {err}"),
+    )
+}
+# let _: Router = app;
+```
+
+[`tower::Service`]: `tower::Service`
+[`Infallible`]: std::convert::Infallible
+[`Response`]: crate::response::Response
+[`IntoResponse`]: crate::response::IntoResponse
+
+---
+
+# Intro
+
+Source: https://github.com/tokio-rs/axum/blob/main/axum/src/docs/extract.md
+
+Types and traits for extracting data from requests.
+
+# Intro
+
+A handler function is an async function that takes any number of
+"extractors" as arguments. An extractor is a type that implements
+[`FromRequest`] or [`FromRequestParts`].
+
+For example, [`Json`] is an extractor that consumes the request body and
+deserializes it as JSON into some target type:
+
+```rust,no_run
+use axum::{
+    extract::Json,
+    routing::post,
+    handler::Handler,
+    Router,
+};
+use serde::Deserialize;
+
+#[derive(Deserialize)]
+struct CreateUser {
+    email: String,
+    password: String,
+}
+
+async fn create_user(Json(payload): Json<CreateUser>) {
+    // ...
+}
+
+let app = Router::new().route("/users", post(create_user));
+# let _: Router = app;
+```
+
+# Common extractors
+
+Some commonly used extractors are:
+
+```rust,no_run
+use axum::{
+    extract::{Request, Json, Path, Extension, Query},
+    routing::post,
+    http::header::HeaderMap,
+    body::{Bytes, Body},
+    Router,
+};
+use serde_json::Value;
+use std::collections::HashMap;
+
+// `Path` gives you the path parameters and deserializes them. See its docs for
+// more details
+async fn path(Path(user_id): Path<u32>) {}
+
+// `Query` gives you the query parameters and deserializes them.
+async fn query(Query(params): Query<HashMap<String, String>>) {}
+
+// `HeaderMap` gives you all the headers
+async fn headers(headers: HeaderMap) {}
+
+// `String` consumes the request body and ensures it is valid utf-8
+async fn string(body: String) {}
+
+// `Bytes` gives you the raw request body
+async fn bytes(body: Bytes) {}
+
+// We've already seen `Json` for parsing the request body as json
+async fn json(Json(payload): Json<Value>) {}
+
+// `Request` gives you the whole request for maximum control
+async fn request(request: Request) {}
+
+// `Extension` extracts data from "request extensions"
+// This is commonly used to share state with handlers
+async fn extension(Extension(state): Extension<State>) {}
+
+#[derive(Clone)]
+struct State { /* ... */ }
+
+let app = Router::new()
+    .route("/path/{user_id}", post(path))
+    .route("/query", post(query))
+    .route("/string", post(string))
+    .route("/bytes", post(bytes))
+    .route("/json", post(json))
+    .route("/request", post(request))
+    .route("/extension", post(extension));
+# let _: Router = app;
+```
+
+# Applying multiple extractors
+
+You can also apply multiple extractors:
+
+```rust,no_run
+use axum::{
+    extract::{Path, Query},
+    routing::get,
+    Router,
+};
+use uuid::Uuid;
+use serde::Deserialize;
+
+let app = Router::new().route("/users/{id}/things", get(get_user_things));
+
+#[derive(Deserialize)]
+struct Pagination {
+    page: usize,
+    per_page: usize,
+}
+
+async fn get_user_things(
+    Path(user_id): Path<Uuid>,
+    Query(pagination): Query<Pagination>,
+) {
+    // ...
+}
+# let _: Router = app;
+```
+
+# The order of extractors
+
+Extractors always run in the order of the function parameters that is from
+left to right.
+
+The request body is an asynchronous stream that can only be consumed once.
+Therefore you can only have one extractor that consumes the request body. axum
+enforces this by requiring such extractors to be the _last_ argument your
+handler takes.
+
+For example
+
+```rust
+use axum::{extract::State, http::{Method, HeaderMap}};
+#
+# #[derive(Clone)]
+# struct AppState {
+# }
+
+async fn handler(
+    // `Method` and `HeaderMap` don't consume the request body so they can
+    // put anywhere in the argument list (but before `body`)
+    method: Method,
+    headers: HeaderMap,
+    // `State` is also an extractor so it needs to be before `body`
+    State(state): State<AppState>,
+    // `String` consumes the request body and thus must be the last extractor
+    body: String,
+) {
+    // ...
+}
+#
+# let _: axum::routing::MethodRouter<AppState> = axum::routing::get(handler);
+```
+
+We get a compile error if `String` isn't the last extractor:
+
+```rust,compile_fail
+use axum::http::Method;
+
+async fn handler(
+    // this doesn't work since `String` must be the last argument
+    body: String,
+    method: Method,
+) {
+    // ...
+}
+#
+# let _: axum::routing::MethodRouter = axum::routing::get(handler);
+```
+
+This also means you cannot consume the request body twice:
+
+```rust,compile_fail
+use axum::Json;
+use serde::Deserialize;
+
+#[derive(Deserialize)]
+struct Payload {}
+
+async fn handler(
+    // `String` and `Json` both consume the request body
+    // so they cannot both be used
+    string_body: String,
+    json_body: Json<Payload>,
+) {
+    // ...
+}
+#
+# let _: axum::routing::MethodRouter = axum::routing::get(handler);
+```
+
+axum enforces this by requiring the last extractor implements [`FromRequest`]
+and all others implement [`FromRequestParts`].
+
+# Handling extractor rejections
+
+If you want to handle the case of an extractor failing within a specific
+handler, you can wrap it in `Result`, with the error being the rejection type
+of the extractor:
+
+```rust,no_run
+use axum::{
+    extract::{Json, rejection::JsonRejection},
+    routing::post,
+    Router,
+};
+use serde_json::Value;
+
+async fn create_user(payload: Result<Json<Value>, JsonRejection>) {
+    match payload {
+        Ok(payload) => {
+            // We got a valid JSON payload
+        }
+        Err(JsonRejection::MissingJsonContentType(_)) => {
+            // Request didn't have `Content-Type: application/json`
+            // header
+        }
+        Err(JsonRejection::JsonDataError(_)) => {
+            // Couldn't deserialize the body into the target type
+        }
+        Err(JsonRejection::JsonSyntaxError(_)) => {
+            // Syntax error in the body
+        }
+        Err(JsonRejection::BytesRejection(_)) => {
+            // Failed to extract the request body
+        }
+        Err(_) => {
+            // `JsonRejection` is marked `#[non_exhaustive]` so match must
+            // include a catch-all case.
+        }
+    }
+}
+
+let app = Router::new().route("/users", post(create_user));
+# let _: Router = app;
+```
+
+# Optional extractors
+
+Some extractors implement [`OptionalFromRequestParts`] in addition to
+[`FromRequestParts`], or [`OptionalFromRequest`] in addition to [`FromRequest`].
+
+These extractors can be used inside of `Option`. It depends on the particular
+`OptionalFromRequestParts` or `OptionalFromRequest` implementation what this
+does: For example for `TypedHeader` from axum-extra, you get `None` if the
+header you're trying to extract is not part of the request, but if the header
+is present and fails to parse, the request is rejected.
+
+```rust,no_run
+use axum::{routing::post, Router};
+use axum_extra::{headers::UserAgent, TypedHeader};
+use serde_json::Value;
+
+async fn foo(user_agent: Option<TypedHeader<UserAgent>>) {
+    if let Some(TypedHeader(user_agent)) = user_agent {
+        // The client sent a user agent
+    } else {
+        // No user agent header
+    }
+}
+
+let app = Router::new().route("/foo", post(foo));
+# let _: Router = app;
+```
+
+# Customizing extractor responses
+
+If an extractor fails it will return a response with the error and your
+handler will not be called. To customize the error response you have two
+options:
+
+1. Use `Result<T, T::Rejection>` as your extractor like shown in
+   ["Handling extractor rejections"](#handling-extractor-rejections).
+   This works well if you're only using the extractor in a single handler.
+2. Create your own extractor that in its [`FromRequest`] implementation calls
+   one of axum's built in extractors but returns a different response for
+   rejections. See the [customize-extractor-error] example for more details.
+
+# Accessing inner errors
+
+axum's built-in extractors don't directly expose the inner error. This gives us
+more flexibility and allows us to change internal implementations without
+breaking the public API.
+
+For example that means while [`Json`] is implemented using [`serde_json`] it
+doesn't directly expose the [`serde_json::Error`] that's contained in
+[`JsonRejection::JsonDataError`]. However it is still possible to access via
+methods from [`std::error::Error`]:
+
+```rust
+use std::error::Error;
+use axum::{
+    extract::{Json, rejection::JsonRejection},
+    response::IntoResponse,
+    http::StatusCode,
+};
+use serde_json::{json, Value};
+
+async fn handler(
+    result: Result<Json<Value>, JsonRejection>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    match result {
+        // if the client sent valid JSON then we're good
+        Ok(Json(payload)) => Ok(Json(json!({ "payload": payload }))),
+
+        Err(err) => match err {
+            JsonRejection::JsonDataError(err) => {
+                Err(serde_json_error_response(err))
+            }
+            JsonRejection::JsonSyntaxError(err) => {
+                Err(serde_json_error_response(err))
+            }
+            // handle other rejections from the `Json` extractor
+            JsonRejection::MissingJsonContentType(_) => Err((
+                StatusCode::BAD_REQUEST,
+                "Missing `Content-Type: application/json` header".to_string(),
+            )),
+            JsonRejection::BytesRejection(_) => Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to buffer request body".to_string(),
+            )),
+            // we must provide a catch-all case since `JsonRejection` is marked
+            // `#[non_exhaustive]`
+            _ => Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Unknown error".to_string(),
+            )),
+        },
+    }
+}
+
+// attempt to extract the inner `serde_path_to_error::Error<serde_json::Error>`,
+// if that succeeds we can provide a more specific error.
+//
+// `Json` uses `serde_path_to_error` so the error will be wrapped in `serde_path_to_error::Error`.
+fn serde_json_error_response<E>(err: E) -> (StatusCode, String)
+where
+    E: Error + 'static,
+{
+    if let Some(err) = find_error_source::<serde_path_to_error::Error<serde_json::Error>>(&err) {
+        let serde_json_err = err.inner();
+        (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Invalid JSON at line {} column {}",
+                serde_json_err.line(),
+                serde_json_err.column()
+            ),
+        )
+    } else {
+        (StatusCode::BAD_REQUEST, "Unknown error".to_string())
+    }
+}
+
+// attempt to downcast `err` into a `T` and if that fails recursively try and
+// downcast `err`'s source
+fn find_error_source<'a, T>(err: &'a (dyn Error + 'static)) -> Option<&'a T>
+where
+    T: Error + 'static,
+{
+    if let Some(err) = err.downcast_ref::<T>() {
+        Some(err)
+    } else if let Some(source) = err.source() {
+        find_error_source(source)
+    } else {
+        None
+    }
+}
+# 
+# #[tokio::main]
+# async fn main() {
+#     use axum::extract::FromRequest;
+# 
+#     let req = axum::http::Request::builder()
+#         .header("content-type", "application/json")
+#         .body(axum::body::Body::from("{"))
+#         .unwrap();
+# 
+#     let err = match Json::<serde_json::Value>::from_request(req, &()).await.unwrap_err() {
+#         JsonRejection::JsonSyntaxError(err) => err,
+#         _ => panic!(),
+#     };
+# 
+#     let (_, body) = serde_json_error_response(err);
+#     assert_eq!(body, "Invalid JSON at line 1 column 1");
+# }
+```
+
+Note that while this approach works it might break in the future if axum changes
+its implementation to use a different error type internally. Such changes might
+happen without major breaking versions.
+
+# Defining custom extractors
+
+You can also define your own extractors by implementing either
+[`FromRequestParts`] or [`FromRequest`].
+
+## Implementing `FromRequestParts`
+
+Implement `FromRequestParts` if your extractor doesn't need access to the
+request body:
+
+```rust,no_run
+use axum::{
+    extract::FromRequestParts,
+    routing::get,
+    Router,
+    http::{
+        StatusCode,
+        header::{HeaderValue, USER_AGENT},
+        request::Parts,
+    },
+};
+
+struct ExtractUserAgent(HeaderValue);
+
+impl<S> FromRequestParts<S> for ExtractUserAgent
+where
+    S: Send + Sync,
+{
+    type Rejection = (StatusCode, &'static str);
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        if let Some(user_agent) = parts.headers.get(USER_AGENT) {
+            Ok(ExtractUserAgent(user_agent.clone()))
+        } else {
+            Err((StatusCode::BAD_REQUEST, "`User-Agent` header is missing"))
+        }
+    }
+}
+
+async fn handler(ExtractUserAgent(user_agent): ExtractUserAgent) {
+    // ...
+}
+
+let app = Router::new().route("/foo", get(handler));
+# let _: Router = app;
+```
+
+## Implementing `FromRequest`
+
+If your extractor needs to consume the request body you must implement [`FromRequest`]
+
+```rust,no_run
+use axum::{
+    extract::{Request, FromRequest},
+    response::{Response, IntoResponse},
+    body::{Bytes, Body},
+    routing::get,
+    Router,
+    http::{
+        StatusCode,
+        header::{HeaderValue, USER_AGENT},
+    },
+};
+
+struct ValidatedBody(Bytes);
+
+impl<S> FromRequest<S> for ValidatedBody
+where
+    Bytes: FromRequest<S>,
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        let body = Bytes::from_request(req, state)
+            .await
+            .map_err(IntoResponse::into_response)?;
+
+        // do validation...
+
+        Ok(Self(body))
+    }
+}
+
+async fn handler(ValidatedBody(body): ValidatedBody) {
+    // ...
+}
+
+let app = Router::new().route("/foo", get(handler));
+# let _: Router = app;
+```
+
+## Cannot implement both `FromRequest` and `FromRequestParts`
+
+Note that you will make your extractor unusable by implementing both
+`FromRequest` and `FromRequestParts` directly for the same type, unless it is
+wrapping another extractor:
+
+```rust,compile_fail
+use axum::{
+    Router,
+    routing::get,
+    extract::{FromRequest, Request, FromRequestParts},
+    http::request::Parts,
+    body::Body,
+};
+use std::convert::Infallible;
+
+// Some extractor that doesn't wrap another extractor
+struct MyExtractor;
+
+// `MyExtractor` implements both `FromRequest`
+impl<S> FromRequest<S> for MyExtractor
+where
+    S: Send + Sync,
+{
+    type Rejection = Infallible;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        // ...
+        # todo!()
+    }
+}
+
+// and `FromRequestParts`
+impl<S> FromRequestParts<S> for MyExtractor
+where
+    S: Send + Sync,
+{
+    type Rejection = Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        // ...
+        # todo!()
+    }
+}
+
+let app = Router::new().route(
+    "/",
+    // This fails when we go to actually use `MyExtractor` in a handler function.
+    // This is due to a limit in Rust's type system.
+    //
+    // The workaround is to implement either `FromRequest` or `FromRequestParts`
+    // but not both, if your extractor doesn't wrap another extractor.
+    //
+    // See "Wrapping extractors" for how to wrap other extractors.
+    get(|_: MyExtractor| async {}),
+);
+# let _: Router = app;
+```
+
+# Accessing other extractors in `FromRequest` or `FromRequestParts` implementations
+
+When defining custom extractors you often need to access another extractor
+in your implementation.
+
+```rust
+use axum::{
+    extract::{Extension, FromRequestParts},
+    http::{StatusCode, HeaderMap, request::Parts},
+    response::{IntoResponse, Response},
+    routing::get,
+    Router,
+};
+
+#[derive(Clone)]
+struct State {
+    // ...
+}
+
+struct AuthenticatedUser {
+    // ...
+}
+
+impl<S> FromRequestParts<S> for AuthenticatedUser
+where
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        // You can either call them directly...
+        let headers = HeaderMap::from_request_parts(parts, state)
+            .await
+            .map_err(|err| match err {})?;
+
+        // ... or use `extract` / `extract_with_state` from `RequestExt` / `RequestPartsExt`
+        use axum::RequestPartsExt;
+        let Extension(state) = parts.extract::<Extension<State>>()
+            .await
+            .map_err(|err| err.into_response())?;
+
+        unimplemented!("actually perform the authorization")
+    }
+}
+
+async fn handler(user: AuthenticatedUser) {
+    // ...
+}
+
+let state = State { /* ... */ };
+
+let app = Router::new().route("/", get(handler)).layer(Extension(state));
+# let _: Router = app;
+```
+
+# Request body limits
+
+For security reasons, [`Bytes`] will, by default, not accept bodies larger than
+2MB. This also applies to extractors that use [`Bytes`] internally such as
+`String`, [`Json`], and [`Form`].
+
+For more details, including how to disable this limit, see [`DefaultBodyLimit`].
+
+# Wrapping extractors
+
+If you want to write an extractor that generically wraps another extractor
+(that may or may not consume the request body) you should implement both
+[`FromRequest`] and [`FromRequestParts`]:
+
+```rust
+use axum::{
+    Router,
+    body::Body,
+    routing::get,
+    extract::{Request, FromRequest, FromRequestParts},
+    http::{HeaderMap, request::Parts},
+};
+use std::time::{Instant, Duration};
+
+// an extractor that wraps another and measures how long time it takes to run
+struct Timing<E> {
+    extractor: E,
+    duration: Duration,
+}
+
+// we must implement both `FromRequestParts`
+impl<S, T> FromRequestParts<S> for Timing<T>
+where
+    S: Send + Sync,
+    T: FromRequestParts<S>,
+{
+    type Rejection = T::Rejection;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let start = Instant::now();
+        let extractor = T::from_request_parts(parts, state).await?;
+        let duration = start.elapsed();
+        Ok(Timing {
+            extractor,
+            duration,
+        })
+    }
+}
+
+// and `FromRequest`
+impl<S, T> FromRequest<S> for Timing<T>
+where
+    S: Send + Sync,
+    T: FromRequest<S>,
+{
+    type Rejection = T::Rejection;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        let start = Instant::now();
+        let extractor = T::from_request(req, state).await?;
+        let duration = start.elapsed();
+        Ok(Timing {
+            extractor,
+            duration,
+        })
+    }
+}
+
+async fn handler(
+    // this uses the `FromRequestParts` impl
+    _: Timing<HeaderMap>,
+    // this uses the `FromRequest` impl
+    _: Timing<String>,
+) {}
+# let _: axum::routing::MethodRouter = axum::routing::get(handler);
+```
+
+# Logging rejections
+
+All built-in extractors will log rejections for easier debugging. To see the
+logs, enable the `tracing` feature for axum (enabled by default) and the
+`axum::rejection=trace` tracing target, for example with
+`RUST_LOG=info,axum::rejection=trace cargo run`.
+
+[axum-extra]: https://docs.rs/axum-extra/latest/axum_extra/extract/index.html
+[`body::Body`]: crate::body::Body
+[`Bytes`]: crate::body::Bytes
+[customize-extractor-error]: https://github.com/tokio-rs/axum/blob/main/examples/customize-extractor-error/src/main.rs
+[`HeaderMap`]: https://docs.rs/http/latest/http/header/struct.HeaderMap.html
+[`Request`]: https://docs.rs/http/latest/http/struct.Request.html
+[`JsonRejection::JsonDataError`]: rejection::JsonRejection::JsonDataError
+
+---
+
+# handlers_intro.md
+
+Source: https://github.com/tokio-rs/axum/blob/main/axum/src/docs/handlers_intro.md
+
+In axum a "handler" is an async function that accepts zero or more
+["extractors"](crate::extract) as arguments and returns something that
+can be converted [into a response](crate::response).
+
+Handlers are where your application logic lives and axum applications are built
+by routing between handlers.
+
+[`debug_handler`]: https://docs.rs/axum-macros/latest/axum_macros/attr.debug_handler.html
+
+---
+
+# let _: Router = app;
+
+Source: https://github.com/tokio-rs/axum/blob/main/axum/src/docs/method_routing/fallback.md
+
+Add a fallback service to the router.
+
+This service will be called if no route matches the incoming request.
+
+```rust
+use axum::{
+    Router,
+    routing::get,
+    handler::Handler,
+    response::IntoResponse,
+    http::{StatusCode, Method, Uri},
+};
+
+let handler = get(|| async {}).fallback(fallback);
+
+let app = Router::new().route("/", handler);
+
+async fn fallback(method: Method, uri: Uri) -> (StatusCode, String) {
+    (StatusCode::NOT_FOUND, format!("`{method}` not allowed for {uri}"))
+}
+# let _: Router = app;
+```
+
+## When used with `MethodRouter::merge`
+
+Two routers that both have a fallback cannot be merged. Doing so results in a
+panic:
+
+```rust,should_panic
+use axum::{
+    routing::{get, post},
+    handler::Handler,
+    response::IntoResponse,
+    http::{StatusCode, Uri},
+};
+
+let one = get(|| async {}).fallback(fallback_one);
+
+let two = post(|| async {}).fallback(fallback_two);
+
+let method_route = one.merge(two);
+
+async fn fallback_one() -> impl IntoResponse { /* ... */ }
+async fn fallback_two() -> impl IntoResponse { /* ... */ }
+# let app: axum::Router = axum::Router::new().route("/", method_route);
+```
+
+## Setting the `Allow` header
+
+By default `MethodRouter` will set the `Allow` header when returning `405 Method
+Not Allowed`. This is also done when the fallback returns `405 Method Not Allowed`
+unless the response generated by the fallback already sets the `Allow` header.
+
+This means if you use `fallback` to accept additional methods, you should make
+sure you set the `Allow` header correctly.
+
+---
+
+# Example
+
+Source: https://github.com/tokio-rs/axum/blob/main/axum/src/docs/method_routing/layer.md
+
+Apply a [`tower::Layer`] to all routes in the router.
+
+This can be used to add additional processing to a request for a group
+of routes.
+
+Note that the middleware is only applied to existing routes. So you have to
+first add your routes (and / or fallback) and then call `layer` afterwards. Additional
+routes added after `layer` is called will not have the middleware added.
+
+Works similarly to [`Router::layer`](super::Router::layer). See that method for
+more details.
+
+# Example
+
+```rust
+use axum::{routing::get, Router};
+use tower::limit::ConcurrencyLimitLayer;
+
+async fn handler() {}
+
+let app = Router::new().route(
+    "/",
+    // All requests to `GET /` will be sent through `ConcurrencyLimitLayer`
+    get(handler).layer(ConcurrencyLimitLayer::new(64)),
+);
+# let _: Router = app;
+```
+
+---
+
+# let _: Router = app;
+
+Source: https://github.com/tokio-rs/axum/blob/main/axum/src/docs/method_routing/merge.md
+
+Merge two routers into one.
+
+This is useful for breaking routers into smaller pieces and combining them
+into one.
+
+```rust
+use axum::{
+    routing::{get, post},
+    Router,
+};
+
+let get = get(|| async {});
+let post = post(|| async {});
+
+let merged = get.merge(post);
+
+let app = Router::new().route("/", merged);
+
+// Our app now accepts
+// - GET /
+// - POST /
+# let _: Router = app;
+```
+
+---
+
+# Example
+
+Source: https://github.com/tokio-rs/axum/blob/main/axum/src/docs/method_routing/route_layer.md
+
+Apply a [`tower::Layer`] to the router that will only run if the request matches
+a route.
+
+Note that the middleware is only applied to existing routes. First add your routes and then call `route_layer`
+afterwards. Additional routes added after `route_layer` is called will not have
+the middleware added.
+
+This works similarly to [`MethodRouter::layer`] except the middleware will only run if
+the request matches a route. This is useful for middleware that returns early
+(such as authorization) which might otherwise convert a `405 Method Not Allowed` into a
+`401 Unauthorized`.
+
+# Example
+
+```rust
+use axum::{
+    routing::get,
+    Router,
+};
+use tower_http::validate_request::ValidateRequestHeaderLayer;
+
+let app = Router::new().route(
+    "/foo",
+    get(|| async {})
+        .route_layer(ValidateRequestHeaderLayer::bearer("password"))
+);
+
+// `GET /foo` with a valid token will receive `200 OK`
+// `GET /foo` with an invalid token will receive `401 Unauthorized`
+// `POST /FOO` with an invalid token will receive `405 Method Not Allowed`
+# let _: Router = app;
+```
+
+---
+
+# Intro
+
+Source: https://github.com/tokio-rs/axum/blob/main/axum/src/docs/middleware.md
+
+# Intro
+
+axum is unique in that it doesn't have its own bespoke middleware system and
+instead integrates with [`tower`]. This means the ecosystem of [`tower`] and
+[`tower-http`] middleware all work with axum.
+
+While it's not necessary to fully understand tower to write or use middleware
+with axum, having at least a basic understanding of tower's concepts is
+recommended. See [tower's guides][tower-guides] for a general introduction.
+Reading the documentation for [`tower::ServiceBuilder`] is also recommended.
+
+# Applying middleware
+
+axum allows you to add middleware just about anywhere
+
+- To entire routers with [`Router::layer`] and [`Router::route_layer`].
+- To method routers with [`MethodRouter::layer`] and [`MethodRouter::route_layer`].
+- To individual handlers with [`Handler::layer`].
+
+## Applying multiple middleware
+
+It's recommended to use [`tower::ServiceBuilder`] to apply multiple middleware at
+once, instead of calling `layer` (or `route_layer`) repeatedly:
+
+```rust
+use axum::{
+    routing::get,
+    Extension,
+    Router,
+};
+use tower_http::{trace::TraceLayer};
+use tower::ServiceBuilder;
+
+async fn handler() {}
+
+#[derive(Clone)]
+struct State {}
+
+let app = Router::new()
+    .route("/", get(handler))
+    .layer(
+        ServiceBuilder::new()
+            .layer(TraceLayer::new_for_http())
+            .layer(Extension(State {}))
+    );
+# let _: Router = app;
+```
+
+# Commonly used middleware
+
+Some commonly used middleware are:
+
+- [`TraceLayer`](tower_http::trace) for high level tracing/logging.
+- [`CorsLayer`](tower_http::cors) for handling CORS.
+- [`CompressionLayer`](tower_http::compression) for automatic compression of responses.
+- [`RequestIdLayer`](tower_http::request_id) and
+  [`PropagateRequestIdLayer`](tower_http::request_id) set and propagate request
+  ids.
+- [`TimeoutLayer`](tower_http::timeout::TimeoutLayer) for timeouts.
+
+# Ordering
+
+When you add middleware with [`Router::layer`] (or similar) all previously added
+routes will be wrapped in the middleware. Generally speaking, this results in
+middleware being executed from bottom to top.
+
+So if you do this:
+
+```rust
+use axum::{routing::get, Router};
+
+async fn handler() {}
+
+# let layer_one = axum::Extension(());
+# let layer_two = axum::Extension(());
+# let layer_three = axum::Extension(());
+#
+let app = Router::new()
+    .route("/", get(handler))
+    .layer(layer_one)
+    .layer(layer_two)
+    .layer(layer_three);
+# let _: Router = app;
+```
+
+Think of the middleware as being layered like an onion where each new layer
+wraps all previous layers:
+
+```not_rust
+        requests
+           |
+           v
++----- layer_three -----+
+| +---- layer_two ----+ |
+| | +-- layer_one --+ | |
+| | |               | | |
+| | |    handler    | | |
+| | |               | | |
+| | +-- layer_one --+ | |
+| +---- layer_two ----+ |
++----- layer_three -----+
+           |
+           v
+        responses
+```
+
+That is:
+
+- First `layer_three` receives the request
+- It then does its thing and passes the request onto `layer_two`
+- Which passes the request onto `layer_one`
+- Which passes the request onto `handler` where a response is produced
+- That response is then passed to `layer_one`
+- Then to `layer_two`
+- And finally to `layer_three` where it's returned out of your app
+
+It's a little more complicated in practice because any middleware is free to
+return early and not call the next layer, for example if a request cannot be
+authorized, but it's a useful mental model to have.
+
+As previously mentioned it's recommended to add multiple middleware using
+`tower::ServiceBuilder`, however this impacts ordering:
+
+```rust
+use tower::ServiceBuilder;
+use axum::{routing::get, Router};
+
+async fn handler() {}
+
+# let layer_one = axum::Extension(());
+# let layer_two = axum::Extension(());
+# let layer_three = axum::Extension(());
+#
+let app = Router::new()
+    .route("/", get(handler))
+    .layer(
+        ServiceBuilder::new()
+            .layer(layer_one)
+            .layer(layer_two)
+            .layer(layer_three),
+    );
+# let _: Router = app;
+```
+
+`ServiceBuilder` works by composing all layers into one such that they run top
+to bottom. So with the previous code `layer_one` would receive the request
+first, then `layer_two`, then `layer_three`, then `handler`, and then the
+response would bubble back up through `layer_three`, then `layer_two`, and
+finally `layer_one`.
+
+Executing middleware top to bottom is generally easier to understand and follow
+mentally which is one of the reasons `ServiceBuilder` is recommended.
+
+# Writing middleware
+
+axum offers many ways of writing middleware, at different levels of abstraction
+and with different pros and cons.
+
+## `axum::middleware::from_fn`
+
+Use [`axum::middleware::from_fn`] to write your middleware when:
+
+- You're not comfortable with implementing your own futures and would rather use
+  the familiar `async`/`await` syntax.
+- You don't intend to publish your middleware as a crate for others to use.
+  Middleware written like this are only compatible with axum.
+
+## `axum::middleware::from_extractor`
+
+Use [`axum::middleware::from_extractor`] to write your middleware when:
+
+- You have a type that you sometimes want to use as an extractor and sometimes
+  as a middleware. If you only need your type as a middleware prefer
+  [`middleware::from_fn`].
+
+## tower's combinators
+
+tower has several utility combinators that can be used to perform simple
+modifications to requests or responses. The most commonly used ones are
+
+- [`ServiceBuilder::map_request`]
+- [`ServiceBuilder::map_response`]
+- [`ServiceBuilder::then`]
+- [`ServiceBuilder::and_then`]
+
+You should use these when
+
+- You want to perform a small ad hoc operation, such as adding a header.
+- You don't intend to publish your middleware as a crate for others to use.
+
+## `tower::Service` and `Pin<Box<dyn Future>>`
+
+For maximum control (and a more low level API) you can write your own middleware
+by implementing [`tower::Service`]:
+
+Use [`tower::Service`] with `Pin<Box<dyn Future>>` to write your middleware when:
+
+- Your middleware needs to be configurable for example via builder methods on
+  your [`tower::Layer`] such as [`tower_http::trace::TraceLayer`].
+- You do intend to publish your middleware as a crate for others to use.
+- You're not comfortable with implementing your own futures.
+
+A decent template for such a middleware could be:
+
+```rust
+use axum::{
+    response::Response,
+    body::Body,
+    extract::Request,
+};
+use futures_core::future::BoxFuture;
+use tower::{Service, Layer};
+use std::task::{Context, Poll};
+
+#[derive(Clone)]
+struct MyLayer;
+
+impl<S> Layer<S> for MyLayer {
+    type Service = MyMiddleware<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        MyMiddleware { inner }
+    }
+}
+
+#[derive(Clone)]
+struct MyMiddleware<S> {
+    inner: S,
+}
+
+impl<S> Service<Request> for MyMiddleware<S>
+where
+    S: Service<Request, Response = Response> + Send + 'static,
+    S::Future: Send + 'static,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    // `BoxFuture` is a type alias for `Pin<Box<dyn Future + Send + 'a>>`
+    type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, request: Request) -> Self::Future {
+        let future = self.inner.call(request);
+        Box::pin(async move {
+            let response: Response = future.await?;
+            Ok(response)
+        })
+    }
+}
+```
+
+Note that your error type being defined as `S::Error` means that your middleware typically _returns no errors_. As a principle always try to return a response and try not to bail out with a custom error type. For example, if a 3rd party library you are using inside your new middleware returns its own specialized error type, try to convert it to some reasonable response and return `Ok` with that response.
+
+If you choose to implement a custom error type such as `type Error = BoxError` (a boxed opaque error), or any other error type that is not `Infallible`, you must use a `HandleErrorLayer`, here is an example using a `ServiceBuilder`:
+
+```ignore
+ServiceBuilder::new()
+        .layer(HandleErrorLayer::new(|_: BoxError| async {
+            // because axum uses infallible errors, you must handle your custom error type from your middleware here
+            StatusCode::BAD_REQUEST
+        }))
+        .layer(
+             // <your actual layer which DOES return an error>
+        );
+```
+
+## `tower::Service` and custom futures
+
+If you're comfortable implementing your own futures (or want to learn it) and
+need as much control as possible then using `tower::Service` without boxed
+futures is the way to go.
+
+Use [`tower::Service`] with manual futures to write your middleware when:
+
+- You want your middleware to have the lowest possible overhead.
+- Your middleware needs to be configurable for example via builder methods on
+  your [`tower::Layer`] such as [`tower_http::trace::TraceLayer`].
+- You do intend to publish your middleware as a crate for others to use, perhaps
+  as part of tower-http.
+- You're comfortable with implementing your own futures, or want to learn how
+  the lower levels of async Rust works.
+
+tower's ["Building a middleware from scratch"][tower-from-scratch-guide]
+guide is a good place to learn how to do this.
+
+# Error handling for middleware
+
+axum's error handling model requires handlers to always return a response.
+However middleware is one possible way to introduce errors into an application.
+If hyper receives an error the connection will be closed without sending a
+response. Thus axum requires those errors to be handled gracefully:
+
+```rust
+use axum::{
+    routing::get,
+    error_handling::HandleErrorLayer,
+    http::StatusCode,
+    BoxError,
+    Router,
+};
+use tower::{ServiceBuilder, timeout::TimeoutLayer};
+use std::time::Duration;
+
+async fn handler() {}
+
+let app = Router::new()
+    .route("/", get(handler))
+    .layer(
+        ServiceBuilder::new()
+            // this middleware goes above `TimeoutLayer` because it will receive
+            // errors returned by `TimeoutLayer`
+            .layer(HandleErrorLayer::new(|_: BoxError| async {
+                StatusCode::REQUEST_TIMEOUT
+            }))
+            .layer(TimeoutLayer::new(Duration::from_secs(10)))
+    );
+# let _: Router = app;
+```
+
+See [`error_handling`](crate::error_handling) for more details on axum's error
+handling model.
+
+# Routing to services/middleware and backpressure
+
+Generally routing to one of multiple services and backpressure doesn't mix
+well. Ideally you would want to ensure a service is ready to receive a request
+before calling it. However, in order to know which service to call, you need
+the request...
+
+One approach is to not consider the router service itself ready until all
+destination services are ready. That is the approach used by
+[`tower::steer::Steer`].
+
+Another approach is to always consider all services ready (always return
+`Poll::Ready(Ok(()))`) from `Service::poll_ready` and then actually drive
+readiness inside the response future returned by `Service::call`. This works
+well when your services don't care about backpressure and are always ready
+anyway.
+
+axum expects that all services used in your app won't care about
+backpressure and so it uses the latter strategy. However that means you
+should avoid routing to a service (or using a middleware) that _does_ care
+about backpressure. At the very least you should [load shed][tower::load_shed]
+so requests are dropped quickly and don't keep piling up.
+
+It also means that if `poll_ready` returns an error then that error will be
+returned in the response future from `call` and _not_ from `poll_ready`. In
+that case, the underlying service will _not_ be discarded and will continue
+to be used for future requests. Services that expect to be discarded if
+`poll_ready` fails should _not_ be used with axum.
+
+One possible approach is to only apply backpressure sensitive middleware
+around your entire app. This is possible because axum applications are
+themselves services:
+
+```rust
+use axum::{
+    routing::get,
+    Router,
+};
+use tower::ServiceBuilder;
+# let some_backpressure_sensitive_middleware =
+#     tower::layer::util::Identity::new();
+
+async fn handler() { /* ... */ }
+
+let app = Router::new().route("/", get(handler));
+
+let app = ServiceBuilder::new()
+    .layer(some_backpressure_sensitive_middleware)
+    .service(app);
+# let _: Router = app;
+```
+
+However when applying middleware around your whole application in this way
+you have to take care that errors are still being handled appropriately.
+
+Also note that handlers created from async functions don't care about
+backpressure and are always ready. So if you're not using any Tower
+middleware you don't have to worry about any of this.
+
+# Accessing state in middleware
+
+How to make state available to middleware depends on how the middleware is
+written.
+
+## Accessing state in `axum::middleware::from_fn`
+
+Use [`axum::middleware::from_fn_with_state`](crate::middleware::from_fn_with_state).
+
+## Accessing state in custom `tower::Layer`s
+
+```rust
+use axum::{
+    Router,
+    routing::get,
+    middleware::{self, Next},
+    response::Response,
+    extract::{State, Request},
+};
+use tower::{Layer, Service};
+use std::task::{Context, Poll};
+
+#[derive(Clone)]
+struct AppState {}
+
+#[derive(Clone)]
+struct MyLayer {
+    state: AppState,
+}
+
+impl<S> Layer<S> for MyLayer {
+    type Service = MyService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        MyService {
+            inner,
+            state: self.state.clone(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct MyService<S> {
+    inner: S,
+    state: AppState,
+}
+
+impl<S, B> Service<Request<B>> for MyService<S>
+where
+    S: Service<Request<B>>,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = S::Future;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: Request<B>) -> Self::Future {
+        // Do something with `self.state`.
+        //
+        // See `axum::RequestExt` for how to run extractors directly from
+        // a `Request`.
+
+        self.inner.call(req)
+    }
+}
+
+async fn handler(_: State<AppState>) {}
+
+let state = AppState {};
+
+let app = Router::new()
+    .route("/", get(handler))
+    .layer(MyLayer { state: state.clone() })
+    .with_state(state);
+# let _: axum::Router = app;
+```
+
+# Passing state from middleware to handlers
+
+State can be passed from middleware to handlers using [request extensions]:
+
+```rust
+use axum::{
+    Router,
+    http::StatusCode,
+    routing::get,
+    response::{IntoResponse, Response},
+    middleware::{self, Next},
+    extract::{Request, Extension},
+};
+
+#[derive(Clone)]
+struct CurrentUser { /* ... */ }
+
+async fn auth(mut req: Request, next: Next) -> Result<Response, StatusCode> {
+    let auth_header = req.headers()
+        .get(http::header::AUTHORIZATION)
+        .and_then(|header| header.to_str().ok());
+
+    let auth_header = if let Some(auth_header) = auth_header {
+        auth_header
+    } else {
+        return Err(StatusCode::UNAUTHORIZED);
+    };
+
+    if let Some(current_user) = authorize_current_user(auth_header).await {
+        // insert the current user into a request extension so the handler can
+        // extract it
+        req.extensions_mut().insert(current_user);
+        Ok(next.run(req).await)
+    } else {
+        Err(StatusCode::UNAUTHORIZED)
+    }
+}
+
+async fn authorize_current_user(auth_token: &str) -> Option<CurrentUser> {
+    // ...
+    # unimplemented!()
+}
+
+async fn handler(
+    // extract the current user, set by the middleware
+    Extension(current_user): Extension<CurrentUser>,
+) {
+    // ...
+}
+
+let app = Router::new()
+    .route("/", get(handler))
+    .route_layer(middleware::from_fn(auth));
+# let _: Router = app;
+```
+
+[Response extensions] can also be used but note that request extensions are not
+automatically moved to response extensions. You need to manually do that for the
+extensions you need.
+
+# Rewriting request URI in middleware
+
+Middleware added with [`Router::layer`] will run after routing. That means it
+cannot be used to run middleware that rewrites the request URI. By the time the
+middleware runs the routing is already done.
+
+The workaround is to wrap the middleware around the entire `Router` (this works
+because `Router` implements [`Service`]):
+
+```rust
+use tower::Layer;
+use axum::{
+    Router,
+    ServiceExt, // for `into_make_service`
+    response::Response,
+    middleware::Next,
+    extract::Request,
+};
+
+fn rewrite_request_uri<B>(req: Request<B>) -> Request<B> {
+    // ...
+    # req
+}
+
+// this can be any `tower::Layer`
+let middleware = tower::util::MapRequestLayer::new(rewrite_request_uri);
+
+let app = Router::new();
+
+// apply the layer around the whole `Router`
+// this way the middleware will run before `Router` receives the request
+let app_with_middleware = middleware.layer(app);
+
+# async {
+let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+axum::serve(listener, app_with_middleware.into_make_service()).await;
+# };
+```
+
+[`tower`]: https://crates.io/crates/tower
+[`tower-http`]: https://crates.io/crates/tower-http
+[tower-guides]: https://github.com/tower-rs/tower/tree/master/guides
+[`axum::middleware::from_fn`]: fn@crate::middleware::from_fn
+[`middleware::from_fn`]: fn@crate::middleware::from_fn
+[tower-from-scratch-guide]: https://github.com/tower-rs/tower/blob/master/guides/building-a-middleware-from-scratch.md
+[`ServiceBuilder::map_request`]: tower::ServiceBuilder::map_request
+[`ServiceBuilder::map_response`]: tower::ServiceBuilder::map_response
+[`ServiceBuilder::then`]: tower::ServiceBuilder::then
+[`ServiceBuilder::and_then`]: tower::ServiceBuilder::and_then
+[`axum::middleware::from_extractor`]: fn@crate::middleware::from_extractor
+[`Handler::layer`]: crate::handler::Handler::layer
+[`Router::layer`]: crate::routing::Router::layer
+[`MethodRouter::layer`]: crate::routing::MethodRouter::layer
+[`Router::route_layer`]: crate::routing::Router::route_layer
+[`MethodRouter::route_layer`]: crate::routing::MethodRouter::route_layer
+[request extensions]: https://docs.rs/http/latest/http/request/struct.Request.html#method.extensions
+[Response extensions]: https://docs.rs/http/latest/http/response/struct.Response.html#method.extensions
+[`State`]: crate::extract::State
+[`Service`]: tower::Service
+
+---
+
+# Building responses
+
+Source: https://github.com/tokio-rs/axum/blob/main/axum/src/docs/response.md
+
+Types and traits for generating responses.
+
+# Building responses
+
+Anything that implements [`IntoResponse`] can be returned from a handler. axum
+provides implementations for common types:
+
+```rust,no_run
+use axum::{
+    Json,
+    response::{Html, IntoResponse},
+    http::{StatusCode, Uri, header::{self, HeaderMap, HeaderName}},
+};
+
+// `()` gives an empty response
+async fn empty() {}
+
+// String will get a `text/plain; charset=utf-8` content-type
+async fn plain_text(uri: Uri) -> String {
+    format!("Hi from {}", uri.path())
+}
+
+// Bytes will get an `application/octet-stream` content-type
+async fn bytes() -> Vec<u8> {
+    vec![1, 2, 3, 4]
+}
+
+// `Json` will get an `application/json` content-type and work with anything that
+// implements `serde::Serialize`
+async fn json() -> Json<Vec<String>> {
+    Json(vec!["foo".to_owned(), "bar".to_owned()])
+}
+
+// `Html` will get a `text/html` content-type
+async fn html() -> Html<&'static str> {
+    Html("<p>Hello, World!</p>")
+}
+
+// `StatusCode` gives an empty response with that status code
+async fn status() -> StatusCode {
+    StatusCode::NOT_FOUND
+}
+
+// `HeaderMap` gives an empty response with some headers
+async fn headers() -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(header::SERVER, "axum".parse().unwrap());
+    headers
+}
+
+// An array of tuples also gives headers
+async fn array_headers() -> [(HeaderName, &'static str); 2] {
+    [
+        (header::SERVER, "axum"),
+        (header::CONTENT_TYPE, "text/plain")
+    ]
+}
+
+// Use `impl IntoResponse` to avoid writing the whole type
+async fn impl_trait() -> impl IntoResponse {
+    [
+        (header::SERVER, "axum"),
+        (header::CONTENT_TYPE, "text/plain")
+    ]
+}
+```
+
+Additionally you can return tuples to build more complex responses from
+individual parts.
+
+```rust,no_run
+use axum::{
+    Json,
+    response::IntoResponse,
+    http::{StatusCode, HeaderMap, Uri, header},
+    extract::Extension,
+};
+
+// `(StatusCode, impl IntoResponse)` will override the status code of the response
+async fn with_status(uri: Uri) -> (StatusCode, String) {
+    (StatusCode::NOT_FOUND, format!("Not Found: {}", uri.path()))
+}
+
+// Use `impl IntoResponse` to avoid having to type the whole type
+async fn impl_trait(uri: Uri) -> impl IntoResponse {
+    (StatusCode::NOT_FOUND, format!("Not Found: {}", uri.path()))
+}
+
+// `(HeaderMap, impl IntoResponse)` to add additional headers
+async fn with_headers() -> impl IntoResponse {
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CONTENT_TYPE, "text/plain".parse().unwrap());
+    (headers, "foo")
+}
+
+// Or an array of tuples to more easily build the headers
+async fn with_array_headers() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "text/plain")], "foo")
+}
+
+// Use string keys for custom headers
+async fn with_array_headers_custom() -> impl IntoResponse {
+    ([("x-custom", "custom")], "foo")
+}
+
+// `(StatusCode, headers, impl IntoResponse)` to set status and add headers
+// `headers` can be either a `HeaderMap` or an array of tuples
+async fn with_status_and_array_headers() -> impl IntoResponse {
+    (
+        StatusCode::NOT_FOUND,
+        [(header::CONTENT_TYPE, "text/plain")],
+        "foo",
+    )
+}
+
+// `(Extension<_>, impl IntoResponse)` to set response extensions
+async fn with_status_extensions() -> impl IntoResponse {
+    (
+        Extension(Foo("foo")),
+        "foo",
+    )
+}
+
+#[derive(Clone)]
+struct Foo(&'static str);
+
+// Or mix and match all the things
+async fn all_the_things(uri: Uri) -> impl IntoResponse {
+    let mut header_map = HeaderMap::new();
+    if uri.path() == "/" {
+        header_map.insert(header::SERVER, "axum".parse().unwrap());
+    }
+
+    (
+        // set status code
+        StatusCode::NOT_FOUND,
+        // headers with an array
+        [("x-custom", "custom")],
+        // some extensions
+        Extension(Foo("foo")),
+        Extension(Foo("bar")),
+        // more headers, built dynamically
+        header_map,
+        // and finally the body
+        "foo",
+    )
+}
+```
+
+In general you can return tuples like:
+
+- `(StatusCode, impl IntoResponse)`
+- `(Parts, impl IntoResponse)`
+- `(Response<()>, impl IntoResponse)`
+- `(T1, .., Tn, impl IntoResponse)` where `T1` to `Tn` all implement [`IntoResponseParts`].
+- `(StatusCode, T1, .., Tn, impl IntoResponse)` where `T1` to `Tn` all implement [`IntoResponseParts`].
+- `(Parts, T1, .., Tn, impl IntoResponse)` where `T1` to `Tn` all implement [`IntoResponseParts`].
+- `(Response<()>, T1, .., Tn, impl IntoResponse)` where `T1` to `Tn` all implement [`IntoResponseParts`].
+
+This means you cannot accidentally override the status or body as [`IntoResponseParts`] only allows
+setting headers and extensions.
+
+Use [`Response`] for more low level control:
+
+```rust,no_run
+use axum::{
+    Json,
+    response::{IntoResponse, Response},
+    body::Body,
+    http::StatusCode,
+};
+
+async fn response() -> Response {
+    Response::builder()
+        .status(StatusCode::NOT_FOUND)
+        .header("x-foo", "custom header")
+        .body(Body::from("not found"))
+        .unwrap()
+}
+```
+
+# Returning different response types
+
+If you need to return multiple response types, and `Result<T, E>` isn't appropriate, you can call
+`.into_response()` to turn things into `axum::response::Response`:
+
+```rust
+use axum::{
+    response::{IntoResponse, Redirect, Response},
+    http::StatusCode,
+};
+
+async fn handle() -> Response {
+    if something() {
+        "All good!".into_response()
+    } else if something_else() {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Something went wrong...",
+        ).into_response()
+    } else {
+        Redirect::to("/").into_response()
+    }
+}
+
+fn something() -> bool {
+    // ...
+    # true
+}
+
+fn something_else() -> bool {
+    // ...
+    # true
+}
+```
+
+# Regarding `impl IntoResponse`
+
+You can use `impl IntoResponse` as the return type from handlers to avoid
+typing large types. For example
+
+```rust
+use axum::http::StatusCode;
+
+async fn handler() -> (StatusCode, [(&'static str, &'static str); 1], &'static str) {
+    (StatusCode::OK, [("x-foo", "bar")], "Hello, World!")
+}
+```
+
+Becomes easier using `impl IntoResponse`:
+
+```rust
+use axum::{http::StatusCode, response::IntoResponse};
+
+async fn impl_into_response() -> impl IntoResponse {
+    (StatusCode::OK, [("x-foo", "bar")], "Hello, World!")
+}
+```
+
+However `impl IntoResponse` has a few limitations. Firstly it can only be used
+to return a single type:
+
+```rust,compile_fail
+use axum::{http::StatusCode, response::IntoResponse};
+
+async fn handler() -> impl IntoResponse {
+    if check_something() {
+        StatusCode::NOT_FOUND
+    } else {
+        "Hello, World!"
+    }
+}
+
+fn check_something() -> bool {
+    # false
+    // ...
+}
+```
+
+This function returns either a `StatusCode` or a `&'static str` which `impl
+Trait` doesn't allow.
+
+Secondly `impl IntoResponse` can lead to type inference issues when used with
+`Result` and `?`:
+
+```rust,compile_fail
+use axum::{http::StatusCode, response::IntoResponse};
+
+async fn handler() -> impl IntoResponse {
+    create_thing()?;
+    Ok(StatusCode::CREATED)
+}
+
+fn create_thing() -> Result<(), StatusCode> {
+    # Ok(())
+    // ...
+}
+```
+
+This is because `?` supports using the [`From`] trait to convert to a different
+error type but it doesn't know which type to convert to, because we only
+specified `impl IntoResponse` as the return type.
+
+`Result<impl IntoResponse, impl IntoResponse>` doesn't always work either:
+
+```rust,compile_fail
+use axum::{http::StatusCode, response::IntoResponse};
+
+async fn handler() -> Result<impl IntoResponse, impl IntoResponse> {
+    create_thing()?;
+    Ok(StatusCode::CREATED)
+}
+
+fn create_thing() -> Result<(), StatusCode> {
+    # Ok(())
+    // ...
+}
+```
+
+The solution is to use a concrete error type, such as `Result<impl IntoResponse, StatusCode>`:
+
+```rust
+use axum::{http::StatusCode, response::IntoResponse};
+
+async fn handler() -> Result<impl IntoResponse, StatusCode> {
+    create_thing()?;
+    Ok(StatusCode::CREATED)
+}
+
+fn create_thing() -> Result<(), StatusCode> {
+    # Ok(())
+    // ...
+}
+```
+
+Because of this it is generally not recommended to use `impl IntoResponse`
+unless you're familiar with the details of how `impl Trait` works.
+
+[`IntoResponse`]: crate::response::IntoResponse
+[`IntoResponseParts`]: crate::response::IntoResponseParts
+[`StatusCode`]: http::StatusCode
+
+---
+
+# let _: Router = app;
+
+Source: https://github.com/tokio-rs/axum/blob/main/axum/src/docs/routing/fallback.md
+
+Add a fallback [`Handler`] to the router.
+
+This service will be called if no route matches the incoming request.
+
+```rust
+use axum::{
+    Router,
+    routing::get,
+    handler::Handler,
+    response::IntoResponse,
+    http::{StatusCode, Uri},
+};
+
+let app = Router::new()
+    .route("/foo", get(|| async { /* ... */ }))
+    .fallback(fallback);
+
+async fn fallback(uri: Uri) -> (StatusCode, String) {
+    (StatusCode::NOT_FOUND, format!("No route for {uri}"))
+}
+# let _: Router = app;
+```
+
+Fallbacks only apply to routes that aren't matched by anything in the
+router. If a handler is matched by a request but returns 404 the
+fallback is not called. Note that this applies to [`MethodRouter`]s too: if the
+request hits a valid path but the [`MethodRouter`] does not have an appropriate
+method handler installed, the fallback is not called (use
+[`MethodRouter::fallback`] for this purpose instead).
+
+
+# Handling all requests without other routes
+
+Using `Router::new().fallback(...)` to accept all requests regardless of path or
+method, if you don't have other routes, isn't optimal:
+
+```rust
+use axum::Router;
+
+async fn handler() {}
+
+let app = Router::new().fallback(handler);
+
+# async {
+let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+axum::serve(listener, app).await;
+# };
+```
+
+Running the handler directly is faster since it avoids the overhead of routing:
+
+```rust
+use axum::handler::HandlerWithoutStateExt;
+
+async fn handler() {}
+
+# async {
+let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+axum::serve(listener, handler.into_make_service()).await;
+# };
+```
+
+---
+
+# async {
+
+Source: https://github.com/tokio-rs/axum/blob/main/axum/src/docs/routing/into_make_service_with_connect_info.md
+
+Convert this router into a [`MakeService`], that will store `C`'s
+associated `ConnectInfo` in a request extension such that [`ConnectInfo`]
+can extract it.
+
+This enables extracting things like the client's remote address.
+
+Extracting [`std::net::SocketAddr`] is supported out of the box:
+
+```rust
+use axum::{
+    extract::ConnectInfo,
+    routing::get,
+    Router,
+};
+use std::net::SocketAddr;
+
+let app = Router::new().route("/", get(handler));
+
+async fn handler(ConnectInfo(addr): ConnectInfo<SocketAddr>) -> String {
+    format!("Hello {addr}")
+}
+
+# async {
+let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await;
+# };
+```
+
+You can implement custom a [`Connected`] like so:
+
+```rust
+use axum::{
+    extract::connect_info::{ConnectInfo, Connected},
+    routing::get,
+    serve::IncomingStream,
+    Router,
+};
+use tokio::net::TcpListener;
+
+let app = Router::new().route("/", get(handler));
+
+async fn handler(
+    ConnectInfo(my_connect_info): ConnectInfo<MyConnectInfo>,
+) -> String {
+    format!("Hello {my_connect_info:?}")
+}
+
+#[derive(Clone, Debug)]
+struct MyConnectInfo {
+    // ...
+}
+
+impl Connected<IncomingStream<'_, TcpListener>> for MyConnectInfo {
+    fn connect_info(target: IncomingStream<'_, TcpListener>) -> Self {
+        MyConnectInfo {
+            // ...
+        }
+    }
+}
+
+# async {
+let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+axum::serve(listener, app.into_make_service_with_connect_info::<MyConnectInfo>()).await;
+# };
+```
+
+See the [unix domain socket example][uds] for an example of how to use
+this to collect UDS connection info.
+
+[`MakeService`]: tower::make::MakeService
+[`Connected`]: crate::extract::connect_info::Connected
+[`ConnectInfo`]: crate::extract::connect_info::ConnectInfo
+[uds]: https://github.com/tokio-rs/axum/blob/main/examples/unix-domain-socket/src/main.rs
+
+---
+
+# Example
+
+Source: https://github.com/tokio-rs/axum/blob/main/axum/src/docs/routing/layer.md
+
+Apply a [`tower::Layer`] to all routes in the router.
+
+This can be used to add additional processing to a request for a group
+of routes.
+
+Note that the middleware is only applied to existing routes. So you have to
+first add your routes (and / or fallback) and then call `layer` afterwards. Additional
+routes added after `layer` is called will not have the middleware added.
+
+If you want to add middleware to a single handler you can either use
+[`MethodRouter::layer`] or [`Handler::layer`].
+
+# Example
+
+Adding the [`tower_http::trace::TraceLayer`]:
+
+```rust
+use axum::{routing::get, Router};
+use tower_http::trace::TraceLayer;
+
+let app = Router::new()
+    .route("/foo", get(|| async {}))
+    .route("/bar", get(|| async {}))
+    .layer(TraceLayer::new_for_http());
+# let _: Router = app;
+```
+
+If you need to write your own middleware see ["Writing
+middleware"](crate::middleware#writing-middleware) for the different options.
+
+If you only want middleware on some routes you can use [`Router::merge`]:
+
+```rust
+use axum::{routing::get, Router};
+use tower_http::{trace::TraceLayer, compression::CompressionLayer};
+
+let with_tracing = Router::new()
+    .route("/foo", get(|| async {}))
+    .layer(TraceLayer::new_for_http());
+
+let with_compression = Router::new()
+    .route("/bar", get(|| async {}))
+    .layer(CompressionLayer::new());
+
+// Merge everything into one `Router`
+let app = Router::new()
+    .merge(with_tracing)
+    .merge(with_compression);
+# let _: Router = app;
+```
+
+# Multiple middleware
+
+It's recommended to use [`tower::ServiceBuilder`] when applying multiple
+middleware. See [`middleware`](crate::middleware) for more details.
+
+# Runs after routing
+
+Middleware added with this method will run _after_ routing and thus cannot be
+used to rewrite the request URI. See ["Rewriting request URI in
+middleware"](crate::middleware#rewriting-request-uri-in-middleware) for more
+details and a workaround.
+
+# Error handling
+
+See [`middleware`](crate::middleware) for details on how error handling impacts
+middleware.
+
+---
+
+# async fn users_list() {}
+
+Source: https://github.com/tokio-rs/axum/blob/main/axum/src/docs/routing/merge.md
+
+Merge the paths and fallbacks of two routers into a single [`Router`].
+
+This is useful for breaking apps into smaller pieces and combining them
+into one.
+
+```rust
+use axum::{
+    routing::get,
+    Router,
+};
+#
+# async fn users_list() {}
+# async fn users_show() {}
+# async fn teams_list() {}
+
+// define some routes separately
+let user_routes = Router::new()
+    .route("/users", get(users_list))
+    .route("/users/{id}", get(users_show));
+
+let team_routes = Router::new()
+    .route("/teams", get(teams_list));
+
+// combine them into one
+let app = Router::new()
+    .merge(user_routes)
+    .merge(team_routes);
+
+// could also do `user_routes.merge(team_routes)`
+
+// Our app now accepts
+// - GET /users
+// - GET /users/{id}
+// - GET /teams
+# let _: Router = app;
+```
+
+# Merging routers with state
+
+When combining [`Router`]s with this method, each [`Router`] must have the
+same type of state. If your routers have different types you can use
+[`Router::with_state`] to provide the state and make the types match:
+
+```rust
+use axum::{
+    Router,
+    routing::get,
+    extract::State,
+};
+
+#[derive(Clone)]
+struct InnerState {}
+
+#[derive(Clone)]
+struct OuterState {}
+
+async fn inner_handler(state: State<InnerState>) {}
+
+let inner_router = Router::new()
+    .route("/bar", get(inner_handler))
+    .with_state(InnerState {});
+
+async fn outer_handler(state: State<OuterState>) {}
+
+let app = Router::new()
+    .route("/", get(outer_handler))
+    .merge(inner_router)
+    .with_state(OuterState {});
+# let _: axum::Router = app;
+```
+
+# Merging routers with fallbacks
+
+When combining [`Router`]s with this method, the [fallback](Router::fallback) is also merged.
+However only one of the routers can have a fallback.
+
+# Panics
+
+- If two routers that each have a [fallback](Router::fallback) are merged. This
+  is because `Router` only allows a single fallback.
+
+---
+
+# method_not_allowed_fallback.md
+
+Source: https://github.com/tokio-rs/axum/blob/main/axum/src/docs/routing/method_not_allowed_fallback.md
+
+Add a fallback [`Handler`] for the case where a route exists, but the method of the request is not supported.
+
+Sets a fallback on all previously registered [`MethodRouter`]s,
+to be called when no matching method handler is set.
+
+```rust,no_run
+use axum::{response::IntoResponse, routing::get, Router};
+
+async fn hello_world() -> impl IntoResponse {
+    "Hello, world!\n"
+}
+
+async fn default_fallback() -> impl IntoResponse {
+    "Default fallback\n"
+}
+
+async fn handle_405() -> impl IntoResponse {
+    "Method not allowed fallback"
+}
+
+#[tokio::main]
+async fn main() {
+    let router = Router::new()
+        .route("/", get(hello_world))
+        .fallback(default_fallback)
+        .method_not_allowed_fallback(handle_405);
+
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+
+    axum::serve(listener, router).await;
+}
+```
+
+The fallback only applies if there is a `MethodRouter` registered for a given path, 
+but the method used in the request is not specified. In the example, a `GET` on 
+`http://localhost:3000` causes the `hello_world` handler to react, while issuing a 
+`POST` triggers `handle_405`. Calling an entirely different route, like `http://localhost:3000/hello` 
+causes `default_fallback` to run.
+
+---
+
+# Example
+
+Source: https://github.com/tokio-rs/axum/blob/main/axum/src/docs/routing/nest.md
+
+Nest a [`Router`] at some path.
+
+This allows you to break your application into smaller pieces and compose
+them together.
+
+# Example
+
+```rust
+use axum::{
+    routing::{get, post},
+    Router,
+};
+
+let user_routes = Router::new().route("/{id}", get(|| async {}));
+
+let team_routes = Router::new().route("/", post(|| async {}));
+
+let api_routes = Router::new()
+    .nest("/users", user_routes)
+    .nest("/teams", team_routes);
+
+let app = Router::new().nest("/api", api_routes);
+
+// Our app now accepts
+// - GET /api/users/{id}
+// - POST /api/teams
+# let _: Router = app;
+```
+
+# How the URI changes
+
+Note that nested routes will not see the original request URI but instead
+have the matched prefix stripped. This is necessary for services like static
+file serving to work. Use [`OriginalUri`] if you need the original request
+URI.
+
+# Captures from outer routes
+
+Take care when using `nest` together with dynamic routes as nesting also
+captures from the outer routes:
+
+```rust
+use axum::{
+    extract::Path,
+    routing::get,
+    Router,
+};
+use std::collections::HashMap;
+
+async fn users_get(Path(params): Path<HashMap<String, String>>) {
+    // Both `version` and `id` were captured even though `users_api` only
+    // explicitly captures `id`.
+    let version = params.get("version");
+    let id = params.get("id");
+}
+
+let users_api = Router::new().route("/users/{id}", get(users_get));
+
+let app = Router::new().nest("/{version}/api", users_api);
+# let _: Router = app;
+```
+
+# Differences from wildcard routes
+
+Nested routes are similar to wildcard routes. The difference is that
+wildcard routes still see the whole URI whereas nested routes will have
+the prefix stripped:
+
+```rust
+use axum::{routing::get, http::Uri, Router};
+
+let nested_router = Router::new()
+    .route("/", get(|uri: Uri| async {
+        // `uri` will _not_ contain `/bar`
+    }));
+
+let app = Router::new()
+    .route("/foo/{*rest}", get(|uri: Uri| async {
+        // `uri` will contain `/foo`
+    }))
+    .nest("/bar", nested_router);
+# let _: Router = app;
+```
+
+Additionally, while the wildcard route `/foo/*rest` will not match the
+paths `/foo` or `/foo/`, a nested router at `/foo` will match the path `/foo`
+(but not `/foo/`), and a nested router at `/foo/` will match the path `/foo/`
+(but not `/foo`).
+
+# Fallbacks
+
+If a nested router doesn't have its own fallback then it will inherit the
+fallback from the outer router:
+
+```rust
+use axum::{routing::get, http::StatusCode, handler::Handler, Router};
+
+async fn fallback() -> (StatusCode, &'static str) {
+    (StatusCode::NOT_FOUND, "Not Found")
+}
+
+let api_routes = Router::new().route("/users", get(|| async {}));
+
+let app = Router::new()
+    .nest("/api", api_routes)
+    .fallback(fallback);
+# let _: Router = app;
+```
+
+Here requests like `GET /api/not-found` will go into `api_routes` but because
+it doesn't have a matching route and doesn't have its own fallback it will call
+the fallback from the outer router, i.e. the `fallback` function.
+
+If the nested router has its own fallback then the outer fallback will not be
+inherited:
+
+```rust
+use axum::{
+    routing::get,
+    http::StatusCode,
+    handler::Handler,
+    Json,
+    Router,
+};
+
+async fn fallback() -> (StatusCode, &'static str) {
+    (StatusCode::NOT_FOUND, "Not Found")
+}
+
+async fn api_fallback() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({ "status": "Not Found" })),
+    )
+}
+
+let api_routes = Router::new()
+    .route("/users", get(|| async {}))
+    .fallback(api_fallback);
+
+let app = Router::new()
+    .nest("/api", api_routes)
+    .fallback(fallback);
+# let _: Router = app;
+```
+
+Here requests like `GET /api/not-found` will go to `api_fallback`.
+
+# Nesting routers with state
+
+When combining [`Router`]s with this method, each [`Router`] must have the
+same type of state. If your routers have different types you can use
+[`Router::with_state`] to provide the state and make the types match:
+
+```rust
+use axum::{
+    Router,
+    routing::get,
+    extract::State,
+};
+
+#[derive(Clone)]
+struct InnerState {}
+
+#[derive(Clone)]
+struct OuterState {}
+
+async fn inner_handler(state: State<InnerState>) {}
+
+let inner_router = Router::new()
+    .route("/bar", get(inner_handler))
+    .with_state(InnerState {});
+
+async fn outer_handler(state: State<OuterState>) {}
+
+let app = Router::new()
+    .route("/", get(outer_handler))
+    .nest("/foo", inner_router)
+    .with_state(OuterState {});
+# let _: axum::Router = app;
+```
+
+Note that the inner router will still inherit the fallback from the outer
+router.
+
+# Panics
+
+- If the route overlaps with another route. See [`Router::route`]
+  for more details.
+- If the route contains a wildcard (`*`).
+- If `path` is empty.
+
+[`OriginalUri`]: crate::extract::OriginalUri
+[fallbacks]: Router::fallback
+
+---
+
+# Static paths
+
+Source: https://github.com/tokio-rs/axum/blob/main/axum/src/docs/routing/route.md
+
+Add another route to the router.
+
+`path` is a string of path segments separated by `/`. Each segment
+can either be static, contain a capture, or be a wildcard.
+
+`method_router` is the [`MethodRouter`] that should receive the request if the
+path matches `path`. Usually, `method_router` will be a handler wrapped in a method
+router like [`get`]. See [`handler`](crate::handler) for more details on handlers.
+
+# Static paths
+
+Examples:
+
+- `/`
+- `/foo`
+- `/users/123`
+
+If the incoming request matches the path exactly the corresponding service will
+be called.
+
+# Captures
+
+Paths can contain segments like `/{key}` which matches any single segment and
+will store the value captured at `key`. The value captured can be zero-length
+except for in the invalid path `//`.
+
+Each segment may have only one capture, but it may have static prefixes and suffixes.
+
+Examples:
+
+- `/{key}`
+- `/users/{id}`
+- `/users/{id}/tweets`
+- `/avatars/{id}.jpg`
+- `/avatars/{id}.png`
+
+Captures can be extracted using [`Path`](crate::extract::Path). See its
+documentation for more details.
+
+It is not possible to create segments that only match some types like numbers or
+regular expression. You must handle that manually in your handlers.
+
+[`MatchedPath`] can be used to extract the matched path rather than the actual path.
+
+Captures must not be empty. For example `/a/` will not match `/a/{capture}` and
+`/.png` will not match `/{image}.png`.
+
+You may have either capture(s) with static prefixes, capture(s) with suffixes, or a single
+capture with both prefix and suffix, but these kinds of captures may not be mixed. You may mix
+these with static routes and a standalone capture though. If multiple patterns match, static
+segment takes precedence, then the capture with longest static prefix or suffix.
+
+Example valid mixed route sets:
+- `/logo.png`, `/author.jpg`, `/{id}.png`, `/{id}.jpg`, `/{other_file}` (but you may not add `/old-{id}.png` or `/post-{id}`).
+- `/logo.png`, `/avatar-{id}.jpg`, `/{other_file}` (but you may not add `/{id}.jpg`, `/avatar-{id}.png`).
+
+This is done on each level of the path and if the path matches even if due to a wildcard, that path
+will be chosen. For example if one makes a request to `/foobar/baz` the first route will be used by
+axum because it has better match on the leftmost differing path segment and the whole path matches.
+
+- `/foobar/{*wildcard}`
+- `/foo{wildcard}/baz`
+
+# Wildcards
+
+Paths can end in `/{*key}` which matches all segments and will store the segments
+captured at `key`.
+
+Examples:
+
+- `/{*key}`
+- `/assets/{*path}`
+- `/{id}/{repo}/{*tree}`
+
+Note that `/{*key}` doesn't match empty segments. Thus:
+
+- `/{*key}` doesn't match `/` but does match `/a`, `/a/`, etc.
+- `/x/{*key}` doesn't match `/x` or `/x/` but does match `/x/a`, `/x/a/`, etc.
+
+Wildcard captures can also be extracted using [`Path`](crate::extract::Path):
+
+```rust
+use axum::{
+    Router,
+    routing::get,
+    extract::Path,
+};
+
+let app: Router = Router::new().route("/{*key}", get(handler));
+
+async fn handler(Path(path): Path<String>) -> String {
+    path
+}
+```
+
+Note that the leading slash is not included, i.e. for the route `/foo/{*rest}` and
+the path `/foo/bar/baz` the value of `rest` will be `bar/baz`.
+
+# Accepting multiple methods
+
+To accept multiple methods for the same route you can add all handlers at the
+same time:
+
+```rust
+use axum::{Router, routing::{get, delete}, extract::Path};
+
+let app = Router::new().route(
+    "/",
+    get(get_root).post(post_root).delete(delete_root),
+);
+
+async fn get_root() {}
+
+async fn post_root() {}
+
+async fn delete_root() {}
+# let _: Router = app;
+```
+
+Or you can add them one by one:
+
+```rust
+# use axum::Router;
+# use axum::routing::{get, post, delete};
+#
+let app = Router::new()
+    .route("/", get(get_root))
+    .route("/", post(post_root))
+    .route("/", delete(delete_root));
+#
+# let _: Router = app;
+# async fn get_root() {}
+# async fn post_root() {}
+# async fn delete_root() {}
+```
+
+# More examples
+
+```rust
+use axum::{Router, routing::{get, delete}, extract::Path};
+
+let app = Router::new()
+    .route("/", get(root))
+    .route("/users", get(list_users).post(create_user))
+    .route("/users/{id}", get(show_user))
+    .route("/api/{version}/users/{id}/action", delete(do_users_action))
+    .route("/assets/{*path}", get(serve_asset));
+
+async fn root() {}
+
+async fn list_users() {}
+
+async fn create_user() {}
+
+async fn show_user(Path(id): Path<u64>) {}
+
+async fn do_users_action(Path((version, id)): Path<(String, u64)>) {}
+
+async fn serve_asset(Path(path): Path<String>) {}
+# let _: Router = app;
+```
+
+# Panics
+
+Panics if the route overlaps with another route:
+
+```rust,should_panic
+use axum::{routing::get, Router};
+
+let app = Router::new()
+    .route("/", get(|| async {}))
+    .route("/", get(|| async {}));
+# let _: Router = app;
+```
+
+The static route `/foo` and the dynamic route `/{key}` are not considered to
+overlap and `/foo` will take precedence.
+
+Also panics if `path` is empty or does not start with `/` (for example `"Cargo.lock"`).
+When nesting routers with [`Router::nest`](crate::Router::nest), nested paths are still
+relative segments and must start with `/` (use `"/Cargo.lock"` rather than `"Cargo.lock"`).
+
+---
+
+# Example
+
+Source: https://github.com/tokio-rs/axum/blob/main/axum/src/docs/routing/route_layer.md
+
+Apply a [`tower::Layer`] to the router that will only run if the request matches
+a route.
+
+Note that the middleware is only applied to existing routes. So you have to
+first add your routes (and / or fallback) and then call `route_layer`
+afterwards. Additional routes added after `route_layer` is called will not have
+the middleware added.
+
+This works similarly to [`Router::layer`] except the middleware will only run if
+the request matches a route. This is useful for middleware that returns early
+(such as authorization) which might otherwise convert a `404 Not Found` into a
+`401 Unauthorized`.
+
+This function will panic if no routes have been declared yet on the router,
+since the new layer will have no effect, and this is typically a bug.
+In generic code, you can test if that is the case first, by calling [`Router::has_routes`].
+
+# Example
+
+```rust
+use axum::{
+    routing::get,
+    Router,
+};
+use tower_http::validate_request::ValidateRequestHeaderLayer;
+
+let app = Router::new()
+    .route("/foo", get(|| async {}))
+    .route_layer(ValidateRequestHeaderLayer::bearer("password"));
+
+// `GET /foo` with a valid token will receive `200 OK`
+// `GET /foo` with an invalid token will receive `401 Unauthorized`
+// `GET /not-found` with an invalid token will receive `404 Not Found`
+# let _: Router = app;
+```
+
+---
+
+# Example
+
+Source: https://github.com/tokio-rs/axum/blob/main/axum/src/docs/routing/route_service.md
+
+Add another route to the router that calls a [`Service`].
+
+# Example
+
+```rust,no_run
+use axum::{
+    Router,
+    body::Body,
+    routing::{any_service, get_service},
+    extract::Request,
+    http::StatusCode,
+    error_handling::HandleErrorLayer,
+};
+use tower_http::services::ServeFile;
+use http::Response;
+use std::{convert::Infallible, io};
+use tower::service_fn;
+
+let app = Router::new()
+    .route(
+        // Any request to `/` goes to a service
+        "/",
+        // Services whose response body is not `axum::body::BoxBody`
+        // can be wrapped in `axum::routing::any_service` (or one of the other routing filters)
+        // to have the response body mapped
+        any_service(service_fn(|_: Request| async {
+            let res = Response::new(Body::from("Hi from `GET /`"));
+            Ok::<_, Infallible>(res)
+        }))
+    )
+    .route_service(
+        "/foo",
+        // This service's response body is `axum::body::BoxBody` so
+        // it can be routed to directly.
+        service_fn(|req: Request| async move {
+            let body = Body::from(format!("Hi from `{} /foo`", req.method()));
+            let res = Response::new(body);
+            Ok::<_, Infallible>(res)
+        })
+    )
+    .route_service(
+        // GET `/static/Cargo.toml` goes to a service from tower-http
+        "/static/Cargo.toml",
+        ServeFile::new("Cargo.toml"),
+    );
+# let _: Router = app;
+```
+
+Routing to arbitrary services in this way has complications for backpressure
+([`Service::poll_ready`]). See the [Routing to services and backpressure] module
+for more details.
+
+# Panics
+
+Panics for the same reasons as [`Router::route`] or if you attempt to route to a
+`Router`:
+
+```rust,should_panic
+use axum::{routing::get, Router};
+
+let app = Router::new().route_service(
+    "/",
+    Router::new().route("/foo", get(|| async {})),
+);
+# let _: Router = app;
+```
+
+Use [`Router::nest`] instead.
+
+[Routing to services and backpressure]: middleware/index.html#routing-to-servicesmiddleware-and-backpressure
+
+---
+
+# async {
+
+Source: https://github.com/tokio-rs/axum/blob/main/axum/src/docs/routing/with_state.md
+
+Provide the state for the router. State passed to this method is global and will be used
+for all requests this router receives. That means it is not suitable for holding state derived from a request, such as authorization data extracted in a middleware. Use [`Extension`] instead for such data.
+
+See ["Sharing state with handlers"][sharing-state] for an overview of state patterns,
+including when to use `Arc`, how to extract substates with [`FromRef`], and what the
+`Router<S>` type parameter means.
+
+[sharing-state]: crate#sharing-state-with-handlers
+[`FromRef`]: crate::extract::FromRef
+
+```rust
+use axum::{Router, routing::get, extract::State};
+
+#[derive(Clone)]
+struct AppState {}
+
+let routes = Router::new()
+    .route("/", get(|State(state): State<AppState>| async {
+        // use state
+    }))
+    .with_state(AppState {});
+
+# async {
+let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+axum::serve(listener, routes).await;
+# };
+```
+
+# Returning routers with states from functions
+
+When returning `Router`s from functions, it is generally recommended not to set the
+state directly:
+
+```rust
+use axum::{Router, routing::get, extract::State};
+
+#[derive(Clone)]
+struct AppState {}
+
+// Don't call `Router::with_state` here
+fn routes() -> Router<AppState> {
+    Router::new()
+        .route("/", get(|_: State<AppState>| async {}))
+}
+
+// Instead do it before you run the server
+let routes = routes().with_state(AppState {});
+
+# async {
+let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+axum::serve(listener, routes).await;
+# };
+```
+
+If you do need to provide the state, and you're _not_ nesting/merging the router
+into another router, then return `Router` without any type parameters:
+
+```rust
+# use axum::{Router, routing::get, extract::State};
+# #[derive(Clone)]
+# struct AppState {}
+#
+// Don't return `Router<AppState>`
+fn routes(state: AppState) -> Router {
+    Router::new()
+        .route("/", get(|_: State<AppState>| async {}))
+        .with_state(state)
+}
+
+let routes = routes(AppState {});
+
+# async {
+let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+axum::serve(listener, routes).await;
+# };
+```
+
+This is because we can only call `Router::into_make_service` on `Router<()>`,
+not `Router<AppState>`. See below for more details about why that is.
+
+Note that the state defaults to `()` so `Router` and `Router<()>` is the same.
+
+If you are nesting/merging the router it is recommended to use a generic state
+type on the resulting router:
+
+```rust
+# use axum::{Router, routing::get, extract::State};
+# #[derive(Clone)]
+# struct AppState {}
+#
+fn routes<S>(state: AppState) -> Router<S> {
+    Router::new()
+        .route("/", get(|_: State<AppState>| async {}))
+        .with_state(state)
+}
+
+let routes = Router::new().nest("/api", routes(AppState {}));
+
+# async {
+let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+axum::serve(listener, routes).await;
+# };
+```
+
+# What `S` in `Router<S>` means
+
+`Router<S>` means a router that is _missing_ a state of type `S` to be able to
+handle requests. It does _not_ mean a `Router` that _has_ a state of type `S`.
+
+For example:
+
+```rust
+# use axum::{Router, routing::get, extract::State};
+# #[derive(Clone)]
+# struct AppState {}
+# 
+// A router that _needs_ an `AppState` to handle requests
+let router: Router<AppState> = Router::new()
+    .route("/", get(|_: State<AppState>| async {}));
+
+// Once we call `Router::with_state` the router isn't missing
+// the state anymore, because we just provided it
+//
+// Therefore the router type becomes `Router<()>`, i.e a router
+// that is not missing any state
+let router: Router<()> = router.with_state(AppState {});
+
+// Only `Router<()>` has the `into_make_service` method.
+//
+// You cannot call `into_make_service` on a `Router<AppState>`
+// because it is still missing an `AppState`.
+# async {
+let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+axum::serve(listener, router).await;
+# };
+```
+
+Perhaps a little counterintuitively, `Router::with_state` doesn't always return a
+`Router<()>`. Instead you get to pick what the new missing state type is:
+
+```rust
+# use axum::{Router, routing::get, extract::State};
+# #[derive(Clone)]
+# struct AppState {}
+# 
+let router: Router<AppState> = Router::new()
+    .route("/", get(|_: State<AppState>| async {}));
+
+// When we call `with_state` we're able to pick what the next missing state type is.
+// Here we pick `String`.
+let string_router: Router<String> = router.with_state(AppState {});
+
+// That allows us to add new routes that use `String` as the state type
+let string_router = string_router
+    .route("/needs-string", get(|_: State<String>| async {}));
+
+// Provide the `String` and choose `()` as the new missing state.
+let final_router: Router<()> = string_router.with_state("foo".to_owned());
+
+// Since we have a `Router<()>` we can run it.
+# async {
+let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+axum::serve(listener, final_router).await;
+# };
+```
+
+This is why returning `Router<AppState>` after calling `with_state` doesn't
+work:
+
+```rust,compile_fail
+# use axum::{Router, routing::get, extract::State};
+# #[derive(Clone)]
+# struct AppState {}
+# 
+// This won't work because we're returning a `Router<AppState>`
+// i.e. we're saying we're still missing an `AppState`
+fn routes(state: AppState) -> Router<AppState> {
+    Router::new()
+        .route("/", get(|_: State<AppState>| async {}))
+        .with_state(state)
+}
+
+let app = routes(AppState {});
+
+// We can only call `Router::into_make_service` on a `Router<()>`
+// but `app` is a `Router<AppState>`
+# async {
+let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+axum::serve(listener, app).await;
+# };
+```
+
+Instead return `Router<()>` since we have provided all the state needed:
+
+```rust
+# use axum::{Router, routing::get, extract::State};
+# #[derive(Clone)]
+# struct AppState {}
+# 
+// We've provided all the state necessary so return `Router<()>`
+fn routes(state: AppState) -> Router<()> {
+    Router::new()
+        .route("/", get(|_: State<AppState>| async {}))
+        .with_state(state)
+}
+
+let app = routes(AppState {});
+
+// We can now call `Router::into_make_service`
+# async {
+let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+axum::serve(listener, app).await;
+# };
+```
+
+# A note about performance
+
+If you need a `Router` that implements `Service` but you don't need any state (perhaps
+you're making a library that uses axum internally) then it is recommended to call this
+method before you start serving requests:
+
+```rust
+use axum::{Router, routing::get};
+
+let app = Router::new()
+    .route("/", get(|| async { /* ... */ }))
+    // even though we don't need any state, call `with_state(())` anyway
+    .with_state(());
+# let _: Router = app;
+```
+
+This is not required but it gives axum a chance to update some internals in the router
+which may impact performance and reduce allocations.
+
+Note that [`Router::into_make_service`] and [`Router::into_make_service_with_connect_info`]
+do this automatically.
+
+[`Extension`]: crate::Extension
+
+---
+
+# Example
+
+Source: https://github.com/tokio-rs/axum/blob/main/axum/src/docs/routing/without_v07_checks.md
+
+Turn off checks for compatibility with route matching syntax from 0.7.
+
+This allows usage of paths starting with a colon `:` or an asterisk `*` which are otherwise prohibited.
+
+# Example
+
+```rust
+use axum::{
+    routing::get,
+    Router,
+};
+
+let app = Router::<()>::new()
+    .without_v07_checks()
+    .route("/:colon", get(|| async {}))
+    .route("/*asterisk", get(|| async {}));
+
+// Our app now accepts
+// - GET /:colon
+// - GET /*asterisk
+# let _: Router = app;
+```
+
+Adding such routes without calling this method first will panic.
+
+```rust,should_panic
+use axum::{
+    routing::get,
+    Router,
+};
+
+// This panics...
+let app = Router::<()>::new()
+    .route("/:colon", get(|| async {}));
+```
+
+# Merging
+
+When two routers are merged, v0.7 checks are disabled for route registrations on the resulting router if both of the two routers had them also disabled.
+
+# Nesting
+
+Each router needs to have the checks explicitly disabled. Nesting a router with the checks either enabled or disabled has no effect on the outer router.
+
+---
+
+# Contributing to axum
+
+Source: https://github.com/tokio-rs/axum/blob/main/CONTRIBUTING.md
+
+# Contributing to axum
+
+🎈 Thanks for your help improving the project! We are so happy to have
+you!
+
+There are opportunities to contribute to `axum` at any level. It doesn't
+matter if you are just getting started with Rust or are the most weathered
+expert, we can use your help.
+
+**No contribution is too small and all contributions are valued.**
+
+This guide will help you get started. **Do not let this guide intimidate you**.
+It should be considered a map to help you navigate the process.
+
+Don't know where to start? Check [issues labeled with "E-help-wanted"](https://github.com/tokio-rs/axum/issues?q=is%3Aopen+is%3Aissue+label%3AE-help-wanted) or ["E-easy"](https://github.com/tokio-rs/axum/issues?q=is%3Aopen+is%3Aissue+label%3AE-easy).
+
+You may also get help with contributing in the [`axum` Discord
+channel][discord], please join us!
+
+[discord]: https://discord.gg/tokio
+
+## Conduct
+
+The `axum` project adheres to the [Rust Code of Conduct][coc]. This
+describes the _minimum_ behavior expected from all contributors.
+
+[coc]: https://github.com/rust-lang/rust/blob/master/CODE_OF_CONDUCT.md
+
+## Contributing in Issues
+
+For any issue, there are fundamentally three ways an individual can contribute:
+
+1. By opening the issue for discussion: For instance, if you believe that you
+   have uncovered a bug in an `axum` crate, creating a new issue in the
+   tokio-rs/axum [issue tracker][issues] is the way to report it.
+
+2. By helping to triage the issue: This can be done by providing
+   supporting details (a test case that demonstrates a bug), providing
+   suggestions on how to address the issue, or ensuring that the issue is tagged
+   correctly.
+
+3. By helping to resolve the issue: Typically this is done either in the form of
+   demonstrating that the issue reported is not a problem after all, or more
+   often, by opening a Pull Request that changes some bit of something in
+   axum in a concrete and reviewable manner.
+
+**Anybody can participate in any stage of contribution**. We urge you to
+participate in the discussion around bugs and participate in reviewing PRs.
+
+[issues]: https://github.com/tokio-rs/axum/issues
+
+### Asking for General Help
+
+If you have reviewed existing documentation and still have questions or are
+having problems, you can open an issue asking for help.
+
+In exchange for receiving help, we ask that you contribute back a documentation
+PR that helps others avoid the problems that you encountered.
+
+### Submitting a Bug Report
+
+When opening a new issue in the `axum` issue tracker, users will
+be presented with a [basic template][template] that should be filled in. If you
+believe that you have uncovered a bug, please fill out this form, following the
+template to the best of your ability. Do not worry if you cannot answer every
+detail, just fill in what you can.
+
+The two most important pieces of information we need in order to properly
+evaluate the report is a description of the behavior you are seeing and a simple
+test case we can use to recreate the problem on our own. If we cannot recreate
+the issue, it becomes harder for us to fix.
+
+See [How to create a Minimal, Complete, and Verifiable example][mcve].
+
+[mcve]: https://stackoverflow.com/help/mcve
+[template]: .github/ISSUE_TEMPLATE/bug_report.md
+
+### Triaging a Bug Report
+
+Once an issue has been opened, it is not uncommon for there to be discussion
+around it. Some contributors may have differing opinions about the issue,
+including whether the behavior being seen is a bug or a feature. This discussion
+is part of the process and should be kept focused, helpful, and professional.
+
+Short, clipped responses—that provide neither additional context nor supporting
+detail—are not helpful or professional. To many, such responses are simply
+annoying and unfriendly.
+
+Contributors are encouraged to help one another make forward progress as much as
+possible, empowering one another to solve issues collaboratively. If you choose
+to comment on an issue that you feel either is not a problem that needs to be
+fixed, or if you encounter information in an issue that you feel is incorrect,
+explain why you feel that way with additional supporting context, and be willing
+to be convinced that you may be wrong. By doing so, we can often reach the
+correct outcome much faster.
+
+### Resolving a Bug Report
+
+In the majority of cases, issues are resolved by opening a Pull Request. The
+process for opening and reviewing a Pull Request is similar to that of opening
+and triaging issues, but carries with it a necessary review and approval
+workflow that ensures that the proposed changes meet the minimal quality.
+
+## Pull Requests
+
+Pull Requests are the way concrete changes are made to the code, documentation,
+and dependencies in the `axum` repository.
+
+Even tiny pull requests (e.g., one character pull request fixing a typo in API
+documentation) are greatly appreciated. Before making a large change, it is
+usually a good idea to first open an issue describing the change to solicit
+feedback and guidance. This will increase the likelihood of the PR getting
+merged.
+
+### Tests
+
+If the change being proposed alters code (as opposed to only documentation for
+example), it is either adding new functionality to a crate or it is fixing
+existing, broken functionality. In both of these cases, the pull request should
+include one or more tests to ensure that the crate does not regress in the future.
+
+#### Documentation tests
+
+Ideally, every API has at least one [documentation test] that demonstrates how to
+use the API. Documentation tests are run with `cargo test --doc`. This ensures
+that the example is correct and provides additional test coverage.
+
+The trick to documentation tests is striking a balance between being succinct
+for a reader to understand and actually testing the API.
+
+In Rust documentation, lines that start with `/// #` are removed when the
+documentation is generated. They are only there to get the test to run.
+
+### Commits
+
+It is a recommended best practice to keep your changes as logically grouped as
+possible within individual commits. There is no limit to the number of commits
+any single Pull Request may have, and many contributors find it easier to review
+changes that are split across multiple commits.
+
+Note that multiple commits often get squashed when they are landed (see the
+notes about [commit squashing]).
+
+#### Commit message guidelines
+
+A good commit message should describe what changed and why.
+
+1. The first line should:
+
+  * Contain a short description of the change (preferably 50 characters or less,
+    and no more than 72 characters)
+
+2. Keep the second line blank.
+3. Wrap all other lines at 72 columns (except for long URLs).
+4. If your patch fixes an open issue, you can add a reference to it at the end
+   of the log. Use the `Fixes: #` prefix and the issue number. For other
+   references use `Refs: #`. `Refs` may include multiple issues, separated by a
+   comma.
+
+   Examples:
+
+   - `Fixes: #1337`
+   - `Refs: #1234, #42`
+
+### Opening the Pull Request
+
+From within GitHub, opening a new Pull Request will present you with a
+[template][pr_template] that should be filled out. Please try to do your best at filling out
+the details, but feel free to skip parts if you're not sure what to put.
+
+[pr_template]: .github/PULL_REQUEST_TEMPLATE.md
+
+### Discuss and update
+
+You will probably get feedback or requests for changes to your Pull Request.
+This is a big part of the submission process so don't be discouraged! Some
+contributors may sign off on the Pull Request right away, others may have
+more detailed comments or feedback. This is a necessary part of the process
+in order to evaluate whether the changes are correct and necessary.
+
+**Any community member can review a PR and you might get conflicting feedback**.
+Keep an eye out for comments from code owners to provide guidance on conflicting
+feedback.
+
+**Once the PR is open, do not rebase the commits**. See [Commit Squashing] for
+more details.
+
+### Commit Squashing
+
+In most cases, **do not squash commits that you add to your Pull Request during
+the review process**. When the commits in your Pull Request land, they may be
+squashed into one commit per logical change. Metadata will be added to the
+commit message (including links to the Pull Request, links to relevant issues,
+and the names of the reviewers). The commit history of your Pull Request,
+however, will stay intact on the Pull Request page.
+
+## Reviewing Pull Requests
+
+**Any Tokio, Hyperium, and Tower, axum community member is welcome to review any pull request**.
+
+All contributors who choose to review and provide feedback on Pull Requests have
+a responsibility to both the project and the individual making the contribution.
+Reviews and feedback must be helpful, insightful, and geared towards improving
+the contribution as opposed to simply blocking it. If there are reasons why you
+feel the PR should not land, explain what those are. Do not expect to be able to
+block a Pull Request from advancing simply because you say "No" without giving
+an explanation. Be open to having your mind changed. Be open to working with the
+contributor to make the Pull Request better.
+
+Reviews that are dismissive or disrespectful of the contributor or any other
+reviewers are strictly counter to the Code of Conduct.
+
+When reviewing a Pull Request, the primary goals are for the codebase to improve
+and for the person submitting the request to succeed. **Even if a Pull Request
+does not land, the submitters should come away from the experience feeling like
+their effort was not wasted or unappreciated**. Every Pull Request from a new
+contributor is an opportunity to grow the community.
+
+### Review a bit at a time.
+
+Do not overwhelm new contributors.
+
+It is tempting to micro-optimize and make everything about relative performance,
+perfect grammar, or exact style matches. Do not succumb to that temptation.
+
+Focus first on the most significant aspects of the change:
+
+1. Does this change make sense for axum?
+2. Does this change make axum better, even if only incrementally?
+3. Are there clear bugs or larger scale issues that need attending to?
+4. Is the commit message readable and correct? If it contains a breaking change
+   is it clear enough?
+
+Note that only **incremental** improvement is needed to land a PR. This means
+that the PR does not need to be perfect, only better than the status quo. Follow
+up PRs may be opened to continue iterating.
+
+When changes are necessary, *request* them, do not *demand* them, and **do not
+assume that the submitter already knows how to add a test or run a benchmark**.
+
+Specific performance optimization techniques, coding styles and conventions
+change over time. The first impression you give to a new contributor never does.
+
+Nits (requests for small changes that are not essential) are fine, but try to
+avoid stalling the Pull Request. Most nits can typically be fixed by the axum
+Collaborator landing the Pull Request but they can also be an opportunity for
+the contributor to learn a bit more about the project.
+
+It is always good to clearly indicate nits when you comment: e.g.
+`Nit: change foo() to bar(). But this is not blocking.`
+
+If your comments were addressed but were not folded automatically after new
+commits or if they proved to be mistaken, please, [hide them][hiding-a-comment]
+with the appropriate reason to keep the conversation flow concise and relevant.
+
+### Be aware of the person behind the code
+
+Be aware that *how* you communicate requests and reviews in your feedback can
+have a significant impact on the success of the Pull Request. Yes, we may land a
+particular change that makes `axum` better, but the individual might just
+not want to have anything to do with `axum` ever again. The goal is not
+just having good code.
+
+### Abandoned or Stalled Pull Requests
+
+If a Pull Request appears to be abandoned or stalled, it is polite to first
+check with the contributor to see if they intend to continue the work before
+checking if they would mind if you took it over (especially if it just has nits
+left). When doing so, it is courteous to give the original contributor credit
+for the work they started, either by preserving their name and email address in
+the commit log, or by using an `Author: ` meta-data tag in the commit.
+
+[hiding-a-comment]: https://help.github.com/articles/managing-disruptive-comments/#hiding-a-comment
+[documentation test]: https://doc.rust-lang.org/rustdoc/documentation-tests.html
+[keep-a-changelog]: https://github.com/olivierlacan/keep-a-changelog/blob/master/CHANGELOG.md
+
+---
