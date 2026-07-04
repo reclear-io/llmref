@@ -1,0 +1,1927 @@
+# KeyVal Operator
+
+Source: https://github.com/ivelok/keyval-operator/blob/main/README.md
+
+# KeyVal Operator
+
+KeyVal Operator provides lifecycle management for Redis and Valkey clusters on Kubernetes. It automates configuration, replication alignment, Sentinel-driven failover, rolling updates, and operational safeguards such as PodDisruptionBudget gating and storage resize orchestration.
+
+## Features
+- Declarative management of standalone and Sentinel-backed Redis/Valkey deployments via the `KeyValCluster` CRD.
+- Idempotent reconciler with controlled failover, replica health evaluation, and disruption safety gates.
+- Dedicated metrics and events for observability, including scale/upgrade telemetry and SLA aggregation.
+- Built-in `redis_exporter` sidecar (enabled by default) that reuses Redis AUTH/TLS and exposes `/metrics` on the headless service.
+- Chaos and e2e test suites covering failover, storage, Sentinel quorum, and network degradation scenarios.
+- Helm chart packaging with configurable auth, TLS, storage, and health thresholds.
+
+## Controller Configuration
+The controller process exposes tunables for Redis/Sentinel client IO and the reconcile backoff loop. Defaults are applied through the `keyval-operator-config` ConfigMap and can be overridden via CLI flags or environment variables (the deployment consumes the ConfigMap via `envFrom`). Each value accepts standard Go duration syntax (`200ms`, `5s`, `1m`) unless noted otherwise.
+
+| Flag / Env | Description | Default |
+|-------------|-------------|---------|
+| `--redis-dial-timeout` / `KEYVAL_REDIS_DIAL_TIMEOUT` | TCP connect timeout for Redis/Sentinel clients. | `3s` |
+| `--redis-read-timeout` / `KEYVAL_REDIS_READ_TIMEOUT` | Socket read deadline per Redis command. | `2s` |
+| `--redis-write-timeout` / `KEYVAL_REDIS_WRITE_TIMEOUT` | Socket write deadline per Redis command. | `2s` |
+| `--redis-pool-timeout` / `KEYVAL_REDIS_POOL_TIMEOUT` | Wait time for an idle connection before failing a command. | `2s` |
+| `--redis-operation-timeout` / `KEYVAL_REDIS_OPERATION_TIMEOUT` | Context timeout imposed on each Redis command before retry. | `2s` |
+| `--sentinel-operation-timeout` / `KEYVAL_SENTINEL_OPERATION_TIMEOUT` | Timeout for Sentinel commands (`CKQUORUM`, `RESET`, `FAILOVER`). | `5s` |
+| `--redis-max-retries` / `KEYVAL_REDIS_MAX_RETRIES` | Number of retries per Redis/Sentinel command (initial attempt + retries). | `2` |
+| `--redis-min-idle-conns` / `KEYVAL_REDIS_MIN_IDLE_CONNS` | Minimum idle connections kept in the go-redis pool. | `1` |
+| `--redis-retry-backoff-initial` / `KEYVAL_REDIS_RETRY_INITIAL_BACKOFF` | Initial delay between client retries. | `200ms` |
+| `--redis-retry-backoff-max` / `KEYVAL_REDIS_RETRY_MAX_BACKOFF` | Maximum delay between client retries. | `1s` |
+| `--redis-retry-backoff-factor` / `KEYVAL_REDIS_RETRY_BACKOFF_FACTOR` | Multiplier applied to the client retry backoff. | `2` |
+| `--redis-retry-jitter` / `KEYVAL_REDIS_RETRY_JITTER` | Fractional jitter applied to client retry delays. | `0.1` |
+
+Reconcile concurrency and Kubernetes API rate limits are derived automatically from the workload profile (`small`, `medium`, `large`). Profiles are detected at startup based on the number of `KeyValCluster` resources and their replica counts. A debug-only override is available through the environment variable `KEYVAL_OPERATOR_RECONCILE_PROFILE`; when set, the controller logs a warning. Helm values do not expose this override.
+
+Updating the ConfigMap requires restarting the `keyval-operator-controller-manager` Deployment (`make restart` or `kubectl -n keyval-operator-system rollout restart deploy/keyval-operator-controller-manager`).
+
+## Installation (Helm)
+The chart is published as an OCI artifact in GitHub Container Registry (GHCR). Helm does not support `helm repo add` for OCI sources, so use the OCI workflow directly.
+
+### Install from GHCR
+```bash
+# (Optional) authenticate if the GHCR repository is private
+echo "$GITHUB_PAT" | helm registry login ghcr.io --username <github-username> --password-stdin
+
+helm install keyval-operator oci://ghcr.io/ivelok/keyval-operator/keyval-operator \
+  --namespace keyval-operator-system --create-namespace \
+  --version 0.1.1
+```
+
+You can also download the chart locally with `helm pull oci://ghcr.io/ivelok/keyval-operator/keyval-operator --version 0.1.1`.
+
+### Publish a new chart version
+```bash
+helm package charts/keyval-operator
+helm push keyval-operator-0.1.1.tgz oci://ghcr.io/ivelok/keyval-operator
+```
+
+Bump `version` and `appVersion` in [`charts/keyval-operator/Chart.yaml`](charts/keyval-operator/Chart.yaml) before packaging.
+
+Key values (see [`charts/keyval-operator/values.yaml`](charts/keyval-operator/values.yaml)):
+
+| Value | Description |
+|-------|-------------|
+| `image.repository`, `image.tag` | Override controller container image. |
+| `manager.replicas` | Operator deployment replicas (default 1). |
+| `manager.metricsService.create` | Expose metrics service. |
+| `crds.install` | Install CRDs with the chart (default `true`). |
+| `examples.enabled` | Deploy sample `KeyValCluster` resources. |
+| `examples.clusters[].spec` | Declarative KeyValCluster spec supporting auth/tls/pdb thresholds. |
+
+For advanced scenarios (auth secrets, TLS bundles, PDB strictness), consult [`docs/install.md`](docs/install.md).
+
+## Creating a KeyValCluster
+```yaml
+apiVersion: keyval.ivelok.io/v1alpha1
+kind: KeyValCluster
+metadata:
+  name: kv-sentinel
+spec:
+  mode: Sentinel
+  redisReplicas: 3
+  sentinelCount: 3
+  image: valkey/valkey:7.4
+  storage:
+    type: Persistent
+    size: 20Gi
+  security:
+    auth:
+      enabled: true
+      passwordSecretRef:
+        name: kv-auth
+        key: password
+  health:
+    replicationLagSecondsMax: 5
+    failoverTimeoutSeconds: 20
+    minReplicasForSafety: 2
+```
+
+Apply with `kubectl apply -f <file>` after installing the operator.
+
+Sentinel clusters own a dedicated StatefulSet. Kubernetes treats fields like `spec.serviceName`, `spec.selector`, and `spec.volumeClaimTemplates` as immutable; if they drift, the operator emits a `Warning` event (`SentinelApplyImmutableField`), marks `status.conditions[Reconciled]` as `False` with reason `ImmutableField`, and increments the Prometheus counter `keyval_operator_sentinel_apply_failures_total{reason="immutable_field"}`. Other apply failures surface through `SentinelApplyFailed` and trigger reconcile backoff.
+
+## Operational Runbooks
+Runbooks are stored under [`docs/runbook/`](docs/runbook). Key scenarios include failover recovery, Sentinel quorum loss, replica desync, DR bootstrap, disruption resumption, log verbosity adjustments, and release execution. Validate their structure with `make runbook-check`.
+
+## Development
+- Format & lint: `make fmt` + `make lint`
+- Unit tests: `go test -race -ldflags="-extldflags=-Wl,-w" ./...`
+- E2E suite: `make e2e`
+- Chaos suite: `make chaos`
+- Helm lint/template: `make helm-lint helm-template`
+
+## Release Workflow
+Releases are tag-driven (`vX.Y.Z`) and executed by `.github/workflows/release.yaml`. The workflow builds & signs images, packages the Helm chart, uploads artifacts, and publishes changelog notes. Manual invocation is available via `workflow_dispatch`. Local dry-run: `make release VERSION=X.Y.Z RELEASE_REGISTRY=ghcr.io/<org>`.
+
+## Contributing
+Please review [`AGENTS.md`](AGENTS.md) for repository-wide conventions. Submit PRs against `develop`, ensure all tests (unit/e2e/chaos) pass, and update runbooks when adding operational functionality.
+
+---
+
+# AGENTS.md
+
+Source: https://github.com/ivelok/keyval-operator/blob/main/AGENTS.md
+
+# AGENTS.md
+
+Guidelines for all AI agents working in this repository. This effort rebuilds the Kubernetes operator that manages Redis/Valkey clusters (Standalone and Sentinel modes).
+
+- Scope: applies to the entire repository.
+- Goal: deliver the operator while keeping work aligned with the internal .codex/task plan.
+- Principle: idempotent reconciliation, minimal downtime, safe updates, clear ownership.
+
+
+## Architecture Reference
+- Authoritative plan: `docs/architecture.md` (modules, APIs, reconcile flow, events, policies).
+- CRD reference: `docs/crd/keyvalcluster.md` and `config/crd/bases/*.yaml`.
+
+## Development Environment
+- Run all development and testing against the local Kubernetes cluster provisioned on the workstation.
+- You have full cluster access: `kubectl` (get/apply/delete), log inspection, exec, describe, and more.
+- Validate operator behavior exclusively in this cluster (deployments, upgrades, incident reproduction).
+- Never edit operator-managed resources directly (StatefulSet, Service, PDB, etc.). Manual tweaks fight the controller and corrupt scenarios. Use the CR or other approved inputs to model situations.
+
+## Task Workflow
+- Coordinate scope using .codex/tasks (internal tracker) and follow the sequence agreed there.
+- Keep scope changes small; if the existing plan no longer fits, update the tracker and get confirmation before expanding.
+- Do not introduce functionality outside the approved task set. Discuss adjustments with maintainers before implementing.
+- Before editing, read the relevant files, keep diffs small, and run checks immediately (`go fmt`, `goimports`, `staticcheck`, `go test -race ./...`, `make e2e`, `make build/test` when required).
+- Before running e2e or scenarios that depend on operator behavior, ensure the freshly built image is deployed and the controller manager restarted (`make redeploy` or equivalently `make docker-build` → `kubectl apply -k config/default` → `kubectl -n keyval-operator-system rollout restart deploy/keyval-operator-controller-manager`).
+
+## Development Flow
+1. **Specification** — capture scope in .codex/tasks with goal, inputs, acceptance criteria, and required checks.
+2. **Decomposition** — if the scope is large, split it into sub-tasks (`<NN>.<MM>-...`) so every stage is tracked.
+3. **Pre-review** — reread the specification, identify risks, raise questions/hypotheses, and document them in the task file.
+4. **Implementation** — follow the plan, land small patches, validate code frequently, and redeploy to the local cluster when behavior changes.
+5. **Self-review** — audit your changes: list potential issues, confirm checks passed, and polish the code as needed.
+
+Detailed instructions for working with the e2e/chaos suites live in `test/E2E-AGENTS.md`.
+
+## Target Layout
+Use this structure as you scaffold and refactor:
+
+```
+├── api/                      # CRD types and webhooks
+│   └── v1alpha1/             # KeyValCluster, +kubebuilder annotations
+├── controllers/              # Reconciler and helpers
+│   ├── controller.go         # Main controller wiring
+│   └── internal/             # Domain logic modules
+│       ├── finalizer/        # Resource cleanup
+│       ├── reconcile/        # Reconcile phases
+│       ├── resources/        # SSA builders (StatefulSet, Service, PDB)
+│       ├── security/         # Auth/TLS handling
+│       ├── ssa/              # Server-Side Apply helpers
+│       └── ops/              # Operational logic
+│           ├── bootstrap/    # DR/Initial master selection
+│           ├── eviction/     # Safe pod eviction
+│           ├── importer/     # External sync
+│           ├── observability/# Metrics & Events
+│           ├── replication/  # Topology & role detection
+│           ├── sentinel/     # Failover & Quorum
+│           ├── status/       # Status aggregation
+│           ├── storage/      # PVC resize/cleanup
+│           └── update/       # Rolling updates
+├── config/                   # Kustomize manifests (install/deploy)
+├── docs/                     # Documentation & Runbooks
+├── test/                     # Testing infrastructure
+│   ├── suites/               # E2E scenarios
+│   └── chaos/                # Chaos testing
+└── examples/                 # Example CRs (standalone/sentinel)
+```
+
+## Modules & Responsibilities
+- `resources`: Build ConfigMap, StatefulSet (OnDelete), Service, PDB using SSA.
+- `ops/replication`: Detect roles, ensure topology, handle `REPLICAOF`, manage master address cache.
+- `ops/sentinel`: Coordinate failover (`SENTINEL FAILOVER`), validate good slaves, handle `NOQUORUM`.
+- `ops/update`: Plan and execute rolling updates (single-pod), check health guards.
+- `ops/bootstrap`: Handle DR master selection (force-master/freshness) and external import.
+- `ops/status`: Aggregate conditions, roles, and health gate status.
+- `ops/observability`: Manage Prometheus metrics and Kubernetes events.
+- `security`: Resolve Auth/TLS secrets, build client configurations.
+
+## Reconcile Flow (Summary)
+- Ensure Services (headless, master, sentinel when `mode=Sentinel`).
+- Build ConfigMaps; compute `config-hash`; annotate the PodTemplate.
+- Ensure the StatefulSet with `OnDelete` and a deterministic spec.
+- Detect roles (master/replica), then sync Pod role labels (single-master invariant).
+- Ensure replication (`REPLICAOF`) to the detected master.
+- Plan and execute rolling updates one Pod at a time when drift is detected.
+- In Sentinel mode, coordinate failover when required and validate resulting roles.
+- Update `.status` (masterPod, replicas, readyReplicas, roles, conditions).
+
+## Events and Triggers (Operational)
+- CR changes: recompute desired state; re-run full reconcile.
+- Pod Ready/Deleted/Restarted: re-detect roles, re-label, ensure replication, continue/hold rolling update.
+- StatefulSet drift: enforce `OnDelete`, selectors, labels; schedule rolling update if needed.
+- ConfigMap change: config-hash drift → rolling update planning.
+- Service change: restore selectors/ports; ensure `<cr>-master` selects exactly one Pod.
+- Sentinel role switches: reconcile labels, ensure replication, update status.
+
+## Reconcile Invariants
+- Exactly one master; every other pod is a replica.
+- Operations are idempotent; safe to rerun on any event.
+- StatefulSet uses `OnDelete`; never delete more than one Pod at a time.
+- Sentinel mode only when `spec.mode=Sentinel` and `sentinelCount` is odd and ≥3.
+- The master Service must always select exactly one Pod.
+
+## Apply & Ownership Policy
+- Use server-side apply with a stable field manager (e.g., `keyval-operator`).
+- Preserve user-managed labels/annotations; own only operator-scoped fields.
+- Set OwnerReferences to `KeyValCluster` for garbage collection.
+- Update status using `Status().Patch` only when there is a diff.
+
+## Resource Naming & Labels
+- Labels: `app=<cr>-redis`, `keyvalcluster=<cr>`, `role=master|replica`.
+- Headless Service: `<cr>-headless` (selector `app=<cr>-redis`).
+- Master Service: `<cr>-master` (ClusterIP, selector `role=master`).
+- Ports: Redis `6379`, Sentinel `26379` (sidecar in Sentinel mode).
+
+## Development Standards
+- Go 1.24+; accept `context.Context` first; wrap errors with `%w`; use `log/slog` for structured logging.
+- No panics (except main/tests). Validate external inputs. Keep functions small and testable.
+- Use table-driven tests; run with `-race`; cover error paths; avoid flakes with timeouts.
+- Maintain least-privilege RBAC; set OwnerReferences and finalizers correctly.
+- Prefer server-side apply; preserve user-managed fields.
+
+## Commands
+- Tests require envtest binaries. Place them under `bin/k8s/<k8sVer>-<os>-<arch>/` and set:
+  - `export KUBEBUILDER_ASSETS="$(PWD)/bin/k8s/1.33.0-$(go env GOOS)-$(go env GOARCH)"`
+- Build and test (after scaffolding):
+  - `make build`
+  - `make test`  # Runs go test -race ./...
+  - `make e2e`   # Runs e2e suite in test/suites
+- Quality checks:
+  - `go fmt ./... && go run golang.org/x/tools/cmd/goimports@latest -w .`
+  - `staticcheck ./...`
+
+## Local Dev: Image Updates & Restarts
+- Re-tagging a local image (e.g., `controller:latest`) without changing the pod template will not trigger a rollout. Kubernetes only restarts when the template hash changes.
+- Preferred ways to pick up a rebuilt local image:
+  - `kubectl -n keyval-operator-system rollout restart deploy/keyval-operator-controller-manager`.
+  - Bump the image tag (e.g., `controller:dev-<timestamp>`) and update the Deployment template.
+  - Patch a dummy annotation on the Pod template: `kubectl -n keyval-operator-system patch deploy/keyval-operator-controller-manager -p '{"spec":{"template":{"metadata":{"annotations":{"redeployAt":"$(date +%s)"}}}}}'`.
+- Shortcuts: `make restart` (rollout restart) or `make redeploy` (build + apply manifests + restart).
+
+## Editing Discipline
+- Read, apply a small patch, build, test — repeat.
+- Copy exact context (whitespace matters for patch tools).
+- Keep commit messages scoped: `feat|fix|refactor|test(component): message`.
+
+## Notes
+- Internal task templates live under .codex/tasks for internal use only; refresh the spec there before starting work.
+
+---
+
+# KeyVal Operator — Architecture
+
+Source: https://github.com/ivelok/keyval-operator/blob/main/docs/architecture.md
+
+# KeyVal Operator — Architecture
+
+> The operator aims to deliver idempotent management for Redis/Valkey clusters (Standalone and Sentinel) with minimal downtime, safe updates, and clear observability.
+
+## 1. Control Plane Overview
+- **CRD**: `KeyValCluster` (namespaced). Users describe the operating mode, container images, resource requests, security settings, and PDB/Service options.
+- **Controller**: a single `KeyValClusterReconciler` managed by controller-runtime. The workqueue uses a typed rate limiter (`MaxOfRateLimiter` plus a token bucket capped at 5 RPS) and receives its dependencies via `NewKeyValClusterReconciler`.
+- **Invariants**: one master pod, a StatefulSet with `OnDelete`, replicas stay in sync, the `<cr>-master` Service selects exactly one pod, PDB safety gates are respected, and every action is idempotent.
+
+## 2. Entry Point and Dependency Injection
+- `controllers/reconciler_factory.go` defines `ReconcilerDependencies`: Kubernetes clients, scheme, Redis/Sentinel factories, logger, rate limiter, and eviction parameters.
+- During startup `main.go` selects a reconcile profile (`small`/`medium`/`large`) based on the actual number of `KeyValCluster` objects and their replica counts. The profile configures `MaxConcurrentReconciles`, `client-go` QPS/Burst, and the TTL for the master address cache. Debug overrides are only allowed through `KEYVAL_OPERATOR_RECONCILE_PROFILE`; when the variable is set the operator logs a warning.
+- `KeyValClusterReconciler` keeps no global state; all dependencies are injected on creation, which simplifies testing.
+- Logging uses `log/slog` and integrates with controller-runtime’s `logr`. `logging.Initialize` executes lazily and is concurrency-safe.
+- Package `controllers/errors` exposes typed wrappers `WrapTransient/WrapFatal`. The reconcile result is recorded in the `keyval_reconcile_result_total` metric.
+
+## 3. Internal Module Layout
+```
+controllers/internal/
+├── core            # constants, resource names, annotation keys, DNS helpers
+├── resources       # Kubernetes object builders (ConfigMap, StatefulSet, Service, PDB)
+├── runtime         # shared helpers: predicates, sorting, backoff, ClusterIP preservation
+├── clients         # Redis/Sentinel factories (go-redis v9) with TLS/Auth from security.Settings
+├── security        # resolve AUTH/TLS secrets, build tls.Config and passwords
+├── finalizer       # Finalizer management and storage cleanup hooks
+├── reconcile       # Reconcile phases and flow control
+├── ssa             # Server-Side Apply patch construction and field management
+└── ops
+    ├── bootstrap   # persist PVC freshness annotations, pick a master candidate
+    ├── eviction    # Eviction API wrapper with timeouts, backoff, metrics, events
+    ├── health      # compute health gates and thresholds from spec.health
+    ├── importer    # External source data import (Snapshot/Live modes)
+    ├── observability
+    │   ├── events  # standard Kubernetes events (failover, bootstrap, rolling updates)
+    │   └── metrics # Prometheus metrics: register gauges/counters/histograms
+    ├── replication # EnsureTopology, DetectRoles, EnsureReplication, sentinel reset triggers, master address TTL cache
+    ├── runtimeconfig # apply allow-listed runtime settings (Redis CONFIG, SENTINEL SET)
+    ├── sentinel    # TriggerFailover, validate good slave, handle NOQUORUM
+    ├── status      # build KeyValClusterStatus and conditions, compute healthGate
+    ├── storage     # PVC resize handling and filesystem check logic
+    └── update      # plan and run rolling updates (PlanUpdates + EvaluateGuards)
+```
+- SSA patches use helpers from `controllers/internal/ssa` that build minimal ConfigMap/Service/StatefulSet/PDB payloads. The operator owns only the required fields (the `redis.conf`/`sentinel.conf` content, service selectors and ports, pod template and PVC, PDB parameters), eliminating conflicts with mesh injectors and load-balancer controllers. Attempts to change immutable Service fields (ClusterIP, IPFamilies/IPFamilyPolicy, NodePort) are logged, trigger the `ServiceImmutableField` event, and increment `keyval_operator_service_immutable_change_total{service,field}`.
+
+### Redis Pod Health
+- **Liveness** — the `liveness.sh` script (mounted from the ConfigMap) runs `redis-cli PING` against `127.0.0.1:${REDIS_PORT}` and automatically adds TLS flags (`--tls`, `--cacert`, `--cert`, `--key`) when the cluster is encrypted. The probe relies on `REDISCLI_AUTH`/`MASTER_USER`, so it catches authentication issues and process stalls better than a pure TCP socket.
+- **Readiness** — the `readiness.sh` script executes `redis-cli --raw INFO replication` and applies role-specific rules: masters only need a successful response, replicas require `master_link_status=up`, `master_sync_in_progress=0`, `master_link_down_since_seconds=0`, and `master_last_io_seconds_ago` below the threshold (15s by default, overridden via `REDIS_READINESS_MAX_LAST_IO_SECONDS`). Diagnostics are printed to stderr, which simplifies `kubectl logs` triage.
+- Both scripts ship alongside `redis.conf` in the ConfigMap and are part of the pod template hash; any change to the probe logic triggers a controlled rollout.
+- `resources/topology.go` injects consistent pod distribution rules: topology spread (zone/hostname with `ScheduleAnyway`) and pod anti-affinity favoring `kubernetes.io/hostname`. Settings are read from `spec.topology`; Redis and Sentinel enable them by default, but users can disable or harden them (required anti-affinity, custom keys) through the CR or Helm chart.
+- `resources/statefulset_*.go` add a `preStop` lifecycle hook (`redis-cli shutdown nosave`) and increase `terminationGracePeriodSeconds` to 25, giving Redis/Valkey time to exit cleanly and avoiding false failovers. Failures emit `RedisPreStopFailed` to stderr, surface in events, and feed the `keyval_operator_graceful_shutdown_duration_seconds` metric (observed once the pod exits).
+- When `spec.metrics.enabled` the Redis StatefulSet appends a `redis_exporter` sidecar (default `ghcr.io/oliver006/redis_exporter:v1.75.0`). The exporter talks to `127.0.0.1:${REDIS_PORT}` using the resolved AUTH secret and automatically switches to `rediss://` with client certificates when TLS/mTLS is enabled. `/metrics` is served over HTTP on the configurable exporter port (default 9121) with dedicated readiness & liveness probes. The headless Service publishes an additional `metrics` port so Prometheus or ServiceMonitor CRs can scrape pods without touching the Redis listener.
+- `ops/bootstrap` supports DR bootstrap through PVC freshness annotations: `UpdatePVCFreshness` stores replication offset/role/timestamp on PVCs, and `SelectCandidate` chooses the master (forced master → highest offset → seed). Metrics `keyval_operator_bootstrap_freshness_source` and `..._gap_seconds` capture the decision source and the gap between the leader and the next candidate.
+- The client package (`controllers/internal/clients`) wraps every go-redis v9 command in a `context.WithTimeout`, limits retries (`MaxRetries=2` by default), honors TLS/Auth from `security.Settings`, and exposes metrics `keyval_operator_external_call_timeouts_total` and `keyval_operator_redis_client_retries_total` to monitor degradation.
+- Metrics `keyval_operator_controller_reconcile_queue_depth{controller}` and the hit/miss counters `keyval_operator_redis_master_cache_hits_total|_misses_total` are produced in `ops/observability/metrics.go`, reflecting the reconcile queue depth and master cache efficiency.
+
+## 4. Eviction Wrapper
+- `ops/eviction.Manager` implements `Runner` with tunables `MaxAttempts`, `PerAttemptTimeout`, `InitialBackoff`, `MaxBackoff`.
+- Every call publishes metrics `keyval_operator_eviction_attempt_total`, `keyval_operator_eviction_result_total{result=attempt|success|timeout|rejected|forbidden|error|cancelled}`, `keyval_operator_pod_eviction_failures_total{reason}`, and emits the `PodEvicted` event.
+- Transient errors (`429 TooManyRequests`, timeouts) are wrapped with `ErrRejected` + `WrapTransient`. Permission errors (`403`) are considered fatal: the controller stops retrying and flags the reconcile as `error`.
+- Rolling updates for Redis and Sentinel (`ops/update.Execute`) receive `ExecuteOptions{Evictor, EvictionSettings, Component}` and rely on the wrapper by default.
+
+## 5. Reconcile Lifecycle
+1. **Fetch CR and finalize** — ensure the finalizer exists; when deletion is requested, invoke `finalizeCluster`.
+2. **Security** — `security.FromSpec` loads AUTH/TLS secrets and returns `Settings`; when `HasAuth` and/or `HasTLS` are true the client configuration is updated and the logger records the active modes.
+3. **Render resources** — call `resources.ConfigMap`, `HeadlessService`, `MasterService`, optional `ReplicasService` and Sentinel services (including headless), plus Redis/Sentinel StatefulSets and the PDB. Everything is applied via SSA with a dedicated `FieldOwner`. Optional services follow `spec.service|replicasService|sentinelService.create`: when toggled to `false` the operator deletes the Service with `propagation=Foreground`, logs `component=service action=delete`, emits `ServiceRemoved`, and bumps `keyval_operator_service_removed_total{service=...}`. Re-enabling the flag recreates the Service while preserving the ClusterIP (`PreserveClusterIP`) and owner references. The toggles are meant for operator-managed services; keep `create=true` if an external system owns the Service to avoid removal. Sentinel StatefulSet `Apply` errors are classified: attempts to change immutable fields (e.g., `spec.serviceName`, `spec.selector`, `spec.volumeClaimTemplates`) raise the `SentinelApplyImmutableField` event, set `Reconciled=False` with reason `ImmutableField`, and increment `keyval_operator_sentinel_apply_failures_total{reason="immutable_field"}`; all other errors are treated as transient and stop reconcile for backoff.
+4. **External import (optional)** — when `spec.bootstrap.externalSource` is present, the importer attaches the bootstrap pod as a replica of the remote instance and aborts the pipeline immediately after persisting status. For `Snapshot` mode it detaches with `REPLICAOF NO ONE` once the link is healthy, records `state=Completed`, then resumes the remaining phases. For `Live` mode it transitions to `state=Following`, keeps the link active, emits `ExternalImportStarted`, and requeues every few seconds while `ConditionExternalImport` reports reason `Following`. When the `externalSource` block is removed, the importer performs the cutover (detach + clear `masterauth`), emits `ExternalImportCompleted`, and allows reconciliation to continue with the usual runtime/label/update phases.
+4. **Inventory pods** — list pods via the headless Service, sort by ordinal, readiness, and PVC annotations.
+5. **Replication and roles** —
+   - `opreplication.EnsureTopology` returns the master, role map, and drift list.
+   - During bootstrap or with a forced candidate the controller sets overrides `ConditionBootstrapInProgress`, `ConditionDisruptionsPaused`, and schedules a Sentinel reset.
+   - Pod labels `role=master|replica` are patched via a conflict-tolerant MergePatch: up to three attempts with pod reload between retries and raising the minimum requeue (2s → 4s → 8s). Conflicts are logged with `attempt` and `resourceVersion`, increment `keyval_operator_pod_label_patch_conflicts_total{pod}`, and successful retries increment `keyval_operator_pod_label_patch_retries_total{pod}`. Corrections also emit the `RoleCorrected` event and the `keyval_label_corrections_total` metric.
+6. **Sentinel** — run `CKQUORUM` using `sentinel.Factory`, refresh `keyval_operator_sentinel_*` metrics, coordinate `SENTINEL RESET` with a cooldown, and emit `SentinelQuorumLost/Restored` plus `ResetSentinelDone`.
+7. **Health gate** — compute status through `status.ComputeStatus`, update conditions `BootstrapInProgress`, `ReplicationHealthy`, `SentinelQuorum`, `FailoverInProgress`, `DisruptionsPaused`, `UpgradeInProgress`, and set `status.healthGate.allowDisruptions`.
+8. **Rolling updates** —
+   - `PlanUpdates` detects drift in annotations/images/resources/health/scale-down.
+   - `EvaluateGuards` blocks updates during bootstrap, failover, lack of healthy replicas, or when disruptions are disabled. It emits `RollingStepBlocked/Resumed` and increments `keyval_disruptions_blocked_total`.
+   - Before deleting the master pod in Sentinel mode the controller invokes `ops/sentinel.TriggerFailover` (events `StartFailover`, `FailoverTriggered`, `FailoverCompleted`, `NewMaster`).
+   - Evictions go through the wrapper; when `ErrRejected` happens the controller resets `keyval_operator_update_in_progress`, sets annotation `keyval.ivelok.io/update-blocked`, and waits for backoff.
+9. **Status** — `ops/status.UpdateStatus` syncs `status.masterPod`, `status.rolesSource`, ready pods, roles, lag, and conditions.
+10. **Finalize metrics and events** — a `defer` captures the duration (`keyval_reconcile_duration_seconds`) and result (`keyval_reconcile_result_total`).
+- Requeues without errors run through an accumulating backoff: the base interval merges with exponential backoff (3 → 6 → 12 → 24 → 48 → 60 s with ±10% jitter). The resulting delay is emitted to `keyval_operator_requeue_backoff_seconds`, preventing busy loops during Redis/Sentinel degradation.
+
+## 6. Observability
+### Prometheus Metrics
+| Metric | Type / Labels | Purpose |
+|--------|---------------|---------|
+| `keyval_reconcile_result_total{namespace,cluster,result}` | Counter | Reconcile outcomes (`success`, `stalled`, `error`). |
+| `keyval_reconcile_duration_seconds{namespace,cluster}` | Histogram | Reconcile time; use `histogram_quantile`. |
+| `keyval_operator_eviction_attempt_total{namespace,cluster,component}` | Counter | Eviction attempts (redis/sentinel). |
+| `keyval_operator_eviction_result_total{namespace,cluster,component,result}` | Counter | Eviction outcomes for PDB analytics. |
+| `keyval_operator_pod_eviction_failures_total{namespace,cluster,component,reason}` | Counter | Breakdown of failed evictions (PDB, RBAC, timeout, errors). |
+| `keyval_operator_update_in_progress{namespace,cluster}` | Gauge | Indicates whether an update is in flight (1) or not. |
+| `keyval_disruptions_blocked_total{namespace,cluster,reason}` | Counter | Reasons why rollouts are blocked (PDBLimit, SentinelQuorum, Bootstrap, …). |
+| `keyval_rolling_deletions_total{namespace,cluster}` | Counter | Pods deleted by the operator. |
+| `keyval_replication_changes_total{namespace,cluster}` | Counter | Count of replication reconfigurations. |
+| `keyval_operator_replication_lag_seconds{namespace,cluster,pod}` | Gauge | Current lag in seconds. |
+| `keyval_label_corrections_total{namespace,cluster}` | Counter | Number of role label corrections. |
+| `keyval_operator_external_call_timeouts_total{namespace,cluster,command,endpoint}` | Counter | Redis/Sentinel command timeouts recorded by the client wrappers. |
+| `keyval_operator_redis_client_retries_total{namespace,cluster,command,endpoint}` | Counter | Extra Redis/Sentinel attempts beyond the initial call. |
+| `keyval_failover_triggered_total{namespace,cluster,type}` / `keyval_failover_completed_total{namespace,cluster}` | Counter | Controlled failovers initiated and completed. |
+| `keyval_bootstrap_attempt_total{namespace,cluster,mode}` / `keyval_bootstrap_failure_total{namespace,cluster}` | Counter | Bootstrap attempts and failures (`standalone`/`sentinel`). |
+| `keyval_external_import_attempt_total{namespace,cluster,mode}` / `keyval_external_import_success_total{…}` | Counter | External import attempts and successful completions grouped by sync mode. |
+| `keyval_external_import_failure_total{namespace,cluster,reason}` | Counter | External import failures (reason = target_not_empty, timeout, source_unreachable, …). |
+| `keyval_external_import_duration_seconds{namespace,cluster,mode}` | Histogram | Duration of bootstrap imports (per mode). |
+| `keyval_runtime_config_applied_total{namespace,cluster,component}` / `keyval_runtime_config_failed_total{…}` | Counter | Redis/Sentinel runtime configuration updates. |
+| `keyval_operator_sentinel_*` (quorum gauges, ready members, resets) | Gauge/Counter | Sentinel health monitoring. |
+| `keyval_operator_sentinel_apply_failures_total{namespace,cluster,reason}` | Counter | Sentinel StatefulSet SSA errors (`reason=immutable_field|error`); feeds drift alerts and runbooks. |
+| `keyval_operator_requeue_backoff_seconds{namespace,cluster}` | Histogram | Effective delay before the next reconcile (exponential backoff + internal requirements). |
+
+### Kubernetes Events
+- `BootstrapStart` / `BootstrapFinish`, `ExternalImportStarted` / `ExternalImportCompleted` / `ExternalImportFailed`, `StartFailover`, `FailoverTriggered`, `FailoverCompleted`, `NewMaster`, `NoGoodSlave`.
+- `SentinelQuorumLost` / `SentinelQuorumRestored`.
+- `SentinelApplyImmutableField` / `SentinelApplyFailed`.
+- `RollingStepBlocked` / `RollingStepResumed`, `PodEvicted`, `PDBModeSwitched`.
+- `ReplicationAligned`, `ReplicationDrift`, `ReplicaLagging/Desynced/Recovered`, `RuntimeConfigApplied/Failed`.
+
+## 7. Idempotence and Safety
+- Resource builders generate deterministic objects, so SSA eliminates drift on repeated reconciles.
+- Pod patches use `client.MergeFrom` with a strict `ResourceVersion` check.
+- The eviction wrapper ensures retries keep state consistent and always respect `ctx.Done()`.
+- Update blocks (bootstrap/failover/PDB) are tracked via annotation `keyval.ivelok.io/update-blocked` and metrics; the operator never deletes more than one pod per cycle.
+- Metrics `keyval_reconcile_result_total` and `keyval_operator_update_in_progress` let operators spot stuck reconciles quickly.
+
+## 8. Test Coverage and E2E
+- **Unit/Integration**: table-driven tests for resource builders, replication, runtime config, eviction, and guard logic. Envtest scenarios validate resource creation and drift-free reconciliation (`TestReconcileStandalone_Idempotent`).
+- **E2E (`make e2e`)**: covers Standalone and Sentinel clusters, runtime configs, failovers, DR bootstrap, rolling updates with PDB/health gates, and TLS (Redis + Sentinel). Runs are expected to finish with `PASS` and logs that demonstrate idempotent reconcile loops.
+
+## 9. Storage Management
+- **Finalizer and cleanup policy.** Field `spec.storage.cleanupOnDelete` enables PVC cleanup when the CR is deleted. The finalizer records the start time (`keyval.ivelok.io/finalizing-since`), emits `StorageCleanupStarted/Finished/TimedOut`, enforces a limit of three deletions per cycle, and updates the `StorageCleanup` status condition (`CleanupEnabled` / `RetentionPolicy` / `DeletingPVCs` / `PVCsDeleted`, `Timeout`). Metrics `keyval_operator_finalizer_duration_seconds{policy,result}` and `keyval_operator_storage_cleanup_failures_total{policy,reason}` track finalize duration and timeouts. If PVCs still exist after `2m`, a warning is raised and the finalizer releases the block, leaving the resources to the user.
+- **PVC expansion.** Module `ops/storage.EnsureResize` watches `spec.storage.size`, patches PVC `spec.resources.requests.storage`, and manages the online expansion loop. While CSI has already enlarged the volume and kubelet has not set `FileSystemResizePending`, the operator skips pod restarts: rolling update marks `storage:resize` only when `FileSystemResizePending=True` for longer than `2m` or `status.capacity` stays below target for more than `15m`. Events `StorageResizeRequested/Completed`, `StorageResizeRestartQueued`, and `StorageResizeBackoff` capture progress plus provider rate limits.
+- **StorageClass guidance.** Redis/Sentinel clusters require low-latency disks with guaranteed fsync (NVMe/SSD, synchronous writes). The StorageClass must support `allowVolumeExpansion`, `volumeBindingMode=WaitForFirstConsumer` (for deliberate node selection), and a `reclaimPolicy` that matches the DR plan. Without expansion support the reconcile loop remains pending (`StorageResizeRequested` without `Completed`), so production workloads should use a class with online expansion.
+
+## 10. Extensibility
+- Every new operation should live in its own subpackage under `controllers/internal/ops/` with clear ownership.
+- New metrics are registered in `observability/metrics.go` (remember to update documentation and tests).
+- For work outside the current scope, align on scope in .codex/tasks before implementation.
+
+## 11. Scaling and Update Telemetry
+- `PlanUpdates` tags pods deleted for scale-down with reason `scale-down`, while the StatefulSet creates replacements. Init container `kv-bootstrap-role` guarantees pods start as replicas, allowing `EnsureReplication` to add them to the topology immediately.
+- The controller tracks the scaling phase via annotation `keyval.ivelok.io/scale-phase` (`up|down`) and emits `ScaleOperationStarted`, `ScaleOperationBlocked`, and `ScaleOperationCompleted`. Events include `direction`, `current/target`, and the specific block reason (`DisruptionsPaused`, `SentinelQuorum`, `NoHealthyReplicas`).
+- Metrics `keyval_operator_scale_in_progress{namespace,cluster}` and `keyval_scale_operations_total{namespace,cluster,direction}` help build SLOs for scaling duration and highlight stuck operations. The gauge resets after `ScaleOperationCompleted`.
+- When scaling down the master in Sentinel mode the operator performs a controlled `SENTINEL FAILOVER` before evicting the pod. Event chain: `ScaleOperationStarted` → `StartFailover`/`FailoverCompleted` → `PodEvicted` (reason `scale-down`). If the failover cannot proceed (no quorum, no healthy replica) the controller emits `ScaleOperationBlocked` and keeps the operation in the `down` phase until conditions recover.
+- Runbook `docs/runbook/scale-and-upgrade.md` lists SRE steps (`kubectl scale/patch`, interpreting events/metrics, diagnosing common blockers).
+
+---
+
+# keyvalcluster.md
+
+Source: https://github.com/ivelok/keyval-operator/blob/main/docs/crd/keyvalcluster.md
+
+**KeyValCluster CRD Design (v1alpha1)**
+- API Group/Version: `keyval.ivelok.io/v1alpha1`
+- Kind: `KeyValCluster`
+- Scope: Namespaced
+- shortNames: `kvc`
+- Modes: `Standalone` and `Sentinel`
+- Kubernetes: v1.26+
+
+**Overview**
+- Manages Redis/Valkey 7+ clusters in Standalone and Sentinel modes.
+- StatefulSet with OnDelete strategy (implementation task), generated ConfigMaps, role labels, failover via Sentinel.
+- Clear `.status` with leader, roles, readiness, and conditions.
+
+**.spec Fields**
+- `mode` (string; required)
+  - Enum: `Standalone`, `Sentinel`
+- `image` (string; required)
+  - Example: `valkey/valkey:7.2` or `redis:7.2`
+- `engine` (string; default: `Valkey`)
+  - Enum: `Redis`, `Valkey`
+  - Used to select a default image when `spec.image` is not explicitly set.
+- `sentinelImage` (string; optional)
+  - Overrides the image used for the Sentinel sidecar. If omitted, reuses `spec.image`.
+- `redisReplicas` (integer; default: 1)
+  - Min: 1
+  - Standalone: must be 1
+  - Sentinel: must be >= 3
+- `sentinelCount` (integer; optional)
+  - Required for `Sentinel` mode; must be odd and >= 3
+  - Must be omitted in `Standalone` mode
+- `resources` (corev1.ResourceRequirements; optional)
+  - Requests/Limits for Redis container
+- `sentinelResources` (corev1.ResourceRequirements; optional)
+  - Requests/Limits for Sentinel Pods; defaults to 50m CPU / 128Mi memory requests when omitted
+  - See `examples/sentinel.yaml` for a cluster that sets distinct Redis vs Sentinel requests
+- `metrics` (MetricsSpec; optional; default enabled)
+  - Adds a `redis_exporter` sidecar to each Redis Pod and exposes HTTP metrics on the headless Service (`<cr>-headless`) when enabled
+  - `enabled` (bool; default true) — disable to omit the exporter container and the `metrics` ServicePort
+  - `image` (string; optional; default `ghcr.io/oliver006/redis_exporter:v1.75.0`)
+  - `port` (integer; default 9121) — HTTP listen port for `/metrics`
+  - `resources` (corev1.ResourceRequirements; optional; default requests: `20m` CPU, `64Mi` memory)
+  - The exporter connects to `localhost`, reuses Redis AUTH credentials, and negotiates TLS/mTLS automatically when `spec.security` enables them
+- `storage` (StorageSpec; optional)
+  - `type` enum: `Persistent` (default) or `Ephemeral`
+  - `size` (string quantity; required if `Persistent`)
+  - `cleanupOnDelete` (bool; optional; default false) — delete PVCs when the CR is removed (`true`) or retain them for manual recovery (`false`)
+  - `storageClassName` (string; optional)
+  - `accessModes` ([]string; optional; default `ReadWriteOnce`)
+  - Recommended StorageClass: support `allowVolumeExpansion`, deliver low latency with guaranteed fsync (NVMe/SSD). The operator suppresses pod restarts while online expansion completes; it adds `storage:resize` to the update plan only when `FileSystemResizePending` stays true for more than 2 minutes or `status.capacity` fails to reach the target for over 15 minutes. Events `StorageResizeRestartQueued` and `StorageResizeBackoff` expose fallback scenarios and provider throttling.
+- `redisConfig` (map[string]string; optional)
+  - Rendered into `redis.conf`
+- `sentinelConfig` (map[string]string; optional)
+  - Rendered into `sentinel.conf`; only in `Sentinel` mode
+- `security` (SecuritySpec; optional)
+  - `auth` (AuthSpec; optional)
+    - `enabled` (bool) — enables Redis AUTH/ACL. When true, `passwordSecretRef` is required
+    - `username` (string; optional) — ACL user name for replicas/sentinels; defaults to Redis default user when empty
+    - `passwordSecretRef` (`corev1.SecretKeySelector`; required when auth enabled) — references Secret with Redis password
+  - `tls` (TLSSpec; optional)
+    - `enabled` (bool) — enables TLS listeners for Redis and Sentinel
+    - `secretName` (string; required when enabled) — Secret containing `ca.crt`, `tls.crt`, `tls.key` (keys overridable via `caCertKey`, `certKey`, `keyKey`)
+    - `requireClientAuth` (bool; default false) — enables mTLS; the operator uses the client certificate from the Secret
+    - `disablePlaintext` (bool; default false) — sets `port 0`, leaving only `tls-port` active
+- With `security.auth` enabled, the operator renders `requirepass`, `masterauth`, `masteruser`, and Sentinel `auth-pass/auth-user`, and the ConfigMap hash includes the Secret resourceVersion.
+- With `security.tls` enabled, the configs add `tls-port`, `tls-{cert,key,ca-cert}-file`, and `tls-auth-clients`; the PodSpec mounts the Secret at `/tls` and turns on TLS for replication/Sentinel clients.
+- `bootstrap` (BootstrapSpec; optional)
+  - `externalSource` (ExternalSourceSpec; optional) — declarative seed from an existing Redis/Valkey deployment. When present, the operator connects to the remote endpoint before promoting local pods.
+    - `address` (string; required) — redis/rediss URI of the source (supports host:port and optional `/db`).
+    - `auth` (ExternalSourceAuthSpec; optional) — Secret references for ACL `usernameSecretRef` / `passwordSecretRef`. When omitted, the operator connects without authentication.
+    - `tls` (ExternalSourceTLSSpec; optional) — TLS for the outbound connection. `caBundleSecretRef` supplies the CA bundle; `client{Cert,Key}SecretRef` enable mutual TLS; `insecureSkipVerify` skips server validation (not recommended).
+    - `syncMode` (enum; default `Snapshot`) — `Snapshot` detaches once the replica is fully in sync; `Live` keeps the replica link active until you remove the `externalSource` block. While `Live` runs the controller reports `ExternalImport` with reason `Following` and aborts reconciliation after status updates to avoid promoting the local pods prematurely.
+    - `abortIfExistingData` (bool; default true) — refuse to attach when the local datastore already contains keys.
+    - `maxInitialSyncDuration` (duration; default 30m) — upper bound for the initial replication catch-up before the operator marks the import as failed.
+- `health` (HealthSpec; optional)
+  - `replicationLagSecondsMax` (int; default 5) — maximum lag for the `ReplicationHealthy` condition
+  - `failoverTimeoutSeconds` (int; default 20) — allowed failover window before the operator treats it as an incident
+  - `minReplicasForSafety` (int; default 2) — minimum number of healthy members (master + replicas) required to permit voluntary evictions; defaults effectively to 1 in Standalone mode
+- `replicationHealth` (legacy name; optional)
+  - Retained for backward compatibility with early releases; only controls `replicationLagSecondsMax`
+- `service` (ServiceSpec; optional)
+  - Controls `<cr>-master` and `<cr>-headless` Services
+  - `create` (bool; default true), `type` (`ClusterIP|NodePort|LoadBalancer`), `annotations`, `labels`, `ports.redis`
+  - When `create=false`, the operator deletes both Services (event `ServiceRemoved`, metric `keyval_operator_service_removed_total{service="master|headless"}`)
+- `sentinelService` (ServiceSpec; optional)
+  - Controls `<cr>-sentinel` Service in Sentinel mode
+  - `ports.sentinel` default 26379
+  - When `create=false`, the `<cr>-sentinel` Service is removed with event/metric parity (`service="sentinel"`)
+- `replicasService` (ServiceSpec; optional)
+  - Controls `<cr>-replicas` read service
+  - `create=false` removes the Service (metric label `service="replicas"`)
+- `sentinelPod` (SentinelPodSpec; optional)
+  - Allows customizing the Sentinel Pod template (labels, annotations, nodeSelector, tolerations, affinity).
+- `sentinelPDB` (SentinelPDB; optional)
+  - Controls the PodDisruptionBudget for Sentinel pods.
+  - `minAvailable` or `maxUnavailable` (IntOrString).
+- `topology` (TopologySpec; optional)
+  - Configures pod distribution.
+  - `spread`: topologySpreadConstraints (maxSkew, topologyKeys, whenUnsatisfiable).
+  - `antiAffinity`: podAntiAffinity (required vs preferred).
+- `podLabels` / `podAnnotations` (map[string]string; optional)
+
+**.status Fields**
+- `masterPod` (string)
+  - Current master Pod name
+- `replicas` (int)
+  - Desired Redis Pods (mirrors `.spec.redisReplicas`)
+- `rolesSource` (`sentinel|probe|forced`)
+  - Role discovery source (`sentinel` = CKMASTER API, `probe` = direct Redis polling, `forced` = manual override during bootstrap)
+- `readyReplicas` (int)
+  - Number of ready Redis Pods
+- `roles` ([]PodRoleStatus)
+  - `name` (string), `role` (`master|replica|sentinel`), `ready` (bool), `lastTransitionTime` (time)
+- `conditions` ([]Condition)
+  - `Reconciled`, `Available`, `SentinelQuorum`, `ReplicationHealthy`, `FailoverInProgress`, `DisruptionsPaused`, `UpgradeInProgress`, `BootstrapInProgress`, `ExternalImport`, `RuntimeConfigApplied`, `StorageCleanup`
+  - `StorageCleanup` reports the PVC policy (`CleanupEnabled` / `RetentionPolicy` / `EphemeralStorage`) and the finalizer progress (`DeletingPVCs`, `PVCsDeleted`, `Timeout`).
+  - `BootstrapInProgress=True` means a DR/bootstrap cycle is active: the master is re-elected (force-master → freshest PVC → seed), the Redis PDB switches to strict mode, `DisruptionsPaused=True`, and the flag clears only after `CKQUORUM` succeeds followed by sequential `SENTINEL RESET` operations.
+- `healthGate` (HealthGateStatus)
+  - `allowDisruptions` (bool) — aggregated safety flag controlling voluntary evictions and updates
+- `externalImport` (ExternalImportStatus; optional)
+  - `mode` (string) — `Snapshot` or `Live` (mirrors `spec.bootstrap.externalSource.syncMode`).
+  - `state` (string) — `Pending`, `InProgress`, `Following`, `Completed`, or `Failed`.
+  - `source` (string) — address of the remote endpoint.
+  - `startedAt` / `lastSynced` (timestamps) — most recent import timeline.
+  - `message` (string) — human-readable progress/failure notes.
+
+**Validation Rules (OpenAPI/CEL)**
+- `mode` enum: `Standalone`, `Sentinel`
+- `redisReplicas >= 1`
+- `mode == Standalone => redisReplicas == 1`
+- `mode == Standalone => sentinelCount, sentinelConfig omitted`
+- `mode == Sentinel => redisReplicas >= 3`
+- `mode == Sentinel => sentinelCount present, odd, and >= 3`
+- `metadata.name` length <= 63 characters (root x-kubernetes-validations)
+- Immutable: `spec.mode` cannot change after creation (`oldSelf` validation)
+
+**Printer Columns**
+- Mode: `.spec.mode`
+- Replicas: `.spec.redisReplicas`
+- Master: `.status.masterPod`
+
+**Versioning**
+- CRD version: `v1alpha1`
+- Evolution path: `v1beta1` → `v1` after field stability and controller maturity
+- Backward-compatibility: additive changes only; breaking changes gated behind new version
+
+**Migration Constraints**
+- Changing `spec.mode` is not supported after creation (immutable)
+- Scaling:
+  - Standalone: `redisReplicas` fixed at 1
+  - Sentinel: `redisReplicas` may scale (>=3); `sentinelCount` scales in odd increments (3, 5, 7, ...). The controller emits `ScaleOperationStarted/Blocked/Completed` events and updates metrics `keyval_operator_scale_in_progress` and `keyval_scale_operations_total{direction}`; consult `docs/runbook/scale-and-upgrade.md` when operations are blocked.
+- Resource split: pre-change clusters where Sentinels inherited Redis requests should set `spec.sentinelResources` before upgrading if they need to retain the previous sizing; otherwise defaults will apply on next reconcile.
+- Force-master override: annotate the pod `kubectl annotate pod/<cr>-N keyval.ivelok.io/force-master=true` before restart/DR to make the operator pick that PVC as the source of truth.
+
+**DNS/Names**
+- Enforce CR `metadata.name` length <= 63 for safe child resource naming (`<cr>-headless`, `<cr>-master`, etc.)
+- If stricter policy is required, consider a ValidatingWebhook to enforce cross-field invariants and name length consistently.
+
+**Edge Cases**
+- Very long names near 63 chars: ensure generated names (services, pods) remain <= 63
+- Invalid combos: `sentinelCount` set when `mode=Standalone` → validation error
+- Scale up/down in Sentinel: maintain odd `sentinelCount`, keep one-master invariant
+- Sentinel StatefulSet: fields `spec.serviceName`, `spec.selector`, and `spec.volumeClaimTemplates` are immutable. Drift attempts trigger the `SentinelApplyImmutableField` event, set `Reconciled=False` with reason `ImmutableField`, and increment `keyval_operator_sentinel_apply_failures_total{reason="immutable_field"}`; other SSA errors are treated as transient and surface via `SentinelApplyFailed`.
+
+**Examples**
+- See `examples/standalone.yaml`, `examples/sentinel.yaml`, and `examples/external-import.yaml` for valid CRs.
+
+**Kubebuilder Notes**
+- CRD ready for generation via `controller-gen` (validation tags and `XValidation` rules present).
+- Uses CEL validations that require Kubernetes v1.26+ (incl. `oldSelf` for immutability).
+
+---
+
+# Operator E2E Tests
+
+Source: https://github.com/ivelok/keyval-operator/blob/main/docs/e2e.md
+
+# Operator E2E Tests
+
+The `make e2e` target runs the operator through its primary user workflows inside the local Kubernetes cluster. The suite performs a full cycle: builds the controller image, redeploys the operator, provisions Standalone and Sentinel clusters, injects failures, and asserts every invariant.
+
+## Prerequisites
+- Docker with permission to build local images.
+- A reachable `kubectl` context (Docker Desktop/kind/minikube) with the `keyval-operator-system` namespace and the CRDs already installed.
+- The cluster must be able to pull the image referenced by `IMG` (defaults to `controller:latest`).
+- If `go test` requires envtest assets, export `KUBEBUILDER_ASSETS` just as you do for the unit tests.
+
+## Primary Scenario
+```bash
+make e2e
+```
+The command:
+1. Runs `docker-build` and `kubectl apply` through `make deploy` (including a rollout restart).
+2. Executes `go test -tags=e2e ./test/suites/...`, creating the `keyval-e2e` namespace plus Standalone and Sentinel `KeyValCluster` objects.
+3. Applies runtime-allowed changes to `redisConfig`/`sentinelConfig` (for example `maxmemory`, `down-after-milliseconds`) and verifies pod UIDs and Services stay intact.
+4. Checks readiness, deletes the master pod, restarts Sentinel pods, triggers a rolling update with a restart-required flag (`appendonly`), and validates that all invariants hold.
+
+Repeated runs are idempotent: the suite tears down every resource on exit unless instructed to keep them.
+
+> **Important:** Always run `make redeploy` before any `go test -tags=e2e ...` invocation (including focused tests). This guarantees the freshly built operator image is loaded and the deployment restarted before validation.
+
+The E2E harness also removes lingering PVCs labeled `keyvalcluster=<name>` before recreating a cluster so that stale Redis/Sentinel data never affects subsequent runs.
+
+## Additional Makefile Targets
+- `make e2e-setup` — build the image and apply the operator manifests only.
+- `make e2e-test` — run the Go suite without rebuilding or redeploying (uses the current deployment).
+- `make e2e-clean` — delete the namespace and KeyValCluster resources created by the suite.
+- `go test -tags=e2e ./test/suites/security -run TLSPDBEviction` — targeted check for eviction blocking during TLS rotation with a strict PDB.
+- `make chaos` / `make chaos-test` — resurrected chaos suite (see [`docs/runbook/failover-stuck.md`](runbook/failover-stuck.md)) that stresses failover under network faults and restart storms.
+
+## Useful Environment Variables
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `IMG` | `controller:latest` | Operator image to build and deploy before the test. |
+| `E2E_NAMESPACE` | `keyval-e2e` | Namespace where the scenario provisions resources. |
+| `E2E_TIMEOUT` | `15m` | `go test` timeout. |
+| `KEEP_RESOURCES` | `0` | Set to `1/true` to keep CRs/pods after the suite finishes. |
+| `KEEP_ARTIFACTS` | `0` | When enabled, saves state YAML and pod listings to `test/e2e/artifacts/`; automatically enabled on failure. |
+| `E2E_REDIS_IMAGE` | `valkey/valkey:7.2` | Override the Redis/Valkey image used in the scenarios. |
+| `E2E_SENTINEL_IMAGE` | _(empty)_ | Custom Sentinel sidecar image; defaults to the main image when left empty. |
+
+For focused debugging you can skip the redeploy stage:
+```bash
+make e2e-test KEEP_RESOURCES=1 KEEP_ARTIFACTS=1 E2E_TIMEOUT=20m
+```
+
+## Logs and Artifacts
+When a test fails (or when `KEEP_ARTIFACTS=1`) the suite persists:
+- `test/e2e/artifacts/<cluster>.yaml` — final `KeyValCluster` status snapshot.
+- `test/e2e/artifacts/<cluster>-pods.txt` — pod statuses at the end of the run.
+
+These artifacts make reproducing issues easier without rerunning the entire suite.
+
+## What the E2E Suite Verifies
+- Proper provisioning of Standalone and Sentinel `KeyValCluster` objects.
+- Single-master invariant plus correct Service/Endpoint resources, including custom port setups.
+- Runtime application of allow-listed settings (`maxmemory`, `down-after-milliseconds`) without restarting pods.
+- Successful recovery after deleting the master and two Sentinel pods in sequence.
+- DR bootstrap: delete all Redis pods and Sentinels, ensure master selection (force-master → freshest PVC), capture `BootstrapStart/Finish`, sequential `ResetSentinelDone`, and release the strict PDB once quorum returns.
+- Rolling update triggered by a restart-required parameter (`appendonly`) and completion without status drift.
+- Rolling updates go through the Eviction API; the suite checks for the `keyval.ivelok.io/update-blocked` annotation and the reset of `keyval_operator_update_in_progress` gauge.
+- Health gate enforcement: when `status.healthGate.allowDisruptions=false` (via `minReplicasForSafety`), the operator blocks updates, emits `RollingStepBlocked` with reason `DisruptionsPaused`, and increments `keyval_disruptions_blocked_total`.
+- PDB pressure: an artificial `PodDisruptionBudget` returns `429`; the operator cycles `RollingStepBlocked/Resumed` and resumes rollout once the constraint is removed.
+- Sentinel failover: when only the master remains in the plan, the update triggers a controlled `SENTINEL FAILOVER`, emits `FailoverTriggered/Completed`, and updates `status.masterPod`.
+- Sentinel-only updates: changing `sentinelResources` restarts Sentinel pods one at a time, keeps Redis pod UIDs stable, and matches the expected resource requests.
+- Metrics and events remain exposed via `/metrics`; scenarios assert `keyval_disruptions_blocked_total` and `keyval_operator_update_in_progress` before/after operations.
+- Idempotence: after updates finish, the suite re-runs reconcile, confirms `keyval_reconcile_result_total{result="stalled"}` does not grow, and finds `reconciled ... no rolling action` in the logs without reapplying resources.
+
+Run `make e2e` together with `go test ./...` and `staticcheck ./...` before committing substantial changes.
+
+## Manual Replication Intervention
+
+The operator automatically tracks role drift and replica lag; manual work is only required for diagnostics:
+
+1. Promote a replica to master for experimentation:
+   ```bash
+   kubectl -n <ns> exec pod/<cluster>-redis-1 -c redis -- redis-cli replicaof no one
+   ```
+   The CR emits `ReplicationDrift` with pod names, and `keyval_operator_replication_lag_seconds{pod=...}` becomes non-zero temporarily.
+2. Wait for `ReplicationAligned` — the operator issues `REPLICAOF <master>` and, in Sentinel mode, schedules sequential `SENTINEL RESET` operations until `ResetSentinelDone` fires for each pod.
+3. Inspect status via:
+   ```bash
+   kubectl -n <ns> get keyvalcluster <cluster> -o jsonpath='{.status.conditions[?(@.type=="ReplicationHealthy")].status}'
+   kubectl -n <ns> exec pod/<cluster>-redis-1 -c redis -- redis-cli info replication | grep master_link_status
+   ```
+4. To force a specific pod to become master, annotate it with `keyval.ivelok.io/force-master=true` and delete the pod; the next reconcile promotes it while resetting Sentinels.
+
+Key metrics to watch:
+- `keyval_operator_replication_lag_seconds{pod}` — actual lag in seconds.
+- `keyval_operator_sentinel_quorum_healthy` — quorum status (0/1).
+- `keyval_replication_changes_total` — topology change counter.
+- `keyval_disruptions_blocked_total{reason="Bootstrap"}` — indicates rollouts paused until quorum/replication recovers.
+
+---
+
+# Installing KeyVal Operator
+
+Source: https://github.com/ivelok/keyval-operator/blob/main/docs/install.md
+
+# Installing KeyVal Operator
+
+This guide describes how to deploy the KeyVal operator using the Helm chart packaged in this repository and how to bootstrap example `KeyValCluster` resources.
+
+## Prerequisites
+- Kubernetes v1.26 or newer
+- Helm v3.8+
+- Access to a container registry for custom images (optional)
+- `cosign` (optional, for verifying signed release images)
+
+## 1. Add the Helm Repository
+The release workflow publishes the chart as an OCI artifact. Authenticate (if required) and add it locally:
+
+```bash
+helm registry login ghcr.io -u <gh-username>
+helm pull oci://ghcr.io/ivelok/keyval-operator/keyval-operator --version 0.1.1 --untar
+```
+
+Alternatively, package the chart locally during development:
+
+```bash
+make helm-package CHART_VERSION=0.1.1
+```
+
+## 2. Install the Operator
+Install the chart into the `keyval-operator-system` namespace (create it if absent):
+
+```bash
+helm install keyval-operator oci://ghcr.io/ivelok/keyval-operator/keyval-operator \
+  --namespace keyval-operator-system \
+  --create-namespace \
+  --version 0.1.1
+```
+
+Verify deployment:
+
+```bash
+kubectl -n keyval-operator-system get deploy keyval-operator-controller-manager
+kubectl -n keyval-operator-system get pods
+```
+
+## 3. Configure Values
+The chart exposes a comprehensive `values.yaml`. Common overrides:
+
+| Section | Purpose | Example |
+|---------|---------|---------|
+| `image.repository`, `image.tag` | Use a custom controller image | `image.repository=ghcr.io/acme/keyval-operator` |
+| `manager.replicas` | Increase controller HA | `manager.replicas=2` |
+| `manager.metricsService.create` | Disable metrics service | `manager.metricsService.create=false` |
+| `manager.podDisruptionBudget.enabled` | Enforce operator PDB | `manager.podDisruptionBudget.enabled=true` |
+| `manager.watchNamespace` | Scope reconciliation to a single namespace (sets `WATCH_NAMESPACE`) | `manager.watchNamespace=apps` |
+| `examples.enabled` | Deploy sample clusters | `examples.enabled=true` |
+| `examples.clusters[].spec` | Provide ready-to-use `KeyValCluster` specs | See below |
+
+Scoping the operator to a single namespace (via `manager.watchNamespace`) reduces informer load and ensures the controller only caches objects it needs. The chart wires this value into the controller’s `WATCH_NAMESPACE` environment variable automatically; leave it empty to keep the default cluster-wide view.
+
+### TLS and Auth Example
+```yaml
+examples:
+  enabled: true
+  clusters:
+    - name: kv-prod
+      spec:
+        mode: Sentinel
+        redisReplicas: 5
+        sentinelCount: 5
+        storage:
+          type: Persistent
+          size: 200Gi
+          storageClassName: fast-ssd
+        security:
+          auth:
+            enabled: true
+            username: sentinel
+            passwordSecretRef:
+              name: kv-auth
+              key: password
+          tls:
+            enabled: true
+            secretName: kv-tls
+            requireClientAuth: true
+```
+Apply the release and confirm sample clusters are created:
+
+```bash
+kubectl -n keyval-operator-system get keyvalclusters
+```
+
+## 4. Upgrading the Chart
+To upgrade in place:
+
+```bash
+helm upgrade keyval-operator oci://ghcr.io/ivelok/keyval-operator/keyval-operator \
+  --namespace keyval-operator-system \
+  --version <new-version> \
+  -f my-values.yaml
+```
+
+Review the runbooks (`docs/runbook/`) for safe scaling and upgrade procedures prior to applying disruptive changes.
+
+## 5. Uninstall
+Remove all `KeyValCluster` resources first, then uninstall the chart:
+
+```bash
+kubectl delete keyvalclusters.keyval.ivelok.io --all-namespaces --all
+helm uninstall keyval-operator --namespace keyval-operator-system
+```
+
+## Verification Checklist
+- [ ] Operator deployment Ready replicas match desired count
+- [ ] CRDs present: `kubectl get crd keyvalclusters.keyval.ivelok.io`
+- [ ] Metrics endpoint accessible (default `keyval-operator-controller` port 8080)
+- [ ] Example clusters (if enabled) report `Available=True`
+
+For troubleshooting refer to the operational runbooks and observability guide.
+
+---
+
+# KeyVal Operator Observability
+
+Source: https://github.com/ivelok/keyval-operator/blob/main/docs/observability.md
+
+# KeyVal Operator Observability
+
+## Prometheus Metrics
+The controller exposes metrics on `:8080/metrics` (deployment `keyval-operator-controller-manager`). Current dictionary:
+
+| Metric | Type / Labels | Purpose |
+|--------|---------------|---------|
+| `keyval_reconcile_result_total{namespace,cluster,result}` | Counter | Outcome of each reconcile (`success`, `stalled`, `error`); reveals failure frequency and stuck loops. |
+| `keyval_reconcile_duration_seconds{namespace,cluster}` | Histogram | Reconcile duration distribution; recommended SLI: `histogram_quantile(0.9, …)` over 5-minute windows. |
+| `keyval_operator_controller_reconcile_queue_depth{controller}` | Gauge | Current depth of the reconcile workqueue per controller (e.g., `keyvalcluster`). |
+| `keyval_operator_requeue_backoff_seconds{namespace,cluster}` | Histogram | Observed requeue backoff delays; helps track degradation loops. |
+| `keyval_status_update_total{namespace,cluster,mutated}` | Counter | Number of status reconciliation attempts (`mutated=true|false`). |
+| `keyval_operator_eviction_attempt_total{namespace,cluster,component}` | Counter | Number of evictions initiated by the operator (`component=redis|sentinel`). |
+| `keyval_operator_eviction_result_total{namespace,cluster,component,result}` | Counter | Eviction results (`attempt`, `success`, `rejected`, `timeout`, `forbidden`, `error`, `cancelled`); helpful for PDB/RBAC diagnostics. |
+| `keyval_operator_pod_eviction_failures_total{namespace,cluster,component,reason}` | Counter | Failed evictions classified by reason (`too_many_requests`, `forbidden`, `timeout`, `cancelled`, `error`). |
+| `keyval_operator_update_in_progress{namespace,cluster}` | Gauge | Set to 1 while a rolling update (Redis or Sentinel) is active; detects stuck updates. |
+| `keyval_operator_scale_in_progress{namespace,cluster}` | Gauge | Set to 1 while scaling is in progress; resets after `ScaleOperationCompleted`. |
+| `keyval_disruptions_blocked_total{namespace,cluster,reason}` | Counter | Counts rollout blocks (`PDBLimit`, `Bootstrap`, `SentinelQuorum`, `DisruptionsPaused`, …). |
+| `keyval_rolling_deletions_total{namespace,cluster}` | Counter | Pods deleted during rolling updates. |
+| `keyval_scale_operations_total{namespace,cluster,direction}` | Counter | Completed scaling operations (`direction=up|down`); supports scale-duration SLOs. |
+| `keyval_replication_changes_total{namespace,cluster}` | Counter | Topology reconfigurations (`REPLICAOF`). |
+| `keyval_operator_replication_lag_seconds{namespace,cluster,pod}` | Gauge | Replication lag from `INFO replication`. |
+| `keyval_label_corrections_total{namespace,cluster}` | Counter | Pod role label corrections (`role=master|replica`). |
+| `keyval_operator_pod_label_patch_conflicts_total{namespace,cluster,pod}` | Counter | `resourceVersion` conflicts while patching a pod role. |
+| `keyval_operator_pod_label_patch_retries_total{namespace,cluster,pod}` | Counter | Extra attempts required to patch a pod role successfully. |
+| `keyval_operator_redis_master_cache_hits_total` / `_misses_total` | Counter | Internal cache performance for master address lookups. |
+| `keyval_operator_failover_decisions_total{namespace,cluster,source}` | Counter | Source of leader decisions (`sentinel|probe|forced`); highlights non-Sentinel fallbacks. |
+| `keyval_failover_triggered_total{namespace,cluster,type}` / `keyval_failover_completed_total{namespace,cluster}` | Counter | Controlled failovers triggered/completed (`type=manual|automatic|forced`). |
+| `keyval_bootstrap_attempt_total{namespace,cluster,mode}` / `keyval_bootstrap_failure_total{namespace,cluster}` | Counter | Bootstrap attempts/failures (`mode=standalone|sentinel`). |
+| `keyval_operator_bootstrap_freshness_gap_bytes{namespace,cluster}` | Gauge | Difference in replication offset (bytes) between the selected DR master and the next candidate. |
+| `keyval_operator_bootstrap_freshness_source{namespace,cluster,source}` | Gauge | Source of DR bootstrap decision (1=force-master, 2=freshness, 3=seed). |
+| `keyval_external_import_attempt_total{namespace,cluster,mode}` / `keyval_external_import_success_total{namespace,cluster,mode}` | Counter | External import attempts and successful completions (mode = snapshot/live). |
+| `keyval_external_import_failure_total{namespace,cluster,reason}` | Counter | External import failures classified by reason (`target_not_empty`, `timeout`, `source_unreachable`, ...). |
+| `keyval_external_import_duration_seconds{namespace,cluster,mode}` | Histogram | Time spent waiting for external import to finish. |
+| `keyval_runtime_config_applied_total{namespace,cluster,component}` / `keyval_runtime_config_failed_total{…}` | Counter | Runtime config application results (`component=redis|sentinel`). |
+| `keyval_operator_sentinel_quorum_healthy{namespace,cluster}` | Gauge | Result of `CKQUORUM` (1 = quorum present). |
+| `keyval_operator_sentinel_ready_members{namespace,cluster}` | Gauge | Number of Ready Sentinel pods. |
+| `keyval_operator_sentinel_quorum_target{namespace,cluster}` | Gauge | Required majority (`ceil(N/2)`). |
+| `keyval_operator_sentinel_noquorum_reports{namespace,cluster}` | Gauge | Count of Sentinels that reported `NOQUORUM` in the last check. |
+| `keyval_operator_sentinel_quorum_loss_since{namespace,cluster}` | Gauge | Unix timestamp when quorum was first lost (`0` once restored). |
+| `keyval_operator_sentinel_resets_total{namespace,cluster}` | Counter | Number of `SENTINEL RESET` commands executed by the operator. |
+| `keyval_operator_sentinel_apply_failures_total{namespace,cluster,reason}` | Counter | Sentinel StatefulSet SSA errors (`reason=immutable_field|error`). |
+| `keyval_operator_redis_apply_failures_total{namespace,cluster,reason}` | Counter | Redis StatefulSet SSA errors (`reason=immutable_field|error`). |
+| `keyval_operator_external_call_timeouts_total{namespace,cluster,command,endpoint}` | Counter | Redis/Sentinel command timeouts recorded by the client wrappers. |
+| `keyval_operator_redis_client_retries_total{namespace,cluster,command,endpoint}` | Counter | Extra Redis/Sentinel attempts beyond the initial call. |
+| `keyval_operator_finalizer_duration_seconds{namespace,cluster,policy,result}` | Histogram | Duration of storage cleanup finalizer execution. |
+| `keyval_operator_storage_cleanup_failures_total{namespace,cluster,policy,reason}` | Counter | Storage cleanup failures (`reason=timeout|error`). |
+| `keyval_operator_graceful_shutdown_duration_seconds{namespace,cluster,component,pod}` | Histogram | Time taken for pods to terminate (observed via preStop hook or container exit). |
+| `keyval_operator_tls_secret_rotations_total{namespace,cluster,component}` | Counter | Number of TLS secret rotations detected. |
+| `keyval_operator_service_immutable_change_total{namespace,cluster,service,field}` | Counter | Rejected service updates due to immutable field changes. |
+
+Local verification:
+```bash
+kubectl -n keyval-operator-system port-forward deploy/keyval-operator-controller-manager 8080:8080
+curl -s localhost:8080/metrics | grep keyval_
+```
+
+### Redis Exporter Sidecar
+- `spec.metrics.enabled` (default) adds a `redis_exporter` sidecar to every Redis pod and publishes a `metrics` port on the headless service.
+- The sidecar scrapes `127.0.0.1:${REDIS_PORT}`. When Redis AUTH/TLS is active the exporter reuses the resolved Secret and mounts `/tls`, switching to `rediss://` with client certificates automatically.
+- Override the listening port with `spec.metrics.port`; the operator updates the container args (`--web.listen-address=:`), pod `containerPort`, and ServicePort together so hashes stay stable.
+- Prometheus Operator example:
+  ```yaml
+  apiVersion: monitoring.coreos.com/v1
+  kind: ServiceMonitor
+  metadata:
+    name: kv-redis-metrics
+  spec:
+    namespaceSelector:
+      matchNames:
+        - default
+    selector:
+      matchLabels:
+        app: demo-redis
+    endpoints:
+      - port: metrics
+        path: /metrics
+        scheme: http
+  ```
+  For TLS-enabled clusters set `scheme: https` and reference the Redis CA / client certificates via `tlsConfig.ca`, `cert`, and `key`.
+
+## Logging
+The operator uses zap via controller-runtime. Flag `--zap-devel` controls verbosity and format:
+
+- `--zap-devel=true` (default for Kustomize manifests) enables `logger.V(1)` messages and prints human readable `DEBUG\t...` output.
+- `--zap-devel=false` (Helm default via `manager.logLevel=info`) disables the debug stream and leaves JSON info logs only.
+
+To increase verbosity temporarily, add `--zap-devel=true` to the `keyval-operator-controller-manager` deployment or set `manager.logLevel=debug` in Helm, then restart the deployment (`kubectl -n keyval-operator-system rollout restart deploy/keyval-operator-controller-manager`).
+
+Check the active mode by inspecting logs (`kubectl logs ...`): lines containing `level=debug` or `DEBUG` indicate debug is on. See the runbook [logging-verbosity.md](runbook/logging-verbosity.md) for detailed steps and ready-made patches.
+
+## Kubernetes Events
+The operator writes events to the `KeyValCluster` object. Inspect them via `kubectl -n <ns> describe keyvalcluster/<name>`.
+
+| Reason | Type | Description |
+|--------|------|-------------|
+| `BootstrapStart` / `BootstrapFinish` | Normal | Bootstrap start/end (DR, Sentinel, TLS). Ensure Sentinel+TLS SLA ≤150 s between the two events. |
+| `ExternalImportStarted` / `ExternalImportCompleted` / `ExternalImportFailed` | Normal / Normal / Warning | External data import lifecycle when `spec.bootstrap.externalSource` is set. `Completed`/`Failed` align with the `ExternalImport` condition; `Following` indicates `syncMode=Live` is keeping the replica link active until cutover. |
+| `SentinelQuorumLost` / `SentinelQuorumRestored` | Warning / Normal | Sentinel quorum status (`CKQUORUM`). |
+| `StartFailover` | Normal | Controlled `SENTINEL FAILOVER` invocation with type/master details. |
+| `FailoverTriggered` / `FailoverCompleted` | Normal | Failover trigger and completion; `FailoverCompleted` becomes `Warning` on failure. |
+| `NewMaster` | Normal/Warning | Announces the new master after failover (`Warning` when errors occur); increments `keyval_failover_completed_total`. |
+| `PodEvicted` | Normal | Pod eviction during updates with reasons (`config-hash`, `image`, `resources`, `scale-down`, …). |
+| `ScaleOperationStarted` / `ScaleOperationBlocked` / `ScaleOperationCompleted` | Normal / Warning / Normal | Scaling lifecycle; messages include `direction=up|down`, `current/target`, and block reasons (`DisruptionsPaused`, `SentinelQuorum`, …). |
+| `RollingStepBlocked` / `RollingStepResumed` | Warning / Normal | Rollout blocks (PDBLimit, BootstrapInProgress, SentinelQuorum, DisruptionsPaused, ReplicaUnhealthy). |
+| `PDBModeSwitched` | Normal | PDB mode changes (soft ↔ hard) with `component`, `mode`, `minAvailable`. |
+| `ReplicationHeuristicFallback` | Warning | Sentinel unavailable or erroring; operator temporarily polls Redis pods directly. Limited to ≤1 per 30s per cluster. |
+| `ReplicationAligned` / `ReplicationDrift` | Normal / Warning | Replication alignment state; handy during manual interventions. |
+| `NoGoodSlave`, `ReplicaLagging`, `ReplicaRecovered`, `RuntimeConfigApplied`, `RuntimeConfigFailed`, `ResetSentinelDone`, `RoleCorrected` | Various | Additional diagnostics; consult specific messages for details. |
+
+## Prometheus Operator Integration
+Examples live in `examples/observability/`:
+1. `servicemonitor.yaml` — scrape the controller metrics.
+2. `podmonitor.yaml` — scrape external exporters (legacy deployments). Prefer a ServiceMonitor targeting the built-in `metrics` port when `spec.metrics.enabled`.
+
+## Recommended Alerts
+- **ReconcileFailures:** `increase(keyval_reconcile_result_total{result="error"}[15m]) > 0`
+- **EvictionRejected:** `increase(keyval_operator_eviction_result_total{result="rejected"}[5m]) > 0`
+- **UpdateStuck:** `max_over_time(keyval_operator_update_in_progress[10m]) == 1` and `increase(keyval_rolling_deletions_total[10m]) == 0`
+- **SentinelQuorumMissing:** `keyval_operator_sentinel_quorum_healthy == 0` for longer than 2 minutes
+- **BootstrapLoop:** `increase(keyval_bootstrap_failure_total[1h]) > 0`
+
+When `KEEP_ARTIFACTS=1` is set, the e2e suite stores bootstrap-duration JSON files under `test/e2e/artifacts/<cluster>-<mode>-bootstrap.json`. Sentinel TLS scenarios include the measured duration and the 150 s SLA — useful for retrospectives and dashboard correlation.
+
+## Grafana and Annotations
+- Dashboard: `examples/observability/grafana-dashboard.json` (panels for updates, failover, bootstrap, Sentinel, eviction).
+- Event annotations can be drawn from Loki/Prometheus queries such as `reason=~"StartFailover|RollingStepBlocked|PodEvicted"`.
+
+## Diagnostics During E2E
+`make e2e` deploys the operator and test clusters automatically. After a run:
+```bash
+# Ensure stalled metric remains zero
+kubectl -n keyval-operator-system port-forward deploy/keyval-operator-controller-manager 8080 &
+watch -n5 'curl -s localhost:8080/metrics | grep keyval_reconcile_result_total'
+
+# Inspect events from a scenario
+kubectl -n keyval-e2e describe keyvalcluster config-standalone-valkey | grep -A4 Events
+```
+
+For deeper debugging, enable `KEEP_ARTIFACTS=1` and review files in `test/e2e/artifacts/`.
+
+## SLA Report (Failover & MTTR)
+`make sla-report` aggregates data from `test/e2e/artifacts/` and `test/chaos/artifacts/`:
+
+```bash
+make sla-report
+# for custom datasets:
+make sla-report SLA_FLAGS="-chaos /tmp/chaos -e2e /tmp/e2e"
+```
+
+The command outputs `test/sla/report.json` plus a human-readable summary. The report includes:
+
+- Average/maximum MTTR (keys `mttr.*` from chaos scenarios).
+- Average/maximum quorum/failover recovery times (`quorum.*`, `failover.*`).
+- Cumulative time with `allowDisruptions=false` (`disruptions.pauseSeconds`).
+- Scenario inventory (name, duration, notes) and covered e2e tests.
+
+To generate a report from custom artifacts directly via CLI:
+
+```bash
+go run ./cmd/sla-report \
+  -chaos /path/to/chaos/artifacts \
+  -e2e /path/to/e2e/artifacts \
+  -output /tmp/sla-report.json
+```
+
+An example report lives in `test/sla/example-report.json`; unit tests in `internal/sla` use it to guard format compatibility.
+
+---
+
+# KeyVal Operator — Overview
+
+Source: https://github.com/ivelok/keyval-operator/blob/main/docs/project-overview.md
+
+# KeyVal Operator — Overview
+
+## 1. Purpose
+KeyVal Operator automates Redis/Valkey 7+ clusters in Kubernetes (Standalone and Sentinel modes). Core principles: idempotent reconcile loops, minimal downtime, controlled updates, built-in DR bootstrap, and observability via events and metrics. The operator targets Kubernetes 1.26+ and installs the namespaced `KeyValCluster` CRD.
+
+## 2. Repository Layout
+- `api/v1alpha1/` — CRD types, status definitions, CEL validation.
+- `controllers/` — public reconciler, dependency factory, envtest and e2e helper tests.
+- `controllers/internal/` — domain logic modules:
+  - `finalizer`, `reconcile`, `ssa` — reconcile loop phases and server-side apply helpers.
+  - `resources`: ConfigMap/StatefulSet/Service/PDB builders using SSA.
+  - `ops`: replication, Sentinel failover, status, health, runtime config, eviction, observability, bootstrap, importer, storage, update orchestration.
+  - `security`: Auth/TLS resolution, `tls.Config` construction, password handling.
+  - `clients`: Redis/Sentinel client factories built on go-redis v9.
+  - `runtime`: controller-runtime helpers (predicates, backoff, ClusterIP preservation).
+- `docs/` — architecture, observability, e2e guides, runbooks.
+- `test/suites/` — Go tests compiled with `-tags=e2e` covering upgrades, failover, TLS.
+
+## 3. Architectural Highlights
+- **Dependency injection & rate limiting:** `NewKeyValClusterReconciler` receives all dependencies, including the typed rate limiter and eviction settings. No global state, which simplifies testing.
+- **Logging & errors:** `log/slog` with a consistent context (`cluster`, `namespace`, `request`). Errors are labeled via `WrapTransient` / `WrapFatal`, and metric `keyval_reconcile_result_total` records the outcome.
+- **Eviction wrapper:** `ops/eviction` adds timeouts, exponential backoff, metrics `keyval_operator_eviction_*`, and emits `PodEvicted` events.
+- **Replication and failover:** `EnsureTopology` and `TriggerFailover` coordinate DR bootstrap, Sentinel `CKQUORUM`, `SENTINEL RESET`, and events `SentinelQuorumLost/Restored`, `StartFailover`, `NewMaster`.
+- **Rolling updates:** `PlanUpdates` plus `EvaluateGuards` enforce single-pod deletion, honoring PDB, health, and bootstrap rules. The operator triggers a controlled failover before removing the master when required.
+
+## 4. Observability
+- **Prometheus metrics:**
+  - `keyval_reconcile_result_total`, `keyval_reconcile_duration_seconds` — reconcile health.
+  - `keyval_operator_eviction_attempt_total`, `keyval_operator_eviction_result_total` — PDB interaction diagnostics.
+  - `keyval_operator_update_in_progress`, `keyval_disruptions_blocked_total`, `keyval_rolling_deletions_total` — update progress.
+  - `keyval_replication_changes_total`, `keyval_operator_replication_lag_seconds`, `keyval_label_corrections_total`, `keyval_operator_pod_label_patch_conflicts_total`, `keyval_operator_pod_label_patch_retries_total` — replication and pod labels.
+  - `keyval_bootstrap_attempt_total`, `keyval_bootstrap_failure_total`, `keyval_failover_triggered_total`, `keyval_failover_completed_total` — bootstrap and failover tracking.
+  - `keyval_operator_sentinel_*` — Sentinel quorum state and resets.
+  - `keyval_runtime_config_applied_total` / `_failed_total` — runtime config application.
+  - `redis_exporter` sidecar — enabled by default via `spec.metrics`, served on the headless service port `metrics` (default 9121) with TLS/auth passthrough.
+- **Kubernetes events:** `BootstrapStart/Finish`, `RollingStepBlocked/Resumed`, `SentinelQuorumLost/Restored`, `StartFailover`, `FailoverTriggered`, `NewMaster`, `PodEvicted`, `PDBModeSwitched`, `ReplicationAligned/Drift`, `RuntimeConfigApplied/Failed`.
+- For a detailed table, see `docs/observability.md`.
+
+## 5. Testing
+- `go test ./...` (unit/integration) covers resource builders, replication, runtime config, eviction, status updates.
+- `go test -race ./...` — mandatory before a release.
+- `staticcheck ./...` — continuous quality gate.
+- `make e2e` — full workflow (Standalone, Sentinel, DR, failover, TLS, PDB blocking). Key knobs: `IMG`, `E2E_NAMESPACE`, `KEEP_RESOURCES`, `KEEP_ARTIFACTS`.
+- Envtest (`go test -tags=envtest ./controllers/...`) validates resource creation and idempotence (`TestReconcileStandalone_Idempotent`).
+
+## 6. Workflow
+1. **Specification** — capture scope in .codex/tasks (internal tracker) before coding.
+2. **Implementation** — land small patches; after each step run `go fmt`, `goimports`, `staticcheck`, `go test`.
+3. **Verification** — `go test -race ./...`, `make e2e`. Always run `make redeploy` (or `make e2e`, which includes it) before e2e checks.
+4. **Documentation** — update `docs/` whenever architecture, metrics, or runbooks change.
+
+## 7. Operations
+- The operator image runs via the `keyval-operator-controller-manager` Deployment. Use `make redeploy` or `make restart` to pick up a new build.
+- For manual diagnostics: `kubectl -n keyval-operator-system logs deploy/keyval-operator-controller-manager` and port-forward `:8080/metrics`.
+- When using a local `controller:latest` image, ensure the cluster trusts the local registry (Docker Desktop shares it automatically).
+
+More detail lives in `docs/architecture.md`, `docs/observability.md`, `docs/e2e.md`, and `docs/runbook/pdb-troubleshooting.md`.
+
+---
+
+# Public Release Checklist
+
+Source: https://github.com/ivelok/keyval-operator/blob/main/docs/release-checklist.md
+
+# Public Release Checklist
+
+Use this checklist to prepare the KeyVal Operator repository for a public release. Each item should be confirmed before tagging and publishing artifacts.
+
+## 1. Code & Tests
+- [ ] All unit tests pass: `go test ./...`
+- [ ] Static analysis clean: `staticcheck ./...`
+- [ ] End-to-end suite green against local cluster: `make e2e`
+- [ ] Chaos scenarios (optional for patch releases) validated: `make chaos`
+
+## 2. Documentation
+- [ ] README, install guide, and architecture docs are current and English-only
+- [ ] Runbooks updated with any new operational behaviors
+- [ ] CRD reference regenerated if schema changed: `make generate && make manifests`
+- [ ] Release notes drafted for GitHub Release page
+
+## 3. Packaging
+- [ ] Controller image built and pushed to release registry (`make docker-build IMG=<repo>:<tag>`)
+- [ ] Helm chart packaged and signed (if applicable): `make helm-package CHART_VERSION=<version>`
+- [ ] Chart and image digests recorded in release notes
+- [ ] Sample `KeyValCluster` manifests validated on Kubernetes v1.26+ and v1.30+
+
+## 4. Security & Compliance
+- [ ] Dependency scan (`make govulncheck` or `govulncheck ./...`) shows no blocking issues
+- [ ] (Optional) Generate and publish SBOM alongside the container image
+- [ ] Cosign signatures applied to container image and Helm chart
+- [ ] CVE triage status documented in release notes
+
+## 5. Observability & Operations
+- [ ] Grafana dashboards reviewed and updated (`grafana/keyval-operator-overview.json`)
+- [ ] Alert recommendations validated with Prometheus rules
+- [ ] SLA report regenerated after latest e2e/chaos runs: `make sla-report`
+
+## 6. Release Process
+- [ ] Version bumped in `PROJECT`, Helm chart, and manifests
+- [ ] Git tag created and pushed (`git tag -s v<version>`)
+- [ ] GitHub release drafted with artifacts (images, charts, SBOM, release notes)
+- [ ] Internal tracker updated in .codex/tasks
+
+Retain this checklist with the release artifacts to demonstrate readiness and ease future audits.
+
+---
+
+# Runbook: Disaster Recovery Bootstrap
+
+Source: https://github.com/ivelok/keyval-operator/blob/main/docs/runbook/disaster-recovery.md
+
+# Runbook: Disaster Recovery Bootstrap
+
+## Runbook Metadata
+Severity: Sev1
+Time to Mitigate: 45m
+Responsible: DR Coordinator
+
+## Overview
+Use this runbook to perform a disaster recovery (DR) bootstrap when the majority of Redis pods are lost or storage is restored from backups. It leverages PVC freshness annotations and force-master controls provided by the KeyVal operator.
+
+## Detection
+- More than one Redis pod missing or PVCs recently restored from snapshot/backups.
+- Operator events `BootstrapStart` with `reason=BootstrapSelectingMaster` repeating without `BootstrapFinish`.
+- `kubectl -n <ns> get keyvalcluster/<name>` reports `Available=False`, `BootstrapInProgress=True`, or `ExternalImport` stuck in `Pending`/`InProgress`.
+
+## Mitigation
+- [ ] Enumerate PVC freshness annotations: `kubectl -n <ns> get pvc -l keyvalcluster=<name> -o jsonpath='{range .items[*]}{.metadata.name}:{.metadata.annotations.keyval\.ivelok\.io/pvc-repl-offset}{"\n"}{end}'`.
+- [ ] Identify the PVC with the largest offset and annotate the corresponding pod `kubectl -n <ns> annotate pod <pod> keyval.ivelok.io/force-master=true --overwrite`.
+- [ ] If a donor Redis/Valkey instance is available (another KeyValCluster, managed service, or dedicated replica), configure external import before restarting pods:
+      ```bash
+      kubectl -n <ns> patch keyvalcluster/<name> --type merge -p '{"spec":{"bootstrap":{"externalSource":{"address":"redis://<donor-host>:6379","syncMode":"Snapshot"}}}}'
+      ```
+-      Switch `syncMode` to `Live` if you want the new cluster to follow the donor continuously until you decide to cut over. When authentication or TLS are required, pre-create a Secret and reference it via `spec.bootstrap.externalSource.auth` / `tls`. The operator attaches the bootstrap pod as a replica, copies data, and — in `Snapshot` mode — detaches automatically. In `Live` mode it holds the replica link and keeps reporting `ExternalImport` with reason `Following` until you remove the `externalSource` block.
+-      Monitor the `ExternalImport` condition for progress: `WaitingForPods` → `Syncing` → `Following` (Live) or `Completed` (Snapshot). When you are ready to promote the new cluster in Live mode, execute `kubectl -n <ns> patch keyvalcluster/<name> --type merge -p '{"spec":{"bootstrap":{"externalSource":null}}}'` to trigger the cutover. Expect `ExternalImport` to flip to `Completed` and the master pod to be promoted locally.
+- [ ] Restart Redis pods to trigger bootstrap: `kubectl -n <ns> delete pod -l keyvalcluster=<name>`.
+- [ ] Monitor events `BootstrapStart`, `ReplicationAligned`, and `ResetSentinelDone`. Allow Sentinels to reset sequentially (wait ≥5s between pods if issuing manual resets).
+- [ ] If no PVC contains valid data, permit the seed pod (ordinal 0) to become master and allow full resync.
+- [ ] Once bootstrap succeeds, remove `keyval.ivelok.io/force-master` annotations to return to normal operations.
+
+## Verification
+- [ ] Event `BootstrapFinish` appears with the promoted master pod name. When external import is used, also confirm `ExternalImport` reports `Completed` with the expected source (or `Following` if you intentionally keep Live replication active).
+- [ ] `kubectl -n <ns> get keyvalcluster/<name> -o jsonpath='{.status.masterPod}'` returns the expected pod and status conditions `Available=True`, `ReplicationHealthy=True`, `SentinelQuorum=True`.
+- [ ] Master service `<name>-master` resolves to a single Ready pod.
+
+## Cleanup
+- [ ] When removing a temporary DR cluster, confirm `spec.storage.cleanupOnDelete=true` (or adjust the manifest before `kubectl delete`). If `spec.bootstrap.externalSource` was set, remove it once the seeding is complete to avoid accidental re-imports.
+- [ ] Watch the `StorageCleanup` status condition: `DeletingPVCs` → `PVCsDeleted`. Metrics `keyval_operator_finalizer_duration_seconds{policy="delete",result}` and `keyval_operator_storage_cleanup_failures_total{reason}` show finalize duration and timeouts.
+- [ ] If PVCs remain after 2 minutes (status `Timeout` or the `storage_cleanup_failures_total` counter increases), delete the leftovers manually (`kubectl delete pvc -l keyvalcluster=<name>`) and document the reason.
+
+## Escalation
+Escalate immediately to the incident commander and database reliability engineer if bootstrap fails twice or if replica data diverges (mismatched offsets). Share PVC annotation output, operator logs, and Sentinel responses.
+
+## Related Dashboards
+- [ ] Grafana: *KeyVal Bootstrap* (conditions timeline).
+- [ ] Grafana: *KeyVal External Import* (counters `keyval_external_import_*`, duration histogram).
+- [ ] Grafana: *KeyVal Operator / Failover* (event correlation during bootstrap).
+
+
+---
+
+# Runbook: Sentinel Failover Stuck or Not Completing
+
+Source: https://github.com/ivelok/keyval-operator/blob/main/docs/runbook/failover-stuck.md
+
+# Runbook: Sentinel Failover Stuck or Not Completing
+
+## Runbook Metadata
+Severity: Sev1
+Time to Mitigate: 15m
+Responsible: SRE On-call
+
+## Overview
+When the KeyVal operator orchestrates a controlled failover, Sentinels must promote a replica within seconds. This runbook explains how to recover when failover events remain pending (`StartFailover` without `FailoverCompleted`) or the master label never changes.
+
+## Detection
+- Event stream shows repeated `StartFailover` or `FailoverCompleted` with `error=` messages.
+- Condition `FailoverInProgress=True` persists for >2 minutes.
+- Metrics: `keyval_operator_update_in_progress=1` and `keyval_operator_sentinel_quorum_healthy=1`, but `keyval_operator_replication_lag_seconds{role="replica"}` is high or `NoGoodSlave` events fire.
+
+## Mitigation
+- [ ] Check Sentinel health: `kubectl -n <ns> get pods -l app=<cluster>-sentinel` and ensure ≥quorum ready.
+- [ ] Inspect operator logs for `NOGOODSLAVE` or auth failures: `kubectl -n keyval-operator-system logs deploy/keyval-operator-controller-manager | grep <cluster>`.
+- [ ] Run `redis-cli -h <cluster>-master.<ns>.svc -p 6379 info replication` to confirm replicas are connected and `master_link_status=up`.
+- [ ] If no replicas are fully synced, pick the freshest PVC via annotation `keyval.ivelok.io/pvc-repl-offset` and annotate pod `kubectl -n <ns> annotate pod <pod> keyval.ivelok.io/force-master=true --overwrite`.
+- [ ] Trigger new failover by deleting the stuck master pod: `kubectl -n <ns> delete pod <master-pod>`; Sentinel will promote the forced target.
+- [ ] If Sentinels lost state, execute `kubectl -n <ns> exec <sentinel-pod> -- redis-cli SENTINEL RESET <cluster>` sequentially (respect `ResetSentinelDone` events).
+
+## Verification
+- [ ] New event `FailoverCompleted` without errors followed by `NewMaster master=<pod>`.
+- [ ] `kubectl -n <ns> get keyvalcluster/<name> -o jsonpath='{.status.masterPod}'` matches the promoted pod.
+- [ ] `redis-cli -h <cluster>-master.<ns>.svc info replication` shows replicas with `master_link_status=up` and low lag.
+
+## Escalation
+If failover still fails after forcing a master or Sentinel reset, escalate immediately (Sev1) to the database reliability engineer and create an incident bridge. Provide PVC freshness metrics and operator logs.
+
+## Related Dashboards
+- [ ] Grafana: *KeyVal Operator / Failover* (`keyval_failover_triggered_total`, `keyval_failover_completed_total`).
+- [ ] Grafana: *Redis Replication Lag*.
+
+
+---
+
+# Runbook: Adjust KeyVal Operator Log Verbosity
+
+Source: https://github.com/ivelok/keyval-operator/blob/main/docs/runbook/logging-verbosity.md
+
+# Runbook: Adjust KeyVal Operator Log Verbosity
+
+## Runbook Metadata
+Severity: Sev4
+Time to Mitigate: 10m
+Responsible: SRE / Platform Engineer
+
+## Overview
+Use this runbook when the default KeyVal Operator logs do not provide enough detail to explain reconcile decisions or when you need to reduce log volume in production. The controller uses controller-runtime's zap logger and bridges debug statements through `logger.V(1)`.
+
+## Detection
+- Operator logs lack lines with `level=debug` / `severity=DEBUG` even though reconciliation continues.
+- Runbooks or on-call investigations require insight into decisions logged with `logger.V(1)` (rolling update plan, replication retries, PVC cleanup pauses).
+- Alternatively, log ingestion quotas are at risk because the operator emits high-volume debug logs.
+
+## Mitigation
+- [ ] **Determine installation method.**
+      `kubectl -n keyval-operator-system get deploy keyval-operator-controller-manager -o jsonpath='{.metadata.annotations.helm\.sh/release-name}'`
+      (empty output → kustomize install; non-empty → Helm release.)
+- [ ] **Kustomize install – enable debug (`--zap-devel=true`).**
+      ```bash
+      kubectl -n keyval-operator-system patch deploy keyval-operator-controller-manager \
+        --type='json' \
+        -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--zap-devel=true"}]'
+      kubectl -n keyval-operator-system rollout restart deploy/keyval-operator-controller-manager
+      ```
+      (Replace `true` with `false` to return to JSON info-level logging.)
+- [ ] **Helm install – switch `manager.logLevel`.**
+      ```bash
+      helm upgrade keyval-operator keyval-operator/keyval-operator \
+        --reuse-values \
+        --namespace keyval-operator-system \
+        --set manager.logLevel=debug
+      ```
+      Use `manager.logLevel=info` to revert to info-only JSON logs.
+- [ ] **Optional extra args.** Combine with `manager.extraArgs` (Helm) or overlay patches (kustomize) if you prefer to keep the flag in Git instead of a live patch.
+
+## Verification
+- [ ] `kubectl -n keyval-operator-system rollout status deploy/keyval-operator-controller-manager` succeeds.
+- [ ] `kubectl -n keyval-operator-system logs deploy/keyval-operator-controller-manager --tail=20` shows lines with `level=debug` (JSON mode) or `DEBUG	` (dev console mode).
+- [ ] Re-run the workflow that needed additional visibility. Debug-only messages (`plan empty`, `waiting for replicas to finish syncing`, `waiting for PVC deletion`) now appear.
+
+## Side Effects
+- Debug mode increases log throughput (≈2–3×) and uses the human-readable zap console encoder. Plan additional log storage and consider filtering in your collector.
+- Info mode (Helm default) removes `logger.V(1)` lines and uses JSON encoding; this reduces log volume but hides the reconcilers' decision traces.
+
+## Escalation
+- Escalate to the observability on-call if enabling debug logs does not surface the needed signal or if the extra volume risks breaching centralized logging quotas. Provide the patched deployment manifest (or Helm diff), the last `kubectl logs` sample, and Loki/EFK ingestion rates.
+- In multi-tenant clusters, notify the platform lead before leaving the operator in debug mode longer than one business day.
+
+## Related Dashboards
+- Grafana: *KeyVal Operator / Logging* — correlates log volume (`container_log_entries_total`) with reconcile activity.
+- Grafana: *Logging Pipeline Health* — check forwarder backlog, ingestion latency, and quota usage when toggling verbosity.
+
+## Related Documentation
+- [`docs/observability.md`](../observability.md#logging) — logging overview and signal interpretation.
+- [`charts/keyval-operator/values.yaml`](../../charts/keyval-operator/values.yaml) — Helm value `manager.logLevel`.
+
+
+---
+
+# Runbook: Sentinel Quorum Lost
+
+Source: https://github.com/ivelok/keyval-operator/blob/main/docs/runbook/no-quorum.md
+
+# Runbook: Sentinel Quorum Lost
+
+## Runbook Metadata
+Severity: Sev2
+Time to Mitigate: 20m
+Responsible: SRE On-call
+
+## Overview
+Loss of Sentinel quorum prevents automatic failover and pauses disruptive operations. This runbook details how to restore quorum and service continuity.
+
+## Detection
+- Condition `SentinelQuorum=False` on `KeyValCluster` status with reason `SentinelQuorumCheckFailed` or `SentinelQuorumLost`; field `status.rolesSource=probe` signals a fallback to direct probing.
+- Events `SentinelQuorumLost`, `ReplicationHeuristicFallback`, and `ScaleOperationBlocked` (`reason=SentinelQuorum`).
+- Metric `keyval_operator_sentinel_quorum_healthy=0` and `keyval_operator_sentinel_noquorum_reports>0`.
+
+## Mitigation
+- [ ] List Sentinel pods and check readiness: `kubectl -n <ns> get pods -l app=<cluster>-sentinel`.
+- [ ] Restart failed Sentinels: `kubectl -n <ns> delete pod <cluster>-sentinel-<n>` one at a time.
+- [ ] Validate network access from Sentinel to Redis master (port 26379/6379) using `kubectl -n <ns> exec <pod> -- redis-cli -p 26379 PING`.
+- [ ] Ensure authentication secrets exist and match operator config (compare Secret referenced in `.spec.security.auth`).
+- [ ] If persistent storage contains stale state, remove `sentinel-state` PVC or run `redis-cli SENTINEL RESET <cluster>` sequentially with a 5s delay between pods.
+- [ ] For permanent loss (fewer than quorum replicas available), scale Sentinels: `kubectl -n <ns> patch keyvalcluster/<name> --type merge -p '{"spec":{"sentinelCount":5}}'` after ensuring resources.
+
+## Verification
+- [ ] Status condition `SentinelQuorum=True` and event `SentinelQuorumRestored` emitted.
+- [ ] `kubectl -n <ns> exec <cluster>-sentinel-0 -- redis-cli SENTINEL ckquorum <cluster>` returns `OK`.
+- [ ] Rolling operations resume (`keyval_operator_scale_in_progress` returns to 0, pending blocks disappear).
+
+## Escalation
+If quorum cannot be restored within 20 minutes, escalate to database reliability engineer; include outputs of `SENTINEL SENTINELS` and network diagnostics.
+
+## Related Dashboards
+- [ ] Grafana: *KeyVal Sentinels* (`keyval_operator_sentinel_quorum_healthy`, `keyval_operator_sentinel_ready_members`).
+- [ ] Grafana: *KeyVal Operator / Disruptions*.
+
+
+---
+
+# Runbook: PDB Blocks KeyValCluster Rolling Operations
+
+Source: https://github.com/ivelok/keyval-operator/blob/main/docs/runbook/pdb-troubleshooting.md
+
+# Runbook: PDB Blocks KeyValCluster Rolling Operations
+
+## Runbook Metadata
+Severity: Sev3
+Time to Mitigate: 20m
+Responsible: SRE On-call
+
+## Overview
+This runbook explains how to restore rolling operations when a PodDisruptionBudget (PDB) prevents the KeyVal operator from evicting pods during scale or upgrade workflows. The goal is to re-open the disruption gate without risking data loss.
+
+## Detection
+- `kubectl -n <ns> describe keyvalcluster/<name>` shows events `RollingStepBlocked` with `reason=PDBLimit`.
+- Metric `keyval_disruptions_blocked_total{reason="PDBLimit"}` increases.
+- `kubectl -n <ns> get pdb <name>-redis` (and `<name>-sentinel` in Sentinel mode) reports `Allowed disruptions: 0` while pods are Ready.
+
+## Mitigation
+- [ ] Confirm at least one healthy replica exists:
+      `kubectl -n <ns> get pods -l keyvalcluster=<name> --field-selector=status.phase=Running`
+- [ ] Verify health gate status:
+      `kubectl -n <ns> get keyvalcluster/<name> -o jsonpath='{.status.healthGate.allowDisruptions}'`
+- [ ] If gate is `false`, resolve the underlying condition (Sentinel quorum, failover in progress, bootstrap). Use runbooks referenced below.
+- [ ] If all conditions are green but PDB remains hard, patch `spec.health.minReplicasForSafety` to a value `< replicas` and revert once rolling completes.
+- [ ] Remove stale annotation `keyval.ivelok.io/update-blocked` if present:
+      `kubectl -n <ns> annotate keyvalcluster/<name> keyval.ivelok.io/update-blocked-`
+
+## Verification
+- [ ] Event `ScaleOperationBlocked` stops firing and new `ScaleOperationStarted` appears.
+- [ ] `kubectl -n <ns> get pdb <name>-redis -o jsonpath='{.status.allowedDisruptions}'` returns `>= 1` (or `Sentinel` PDB if applicable).
+- [ ] Gauge `keyval_operator_scale_in_progress` or `keyval_operator_update_in_progress` returns to `0` after rollout.
+
+## Escalation
+- If PDB remains hard despite healthy state and no manual overrides, escalate to the platform engineering channel (`#keyval-operator`) and page the primary maintainer.
+- Provide: namespace, cluster name, recent operator logs (`kubectl -n keyval-operator-system logs deploy/keyval-operator-controller-manager`).
+
+## Related Dashboards
+- [ ] Grafana: *KeyVal Operator / Disruptions* (`keyval_disruptions_blocked_total`, `keyval_operator_update_in_progress`).
+
+
+---
+
+# KeyVal Operator Runbooks
+
+Source: https://github.com/ivelok/keyval-operator/blob/main/docs/runbook/README.md
+
+# KeyVal Operator Runbooks
+
+| Scenario | File |
+|----------|------|
+| Sentinel failover stuck or slow | [failover-stuck.md](failover-stuck.md) |
+| Sentinel quorum loss | [no-quorum.md](no-quorum.md) |
+| Replica lag/desync | [replica-desync.md](replica-desync.md) |
+| Disaster recovery bootstrap | [disaster-recovery.md](disaster-recovery.md) |
+| Resume disruptions after safety pause | [resume-disruptions.md](resume-disruptions.md) |
+| Scaling and upgrade workflow | [scale-and-upgrade.md](scale-and-upgrade.md) |
+| PDB blocking rolling updates | [pdb-troubleshooting.md](pdb-troubleshooting.md) |
+| Logging verbosity controls | [logging-verbosity.md](logging-verbosity.md) |
+| Release playbook | [release.md](release.md) |
+
+All runbooks follow the validated structure enforced by `make runbook-check`.
+
+
+---
+
+# Runbook: KeyVal Operator Release Process
+
+Source: https://github.com/ivelok/keyval-operator/blob/main/docs/runbook/release.md
+
+# Runbook: KeyVal Operator Release Process
+
+## Runbook Metadata
+Severity: Sev3
+Time to Mitigate: 40m
+Responsible: Release Manager
+
+## Overview
+This playbook describes the end-to-end process for cutting a new KeyVal operator release, including validation gates, artifact publication, and rollback guidance.
+
+## Detection
+- Scheduled release window or need to deliver new features/patches.
+- GitHub milestone completed and CHANGELOG draft available.
+
+## Mitigation
+- [ ] Freeze main branch (communicate via `#keyval-operator` channel) and ensure CI green on latest commit.
+- [ ] Run `make runbook-check`, `go test ./...`, `make helm-lint`, and `make e2e` locally; address failures.
+- [ ] Bump version in Git tag (`git tag vX.Y.Z && git push origin vX.Y.Z`) or trigger `Release` workflow manually with `version` input.
+- [ ] Monitor `.github/workflows/release.yaml` run; verify steps: image push, cosign sign, helm package upload, changelog generation.
+- [ ] When rolling out the new controller image, allow the existing pod to terminate gracefully. The binary catches `SIGTERM` via `ctrl.SetupSignalHandler()` and drains caches before exit; wait for the old pod to complete before declaring success.
+- [ ] Announce availability with Helm/OCI coordinates (`helm install keyval-operator oci://ghcr.io/<org>/keyval-operator --version X.Y.Z`).
+
+## Verification
+- [ ] Release workflow concludes successfully and publishes GitHub Release with changelog.
+- [ ] New container image `ghcr.io/<org>/keyval-operator:X.Y.Z` exists and passes `cosign verify`.
+- [ ] Helm repo/OCI registry stores chart `keyval-operator-X.Y.Z.tgz`.
+
+## Escalation
+If release automation fails, page the release manager and revert tag (`git tag -d vX.Y.Z; git push --delete origin vX.Y.Z`). If image has already propagated with regressions, execute rollback runbook: retag previous version (`make release VERSION=<prev>`), redeploy clusters, and inform stakeholders.
+
+## Related Dashboards
+- [ ] Grafana: *KeyVal CI/CD* (release workflow success rate).
+- [ ] GH Actions dashboard: `https://github.com/ivelok/keyval-operator/actions/workflows/release.yaml`.
+
+---
+
+# Runbook: Replica Desynchronised or Lagging
+
+Source: https://github.com/ivelok/keyval-operator/blob/main/docs/runbook/replica-desync.md
+
+# Runbook: Replica Desynchronised or Lagging
+
+## Runbook Metadata
+Severity: Sev2
+Time to Mitigate: 25m
+Responsible: SRE On-call
+
+## Overview
+Replica lag or desynchronisation degrades failover safety and can stall rolling updates. This runbook covers diagnosis and remediation when replicas report `Lagging` or `Desynced` health states.
+
+## Detection
+- Status condition `ReplicationHealthy=False` and pod health `Lagging`/`Desynced` in `.status.roles`.
+- Events `ReplicaLagging`, `ReplicaDesynced`, or `ScaleOperationBlocked reason=NoHealthyReplicas`.
+- Metrics `keyval_operator_replication_lag_seconds{pod=...}` exceeding configured threshold.
+
+## Mitigation
+- [ ] Inspect Redis replication info: `kubectl -n <ns> exec <pod> -- redis-cli INFO replication` to confirm `master_link_status` and offset.
+- [ ] Check network latency between replica and master (`mtr`/`kubectl exec -- ping`).
+- [ ] For Sentinel mode, ensure Sentinel state is not forcing outdated master; if required, issue `redis-cli SENTINEL RESET <cluster>` sequentially.
+- [ ] Re-sync replica by deleting pod (OnDelete strategy keeps PVC): `kubectl -n <ns> delete pod <pod>`.
+- [ ] If the replica PVC is corrupt, delete the pod so the operator recreates it from scratch. To promote a different PVC, annotate the corresponding pod with `keyval.ivelok.io/force-master=true` before deletion.
+- [ ] For steady high lag due to load, adjust `spec.health.replicationLagSecondsMax` temporarily and schedule capacity increase.
+
+## Verification
+- [ ] Events `ReplicaRecovered` fired for affected pods.
+- [ ] `kubectl -n <ns> get keyvalcluster/<name> -o jsonpath='{.status.conditions[?(@.type=="ReplicationHealthy")].status}'` returns `True`.
+- [ ] Metrics show lag back within threshold (`increase(keyval_operator_replication_lag_seconds[5m])` near zero).
+
+## Escalation
+Escalate to database reliability engineer if replica repeatedly desyncs within an hour or if no replica can sustain catch-up, as failover safety is compromised.
+
+## Related Dashboards
+- [ ] Grafana: *KeyVal Replication* (`keyval_operator_replication_lag_seconds`).
+- [ ] Grafana: *KeyVal Operator / Health Conditions*.
+
+
+---
+
+# Runbook: Resume Disruptions After Safety Pause
+
+Source: https://github.com/ivelok/keyval-operator/blob/main/docs/runbook/resume-disruptions.md
+
+# Runbook: Resume Disruptions After Safety Pause
+
+## Runbook Metadata
+Severity: Sev3
+Time to Mitigate: 10m
+Responsible: SRE On-call
+
+## Overview
+The KeyVal operator pauses voluntary disruptions when safety conditions fail (`allowDisruptions=false`). This runbook details how to safely resume disruptions once the underlying issue is resolved.
+
+## Detection
+- `kubectl -n <ns> get keyvalcluster/<name>` shows `status.healthGate.allowDisruptions=false`.
+- Annotation `keyval.ivelok.io/update-blocked` set on the KeyValCluster resource.
+- Events `RollingStepBlocked` with reasons `DisruptionsPaused`, `Bootstrap`, or `SentinelQuorum`.
+
+## Mitigation
+- [ ] Identify root cause by inspecting status conditions (`Available`, `SentinelQuorum`, `ReplicationHealthy`, `BootstrapInProgress`).
+- [ ] Resolve blocking runbook (e.g., quorum loss, replica desync, failover stuck) before resuming.
+- [ ] Clear the blocking annotation: `kubectl -n <ns> annotate keyvalcluster/<name> keyval.ivelok.io/update-blocked-`.
+- [ ] If disruptions were paused via manual configuration (e.g., GitOps lock), remove the override in source control.
+- [ ] Trigger reconciliation by touching the resource: `kubectl -n <ns> annotate keyvalcluster/<name> keyval.ivelok.io/scale-phase- --overwrite` (no-op clears stale value).
+
+## Verification
+- [ ] Event `RollingStepResumed` appears with previous `reason`.
+- [ ] `kubectl -n <ns> get keyvalcluster/<name> -o jsonpath='{.status.healthGate.allowDisruptions}'` returns `true`.
+- [ ] Pending updates or scale operations continue (observe `ScaleOperationStarted` followed by `ScaleOperationCompleted`).
+
+## Escalation
+Escalate to platform engineering if `allowDisruptions` remains `false` despite cleared conditions or if the annotation reappears automatically; provide recent events and controller logs.
+
+## Related Dashboards
+- [ ] Grafana: *KeyVal Operator / Disruptions* (`keyval_operator_update_in_progress`, `keyval_disruptions_blocked_total`).
+
+
+---
+
+# Runbook: Scaling and Upgrading KeyValCluster
+
+Source: https://github.com/ivelok/keyval-operator/blob/main/docs/runbook/scale-and-upgrade.md
+
+# Runbook: Scaling and Upgrading KeyValCluster
+
+## Runbook Metadata
+Severity: Sev2
+Time to Mitigate: 30m
+Responsible: SRE On-call
+
+## Overview
+This runbook guides you through safe scaling (up/down) and rolling upgrades of KeyValCluster instances managed by the KeyVal operator. It covers event signals, guardrails, and recovery actions required to maintain write availability.
+
+## Detection
+- Scaling initiated via `kubectl patch` or GitOps manifests produces events `ScaleOperationStarted` with `direction=up|down`.
+- Rolling upgrades surface through `PodEvicted` events with reasons `config-hash`, `image:redis`, `image:sentinel`, and gauge `keyval_operator_update_in_progress=1`. From that point the operator must finish within **≤5 minutes**; otherwise the rollout is considered stuck.
+- Blocks appear as `ScaleOperationBlocked` or `RollingStepBlocked` events, often coupled with `allowDisruptions=false` in status.
+
+## Mitigation
+- [ ] Confirm cluster readiness: `kubectl -n <ns> get keyvalcluster/<name>` should report `SentinelQuorum=True`, `ReplicationHealthy=True`.
+- [ ] Ensure at least one healthy replica by running `kubectl -n <ns> get pods -l keyvalcluster=<name> -o custom-columns=NAME:.metadata.name,READY:.status.containerStatuses[0].ready`.
+- [ ] Trigger scale via spec patch (example to 5 replicas):
+      `kubectl -n <ns> patch keyvalcluster/<name> --type merge -p '{"spec":{"redisReplicas":5}}'`
+- [ ] For scale-down ensure failover ready: if event `NoGoodSlave` repeats, pause and validate replica sync via `redis-cli INFO replication`.
+- [ ] Apply rolling update by patching image/config; monitor `StartFailover`/`FailoverCompleted` events before the master eviction step. If `keyval_operator_update_in_progress=1` stays true for more than 5 minutes or new `PodEvicted` events stop appearing, declare an incident and follow the manual diagnostics below.
+- [ ] If guard blocking persists, reference supporting runbooks: quorum loss, replica desync, or disruptions paused.
+
+## Verification
+- [ ] Event `ScaleOperationCompleted direction=<expected>` occurs with the intended `target` value.
+- [ ] `keyval_operator_scale_in_progress` and `keyval_operator_update_in_progress` gauges drop to `0` within 5 minutes of the operation start.
+- [ ] Services `<name>-master` and `<name>-sentinel` resolve to a single healthy endpoint each.
+- [ ] `kubectl -n <ns> get pods -l keyvalcluster=<name>` matches desired replica counts (Redis + Sentinel) and all pods are Ready.
+
+## Escalation
+Escalate to platform engineering (`#keyval-operator` channel) if scaling or upgrade remains blocked for >30 minutes despite cleared health conditions. Provide event extracts and operator logs (`kubectl -n keyval-operator-system logs deploy/keyval-operator-controller-manager`).
+
+## Related Dashboards
+- [ ] Grafana: *KeyVal Operator / Lifecycle* (metrics `keyval_operator_scale_in_progress`, `keyval_scale_operations_total`, `keyval_operator_update_in_progress` with an alert >5 minutes).
+- [ ] Grafana: *KeyVal Operator / Failover* (events + lag gauges).
+
+## Notes
+- When `KEEP_ARTIFACTS=1` is set, e2e tests save `artifacts/<cluster>-rolling-update.json` with a summary (duration, 5-minute threshold, list of pending/notReady pods). Use it for incident analysis and SLA tracking.
+
+
+---
+
+# KeyVal Operator Security Guide
+
+Source: https://github.com/ivelok/keyval-operator/blob/main/docs/security.md
+
+# KeyVal Operator Security Guide
+
+The operator now supports first-class authentication, TLS, and hardened pod defaults. This document explains how to enable and operate those features.
+
+## 1. Spec Overview
+
+`spec.security` controls cluster-level authentication and transport settings:
+
+```yaml
+spec:
+  security:
+    auth:
+      enabled: true
+      username: app
+      passwordSecretRef:
+        name: demo-redis-auth
+        key: password
+    tls:
+      enabled: true
+      secretName: demo-redis-tls
+      requireClientAuth: true
+      disablePlaintext: true
+```
+
+- `auth.enabled`: when true the operator reads the referenced Secret and renders `requirepass`, `masterauth`, and Sentinel `auth-pass/auth-user` directives. Replication, failover, runtime config, and bootstrap clients use the same credentials automatically.
+- `auth.username`: optional ACL user for replicas/Sentinels. Leave empty to keep the Redis `default` user.
+- `auth.passwordSecretRef`: Secret key selector pointing at the Redis password. The Secret is never logged; only its resourceVersion/name participates in config hashes.
+- `tls.enabled`: enables TLS listeners (`tls-port`) for Redis and Sentinel. The Secret must contain the usual keys (`ca.crt`, `tls.crt`, `tls.key`), overridable via `caCertKey/certKey/keyKey`.
+- `tls.requireClientAuth`: switches replicas/Sentinals/operator clients to mTLS (`--tls --cert --key`).
+- `tls.disablePlaintext`: sets `port 0`, so only `tls-port` stays open.
+
+## 2. Authentication Workflow
+
+1. Create the password Secret:
+   ```bash
+   kubectl create secret generic demo-redis-auth \
+     --from-literal=password='S3cureP@ss!'
+   ```
+2. Patch the `KeyValCluster` with `spec.security.auth.enabled=true` and reference the Secret.
+3. The operator reconciles the ConfigMap and statefulset; pods restart one-by-one with `requirepass`/`masterauth`. Sentinels authenticate automatically via `AUTH <user> <pass>`.
+4. Clients must use `AUTH` (or ACL with username) from now on.
+
+Changing the password is handled by updating the Secret and the spec; the operator recalculates the config hash and performs a safe rolling restart.
+
+## 3. TLS Enablement
+
+1. Prepare a Secret containing `ca.crt`, `tls.crt`, and `tls.key` (PEM):
+   ```bash
+   kubectl create secret tls demo-redis-tls \
+     --cert=server.pem --key=server.key
+   kubectl patch secret demo-redis-tls --type merge -p '{"data":{"ca.crt":"$(base64 < ca.pem)"}}'
+   ```
+2. Set `spec.security.tls.enabled=true` and reference the Secret. Optional:
+   - `requireClientAuth=true` enables mTLS.
+   - `disablePlaintext=true` closes the plain TCP port by rendering `port 0`.
+3. The ConfigMap gains TLS directives, pods mount the Secret at `/tls`, and `redis-cli` inside the bootstrap/init container runs with `--tls`/`--cert`/`--key` flags.
+4. Verify:
+   ```bash
+   kubectl exec demo-0 -- redis-cli --tls --cacert /tls/ca.crt \
+     --cert /tls/tls.crt --key /tls/tls.key PING
+   ```
+
+### 3.1. TLS Sentinel bootstrap SLO
+
+- **SLA:** A Sentinel cluster with TLS/mTLS enabled must reach `Available=True` no later than **150 s** after the CR is created. The threshold is enforced by the e2e test `TestSentinelAuthTLS` and validated in CI.
+- **Monitoring:** Track the delta between the `BootstrapStart` and `BootstrapFinish` events (or inspect `kubectl describe kvc/<name>`). The metric `keyval_bootstrap_attempt_total` increments at the start, while `keyval_bootstrap_failure_total` indicates failures. Successful attempts equal `max_over_time(keyval_bootstrap_attempt_total{cluster="<name>"}[5m]) - max_over_time(keyval_bootstrap_failure_total{cluster="<name>"}[5m])`.
+- **Artifacts:** When `KEEP_ARTIFACTS=1`, the e2e suite stores `artifacts/<cluster>-sentinel-tls-bootstrap.json` with the observed duration and threshold for later analysis.
+- **Alerting:** If `BootstrapFinish` is missing within 150 s, inspect the Secret (`kubectl get secret <tls> -o yaml`), readiness probes (`kubectl get pod <name> -o jsonpath='{.status.conditions}'`), and init-container logs (`redis-cli --tls --cacert ...`). Maintain resource headroom—CPU or IO starvation often prolongs handshakes.
+
+## 4. Pod Security Defaults
+
+- All Redis and Sentinel pods run as a non-root user (`uid/gid 1000`, `fsGroup 1000`) and drop all Linux capabilities. `allowPrivilegeEscalation` is disabled.
+- Redis containers use a read-only root filesystem; writable paths are provided via `/data`, `/conf`, and `/runtime-conf` volumes.
+- Init containers inherit the same non-root context and rely on `fsGroup` to write into ConfigMap-backed volumes.
+
+These defaults satisfy the Kubernetes Pod Security `restricted` profile out of the box.
+
+## 5. Network Policies
+
+The operator does not create NetworkPolicies automatically, but examples are provided under `examples/networkpolicy/`:
+
+- `redis.yaml`: allows ingress to Redis pods only from labelled client namespaces and keeps replica traffic internal to the cluster.
+- `sentinel.yaml`: restricts access to Sentinel TCP port 26379 to the operator and Redis pods.
+
+Customize the placeholders (`<cluster-name>`, namespace labels) before applying them in your environment.
+
+## 6. RBAC Footprint
+
+The operator runs with a single ClusterRole scoped to the resources it reconciles. The table below lists the effective permissions applied by both Kustomize and Helm deployments:
+
+| API Group              | Resource (subresource)      | Verbs                              | Purpose |
+|------------------------|-----------------------------|------------------------------------|---------|
+| `core`                 | `pods`                      | `get`, `list`, `watch`, `patch`, `delete` | Inspect readiness/labels, patch labels, evict failed pods |
+| `core`                 | `services`                  | `get`, `list`, `watch`, `create`, `patch`, `delete` | Manage headless/master services and disable them on request |
+| `core`                 | `configmaps`                | `get`, `list`, `watch`, `create`, `patch` | Render and roll config hashes |
+| `core`                 | `events`                    | `create`, `patch`, `update`        | Emit reconciliation events |
+| `core`                 | `secrets`                   | `get`, `list`, `watch`             | Read TLS/auth material referenced by the CR |
+| `core`                 | `persistentvolumeclaims`    | `get`, `list`, `watch`, `patch`, `update`, `delete` | Track resize status, drop PVCs when `cleanupOnDelete=true` |
+| `core`                 | `pods/eviction`             | `create`                           | Perform safe pod evictions during rolling updates |
+| `apps`                 | `statefulsets`              | `get`, `list`, `watch`, `create`, `patch` | Manage Redis/Sentinel StatefulSets via server-side apply |
+| `policy`               | `poddisruptionbudgets`      | `get`, `list`, `watch`, `create`, `patch`, `delete` | Coordinate disruption budgets for Redis/Sentinel, remove during cleanup |
+| `coordination.k8s.io`  | `leases`                    | `get`, `list`, `watch`, `create`, `update`, `patch` | Controller-runtime leader election |
+| `keyval.ivelok.io`     | `keyvalclusters`            | `get`, `list`, `watch`, `patch`, `update` | Read CR spec and annotate/patch status fields |
+| `keyval.ivelok.io`     | `keyvalclusters/status`     | `get`, `patch`, `update`           | Publish status updates |
+| `keyval.ivelok.io`     | `keyvalclusters/finalizers` | `get`, `patch`, `update`           | Manage finalizer lifecycle |
+
+To verify a live deployment, run:
+
+```bash
+hack/verify-rbac.sh # optionally pass <serviceAccount> <namespace>
+```
+
+The check issues `kubectl auth can-i` calls for every rule while impersonating the controller ServiceAccount. CI runs `go test ./test/rbac` to ensure the rendered Kustomize and Helm roles stay in sync with the table above.
+
+## 7. Troubleshooting
+
+- If pods loop with `NOAUTH`, ensure the password Secret exists and `spec.security.auth.enabled=true`.
+- For TLS handshake failures, verify the Secret keys align with `caCertKey/certKey/keyKey` and that clients pass `--tls`.
+- The config hash stored in `StatefulSet.spec.template.annotations['keyval.ivelok.io/config-hash']` changes when secrets rotate; the operator orchestrates a rolling restart. Check the annotation to confirm.
+
+---
+
+# KeyVal Operator Test Matrix
+
+Source: https://github.com/ivelok/keyval-operator/blob/main/docs/testing.md
+
+# KeyVal Operator Test Matrix
+
+This guide explains how to run the different testing layers (unit, e2e, chaos, SLA) locally and how they are wired into CI.
+
+## 1. Unit Tests
+- **Command:** `go test -race ./...`
+- **Purpose:** fast coverage for controller logic and supporting packages.
+- **Requirements:** Go 1.24+; no network access required.
+
+```bash
+# local run
+GOFLAGS=-count=1 go test -race ./...
+```
+
+The CI job `unit` executes this command on every push/PR (see `.github/workflows/tests.yaml`).
+
+## 2. E2E Scenarios
+- **Command:** `make e2e`
+- **Functionality:**
+  - `docker-build` — builds the operator image (set `IMG` if you need a custom tag).
+  - `deploy` — applies manifests to the cluster.
+  - `go test -tags=e2e ./test/suites/...` — provisions Standalone/Sentinel `KeyValCluster` objects, injects failures, and validates invariants (OnDelete, labels, failover, runtime config).
+  - Dedicated cases cover scaling (`TestSentinelScaleUpDown`, `TestSentinelScaleBlockedByQuorum`) and Sentinel rolling upgrade (`TestSentinelRollingUpgrade`), asserting events `ScaleOperation*`, `StartFailover`/`FailoverCompleted`, and metric `keyval_operator_scale_in_progress`.
+  - The version matrix runs Standalone and Sentinel scenarios for Valkey 7.2 / 8.1.2 and Redis 7.2 / 8.2.1; sub jobs run in parallel limited by `E2E_PARALLELISM` to keep total duration bounded.
+- **Variables:**
+  - `IMG` — image name (defaults to `controller:latest`). The cluster must access it; for kind set `KIND_CLUSTER_NAME` as described below.
+  - `E2E_PARALLELISM` — maximum number of concurrent e2e scenarios (default `min(4, max(1, GOMAXPROCS/2))`); backward compatible via `TESTS_NEW_PARALLELISM`.
+  - `E2E_NAMESPACE`, `E2E_TIMEOUT`, `KEEP_RESOURCES`, `KEEP_ARTIFACTS` — see `docs/e2e.md`.
+- **kind workflow:**
+  - Create the cluster: `kind create cluster --name kv-dev`.
+  - Run: `IMG=controller:dev KIND_CLUSTER_NAME=kv-dev KEEP_ARTIFACTS=1 make e2e`.
+  - The target automatically calls `kind load docker-image` after the build.
+
+In CI the matrix `k8s` (suite=`e2e`) spins up a kind cluster, runs `make e2e`, and stores artifacts (state YAML, pod list, `e2e-runtime.json`).
+
+## 3. Chaos Scenarios
+- **Command:** `make chaos`
+- **What it does:** executes Go tests under `test/chaos`, which reuse the e2e framework and save JSON metrics (`*-metrics.json`). The suite includes:
+  - `pod-kill-master` — kill the master plus Sentinel pods.
+  - `network-latency` — temporarily hide Sentinel pods (simulate network issues).
+  - `sentinel-flood` — mass Sentinel restarts.
+- **Variables:**
+  - `CHAOS_NAMESPACE`, `CHAOS_TIMEOUT`, `CHAOS_EXPERIMENTS`, `KEEP_ARTIFACTS`, `KEEP_RESOURCES` (see `test/chaos/README.md`).
+- **Cluster preparation:** make sure the operator is built and deployed beforehand (for example `IMG=controller:dev KIND_CLUSTER_NAME=kv-dev make redeploy`).
+
+The CI matrix `k8s` (suite=`chaos`) performs:
+1. `make redeploy` (prepare image + manifests).
+2. `make chaos` with `KEEP_ARTIFACTS=1`.
+3. Upload artifacts from `test/chaos/artifacts`.
+
+## 4. SLA Report
+- **Command:** `make sla-report`
+- **Purpose:** aggregates durations from e2e/chaos artifacts and produces `test/sla/report.json`.
+- **Parameters:**
+  - `SLA_FLAGS` — optional list of `-chaos/-e2e` directories to include.
+  - Set `SLA_REPORT_NOW=2025-01-01T00:00:00Z` for deterministic runs (fixes the timestamp used by the CLI).
+
+Example workflow:
+```bash
+# after make e2e/chaos with artifacts preserved
+make sla-report
+cat test/sla/report.json | jq '.summary'
+```
+
+The CI job `sla` downloads artifacts from `e2e` and `chaos`, runs `make sla-report`, and publishes the resulting JSON.
+
+## 5. CI Overview (`.github/workflows/tests.yaml`)
+| Job | Description | Artifacts |
+|-----|-------------|-----------|
+| `unit` | `go test -race ./...` | — |
+| `k8s (suite=e2e)` | kind cluster → `make e2e` | `test/e2e/artifacts/` |
+| `k8s (suite=chaos)` | kind cluster → `make redeploy` → `make chaos` | `test/chaos/artifacts/` |
+| `sla` | download artifacts, run `make sla-report` | `test/sla/report.json` |
+
+> **Runtime:** end-to-end execution takes roughly 35–40 minutes (unit ≈ 2 min, e2e ≈ 15 min, chaos ≈ 20 min, SLA < 1 min). Long-running steps are parallelized.
+
+## 6. Working with Artifacts
+- E2E: `e2e-runtime.json`, state YAMLs, and pod listings.
+- Chaos: `*-metrics.json` (consumed by the SLA tool), `*-status.yaml`, `*-events.txt`.
+- SLA: final `report.json` (attached in CI and available locally).
+
+When debugging locally, set `KEEP_ARTIFACTS=1` so artifacts survive after the tests finish.
+
+## 7. Quick Checklist Before a Run
+1. `go test -race ./...`
+2. `kind create cluster --name kv-dev` (if needed)
+3. `IMG=controller:dev KIND_CLUSTER_NAME=kv-dev make e2e`
+4. `IMG=controller:dev KIND_CLUSTER_NAME=kv-dev make chaos`
+5. `make sla-report`
+
+Compare the results with `test/sla/example-report.json` or push to CI for validation.
+
+---
+
+# GEMINI.md
+
+Source: https://github.com/ivelok/keyval-operator/blob/main/GEMINI.md
+
+# GEMINI.md
+
+Guidelines for Gemini agent working in this repository. This effort rebuilds the Kubernetes operator that manages Redis/Valkey clusters (Standalone and Sentinel modes).
+
+- Scope: applies to the entire repository.
+- Goal: deliver the operator while keeping work aligned with the internal .codex/task plan.
+- Principle: idempotent reconciliation, minimal downtime, safe updates, clear ownership.
+
+
+## Architecture Reference
+- Authoritative plan: `docs/architecture.md` (modules, APIs, reconcile flow, events, policies).
+- CRD reference: `docs/crd/keyvalcluster.md` and `config/crd/bases/*.yaml`.
+
+## Development Environment
+- Run all development and testing against the local Kubernetes cluster provisioned on the workstation.
+- You have full cluster access: `kubectl` (get/apply/delete), log inspection, exec, describe, and more.
+- Validate operator behavior exclusively in this cluster (deployments, upgrades, incident reproduction).
+- Never edit operator-managed resources directly (StatefulSet, Service, PDB, etc.). Manual tweaks fight the controller and corrupt scenarios. Use the CR or other approved inputs to model situations.
+
+## Task Workflow
+- Coordinate scope using .codex/tasks (internal tracker) and follow the sequence agreed there.
+- Keep scope changes small; if the existing plan no longer fits, update the tracker and get confirmation before expanding.
+- Do not introduce functionality outside the approved task set. Discuss adjustments with maintainers before implementing.
+- Before editing, read the relevant files, keep diffs small, and run checks immediately (`go fmt`, `goimports`, `staticcheck`, `go test -race ./...`, `make e2e`, `make build/test` when required).
+- Before running e2e or scenarios that depend on operator behavior, ensure the freshly built image is deployed and the controller manager restarted (`make redeploy` or equivalently `make docker-build` → `kubectl apply -k config/default` → `kubectl -n keyval-operator-system rollout restart deploy/keyval-operator-controller-manager`).
+
+## Development Flow
+1. **Specification** — capture scope in .codex/tasks with goal, inputs, acceptance criteria, and required checks.
+2. **Decomposition** — if the scope is large, split it into sub-tasks (`<NN>.<MM>-...`) so every stage is tracked.
+3. **Pre-review** — reread the specification, identify risks, raise questions/hypotheses, and document them in the task file.
+4. **Implementation** — follow the plan, land small patches, validate code frequently, and redeploy to the local cluster when behavior changes.
+5. **Self-review** — audit your changes: list potential issues, confirm checks passed, and polish the code as needed.
+
+Detailed instructions for working with the e2e/chaos suites live in `test/E2E-AGENTS.md`.
+
+## Target Layout
+Use this structure as you scaffold and refactor:
+
+```
+├── api/                      # CRD types and webhooks
+│   └── v1alpha1/             # KeyValCluster, +kubebuilder annotations
+├── controllers/              # Reconciler and helpers
+│   ├── controller.go         # Main controller wiring
+│   └── internal/             # Domain logic modules
+│       ├── finalizer/        # Resource cleanup
+│       ├── reconcile/        # Reconcile phases
+│       ├── resources/        # SSA builders (StatefulSet, Service, PDB)
+│       ├── security/         # Auth/TLS handling
+│       ├── ssa/              # Server-Side Apply helpers
+│       └── ops/              # Operational logic
+│           ├── bootstrap/    # DR/Initial master selection
+│           ├── eviction/     # Safe pod eviction
+│           ├── importer/     # External sync
+│           ├── observability/# Metrics & Events
+│           ├── replication/  # Topology & role detection
+│           ├── sentinel/     # Failover & Quorum
+│           ├── status/       # Status aggregation
+│           ├── storage/      # PVC resize/cleanup
+│           └── update/       # Rolling updates
+├── config/                   # Kustomize manifests (install/deploy)
+├── docs/                     # Documentation & Runbooks
+├── test/                     # Testing infrastructure
+│   ├── suites/               # E2E scenarios
+│   └── chaos/                # Chaos testing
+└── examples/                 # Example CRs (standalone/sentinel)
+```
+
+## Modules & Responsibilities
+- `resources`: Build ConfigMap, StatefulSet (OnDelete), Service, PDB using SSA.
+- `ops/replication`: Detect roles, ensure topology, handle `REPLICAOF`, manage master address cache.
+- `ops/sentinel`: Coordinate failover (`SENTINEL FAILOVER`), validate good slaves, handle `NOQUORUM`.
+- `ops/update`: Plan and execute rolling updates (single-pod), check health guards.
+- `ops/bootstrap`: Handle DR master selection (force-master/freshness) and external import.
+- `ops/status`: Aggregate conditions, roles, and health gate status.
+- `ops/observability`: Manage Prometheus metrics and Kubernetes events.
+- `security`: Resolve Auth/TLS secrets, build client configurations.
+
+## Reconcile Flow (Summary)
+- Ensure Services (headless, master, sentinel when `mode=Sentinel`).
+- Build ConfigMaps; compute `config-hash`; annotate the PodTemplate.
+- Ensure the StatefulSet with `OnDelete` and a deterministic spec.
+- Detect roles (master/replica), then sync Pod role labels (single-master invariant).
+- Ensure replication (`REPLICAOF`) to the detected master.
+- Plan and execute rolling updates one Pod at a time when drift is detected.
+- In Sentinel mode, coordinate failover when required and validate resulting roles.
+- Update `.status` (masterPod, replicas, readyReplicas, roles, conditions).
+
+## Events and Triggers (Operational)
+- CR changes: recompute desired state; re-run full reconcile.
+- Pod Ready/Deleted/Restarted: re-detect roles, re-label, ensure replication, continue/hold rolling update.
+- StatefulSet drift: enforce `OnDelete`, selectors, labels; schedule rolling update if needed.
+- ConfigMap change: config-hash drift → rolling update planning.
+- Service change: restore selectors/ports; ensure `<cr>-master` selects exactly one Pod.
+- Sentinel role switches: reconcile labels, ensure replication, update status.
+
+## Reconcile Invariants
+- Exactly one master; every other pod is a replica.
+- Operations are idempotent; safe to rerun on any event.
+- StatefulSet uses `OnDelete`; never delete more than one Pod at a time.
+- Sentinel mode only when `spec.mode=Sentinel` and `sentinelCount` is odd and ≥3.
+- The master Service must always select exactly one Pod.
+
+## Apply & Ownership Policy
+- Use server-side apply with a stable field manager (e.g., `keyval-operator`).
+- Preserve user-managed labels/annotations; own only operator-scoped fields.
+- Set OwnerReferences to `KeyValCluster` for garbage collection.
+- Update status using `Status().Patch` only when there is a diff.
+
+## Resource Naming & Labels
+- Labels: `app=<cr>-redis`, `keyvalcluster=<cr>`, `role=master|replica`.
+- Headless Service: `<cr>-headless` (selector `app=<cr>-redis`).
+- Master Service: `<cr>-master` (ClusterIP, selector `role=master`).
+- Ports: Redis `6379`, Sentinel `26379` (sidecar in Sentinel mode).
+
+## Development Standards
+- Go 1.24+; accept `context.Context` first; wrap errors with `%w`; use `log/slog` for structured logging.
+- No panics (except main/tests). Validate external inputs. Keep functions small and testable.
+- Use table-driven tests; run with `-race`; cover error paths; avoid flakes with timeouts.
+- Maintain least-privilege RBAC; set OwnerReferences and finalizers correctly.
+- Prefer server-side apply; preserve user-managed fields.
+
+## Commands
+- Tests require envtest binaries. Place them under `bin/k8s/<k8sVer>-<os>-<arch>/` and set:
+  - `export KUBEBUILDER_ASSETS="$(PWD)/bin/k8s/1.33.0-$(go env GOOS)-$(go env GOARCH)"`
+- Build and test (after scaffolding):
+  - `make build`
+  - `make test`  # Runs go test -race ./...
+  - `make e2e`   # Runs e2e suite in test/suites
+- Quality checks:
+  - `go fmt ./... && go run golang.org/x/tools/cmd/goimports@latest -w .`
+  - `staticcheck ./...`
+
+## Local Dev: Image Updates & Restarts
+- Re-tagging a local image (e.g., `controller:latest`) without changing the pod template will not trigger a rollout. Kubernetes only restarts when the template hash changes.
+- Preferred ways to pick up a rebuilt local image:
+  - `kubectl -n keyval-operator-system rollout restart deploy/keyval-operator-controller-manager`.
+  - Bump the image tag (e.g., `controller:dev-<timestamp>`) and update the Deployment template.
+  - Patch a dummy annotation on the Pod template: `kubectl -n keyval-operator-system patch deploy/keyval-operator-controller-manager -p '{"spec":{"template":{"metadata":{"annotations":{"redeployAt":"$(date +%s)"}}}}}'`.
+- Shortcuts: `make restart` (rollout restart) or `make redeploy` (build + apply manifests + restart).
+
+## Editing Discipline
+- Read, apply a small patch, build, test — repeat.
+- Copy exact context (whitespace matters for patch tools).
+- Keep commit messages scoped: `feat|fix|refactor|test(component): message`.
+
+## Notes
+- Internal task templates live under .codex/tasks for internal use only; refresh the spec there before starting work.
+
+---

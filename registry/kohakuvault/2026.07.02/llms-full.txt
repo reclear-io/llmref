@@ -1,0 +1,1174 @@
+# KohakuVault
+
+Source: https://github.com/kohakublueleaf/kohakuvault/blob/main/README.md
+
+# KohakuVault
+
+
+One-file SQLite datastore with:
+  * `KVault` key-value storage inspired by [BoringDB](https://github.com/mel-project/boringdb) (streaming blobs + auto-pack for dict/list/numpy)
+  * `TextVault` full-text search with FTS5 BM25 ranking (ideal for RAG pipelines)
+  * `ColumnVault` columnar layout inspired by Stanchion (typed chunks: `i64`, `msgpack`, `vec:*`) built on SQLite BLOB ranges
+  * write-back caches plus standalone CSB+Tree / SkipList containers for ordered/temporal metadata
+  * `VectorKVault` (sqlite-vec) for k-NN search living in the same `.db`
+
+
+```python
+from kohakuvault import KVault, TextVault, ColumnVault, VectorKVault, CSBTree
+import numpy as np
+
+DB = "test.db"
+
+# Store media + metadata in one file
+kv = KVault(DB, table="media")
+kv["video:42"] = b"abcdefg" # raw bytes stay raw
+kv["video:42:meta"] = {"fps": 60, "tags": ["tutorial", "gpu"]}  # auto MessagePack
+
+# Full-text search with BM25 ranking (great for RAG)
+tv = TextVault(DB, table="docs")
+tv.insert("Machine learning is a subset of AI", {"category": "tech"})
+for doc_id, score, meta in tv.search("machine learning", k=5):
+    print(f"Doc {doc_id}: score={score:.4f}")
+
+# Incremental columnar logging (no file rewrites)
+cols = ColumnVault(kv) # or ColumnVault(DB)
+ids = cols.ensure("ids", "i64")
+latency = cols.ensure("latency_ms", "f64")
+embeddings = cols.ensure("embeddings", "vec:f32:384")
+with cols.cache(cap_bytes=8 << 20):
+    ids.append(len(ids))
+    latency.append(12.3)
+    embeddings.append(np.random.randn(384).astype(np.float32))
+
+# Ordered metadata via embedded CSBTree
+index = CSBTree()
+index.insert(latency[-1], ids[-1])  # log-latency -> run-id
+
+# Vector similarity search (sqlite-vec inside the same DB)
+search = VectorKVault(DB, table="runs", dimensions=384, metric="cosine")
+for idx, emb in enumerate(embeddings[:10]):
+    search.insert(emb, str(idx).encode())
+for rank, (rid, distance, run_id) in enumerate(search.search(embeddings[-1], k=3), 1):
+    print(rank, distance, run_id.decode())
+```
+
+
+## Why this exists
+- **Single-file SWMR** – SQLite WAL lets one writer and many readers share a file. Parquet can’t append, DuckDB locks the DB, Lance spawns version files.
+- **Columnar layout, not SQL tables** – `ColumnVault` stores chunks in `col_chunks`/`_idx`, Stanchion-style, so incremental appends don’t rewrite tables.
+- **Auto-packed KV everywhere** – `KVault` (BoringDB-inspired) automatically serializes dict/list/numpy values and keeps raw bytes untouched; every key-value interaction goes through this pipeline.
+- **Write caches** – Vault- and column-level caches batch inserts automatically.
+- **Standalone CSB+Tree / SkipList** – Specialized containers for ordered metadata or range queries without leaving the process.
+- **Vector keys/search** – `vec:*` dtypes store tensors, and `VectorKVault` (sqlite-vec) runs k-NN search inside the same DB.
+
+If your workflow looks like *“keep logging forever, but don’t spawn thousands of files”*, KohakuVault is the tool.
+
+## Installation
+
+```bash
+pip install kohakuvault
+```
+
+For development (build the PyO3 extension, run tests):
+
+```bash
+pip install -e .[dev]
+
+# everytime you change the rust code, you should run this command
+maturin develop
+```
+
+## Use cases / references
+- **Media vaults** – Random-access blobs + metadata (`tests/test_kv_headers.py`, `examples/basic_usage.py`).
+- **RAG pipelines** – Full-text BM25 search + vector similarity in the same DB (`tests/test_text_vault.py`).
+- **Incremental ML logging** – Fixed/var columns, vector dtypes, caches (`tests/test_columnar.py`, `examples/columnar_demo.py`).
+- **Vector-heavy retrieval** – `VectorKVault`, CSBTree/SkipList, auto-packed metadata (`tests/test_vector_kvault.py`, `examples/vector_search_numpy.py`, `examples/all_usage.py`).
+
+## Performance notes
+
+Benchmarks on an M1 Max (WAL on, cache enabled):
+- `KVault` streaming + cache: **24K writes/s**, **63K reads/s** (`examples/benchmark.py`).
+- `ColumnVault` extend (`i64`): **12.5M ops/s**; slicing 100 elements hits **2.3M slices/s**.
+- `DataPacker` vector unpack: **35× faster** than Python loops for 768-dim tensors.
+
+## Documentation
+
+- [Documentation index](docs/README.md)
+- [KVault Guide](docs/kvault.md)
+- [TextVault Guide](docs/textvault.md) – Full-text search with BM25 ranking
+- [ColumnVault Guide](docs/columnvault.md)
+- [Vector Storage & Search](docs/vectors.md)
+- [DataPacker Reference](docs/datapacker.md)
+- [Architecture Deep Dive](docs/architecture.md)
+- [Structured Data Cookbook](docs/structured_columns.md)
+
+## Development workflow
+
+```bash
+pip install -e .[dev]
+maturin develop
+```
+
+Formatting/linting/testing before PR:
+```bash
+black .
+cargo fmt
+cargo clippy
+maturin develop --release
+pytest
+```
+
+- PyO3 module: `src/kvault-rust` (use `maturin develop` if you prefer).
+- Format Python with `black`.
+- Keep docs updated and linked via `docs/README.md`.
+
+## License
+
+Apache 2.0. See [LICENSE](LICENSE).
+
+---
+
+# KohakuVault Architecture
+
+Source: https://github.com/kohakublueleaf/kohakuvault/blob/main/docs/architecture.md
+
+# KohakuVault Architecture
+
+KohakuVault is a pure-Python package backed by a Rust extension that talks to SQLite. Python keeps the ergonomic APIs (`Mapping`, `MutableSequence`, context managers, retries) while Rust handles serialization, chunk orchestration, and tight loops. Everything eventually lands in a single SQLite database so deployment stays trivial.
+
+## Layered Model
+
+| Layer | Location | Responsibilities |
+|-------|----------|------------------|
+| Python proxies | `src/kohakuvault/proxy.py`, `column_proxy.py`, `vector_proxy.py`, `wrappers.py` | Public API, argument validation, retry/backoff, cache orchestration, type wrappers for auto-pack |
+| PyO3 module | `src/kvault-rust/lib.rs` | Exposes `_KVault`, `_ColumnVault`, `DataPacker`, CSBTree, SkipList, and `_VectorKVault` to Python |
+| Rust subsystems | `src/kvault-rust/kv`, `col`, `packer`, `tree`, `skiplist`, `vkvault`, `vector_utils.rs` | SQLite sessions (rusqlite), chunk/cache management, serialization, ordered containers, sqlite-vec integration |
+| Storage | SQLite database (`.db`, `.db-wal`, `.db-shm`) | ACID persistence, WAL concurrency, single deployment artifact |
+
+## Data Layout
+
+All components share one SQLite database file. Default table names are configurable but the on-disk patterns stay consistent:
+
+- **KVault** – `kv` (default) with `key BLOB PRIMARY KEY, value BLOB NOT NULL`. Values may contain a 10-byte auto-pack header (see below) or raw bytes.
+- **Column metadata** – `col_meta` stores column id, dtype string, logical length, min/max chunk sizes, and cache hints.
+- **Column chunks** – `col_chunks` persists payload blobs keyed by column id and chunk id. Fixed-size columns append contiguous elements, while variable-size columns keep chunk usage metadata.
+- **Variable-size indexes** – for each var-size column we maintain `{name}_data` + `{name}_idx`. Index rows hold 12-byte triples `(chunk_id, start, end)` so we can jump straight to the byte range.
+- **Vector search** – `_VectorKVault` creates a sqlite-vec `vec0` virtual table for dense vectors plus a companion blob table for arbitrary values. Rows reference the value blob id so vector scans remain cache-friendly.
+- **Metadata** – `kohakuvault_meta` records schema versions for migrations and sanity checks.
+
+WAL (Write-Ahead Logging) keeps readers isolated from writers. Both `_KVault` and `_ColumnVault` expose `checkpoint()` helpers so long-running jobs can merge WAL pages back to the main file.
+
+## Auto-Pack Pipeline
+
+Auto-packing lets `KVault` accept rich Python objects without manual serialization. The Rust implementation in `kv/autopacker.rs` runs through a priority order:
+
+1. `bytes` → stored as-is (no header, zero overhead).
+2. Explicit wrappers (`MsgPack`, `Json`, `Cbor`, `Pickle` from `kohakuvault.wrappers`) → force an encoding when you need one.
+3. NumPy arrays → `vec:*` DataPacker dtype.
+4. Int/float → `i64`/`f64` DataPacker dtypes.
+5. `str` → UTF-8 bytes.
+6. dict/list → MessagePack with a Pickle fallback.
+7. Everything else → Pickle if enabled.
+
+Non-raw values are prefixed with a 10-byte header defined in `kv/header.rs`:
+
+```
+|0x89 0x4B|version|encoding|flags|reserved(3)|0x56 0x4B|
+```
+
+`encoding` tracks MessagePack/CBOR/DataPacker/etc. The header guard makes it safe to mix raw blobs (images, audio) with auto-packed objects in the same table. `KVault.enable_auto_pack()` and `disable_auto_pack()` toggle the behaviour, and `auto_pack_enabled()` reports the current state. Wrappers simply give callers an opt-in way to override the default encoding choice (for example, force JSON bytes for downstream tools).
+
+## Connections, Caches, and Concurrency
+
+- Each `_KVault` holds a `rusqlite::Connection` behind a `Mutex`. Write-back caches live in Rust (`WriteBackCache`) and are flushed via explicit calls (`flush_cache`, context managers) or daemon timers started from Python.
+- `_ColumnVault` owns its own connection plus per-column caches stored in a `Mutex<HashMap<ColumnCache>>`. The caches buffer appends/updates until thresholds are hit or manual flushes occur.
+- Python’s `_with_retries` helper wraps every call, converting rusqlite errors into typed Python exceptions (`DatabaseBusy`, `NotFound`, `InvalidArgument`). Busy loops use exponential backoff before surfacing an error.
+- Cache lock contexts (`kv.lock_cache()`, `column.cache().lock_cache()`) temporarily block auto-flushes so multi-step transactions can batch writes safely.
+
+## Chunking Strategy
+
+Fixed-size columns align chunk boundaries to `elem_size`, so slicing `col[1_000:2_000]` can stream contiguous blobs without reassembling boundaries. Variable-size columns append to `_data` chunks while `_idx` keeps offsets. When an update outgrows its original chunk, the Rust backend rebuilds the affected chunk and updates metadata atomically.
+
+Chunk growth is exponential between `min_chunk_bytes` and `max_chunk_bytes` (defaults 128 KiB → 16 MiB). You can override these when creating columns to match your workload (e.g., smaller chunks for high-churn logs, larger chunks for wide analytics tables).
+
+## Vector Search Stack
+
+`VectorKVault` builds on sqlite-vec 0.1.6:
+
+- `VectorKVault.insert()` normalizes numpy arrays/lists/bytes into float lists and forwards them to the Rust `_VectorKVault` which inserts into the `vec0` virtual table plus a blob table for values.
+- Queries (`search`, `get`) run brute-force scans accelerated by SIMD (AVX/NEON) inside sqlite-vec. Metrics include `cosine`, `l2`, `l1`, and `hamming`. Per-query overrides are supported.
+- Maintenance APIs (`get_by_id`, `update`, `delete`, `exists`, `count`, `info`) expose the sqlite-vec rowid, making it easy to track metadata in other tables.
+
+Because sqlite-vec currently performs full scans, WAL checkpoints and VACUUMs are important for keeping the file compact and query times predictable.
+
+## Maintenance Hooks
+
+| Operation | Python method | Notes |
+|-----------|---------------|-------|
+| WAL checkpoint | `KVault.checkpoint()`, `ColumnVault.checkpoint()` | Calls into `common::checkpoint_wal` |
+| Optimization | `KVault.optimize()` | Runs `PRAGMA optimize; VACUUM;` |
+| Cache flush | `flush_cache()` on vaults/columns | Forces buffered writes into SQLite |
+| Auto-pack headers | `KVault.enable_headers()`/`disable_headers()` | Control whether raw bytes get headers (rarely needed) |
+
+## Repository Map
+
+```
+KohakuVault/
+├── src/
+│   ├── kohakuvault/
+│   │   ├── proxy.py          # KVault proxy & auto-pack controls
+│   │   ├── column_proxy.py   # ColumnVault proxies & dtype parsing
+│   │   ├── vector_proxy.py   # VectorKVault proxy
+│   │   ├── wrappers.py       # MsgPack/Json/Cbor/Pickle wrappers
+│   │   └── errors.py         # Exception hierarchy
+│   └── kvault-rust/
+│       ├── kv/               # Key-value subsystem & auto-pack header
+│       ├── col/              # Column subsystem & caches
+│       ├── packer/           # DataPacker
+│       ├── vkvault/          # Vector search
+│       ├── tree/             # CSBTree
+│       └── skiplist/         # Lock-free skip list
+├── docs/                     # Guides (this folder)
+├── examples/                 # Benchmarks and demos
+└── tests/                    # Pytest suite covering KV/columns/vectors
+```
+
+Keep this layout handy when onboarding new contributors—most bugs fall into “Python proxy”, “Rust backend”, or “SQLite plumbing”, and this map shows where to dive in.
+
+---
+
+# ColumnVault Guide
+
+Source: https://github.com/kohakublueleaf/kohakuvault/blob/main/docs/columnvault.md
+
+# ColumnVault Guide
+
+`ColumnVault` exposes list-like typed columns stored in the same SQLite database as `KVault`. Each column tracks its dtype, chunk sizes, and caches in Rust so Python code can treat it like a `MutableSequence` without worrying about serialization or chunk math.
+
+## Concepts at a Glance
+
+| Component | Description |
+|-----------|-------------|
+| `_ColumnVault` | Rust backend that owns the SQLite connection, chunk allocator, and per-column caches. |
+| `Column` | Fixed-size column proxy (ints, floats, fixed strings/bytes, fixed MessagePack/CBOR, fixed vector shapes). |
+| `VarSizeColumn` | Variable-size proxy backed by paired `{name}_data` + `{name}_idx` tables storing chunk offsets. |
+| `DataPacker` | Serializer/deserializer for dtype strings. Python falls back to `DTYPE_INFO` when the extension is missing. |
+| Cache Daemon | Optional background thread that flushes buffered appends after an idle interval. |
+
+## Creating and Discovering Columns
+
+```python
+from kohakuvault import ColumnVault
+import numpy as np
+
+vault = ColumnVault("analytics.db")
+counts = vault.create_column("counts", "i64")
+counts.extend(range(10))
+
+# Reuse existing column or create it lazily
+metrics = vault.ensure("metrics", "msgpack")
+```
+
+`ColumnVault.list_columns()` returns `(name, dtype, length)` triplets; `ColumnVault.delete_column()` removes data plus metadata.
+
+## DType Grammar
+
+`create_column(name, dtype, **opts)` accepts the full DataPacker grammar:
+
+| Category | Examples | Notes |
+|----------|----------|-------|
+| Integers | `"i64"`, `"i32"` | Stored little-endian; see `pack_i64`/`pack_i32`. |
+| Floats | `"f64"`, `"f32"` | IEEE-754 doubles/floats. |
+| Fixed bytes | `"bytes:32"` | Zero-padded/truncated to fixed length. |
+| Variable bytes | `"bytes"` | Stored verbatim; offsets tracked in `_idx`. |
+| Strings | `"str:utf8"`, `"str:32:utf8"`, `"str:utf16le"`, `"str:latin1"`, `"str:ascii"` | Fixed-width forms pad/truncate encoded bytes. |
+| Structured | `"msgpack"`, `"msgpack:256"`, `"cbor"`, `"cbor:512"` | Prefer fixed sizes (`:N`) when payloads have an upper bound to stay on the fixed-size fast path. |
+| Vectors | `"vec:f32:768"`, `"vec:u8:3:224:224"`, `"vec:f32"` | Fixed-shape (`vec:<type>:dim[:dim...]`) or arbitrary-shape (`vec:<type>`). Supported element types: `f32`, `f64`, `i8/16/32/64`, `u8/16/32/64`. |
+
+`parse_dtype()` tries to instantiate a Rust `DataPacker` first and falls back to Python helpers (`DTYPE_INFO`) if the extension isn’t available.
+
+## Fixed-Size Columns (`Column`)
+
+- Appends/extends buffer values in Rust, aligning chunk boundaries to `elem_size`.
+- `__getitem__` supports integers and slices; slices stream batches to minimise Python overhead.
+- `__setitem__` accepts scalars or slices—slice assignments pack the entire batch before calling `_setitem_slice` so there’s only one round-trip to Rust.
+- Iteration reads 1000-element batches for speed.
+- `insert`/`delete` are supported but incur chunk rewrites when the change isn’t at the tail; design for append-heavy workloads when possible.
+
+```python
+scores = vault.create_column("scores", "f64")
+scores.extend([95.5, 87.3, 99.1])
+scores[1:3] = [90.0, 91.5]
+```
+
+## Variable-Size & Structured Columns (`VarSizeColumn`)
+
+Structured data is just a var-size column with a dtype that knows how to (de)serialize values:
+
+```python
+events = vault.ensure("events", "msgpack")
+events.append({"type": "login", "user": 42})
+events.extend({"type": "purchase", "amount": a} for a in amounts)
+
+# JSON Schema validation with DataPacker
+from kohakuvault import DataPacker
+schema = {"type": "object", "required": ["id", "name"]}
+packer = DataPacker.with_json_schema(schema)
+```
+
+Implementation details:
+
+- Appends choose between typed (`append_typed[_cached]`) and raw bytes depending on whether a `DataPacker` exists.
+- Reads look up `(chunk_id, start, end)` from `{name}_idx` before slicing bytes. With a `DataPacker`, `batch_read_varsize_unpacked` returns decoded Python objects.
+- Updates handle three cases: equal size (in-place overwrite), shrink (overwrite + shift), grow (rebuild chunk and adjust offsets). All logic happens in Rust to avoid Python loops.
+- Slice assignments use `update_varsize_slice`, so you can replace arbitrary segments atomically.
+
+## Vector Columns
+
+Use vector dtypes when you need dense tensors but don’t need search yet:
+
+```python
+embeddings = vault.create_column("embeddings", "vec:f32:768")
+embeddings.extend(np.random.randn(10_000, 768).astype(np.float32))
+
+images = vault.create_column("mnist", "vec:u8:28:28")
+```
+
+Fixed-shape vectors add only 1 byte of overhead (type byte). Arbitrary-shape vectors encode `ndim` and shape metadata (`2 + ndim * 4` bytes) before the raw buffer.
+
+Combine with `DataPacker("vec:f32:768")` when you need to batch `pack_many`/`unpack_many` operations outside `ColumnVault`.
+
+## Caching & Chunk Tuning
+
+```python
+with vault.cache(cap_bytes=32 << 20, flush_threshold=8 << 20):
+    counts.extend(range(1_000_000))
+
+col = vault["counts"]
+with col.cache(cap_bytes=4 << 20):
+    col.append(123)
+```
+
+- `ColumnVault.cache()` toggles caches for every known column, great for coordinated ingests.
+- Individual columns also expose `cache()`/`enable_cache()`/`flush_cache()` APIs.
+- `lock_cache()` exists on both the vault and column proxies to delay daemon flushes during multi-step operations.
+- Override `min_chunk_bytes`/`max_chunk_bytes` in `create_column` if defaults (128 KiB / 16 MiB) don’t match your workload. Smaller chunks help high-churn tables; bigger chunks benefit sequential scans.
+
+## Patterns
+
+- **Metadata + Blobs** – pair `ColumnVault` for structured metadata with `KVault` for binary payloads.
+- **Secondary Indexes** – combine `ColumnVault` columns with `CSBTree`/`SkipList` when you need ordered lookups on derived keys.
+- **Hybrid Analytics** – store IDs in `i64`, timestamps in `i64`, embeddings in `vec:f32:384`, and metadata in `msgpack` while pointing everything at the same SQLite file.
+
+## Error Handling & Testing
+
+Operations raise `InvalidArgument` for dtype mismatches, `NotFound` for missing columns, and `KohakuVaultError` for runtime issues. Relevant tests live under `tests/test_columnar.py`, `tests/test_structured_columns.py`, `tests/test_varsize_operations.py`, and `tests/test_column_cache.py`.
+
+For more structured-data recipes, see `docs/structured_columns.md`. For vector-specific advice (including `VectorKVault`), jump to `docs/vectors.md`.
+
+---
+
+# DataPacker Reference
+
+Source: https://github.com/kohakublueleaf/kohakuvault/blob/main/docs/datapacker.md
+
+# DataPacker Reference
+
+`DataPacker` is the Rust serializer/deserializer shared by `ColumnVault`, `KVault`’s auto-pack pipeline, and standalone workflows. It validates dtype strings, packs values without Python loops, and exposes batch APIs for bulk transfers.
+
+## Supported Dtype Strings
+
+| Category | Pattern | Notes |
+|----------|---------|-------|
+| Integers | `i8`, `i16`, `i32`, `i64` | Little-endian; booleans map to `i8`. |
+| Floats | `f32`, `f64` | IEEE-754. |
+| Bytes | `bytes`, `bytes:N` | Variable or fixed-width zero-padded buffers. |
+| Strings | `str:utf8`, `str:utf16le`, `str:utf16be`, `str:latin1`, `str:ascii`, `str:N:utf8`, etc. | Fixed-width versions pad/truncate encoded bytes. |
+| Structured | `msgpack`, `msgpack:N`, `cbor`, `cbor:N` | Pick fixed sizes when possible to keep `ColumnVault` in the fixed-size fast path. |
+| Vectors | `vec:<elem>[:dim[:dim...]]` | `<elem>` ∈ `{f32,f64,i8,i16,i32,i64,u8,u16,u32,u64}`. Without dims → arbitrary shape (stores ndim + shape). |
+
+Creating a packer validates the dtype immediately:
+
+```python
+from kohakuvault import DataPacker
+
+fixed = DataPacker("str:32:utf8")
+assert fixed.elem_size == 32 and not fixed.is_varsize
+
+var = DataPacker("vec:f32")
+assert var.elem_size == 0 and var.is_varsize
+```
+
+## Packing & Unpacking
+
+```python
+packer = DataPacker("msgpack")
+blob = packer.pack({"user": 1, "tags": ["vip", "beta"]})
+restored = packer.unpack(blob, offset=0)
+```
+
+Offsets only matter for buffer views—you can store multiple values in one blob and read them by passing different offsets.
+
+## Batch APIs
+
+```python
+from kohakuvault import DataPacker
+import numpy as np
+
+pack_i64 = DataPacker("i64")
+values = list(range(1_000))
+buffer = pack_i64.pack_many(values)
+assert pack_i64.unpack_many(buffer, count=len(values)) == values
+
+pack_vec = DataPacker("vec:f32:768")
+vectors = [np.random.randn(768).astype(np.float32) for _ in range(1_000)]
+buffer = pack_vec.pack_many(vectors)
+restored = pack_vec.unpack_many(buffer, count=len(vectors))
+```
+
+- Fixed-size types use `count=...`.
+- Variable-size types use `offsets=[...]` (accumulate byte positions yourself).
+- Mixing `count` and `offsets` raises `ValueError`.
+
+## JSON Schema Validation
+
+```python
+schema = {
+    "type": "object",
+    "properties": {
+        "id": {"type": "integer"},
+        "name": {"type": "string"},
+    },
+    "required": ["id", "name"],
+}
+
+packer = DataPacker.with_json_schema(schema)
+packer.pack({"id": 1, "name": "Rin"})
+packer.pack({"id": "oops"})  # raises ValueError
+```
+
+Schemas are cached by MD5 hash, so reusing the same schema in multiple packers is cheap.
+
+## Auto-Pack Integration
+
+`KVault.enable_auto_pack()` instantiates `DataPacker` internally to serialize numpy arrays (`vec:*`), ints (`i64`), floats (`f64`), strings, and structured data. Wrappers (`MsgPack`, `Json`, `Cbor`, `Pickle`) are optional—they set `encoding_name` to override the automatic choice when you need a specific format.
+
+If the Rust extension isn’t available, python fallbacks in `column_proxy.py` handle legacy dtypes (`i64`, `f64`, `bytes:N`). Prefer installing the extension for performance and full dtype coverage.
+
+## Threading & Performance
+
+- Packer instances are **not** thread-safe—create one per thread if you plan to reuse them in worker pools.
+- Construction is cheap; cache packers per dtype to avoid repeated validation.
+- JSON Schema validation and arbitrary-shape vectors allocate temporary buffers proportional to the payload; fixed-size packers can stream directly into preallocated buffers.
+
+## Testing & Examples
+
+- `tests/test_packer.py` covers primitives, strings, structured payloads, and vector types.
+- `examples/datapacker_demo.py` shows schema validation + `ColumnVault` integration.
+- `examples/benchmark_packer.py` compares `pack_many`/`unpack_many` against pure Python loops.
+
+Keep this page in sync with new dtype strings—`ColumnVault`, auto-pack, and future APIs all rely on DataPacker to stay consistent.
+
+---
+
+# KVault Guide
+
+Source: https://github.com/kohakublueleaf/kohakuvault/blob/main/docs/kvault.md
+
+# KVault Guide
+
+`KVault` is the dict-like face of KohakuVault. It runs on top of a Rust core (`_KVault`) that streams bytes directly into SQLite, adds an auto-pack pipeline for Python objects, and layers caching/streaming helpers around it.
+
+## Why Use It?
+- Works like a Python `dict`, but stores data durably in SQLite.
+- Auto-pack (enabled by default) turns numpy arrays, dicts, lists, and scalars into compact binary automatically.
+- Write-back caches and streaming APIs let you ingest millions of records without Python loops becoming the bottleneck.
+- Sharing the same `.db` file as `ColumnVault`/`VectorKVault` keeps deployments simple.
+
+## Quick Start
+
+```python
+from kohakuvault import KVault
+import numpy as np
+
+kv = KVault("app.db")  # auto-pack is on by default
+kv["config"] = {"timeout": 30, "retries": 3}         # auto MessagePack
+kv["embedding"] = np.random.randn(768).astype(np.float32)
+kv["image.jpg"] = open("image.jpg", "rb").read()     # raw bytes stay raw
+
+assert kv["config"]["timeout"] == 30
+assert kv["embedding"].shape == (768,)
+```
+
+## Auto-Pack and Headers
+
+Auto-pack is implemented in Rust (`kv/autopacker.rs`) and follows this priority:
+
+1. `bytes` → stored as-is, no header.
+2. Explicit wrappers (`MsgPack`, `Json`, `Cbor`, `Pickle`) → force a particular encoding when you need it.
+3. NumPy arrays → `vec:*` DataPacker dtype.
+4. Integers/floats → `i64`/`f64` DataPacker dtype.
+5. `str` → UTF-8.
+6. dict/list → MessagePack with optional Pickle fallback.
+7. Everything else → Pickle if enabled.
+
+The resulting blob may include a 10-byte header (`|0x89 0x4B|version|encoding|flags|reserved|0x56 0x4B|`) so reads can auto-detect encoding. You control behaviour with:
+
+```python
+kv.enable_auto_pack(use_pickle=True)   # default
+kv.disable_auto_pack()                 # revert to bytes-only
+kv.auto_pack_enabled()                 # -> bool
+```
+
+Need raw headers for custom tooling? `enable_headers()`/`disable_headers()` toggle the header injection while keeping bytes untouched.
+
+### Explicit encodings (optional)
+
+Wrappers from `kohakuvault.wrappers` are only needed when you must override the automatic choice. For example, wrap a value in `Json(...)` if an external system expects JSON bytes or `MsgPack(...)` if you want to guarantee MessagePack even when auto-pack would normally choose Pickle. Plain dicts/lists/numpy arrays do **not** require wrappers.
+
+## Data Model & Defaults
+
+| Aspect | Value |
+|--------|-------|
+| Table name | `kv` (override via `KVault(..., table="...")`) |
+| Schema | `CREATE TABLE kv (key BLOB PRIMARY KEY, value BLOB NOT NULL)` |
+| Key types | `bytes` or `str` (UTF-8 encoded) |
+| Value types | Any auto-packable Python object, bytes-like objects, file-like streams |
+| Chunk size | `chunk_size` arg (1 MiB default) controls stream batch size |
+| SQLite PRAGMAs | WAL on, 32 KiB page size, 256 MiB mmap, cache 100 MB by default |
+
+## Caching and Concurrency
+
+`KVault` uses a Rust write-back cache so you can buffer millions of writes before hitting SQLite:
+
+```python
+with kv.cache(cap_bytes=64 << 20, flush_threshold=8 << 20) as buffered:
+    for i in range(200_000):
+        buffered[f"log:{i}"] = b"..."
+
+kv.enable_cache(flush_interval=5.0)  # background daemon flush
+with kv.lock_cache():                 # block daemon flush temporarily
+    mutate_many_keys()
+kv.flush_cache()
+```
+
+- Values larger than `cap_bytes` bypass the cache automatically.
+- `flush_cache()` is safe to call repeatedly; it only flushes dirty entries.
+- `lock_cache()` is a context manager that defers auto-flushes when you need deterministic batching.
+- Every operation is wrapped in `_with_retries` (exponential backoff, 4 attempts by default) to deal with SQLite `BUSY`/`LOCKED` cases.
+
+## Streaming APIs
+
+```python
+# Upload large blobs without loading them fully in memory
+with open("movie.mp4", "rb") as reader:
+    kv.put_file("movie:2024", reader, chunk_size=4 << 20)
+
+with open("copy.mp4", "wb") as writer:
+    kv.get_to_file("movie:2024", writer, chunk_size=4 << 20)
+```
+
+`put_file` writes through the SQLite incremental BLOB API (zero-blob, `blob_open`); `get_to_file` streams in chunks. When `size` is omitted, KohakuVault attempts to determine it via `seek/tell` or file descriptors; otherwise it buffers into a `BytesIO` fallback.
+
+## API Cheat Sheet
+
+| Category | Methods |
+|----------|---------|
+| CRUD | `__getitem__`, `__setitem__`, `__delitem__`, `get`, `put`, `delete`, `exists`, `__contains__`, `len` |
+| Iteration | `keys(prefix=None, limit=10_000)`, `values()`, `items()` (all batched) |
+| Streaming | `put_file`, `get_to_file` |
+| Caching | `enable_cache`, `disable_cache`, `flush_cache`, `cache(cap_bytes, flush_threshold, auto_flush=True)`, `lock_cache()` |
+| Auto-pack | `enable_auto_pack`, `disable_auto_pack`, `auto_pack_enabled`, `enable_headers`, `disable_headers`, `headers_enabled` |
+| Maintenance | `checkpoint`, `optimize`, `close` |
+
+All methods raise typed exceptions from `kohakuvault.errors`: `DatabaseBusy`, `NotFound`, `InvalidArgument`, `IoError`, or `KohakuVaultError` for unexpected failures.
+
+## Interop Patterns
+
+- **Share the DB with ColumnVault** – pass a `KVault` instance to `ColumnVault(kv)` to reuse its database file when mixing blobs and typed columns.
+- **Metadata + Blobs** – keep large binary payloads in `KVault` while storing structured metadata in MessagePack columns.
+- **Vector Pipelines** – auto-pack stores numpy arrays directly; pair this with `VectorKVault` for similarity search when you need indexing.
+
+## Maintenance & Diagnostics
+
+- Call `kv.checkpoint()` in long-running writers to keep the WAL small.
+- `kv.optimize()` issues `PRAGMA optimize; VACUUM;`—handy after bulk deletes.
+- Always `close()` or use context managers so caches flush and WAL checkpoints run, otherwise background daemon threads keep the process alive.
+- For 0.6.x compatibility, `disable_auto_pack()` returns you to the old bytes-only behaviour instantly.
+
+## Testing & Benchmarks
+
+- Pytests: `tests/test_basic.py`, `tests/test_setitem.py`, `tests/test_cache.py` cover CRUD, caching, retries, and streaming.
+- Benchmarks: `examples/benchmark.py` shows cache vs non-cache throughput; `examples/all_usage.py` exercises hybrid KVault/ColumnVault/VectorKVault workflows.
+
+Keep this guide handy when adding new methods—if it changes behaviour, document it here and link from `docs/index.md` so users know where to look.
+
+---
+
+# KohakuVault Documentation
+
+Source: https://github.com/kohakublueleaf/kohakuvault/blob/main/docs/README.md
+
+# KohakuVault Documentation
+
+Use this index to navigate the guides that ship with the repository. Each page is versioned with the code in this tree, so the APIs, defaults, and caveats match what you have locally.
+
+## Quick Starts
+- [README](../README.md) – overview, installation, and end-to-end demo that stitches `KVault`, `ColumnVault`, and `VectorKVault` together.
+- [`examples/basic_usage.py`](../examples/basic_usage.py) – the fastest way to see the Python API without reading every guide.
+
+## Core Guides
+- [KVault Guide](kvault.md) – dict-like storage, auto-packing, caching, streaming, and retry semantics.
+- [TextVault Guide](textvault.md) – full-text search with FTS5 BM25 ranking, ideal for RAG pipelines.
+- [ColumnVault Guide](columnvault.md) – typed columns, dtype grammar, structured data, caching, and chunk tuning.
+- [Vector Storage & Search](vectors.md) – vector dtypes inside `ColumnVault` plus similarity search with `VectorKVault`/`sqlite-vec`.
+- [Structured Data Cookbook](structured_columns.md) – practical recipes for MessagePack/CBOR columns, schema validation, and hybrid layouts.
+- [DataPacker Reference](datapacker.md) – dtype strings, batch APIs, JSON-Schema validation, and how auto-pack builds on it.
+
+## System Architecture & Releases
+- [Architecture Deep Dive](architecture.md) – Python↔Rust layering, SQLite layout, cache design, and the auto-pack pipeline.
+- [Release Notes](../RELEASE_NOTES_0.7.0.md) – highlights for the 0.7.x series, including vector search and auto-packing.
+
+## Testing & Development
+- [tests/](../tests) – pytest suite covering KV, columns, vectors, and structured data.
+- [examples/](../examples) – benchmark and tutorial scripts you can run to validate performance claims.
+
+If you add a new component, drop a short guide in this folder and link it here so future readers know where to look.
+
+---
+
+# Structured Data Cookbook
+
+Source: https://github.com/kohakublueleaf/kohakuvault/blob/main/docs/structured_columns.md
+
+# Structured Data Cookbook
+
+This page complements the [ColumnVault Guide](columnvault.md) with recipes focused on MessagePack/CBOR columns, schema validation, and hybrid layouts. Use it when you already know the basics of `ColumnVault` but need practical patterns.
+
+## Choosing the Right Dtype
+
+| Use case | Recommended dtype | Why |
+|----------|-------------------|-----|
+| JSON-like metadata with flexible keys | `msgpack` | Compact, schemaless, decoded transparently via `DataPacker`. |
+| IoT / IETF interoperability | `cbor` or `cbor:256` | Standardized, supports more numeric types, optional schema validation. |
+| Short human-readable tags | `str:32:utf8` | Fixed width keeps the column on the fast fixed-size path. |
+| Mixed binary/text payloads | `bytes` + companion `msgpack` column | Keeps heavy blobs separate from structured metadata. |
+| Deterministic record sizes | `msgpack:256`, `cbor:512` | Avoids `_idx` tables altogether by keeping every element the same width. |
+
+## Schema Validation
+
+`DataPacker` can enforce JSON Schema when serializing MessagePack payloads:
+
+```python
+from kohakuvault import ColumnVault, DataPacker
+
+schema = {
+    "type": "object",
+    "properties": {
+        "id": {"type": "integer"},
+        "name": {"type": "string"},
+        "tags": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["id", "name"],
+}
+
+packer = DataPacker.with_json_schema(schema)
+vault = ColumnVault("users.db")
+users = vault.ensure("users", "msgpack")
+users.append({"id": 1, "name": "Rin"})
+```
+
+Failures raise `ValueError` before the write reaches SQLite, so consider validating in Python for hot loops and reserving schema enforcement for ingestion boundaries.
+
+## Hybrid Layouts
+
+### Metadata + Blobs
+
+```python
+from kohakuvault import KVault, ColumnVault
+
+kv = KVault("media.db")
+cols = ColumnVault(kv)
+meta = cols.ensure("media_meta", "msgpack")
+
+for asset in assets:
+    kv[f"blob:{asset['id']}"] = asset["bytes"]
+    meta.append({"id": asset["id"], "size": len(asset["bytes"]), "mime": asset["mime"]})
+```
+
+Binary payloads stay in `KVault`, while structured metadata lands in MessagePack so you can filter, slice, or extend without reparsing blobs.
+
+### Secondary Indexes
+
+```python
+from kohakuvault import ColumnVault, CSBTree
+
+cols = ColumnVault("events.db")
+events = cols.ensure("events", "msgpack")
+index = CSBTree()
+
+row_id = len(events)
+events.append({"user": 42, "type": "login"})
+index.insert(42, row_id)
+
+for _, rid in index.range(42, 42):
+    handle(events[rid])
+```
+
+CSBTree/SkipList live inside the same PyO3 module, so you can build in-memory indexes keyed by user id, timestamp buckets, or composite keys while keeping the canonical record in a column.
+
+## Performance Tips
+
+- Batch operations (`extend`, slice assignment) beat Python loops—every call crosses the PyO3 boundary.
+- Enable caches when appending many records: `with events.cache(cap_bytes=8 << 20): ...`.
+- Tune `min_chunk_bytes`/`max_chunk_bytes` if you store large, variable payloads. Smaller chunks reduce rewrite cost when editing random rows.
+- For large hot columns, occasionally call `ColumnVault.checkpoint()` to merge WAL changes and keep sqlite-vec (if you also use vectors) snappy.
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---------|--------------|-----|
+| `ValueError: Invalid dtype` | Typo in dtype string | Use `DataPacker(dtype)` in a REPL to validate before creating the column. |
+| `TypeError: Expected bytes` | Value not serializable under current dtype | Switch to a structured dtype (`msgpack`, `cbor`, etc.) or pre-serialize before appending (auto-pack wrappers only affect KVault). |
+| Slice assignment raises `ValueError` | Replacement batch length mismatch | Ensure `len(values) == high - low`. |
+| Updates are slow | Column is variable-size | Switch to fixed-size (`msgpack:NN`) where possible or increase chunk sizes. |
+
+See [ColumnVault Guide](columnvault.md) for base APIs and [vectors.md](vectors.md) for vector-specific advice.
+
+---
+
+# TextVault – Full-Text Search with BM25 Ranking
+
+Source: https://github.com/kohakublueleaf/kohakuvault/blob/main/docs/textvault.md
+
+# TextVault – Full-Text Search with BM25 Ranking
+
+KohakuVault 0.8 introduces `TextVault`, a full-text search storage built on SQLite's FTS5 extension. It combines the convenience of `KVault`'s auto-packing with powerful BM25-ranked search, making it ideal for RAG (Retrieval-Augmented Generation) pipelines and document retrieval systems.
+
+## Quick Start
+
+```python
+from kohakuvault import TextVault
+
+# Create a single-column text vault
+tv = TextVault("documents.db")
+
+# Insert documents with any Python value
+doc_id = tv.insert("Machine learning is a subset of AI", {"category": "tech", "importance": 5})
+
+# Search with BM25 ranking
+results = tv.search("machine learning", k=10)
+for doc_id, score, value in results:
+    print(f"ID {doc_id}: score={score:.4f}, value={value}")
+```
+
+## Features
+
+- **BM25 ranking** – Industry-standard relevance scoring via FTS5
+- **Safe query escaping** – Special characters (?, +, @, etc.) handled automatically
+- **Multi-column schemas** – Index title, body, tags separately
+- **Auto-packing** – Store any Python object (dict, list, numpy) as values
+- **Dict-like interface** – `tv["key"] = value` for simple key-value usage
+- **Snippet highlighting** – Get highlighted matches in context
+
+## Single-Column vs Multi-Column
+
+### Single Column (Default)
+
+Best for simple document storage:
+
+```python
+tv = TextVault("data.db")  # defaults to columns=["content"]
+tv.insert("Hello world", {"meta": "data"})
+value = tv["Hello world"]  # exact match lookup
+```
+
+### Multi-Column
+
+Best for structured documents with separate searchable fields:
+
+```python
+tv = TextVault("data.db", columns=["title", "body", "tags"])
+tv.insert(
+    {"title": "Introduction to ML", "body": "Machine learning is...", "tags": "ml ai tutorial"},
+    {"author": "John", "date": "2024-01-01"}
+)
+
+# Search specific columns
+results = tv.search("introduction", column="title")
+results = tv.search("tutorial", column="tags")
+```
+
+## Search Methods
+
+### Basic Search
+
+Returns `(id, bm25_score, value)` tuples sorted by relevance (higher = better):
+
+```python
+results = tv.search("hello world", k=10)
+for doc_id, score, value in results:
+    print(f"Doc {doc_id}: {score:.4f}")
+```
+
+### Search with Text Content
+
+Returns the indexed text alongside results:
+
+```python
+results = tv.search_with_text("machine learning", k=5)
+for doc_id, score, text, value in results:
+    print(f"Text: {text}")
+    print(f"Value: {value}")
+```
+
+### Search with Snippets
+
+Get highlighted context around matches:
+
+```python
+results = tv.search_with_snippets(
+    "machine learning",
+    k=10,
+    snippet_tokens=15,          # words around match
+    highlight_start="<b>",      # custom highlight markers
+    highlight_end="</b>"
+)
+for doc_id, score, snippet, value in results:
+    print(f"Snippet: {snippet}")  # "...is a <b>machine learning</b> algorithm that..."
+```
+
+## Query Syntax
+
+### Safe Mode (Default)
+
+By default, `escape=True` wraps your query for safe literal matching. This handles FTS5 special characters automatically:
+
+```python
+tv.search("What is this?")      # Works with ?
+tv.search("C++ programming")    # Works with +
+tv.search("test@email.com")     # Works with @
+tv.search('He said "hello"')    # Works with quotes
+```
+
+### Raw FTS5 Syntax
+
+Set `escape=False` to use FTS5 query operators:
+
+```python
+tv.search("hello AND world", escape=False)     # Both terms required
+tv.search("python OR java", escape=False)      # Either term
+tv.search("hello NOT goodbye", escape=False)   # Exclusion
+tv.search("mach*", escape=False)               # Prefix matching
+tv.search("NEAR(hello world, 5)", escape=False) # Proximity search
+```
+
+## CRUD Operations
+
+### Insert
+
+```python
+# Single column
+doc_id = tv.insert("document text", {"key": "value"})
+
+# Multi-column
+doc_id = tv.insert(
+    {"title": "Hello", "body": "World", "tags": "greeting"},
+    {"created": "2024-01-01"}
+)
+```
+
+### Get by ID
+
+```python
+text, value = tv.get_by_id(doc_id)
+# Single column: text is string
+# Multi-column: text is dict {"title": "...", "body": "...", "tags": "..."}
+```
+
+### Get by Exact Key (Single-Column Only)
+
+```python
+value = tv.get("exact document text")
+# or dict-style:
+value = tv["exact document text"]
+```
+
+### Update
+
+```python
+# Update text only
+tv.update(doc_id, texts="new document text")
+
+# Update value only
+tv.update(doc_id, value={"new": "metadata"})
+
+# Update both
+tv.update(doc_id, texts="new text", value={"new": "value"})
+```
+
+### Delete
+
+```python
+tv.delete(doc_id)
+# or for single-column with exact match:
+del tv["exact document text"]
+```
+
+## Auto-Packing
+
+TextVault uses the same auto-packing system as KVault and VectorKVault:
+
+```python
+# Store any Python object as values
+tv.insert("text", {"dict": "value"})           # MessagePack
+tv.insert("text", [1, 2, 3])                   # MessagePack
+tv.insert("text", np.array([1, 2, 3]))         # DataPacker vec:*
+tv.insert("text", 42)                          # DataPacker i64
+tv.insert("text", b"raw bytes")               # Raw (no header)
+
+# Values are automatically decoded on retrieval
+text, value = tv.get_by_id(doc_id)
+print(type(value))  # <class 'dict'>, <class 'list'>, <class 'numpy.ndarray'>, etc.
+```
+
+### Managing Auto-Pack
+
+```python
+# Check status
+tv.auto_pack_enabled()  # True by default
+
+# Disable for bytes-only mode
+tv.disable_auto_pack()
+
+# Re-enable
+tv.enable_auto_pack(use_pickle=True)  # use_pickle allows custom objects
+```
+
+## Utility Methods
+
+```python
+len(tv)                    # Document count
+tv.count()                 # Same as len()
+tv.count_matches("query")  # Count matching documents
+tv.exists(doc_id)          # Check if ID exists
+doc_id in tv               # Same as exists()
+tv.info()                  # {"table": "...", "columns": [...], "count": N}
+tv.columns                 # ["content"] or ["title", "body", "tags"]
+tv.keys(limit=100, offset=0)  # Paginated list of rowids
+tv.clear()                 # Delete all documents
+```
+
+## RAG Pipeline Example
+
+```python
+from kohakuvault import TextVault, VectorKVault
+import numpy as np
+
+# Documents with text search
+docs = TextVault("rag.db", table="documents")
+
+# Embeddings with vector search
+vecs = VectorKVault("rag.db", table="embeddings", dimensions=384, metric="cosine")
+
+# Index documents
+for idx, doc in enumerate(documents):
+    # Store full document with metadata
+    doc_id = docs.insert(doc["text"], {"source": doc["source"], "date": doc["date"]})
+
+    # Store embedding linked to doc_id
+    embedding = model.encode(doc["text"])
+    vecs.insert(embedding.astype(np.float32), str(doc_id).encode())
+
+# Hybrid search: combine BM25 + vector similarity
+def hybrid_search(query: str, k: int = 10, alpha: float = 0.5):
+    # BM25 search
+    bm25_results = {doc_id: score for doc_id, score, _ in docs.search(query, k=k*2)}
+
+    # Vector search
+    query_vec = model.encode(query).astype(np.float32)
+    vec_results = {int(doc_id): 1/(1+dist) for _, dist, doc_id in vecs.search(query_vec, k=k*2)}
+
+    # Combine scores
+    all_ids = set(bm25_results) | set(vec_results)
+    combined = []
+    for doc_id in all_ids:
+        bm25_score = bm25_results.get(doc_id, 0)
+        vec_score = vec_results.get(doc_id, 0)
+        combined.append((doc_id, alpha * bm25_score + (1-alpha) * vec_score))
+
+    return sorted(combined, key=lambda x: x[1], reverse=True)[:k]
+```
+
+## Performance Notes
+
+- FTS5 uses an inverted index, so searches are fast even with millions of documents
+- BM25 scoring is computed at query time with minimal overhead
+- The separate values table keeps the FTS5 index lean
+- Use `escape=True` (default) unless you need FTS5 operators
+- For very large result sets, use `k` to limit results rather than post-filtering
+
+## Schema Design
+
+TextVault creates two tables:
+
+1. **FTS5 virtual table** (`{table}`) – Stores indexed text columns + `value_ref`
+2. **Values table** (`{table}_values`) – Stores blob values separately
+
+This separation keeps the FTS5 index efficient while allowing arbitrary-size values.
+
+```sql
+-- What TextVault creates:
+CREATE VIRTUAL TABLE text_vault USING fts5(content, value_ref UNINDEXED);
+CREATE TABLE text_vault_values (id INTEGER PRIMARY KEY, value BLOB);
+```
+
+## See Also
+
+- [KVault Guide](kvault.md) – Key-value storage with auto-packing
+- [Vector Storage & Search](vectors.md) – VectorKVault for similarity search
+- [DataPacker Reference](datapacker.md) – How auto-pack serialization works
+
+---
+
+# Vector Storage & Search
+
+Source: https://github.com/kohakublueleaf/kohakuvault/blob/main/docs/vectors.md
+
+# Vector Storage & Search
+
+KohakuVault 0.7 ships two complementary vector features:
+
+1. `vec:*` dtypes inside `ColumnVault` for storing dense arrays/tensors alongside other columns.
+2. `VectorKVault`, a sqlite-vec powered similarity search engine for k-NN queries.
+
+Both live in the same SQLite file so you can ingest once and fan out to analytics, retrieval, and metadata workflows.
+
+## Vector Columns (`ColumnVault`)
+
+### Fixed-Shape Vectors
+
+Use fixed-shape dtypes when every vector shares the same dimensions:
+
+```python
+from kohakuvault import ColumnVault
+import numpy as np
+
+cv = ColumnVault("vectors.db")
+embeddings = cv.create_column("bert", "vec:f32:768")
+embeddings.extend(np.random.randn(10_000, 768).astype(np.float32))
+```
+
+Overhead: 1 byte per vector (type byte). Ideal for embeddings, image tensors, and matrices with stable shapes (`vec:u8:3:224:224`).
+
+### Arbitrary-Shape Vectors
+
+```python
+generic = cv.create_column("generic", "vec:f32")
+generic.append(np.random.randn(100).astype(np.float32))
+generic.append(np.random.randn(10, 20).astype(np.float32))
+```
+
+Overhead: `2 + ndim * 4` bytes (stores ndim and each dimension). Use when shapes vary but you still want zero-copy serialization.
+
+### Supported Element Types
+
+`f32`, `f64`, `i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64` – matching `DataPacker`’s `ElementType` enum. Mixed precision? Convert before writing.
+
+### Batch Operations with DataPacker
+
+```python
+from kohakuvault import DataPacker
+
+packer = DataPacker("vec:f32:768")
+vectors = [np.random.randn(768).astype(np.float32) for _ in range(10_000)]
+buffer = packer.pack_many(vectors)
+unpacked = packer.unpack_many(buffer, count=len(vectors))
+```
+
+Use this when you need to preprocess vectors before inserting or when marshaling data over the network. Arbitrary-shape vectors use `offsets=` instead of `count=`.
+
+## VectorKVault (Similarity Search)
+
+`VectorKVault` wraps sqlite-vec’s `vec0` virtual table and stores arbitrary values in a side table. It’s perfect for brute-force k-NN on tens of thousands of vectors.
+
+```python
+from kohakuvault import VectorKVault
+import numpy as np
+
+vkv = VectorKVault("search.db", table="search", dimensions=384, metric="cosine", vector_type="f32")
+
+vector = np.random.randn(384).astype(np.float32)
+doc_id = vkv.insert(vector, b"document payload")
+
+results = vkv.search(vector, k=10)
+for row_id, distance, payload in results:
+    print(row_id, distance, payload[:32])
+
+closest = vkv.get(vector)
+vector2, payload2 = vkv.get_by_id(doc_id)
+vkv.update(doc_id, vector=new_vector)
+vkv.delete(doc_id)
+```
+
+### Configuration
+
+| Parameter | Meaning |
+|-----------|---------|
+| `dimensions` | Length of every vector you insert (enforced). |
+| `metric` | `"cosine"`, `"l2"`, `"l1"`, or `"hamming"`. Per-query overrides allowed via `search(..., metric="l2")`. |
+| `vector_type` | `"f32"`, `"int8"`, or `"bit"` depending on sqlite-vec support. Defaults to `f32`. |
+| `table` | Logical table name; both the vec0 virtual table and blob table derive from this. |
+
+### CRUD & Introspection
+
+| Method | Description |
+|--------|-------------|
+| `insert(vector, value, metadata=None)` | Inserts vector/value and returns rowid. `metadata` is reserved for future use. |
+| `search(query, k=10, metric=None)` | Returns list of `(row_id, distance, value)` sorted by distance. |
+| `get(query, metric=None)` | Shortcut for `k=1` that returns the value bytes. Raises `NotFound` if empty. |
+| `get_by_id(row_id)` | Returns `(numpy_vector, value)` so you can inspect stored vectors. |
+| `update(row_id, vector=None, value=None)` | Mutate stored vectors/values independently. |
+| `delete(row_id)` | Remove entry. |
+| `exists(row_id)` | Boolean check. |
+| `count()` | Number of rows inside the vec0 table. |
+| `info()` | Dict with table, dimensions, metric, vector type, and count. |
+
+### Performance Characteristics
+
+- sqlite-vec 0.1.6 performs brute-force scans with SIMD acceleration (AVX on x86, NEON on Apple Silicon). Expect <1 ms for 1K rows, <10 ms for 100K rows on modern hardware.
+- Because scans touch the entire table, keep WALs short (`checkpoint()` regularly) and VACUUM after bulk deletes.
+- Use `vector_type="int8"` plus quantized vectors when you need smaller storage or faster Hamming metrics.
+
+## Putting It Together
+
+```python
+from kohakuvault import KVault, ColumnVault, VectorKVault
+import numpy as np
+
+db = "semantic.db"
+kv = KVault(db, table="documents")
+cv = ColumnVault(kv)
+emb = cv.create_column("embeddings", "vec:f32:384")
+titles = cv.create_column("titles", "str:utf8")
+
+for idx, (title, text, embedding) in enumerate(dataset):
+    kv[f"doc:{idx}"] = text.encode()
+    titles.append(title)
+    emb.append(embedding.astype(np.float32))
+
+search = VectorKVault(db, table="search_index", dimensions=384, metric="cosine")
+for idx, embedding in enumerate(emb[-len(dataset):]):
+    search.insert(embedding, str(idx).encode())
+
+query = model.encode("machine learning").astype(np.float32)
+for rank, (row_id, dist, doc_idx_bytes) in enumerate(search.search(query, k=5), 1):
+    doc_idx = int(doc_idx_bytes)
+    print(rank, dist, titles[doc_idx], kv[f"doc:{doc_idx}"][:80])
+```
+
+Vector storage, metadata, and similarity search all share `semantic.db`. No extra services required.
+
+For more on dtype grammar and caching, see [ColumnVault Guide](columnvault.md). For auto-pack details (storing vectors directly in `KVault`), see [KVault Guide](kvault.md).
+
+---
