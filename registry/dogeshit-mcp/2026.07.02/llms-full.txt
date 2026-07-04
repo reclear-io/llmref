@@ -1,0 +1,509 @@
+# Dogeshit MCP
+
+Source: https://github.com/dogeshitmeme/dogeshit-mcp/blob/main/README.md
+
+# Dogeshit MCP
+
+
+> Reference implementation: **EIP-7702 + Model Context Protocol (MCP) + on-chain mint**.
+> Powers $SHIT — the first production meme coin minted via claude.ai (Ethereum mainnet, 2026-05-07).
+
+This is the backend that lets an AI agent (claude.ai) trigger on-chain `mint()` calls on a user's behalf, where the user retains full custody and the contract enforces "tokens always go to the caller's own wallet".
+
+```
+user → "mint me some shit" → claude.ai → MCP /mcp endpoint → relayer → mint()
+                                           ↑                    ↑
+                                    JWT.sub = wallet      tx.origin == relayer (gate)
+                                    (issued via SIWE)     recipient = msg.sender (hardcoded)
+```
+
+The user never sees a private key for the relayer. The relayer never sees a way to direct tokens elsewhere. Everything is verifiable on-chain.
+
+---
+
+## What's in the box
+
+| Component | LoC | What it does |
+|---|---|---|
+| **MCP server** (`src/mcp/`) | ~1010 | MCP 2025-11-25 dispatcher + 5 tools (mint / balance / info / quota / auth status) + idempotency cache for client retries |
+| **OAuth AS** (`src/oauth/`) | ~1050 | SIWE-based wallet auth, ES256 JWT issue + verify (signing key persisted to sqlite — kid survives restarts), dynamic client registration, sqlite store |
+| **Relayer** (`src/relayer.ts`) | ~560 | Pipelined nonce queue, per-caller in-flight cap (1/wallet), single-shot send + wait (no replacement — anti-rat-race), gas cap |
+| **Rate limit + CIDR** (`src/rate-limit.ts`, `src/cidr.ts`) | ~230 | Token bucket, peer-aware IP derivation, IPv4 CIDR matching |
+| **Server entry** (`src/server.ts`) | ~395 | Hono app, CORS, IP allowlist gate, `/health` (with queue metrics), `/api/config`, `/api/revoke`, graceful shutdown drain |
+
+Total ≈ 3,500 lines TypeScript. 89 unit tests + 5 integration suites. CI runs audit + type check + tests + English-only guard on every push and PR.
+
+---
+
+## Why this exists
+
+EIP-7702 (live since Pectra) lets an EOA temporarily run smart contract code. Combined with MCP (Anthropic's protocol for AI tool use), an AI agent can call dApps as the user's authorized agent.
+
+This codebase is the missing reference: **how do you actually wire it up in production?**
+
+- Token contract enforces `tx.origin == relayer && recipient == msg.sender` → AI cannot redirect tokens
+- 7702 authorization is signed and broadcast by the user's own wallet (not the backend) → backend never holds user's auth
+- MCP tools accept `count` parameter; relayer batches via `batchMint(count)` for gas savings
+- Pipelined nonce queue lets concurrent users mint without serial bottleneck
+
+The architecture highlights below cover the key design decisions.
+
+---
+
+## Quick start
+
+```sh
+# Prereqs:
+#   1. bun        — https://bun.sh
+#   2. An RPC URL — anvil for local, sepolia/mainnet for testnet/prod
+#   3. Token + MintDelegate already deployed at known addresses
+#      (see contracts repo: deploys via `forge script`)
+#
+# The backend reads contract immutables at startup (prewarm) and refuses
+# to listen if the contracts aren't reachable — this is intentional
+# fail-fast behavior, not a bug.
+
+# 1. Install deps
+bun install
+
+# 2. Configure
+cp .env.example .env
+# Edit .env (required, process won't boot without these):
+#   CHAIN, RPC_URL                        — your chain + RPC endpoint(s)
+#   TOKEN_ADDRESS, MINT_DELEGATE_ADDRESS  — deployed contract addresses
+#   RELAYER_PRIVATE_KEY                   — pre-funded wallet that signs mint txs
+#   RELAYER_MAX_FEE_GWEI                  — gas cap (e.g. 4.2069 mainnet, 0.42069 L2)
+# Strongly recommended for production:
+#   MCP_ALLOWED_IP_CIDRS=160.79.104.0/21  — gate /mcp to claude.ai egress
+#   RELAYER_MIN_BALANCE_ETH=0.05          — alert before relayer runs dry
+
+# 3. Run
+bun --hot --env-file=.env run src/server.ts        # backend on :42069
+
+# 4. Verify
+curl http://127.0.0.1:42069/health                 # liveness: rpc + sqlite + relayer ETH
+curl http://127.0.0.1:42069/api/config             # chain + contract config
+curl http://127.0.0.1:42069/jwks.json              # OAuth public keys
+curl http://127.0.0.1:42069/.well-known/oauth-authorization-server
+```
+
+For zero-config local development, the contracts repo provides a one-shot
+script that runs anvil, deploys $SHIT + MintDelegate, and prints the
+addresses to paste into `.env`.
+
+---
+
+## Tests
+
+```sh
+# Unit tests — auto-discovered by bun test (~5 sec, no external deps)
+bun test
+
+# Integration tests — manual, require anvil/sepolia running + contracts deployed
+bun run tests/integration/full.ts            # full flow: OAuth → SIWE → 7702 self-tx → MCP mint
+bun run tests/integration/oauth.ts            # OAuth AS standalone
+bun run tests/integration/mcp.ts              # MCP protocol layer
+MCP_DEV_AUTH=1 bun run tests/integration/mcp-edges.ts  # MCP/OAuth edge cases
+bun run tests/integration/security.ts         # CORS / state / error leakage
+```
+
+**Layout:**
+- `tests/*.test.ts` — unit tests, auto-picked by `bun test`
+- `tests/integration/*.ts` — integration tests, run manually (each is an
+  IIFE; needs running RPC + deployed contracts to assert against)
+- `tests/_setup/test-env.ts` — preload (see `bunfig.toml`); sanitizes
+  `MCP_LOG_PATH` to `/tmp` before unit tests touch the logger
+
+**Coverage strategy:**
+Unit tests cover protocol-layer logic (JWT verification, SIWE message
+parsing, OAuth store CRUD, rate-limit token bucket, log routing, MCP
+audit fields, mint idempotency cache). Relayer + MCP routing have low
+unit-coverage by design — they require real chain state, so they're
+covered by `integration/full.ts` (end-to-end mint flow) and
+`integration/mcp.ts` (MCP protocol layer).
+
+---
+
+## Deploy
+
+The mainnet deployment of $SHIT uses this codebase as-is. **See [`DEPLOY.md`](./DEPLOY.md)** for a full Cloudflare Tunnel walkthrough, hardening checklist, nginx alternative, and health-monitoring wiring.
+
+Short version:
+
+1. Deploy `Token.sol` + `MintDelegate.sol` (see contracts repo)
+2. Fill `TOKEN_ADDRESS`, `MINT_DELEGATE_ADDRESS`, `RELAYER_PRIVATE_KEY` in `.env`
+3. Pre-fund the relayer wallet with ETH (~50k + N × 30k gas per `batchMint(N)`)
+4. Set `MCP_ALLOWED_IP_CIDRS=160.79.104.0/21` to gate `/mcp` to claude.ai egress
+5. Set `RPC_URL` to a comma-separated fallback list so a flaky primary doesn't tank the backend
+6. Set `RELAYER_MIN_BALANCE_ETH` so `/health` returns 503 before mints start failing
+7. Run behind a same-host reverse proxy (Cloudflare Tunnel recommended). The default bind is `127.0.0.1`; the proxy connects locally
+8. Add the public `/mcp` URL to claude.ai → Settings → Connectors
+
+---
+
+## Architecture highlights
+
+### Self-submit 7702 (no auth caching)
+
+The user signs the EIP-7702 authorization and broadcasts the type-4 tx **from their own wallet**. The backend never sees the auth, never broadcasts the activation tx, never pays activation gas. This is a deliberate trust-minimization: the only key the backend holds is the relayer key, and the relayer can only sign type-2 mint txs (not type-4 delegations).
+
+### Token contract gates
+
+```solidity
+function mint() external {
+    if (tx.origin != RELAYER) revert NotViaRelayer();
+    if (!_isDelegatedToMintDelegate(msg.sender)) revert NotDelegated();
+    // ...
+    _mint(msg.sender, MINT_AMOUNT);  // recipient HARDCODED to msg.sender
+}
+```
+
+`tx.origin` gate ensures only the project relayer can trigger mint. `msg.sender` (= user's 7702-delegated EOA) is the hardcoded recipient — the relayer cannot direct tokens to any other address. Worst-case "forced exposure" for a user is `MAX_PER_WALLET (10) × FEE_WEI (0.00111 ETH) ≈ $30-50` in exchange for `100M $SHIT`.
+
+### Pipelined relayer
+
+Concurrent MCP calls don't bottleneck on serial nonce reservation. The relayer queue locks only the `getNonce → submit` critical section, then releases. Subsequent senders proceed while previous ones wait for confirmation.
+
+There is intentionally NO stuck-tx replacement: modern Ethereum nodes (geth/erigon/reth/nethermind) retain pending txs for hours, so a tx priced below current basefee waits in mempool and lands once basefee normalizes. If the wait times out we surface `receipt_timeout`; the MCP idempotency cache (60s) keeps a transport-retry from accidentally triggering a second mint at a different nonce.
+
+**Per-caller fairness cap**: a single wallet may hold at most one in-flight tx (`RELAYER_QUEUE_PER_KEY_MAX=1` default). Real users wait for confirmation before re-asking; transport-timeout retries are absorbed by the idempotency cache. With this cap, the global pool of `RELAYER_QUEUE_MAX=50` slots serves up to 50 distinct callers simultaneously — no single wallet can head-of-line block the queue.
+
+**Graceful shutdown**: on SIGINT/SIGTERM the server flips a flag that returns 503 from every new request (the load balancer takes the instance out of rotation), then polls the queue until empty or `SHUTDOWN_TIMEOUT_MS` (default 25s) elapses, letting in-flight receipt waits settle naturally before sqlite close + `process.exit`. Pairs with k8s default `terminationGracePeriodSeconds=30`.
+
+### Rate limiting
+
+Three layers, ordered:
+1. **IP bucket** (`/register` 5/min, `/mcp` 120/min/IP) — skipped for `MCP_ALLOWED_IP_CIDRS` because trusted infra (claude.ai's outbound `/21`) multiplexes thousands of users; without the skip a popular launch self-DoSes on a single shared IP bucket.
+2. **JWT-sub bucket** (`/mcp` 60/min/wallet) — **always applies**, including from trusted IPs. Stops a single user (or stolen JWT) from spamming mint attempts and burning relayer gas on revert-by-cap txs, or flooding read-only tools to drain RPC quota.
+3. **Contract cap** (`MAX_PER_WALLET = 10`) — hard, immutable, last line of defense. Even with all rate limits bypassed, a wallet cannot mint more than 10 lifetime slots.
+
+Source-IP derivation (`clientIp()`) is peer-aware: the backend trusts `cf-connecting-ip` / `x-forwarded-for` only when the connecting socket peer is loopback (i.e. behind a same-host reverse proxy). Public-facing peers cannot spoof their way past the IP allowlist.
+
+### Mint idempotency
+
+`token_mint` is wrapped in a 60-second in-memory dedup cache keyed on `(wallet, count)`. When the MCP client retries on transport timeout, the retry receives the same `Promise` as the original call — both successes and failures are cached, because a `receipt_timeout` doesn't tell us whether the tx eventually landed and re-submitting blindly risks a double mint. Validation (delegation-status checks, count range) re-runs every call, so a user activating mid-window doesn't see a stale "not_delegated" error.
+
+### Security audits
+
+6+ rounds of full-stack audit (multi-agent, "find real bugs, no over-engineering"). Notable findings already addressed: X-Forwarded-For spoofing on the IP allowlist, missing address validation in `token_balance`, trusted-IP bypass of the per-wallet rate limit (now always enforced), mint duplication on MCP-client transport retry, JWKS signing key persisted to sqlite (kid survives restarts so deploys don't invalidate outstanding access tokens). Cumulative: 25+ real bugs fixed, 12+ real optimizations, 89 unit tests, 52+ over-defensive proposals rejected.
+
+---
+
+## Configuration
+
+See [`.env.example`](./.env.example) for every supported env var with inline notes.
+
+**Required** (process refuses to boot without these):
+- `CHAIN` — `anvil` | `sepolia` | `mainnet`
+- `RPC_URL` — single URL or comma-separated list for fallback (viem's `fallback` transport tries them in order)
+- `TOKEN_ADDRESS` / `MINT_DELEGATE_ADDRESS` — deployed contract addrs
+- `RELAYER_PRIVATE_KEY` — relayer signs all mint txs with this
+- `RELAYER_MAX_FEE_GWEI` — gas-price cap; no default (forces operator to choose per chain)
+
+**Strongly recommended in production** (silent default but logs a startup warning):
+- `MCP_ALLOWED_IP_CIDRS=160.79.104.0/21` — IP allowlist for `/mcp`, `/register`, `/token`, `/jwks.json`, `/.well-known/*` (anthropic outbound; skips per-IP rate limit, per-wallet limit still applies)
+- `RELAYER_MIN_BALANCE_ETH=0.05` — `/health` returns 503 below this ETH balance, paging on-call before mints fail
+
+**Optional**:
+- `HOST` — bind address (default `127.0.0.1`; set `0.0.0.0` to expose directly without a reverse proxy)
+- `RELAYER_QUEUE_MAX` (default 50) / `RELAYER_QUEUE_PER_KEY_MAX` (default 1) — global / per-caller in-flight pool sizing
+- `SHUTDOWN_TIMEOUT_MS` (default 25000) — graceful drain budget on SIGTERM
+- `RELAYER_TASK_TIMEOUT_MS` (default 120000) — receipt-wait budget per request
+
+---
+
+## Forking for your own AI-mintable token
+
+This codebase is `MIT`. To repurpose:
+
+1. Fork
+2. Deploy your own `Token` + `MintDelegate` (see contracts repo for templates)
+3. Update `.env` with your token address, relayer key, etc.
+4. Customize MCP tools in [`src/mcp/tools.ts`](./src/mcp/tools.ts) (rename `token_mint`, etc., change descriptions)
+5. Register your `/mcp` URL with claude.ai
+
+We deliberately did not abstract the token name — fork and grep-replace.
+
+---
+
+## Contributing
+
+This is a reference implementation, not a managed product. We welcome:
+- Bug reports + reproductions — open an Issue
+- Security disclosures — use GitHub's [private vulnerability reporting](https://github.com/dogeshitmeme/dogeshit-mcp/security/advisories/new). Do NOT file exploitable vulns in public Issues.
+- Discussion of EIP-7702 / MCP integration patterns
+
+PR expectations: run `bun run verify` (audit + tsc + tests) locally — CI runs the same on every push. The repo enforces English-only via a CI grep guard. Default to "no refactor PRs" — this codebase has been through 6+ rounds of audit; refactors land only when they eliminate a concrete bug, real dead code, or measurable performance issue.
+
+We cannot guarantee timely PR reviews. The mainnet $SHIT contracts are immutable; this backend is the only mutable component, and changes are made cautiously.
+
+---
+
+## Links
+
+- **$SHIT mainnet**: [`0xaF1E52927d724Fd34773Bd53adA57f4C2B742069`](https://etherscan.io/address/0xaF1E52927d724Fd34773Bd53adA57f4C2B742069#code)
+- **MintDelegate**: [`0x4206936776996fD5DFd13dB2D69b38a5FA23C848`](https://etherscan.io/address/0x4206936776996fD5DFd13dB2D69b38a5FA23C848#code)
+- **Site**: [dogeshit.meme](https://dogeshit.meme)
+
+---
+
+## License
+
+MIT — see [`LICENSE`](./LICENSE).
+
+---
+
+# Deploy
+
+Source: https://github.com/dogeshitmeme/dogeshit-mcp/blob/main/DEPLOY.md
+
+# Deploy
+
+This server supports three deployment shapes:
+
+1. **Same-host reverse proxy / tunnel** (cloudflared, nginx, Caddy,
+   Traefik, HAProxy) — recommended; the proxy connects to the backend
+   over loopback and the backend trusts proxy headers
+   (`cf-connecting-ip`, `x-forwarded-for`) only for loopback peers.
+   Covered in detail below.
+2. **Direct public bind** (`HOST=0.0.0.0`) — works; the backend reads
+   the real socket peer as the client IP and ignores any spoofed
+   proxy headers. You take on TLS, DDoS, and OS-level firewalling.
+   Covered at the bottom.
+3. **Off-host proxy** (AWS ALB, k8s ingress on a different node) —
+   **not supported** by the IP-derivation path: the proxy's IP becomes
+   the "client IP" and per-IP rate limits collapse to one bucket. Run
+   the proxy on the same host or fork `clientIp()` in
+   `src/rate-limit.ts`.
+
+The default bind is `127.0.0.1:42069`, so a fresh `bun run src/server.ts`
+is only reachable from the same host — set `HOST=0.0.0.0` to opt into
+shape 2.
+
+The reference deployment below uses **Cloudflare Tunnel** (`cloudflared`).
+It's the simplest "no public IP, no firewall rules" path: the tunnel
+terminates locally and rewrites `cf-connecting-ip` to the real source,
+which the backend trusts only because the connecting peer is loopback.
+nginx / Caddy / Traefik on the same host work identically — just set
+`X-Forwarded-For` in the proxy config and the same loopback-trust path
+applies.
+
+---
+
+## Recipe: Cloudflare Tunnel
+
+Prereqs:
+
+- A Cloudflare account
+- A domain on Cloudflare (any plan; tunnels work on the free tier)
+- `cloudflared` installed (`brew install cloudflared` on macOS,
+  package available for Linux distros)
+
+### 1. Authenticate cloudflared
+
+```sh
+cloudflared tunnel login
+```
+
+Browser opens, pick the zone you want to use.
+
+### 2. Create a named tunnel
+
+```sh
+cloudflared tunnel create dogeshit-mcp
+# → Created tunnel dogeshit-mcp with id <UUID>
+# → Credentials written to /Users/<you>/.cloudflared/<UUID>.json
+```
+
+Save the UUID.
+
+### 3. Route a hostname to the tunnel
+
+```sh
+cloudflared tunnel route dns dogeshit-mcp api.example.com
+```
+
+This adds a CNAME in your zone pointing `api.example.com` at
+`<UUID>.cfargotunnel.com`.
+
+### 4. Write the tunnel config
+
+`~/.cloudflared/config.yml`:
+
+```yaml
+tunnel: <UUID>
+credentials-file: /Users/<you>/.cloudflared/<UUID>.json
+ingress:
+  - hostname: api.example.com
+    service: http://127.0.0.1:42069
+  - service: http_status:404
+```
+
+### 5. Start the backend + tunnel
+
+In one terminal:
+
+```sh
+cd backend
+cp .env.example .env
+# fill in: TOKEN_ADDRESS, MINT_DELEGATE_ADDRESS, RELAYER_PRIVATE_KEY,
+#          BASE_URL=https://api.example.com, FRONTEND_URL=https://app.example.com
+bun run src/server.ts
+# server listening on 127.0.0.1:42069
+```
+
+In another:
+
+```sh
+cloudflared tunnel run dogeshit-mcp
+```
+
+For long-running deployments, install cloudflared as a systemd service
+(`cloudflared service install`) and supervise the backend with systemd
+or PM2.
+
+### 6. Verify
+
+```sh
+curl https://api.example.com/health
+# → {"ok":true,"checks":{"rpc":...,"sqlite":...,"relayer_balance":...}}
+```
+
+If you get `403 endpoint restricted to allowlisted IP ranges` on
+`/mcp` from a browser, that's correct — only IPs in
+`MCP_ALLOWED_IP_CIDRS` (default `160.79.104.0/21` = anthropic outbound)
+can hit `/mcp`. claude.ai itself will work.
+
+---
+
+## Health monitoring
+
+Wire upstream monitoring to `GET /health`:
+
+| Upstream | Notes |
+|---|---|
+| Cloudflare Health Check | Free tier; configure on the domain in CF dashboard |
+| UptimeRobot | Public probe; HTTP keyword check on `"ok":true` |
+| Kubernetes liveness | `httpGet: { path: /health, port: 42069 }` |
+| PagerDuty / OpsGenie | Wire to either of the above |
+
+Set `RELAYER_MIN_BALANCE_ETH` in `.env` (e.g., `0.05`) so `/health`
+returns `503` when the relayer wallet runs low on ETH — gives you a
+warning before mints start failing.
+
+The endpoint result is cached 5 seconds, so polling at any rate caps
+RPC cost at 12 calls/minute.
+
+---
+
+## Scaling beyond one process
+
+**Run exactly one backend process per relayer key.** The PipelineQueue
+holds nonce state in memory and assumes it is the only thing using
+that EOA. Two processes sharing the same `RELAYER_PRIVATE_KEY` will
+race for nonces — both fetch `pending+1` from chain at startup, both
+submit at nonce N, the loser hits `nonce_too_low` until the chain
+re-syncs. Result: one of every two mints fails until the operator
+notices.
+
+To increase mint throughput beyond what one relayer can sustain:
+
+1. **Provision N relayer EOAs** (each its own private key, each
+   pre-funded with ETH).
+2. **Run N independent backend processes**, each with its own
+   `RELAYER_PRIVATE_KEY` env. Front them with the same domain via
+   reverse proxy load-balancing (round-robin or least-conn).
+3. Each process maintains its own queue and nonce stream
+   independently — no cross-process coordination needed because the
+   keys are disjoint.
+
+This is the OSS reference impl's deliberate "shared-nothing" stance:
+the codebase doesn't bring in Redis, Postgres, or any other
+coordination layer just to enable horizontal scaling. If you genuinely
+need it, fork and add a shared nonce store (or use the multi-key
+pattern above, which scales linearly without new infrastructure).
+
+For most operators **one process is enough**: a single mainnet relayer
+can sustain ~1 tx per submission round-trip (~50ms) thanks to the
+pipelined queue, which is more than the per-wallet rate limit (60/min
+× number of distinct callers) typically demands.
+
+---
+
+## Production hardening checklist
+
+- [ ] `RELAYER_PRIVATE_KEY` stored in a secret manager (1Password,
+      AWS Secrets Manager, Vault), not in `.env` on disk
+- [ ] `RPC_URL` set to a comma-separated fallback list:
+      `RPC_URL=https://primary-rpc.example.com,https://backup-rpc.example.com`
+- [ ] `MCP_ALLOWED_IP_CIDRS=160.79.104.0/21` (anthropic outbound, per
+      <https://platform.claude.com/docs/en/api/ip-addresses>)
+- [ ] `BASE_URL` and `FRONTEND_URL` are the public HTTPS URLs (no
+      trailing slash)
+- [ ] `RELAYER_MIN_BALANCE_ETH` set so `/health` alerts on low gas
+- [ ] Backend bound to `127.0.0.1` (the default — don't override `HOST`
+      unless you intend to expose directly)
+- [ ] cloudflared running as a service, not in a tmux session
+- [ ] `.data/` directory backed up (contains OAuth state — sessions,
+      issued refresh tokens, registered DCR clients)
+- [ ] `logs/mcp.log` and `logs/oauth.log` rotated by logrotate or
+      shipped to a log aggregator
+- [ ] Pre-fund the relayer wallet with enough ETH for expected mint
+      volume × gas (each `batchMint(N)` costs ~50k + N × ~30k gas)
+
+---
+
+## Alternative: nginx / Caddy on the same host
+
+If you can't use Cloudflare for some reason, any same-host reverse
+proxy works because `clientIp()` trusts proxy headers when the peer
+is loopback.
+
+nginx snippet:
+
+```nginx
+server {
+    listen 443 ssl http2;
+    server_name api.example.com;
+    # ssl_certificate / ssl_certificate_key here
+
+    location / {
+        proxy_pass http://127.0.0.1:42069;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header Host $host;
+    }
+}
+```
+
+The X-Forwarded-For header is what the backend reads (since there's
+no `cf-connecting-ip`). It's trusted because nginx connects from
+loopback.
+
+**Off-host proxies (AWS ALB, k8s ingress on a different node) are not
+supported** by the IP-derivation path — the proxy's IP becomes the
+"client IP" and per-IP rate limits collapse. If you must run that
+shape, fork `clientIp()` in `src/rate-limit.ts` to handle your specific
+proxy IP allowlist.
+
+---
+
+## Direct public bind (not recommended)
+
+If you really want to bind directly to the public internet without any
+proxy:
+
+```sh
+HOST=0.0.0.0 bun run src/server.ts
+```
+
+Risks you accept:
+
+- TLS termination is on you — Bun has no built-in HTTPS in this server
+- DDoS absorption is on you — no Cloudflare in front
+- The IP-allowlist gate (`MCP_ALLOWED_IP_CIDRS`) is your only barrier
+  between the public internet and `/mcp` — keep it set
+- `cf-connecting-ip` and `x-forwarded-for` are both ignored when the
+  socket peer is public, so the per-IP rate limiter sees real source
+  IPs (correct), but you have no DDoS mitigation layer
+
+---
