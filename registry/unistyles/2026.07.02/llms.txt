@@ -1,0 +1,15 @@
+# React Native Unistyles 3.0
+
+> Easily style cross platform React Native apps with a single StyleSheet
+
+This documentation site is a source of truth for the good practices while building apps with React Native Unistyles.
+
+## Documentation Sets
+
+- [Abridged documentation](https://unistyl.es/llms-small.txt): a compact version of the documentation for React Native Unistyles 3.0, with non-essential content removed
+- [Complete documentation](https://unistyl.es/llms-full.txt): the full documentation for React Native Unistyles 3.0
+
+## Notes
+
+- The complete documentation includes all content from the official documentation
+- The content is automatically generated from the same source as the official documentation
