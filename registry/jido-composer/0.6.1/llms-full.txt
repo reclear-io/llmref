@@ -1,0 +1,1264 @@
+# Jido Composer
+
+Source: https://jido-composer.hexdocs.pm/readme.md
+
+# Jido Composer
+
+[![CI](https://github.com/lostbean/jido_composer/actions/workflows/ci.yml/badge.svg)](https://github.com/lostbean/jido_composer/actions/workflows/ci.yml)
+[![Hex.pm](https://img.shields.io/hexpm/v/jido_composer.svg)](https://hex.pm/packages/jido_composer)
+[![Docs](https://img.shields.io/badge/hex-docs-blue.svg)](https://hexdocs.pm/jido_composer)
+
+Build composable agent topologies in Elixir. Mix deterministic workflows (FSM)
+with adaptive orchestrators (LLM) in any combination — they nest arbitrarily.
+Human approval gates and durable persistence are built in, not bolted on.
+
+## Example: Code Review pipeline
+
+```mermaid
+flowchart TD
+    subgraph CodeReviewPipeline [Workflow: Code Review]
+        direction TB
+        subgraph FanOut [FanOut: Parallel Review]
+            Lint[Lint Action]
+            Security[Orchestrator: Security Scanner]
+            Tests[Test Runner Action]
+        end
+        FanOut --> Approval[HumanNode: Approve Merge]
+        Approval -->|approved| Merge[Merge Action]
+        Approval -->|rejected| Failed[Failed]
+    end
+```
+
+```elixir
+# An LLM-driven security scanner (orchestrator)
+defmodule SecurityScanner do
+  use Jido.Composer.Orchestrator,
+    name: "security_scanner",
+    model: "anthropic:claude-sonnet-4-20250514",
+    nodes: [DependencyAuditAction, SecretScanAction, SASTAction],
+    system_prompt: "Scan code for security issues using all available tools."
+end
+
+# A deterministic pipeline that uses the scanner as one parallel branch
+{:ok, parallel_review} = Jido.Composer.Node.FanOutNode.new(
+  name: "parallel_review",
+  branches: [
+    lint: LintAction,
+    security: SecurityScanner,   # orchestrator as a branch
+    tests: TestRunnerAction
+  ]
+)
+
+defmodule CodeReviewPipeline do
+  use Jido.Composer.Workflow,
+    name: "code_review",
+    nodes: %{
+      review: parallel_review,
+      approval: %Jido.Composer.Node.HumanNode{
+        name: "merge_approval",
+        description: "Approve merge to main",
+        prompt: "All checks passed. Approve merge?",
+        allowed_responses: [:approved, :rejected]
+      },
+      merge: MergeAction
+    },
+    transitions: %{
+      {:review, :ok}         => :approval,
+      {:approval, :approved} => :merge,
+      {:approval, :rejected} => :failed,
+      {:merge, :ok}          => :done,
+      {:_, :error}           => :failed
+    },
+    initial: :review
+end
+
+# Run → suspend at human gate → checkpoint → resume later
+agent = CodeReviewPipeline.new()
+{agent, _directives} = CodeReviewPipeline.run(agent, %{repo: "acme/app", pr: 42})
+
+# Persist while waiting for human
+checkpoint = Jido.Composer.Checkpoint.prepare_for_checkpoint(agent)
+
+# Later: resume with approval
+{agent, _directives} = CodeReviewPipeline.cmd(agent, {:suspend_resume, %{
+  suspension_id: suspension.id,
+  response_data: %{request_id: request.id, decision: :approved, respondent: "lead@acme.com"}
+}})
+```
+
+## Three Pillars
+
+### Composable Topologies
+
+Workflows and orchestrators both produce `Jido.Agent` modules. Agents are nodes.
+Nodes compose at any depth — a workflow can contain an orchestrator as a step,
+an orchestrator can invoke a workflow as a tool, and you can nest three or more
+levels deep. The uniform `context → context` interface makes every node
+interchangeable.
+
+### Human-in-the-Loop
+
+HumanNode gates pause workflows for human decisions. Tool approval gates enforce
+pre-execution review on orchestrator tools. Both use the same
+`ApprovalRequest`/`ApprovalResponse` protocol. Beyond HITL, the generalized
+suspension system handles rate limits, async completions, and custom pause
+reasons.
+
+### Durable Persistence
+
+Checkpoint any running or suspended flow to storage. Serialize across process
+boundaries — PIDs become `ChildRef` structs, closures are stripped and
+reattached on restore. Resume with idempotent semantics and top-down child
+re-spawning, even for deeply nested agent hierarchies.
+
+## Installation
+
+```elixir
+def deps do
+  [
+    {:jido_composer, "~> 0.4"}
+  ]
+end
+```
+
+## Control Spectrum
+
+| Level                | Pattern                          | Example              |
+| -------------------- | -------------------------------- | -------------------- |
+| Fully deterministic  | Workflow                         | ETL pipeline         |
+| + runtime mapping    | Workflow + MapNode               | Batch processing     |
+| + human gate         | Workflow + HumanNode             | Approval workflows   |
+| + adaptive step      | Workflow containing Orchestrator | Code review pipeline |
+| + deterministic tool | Orchestrator containing Workflow | Customer support     |
+| + dynamic assembly   | Orchestrator + DynamicAgentNode  | Skill-based dispatch |
+| Fully adaptive       | Orchestrator                     | Research agent       |
+
+## Quick Start: Workflow
+
+Wire actions into a deterministic FSM pipeline:
+
+```elixir
+defmodule ETLPipeline do
+  use Jido.Composer.Workflow,
+    name: "etl_pipeline",
+    nodes: %{
+      extract:   ExtractAction,
+      transform: TransformAction,
+      load:      LoadAction
+    },
+    transitions: %{
+      {:extract, :ok}   => :transform,
+      {:transform, :ok} => :load,
+      {:load, :ok}      => :done,
+      {:_, :error}      => :failed
+    },
+    initial: :extract
+end
+
+agent = ETLPipeline.new()
+{:ok, result} = ETLPipeline.run_sync(agent, %{source: "customer_db"})
+# result[:load][:loaded] => 2
+```
+
+```mermaid
+stateDiagram-v2
+    [*] --> extract
+    extract --> transform : ok
+    transform --> load : ok
+    load --> done : ok
+    extract --> failed : error
+    transform --> failed : error
+    load --> failed : error
+```
+
+See [Getting Started](guides/getting-started.md) for the full walkthrough with
+action definitions.
+
+## Quick Start: Orchestrator
+
+Give an LLM tools and let it decide what to call:
+
+```elixir
+defmodule AddAction do
+  use Jido.Action,
+    name: "add",
+    description: "Add two numbers",
+    schema: [value: [type: :float, required: true], amount: [type: :float, required: true]]
+
+  @impl true
+  def run(%{value: v, amount: a}, _ctx), do: {:ok, %{result: v + a}}
+end
+
+defmodule MathAssistant do
+  use Jido.Composer.Orchestrator,
+    name: "math_assistant",
+    model: "anthropic:claude-sonnet-4-20250514",
+    nodes: [AddAction],
+    system_prompt: "You are a math assistant. Use the available tools."
+end
+
+agent = MathAssistant.new()
+{:ok, _agent, answer} = MathAssistant.query_sync(agent, "What is 5 + 3?")
+```
+
+## Quick Start: Dynamic Skills
+
+Package capabilities as data and assemble agents at runtime:
+
+```elixir
+alias Jido.Composer.Skill
+
+math_skill = %Skill{
+  name: "math",
+  description: "Arithmetic operations",
+  prompt_fragment: "Use add and multiply tools for calculations.",
+  tools: [AddAction, MultiplyAction]
+}
+
+data_skill = %Skill{
+  name: "data",
+  description: "Price lookups",
+  prompt_fragment: "Use lookup to find item prices.",
+  tools: [LookupAction]
+}
+
+# Assemble an agent from skills — no module definition needed
+{:ok, agent} = Skill.assemble([math_skill, data_skill],
+  base_prompt: "You are a helpful assistant.",
+  model: "anthropic:claude-sonnet-4-20250514"
+)
+
+{:ok, _agent, answer} = Jido.Composer.Skill.BaseOrchestrator.query_sync(
+  agent, "What is the price of a widget times 3?"
+)
+```
+
+For parent-delegated skill selection, use **DynamicAgentNode** — the parent LLM
+picks which skills to equip a sub-agent with per query:
+
+```elixir
+alias Jido.Composer.Node.DynamicAgentNode
+
+dynamic_node = %DynamicAgentNode{
+  name: "delegate_task",
+  description: "Delegate to a sub-agent with selected skills",
+  skill_registry: [math_skill, data_skill],
+  assembly_opts: [
+    base_prompt: "Complete the task using your tools.",
+    model: "anthropic:claude-sonnet-4-20250514"
+  ]
+}
+
+agent = MyCoordinator.new()
+agent = MyCoordinator.configure(agent, nodes: [dynamic_node])
+{:ok, _agent, answer} = MyCoordinator.query_sync(agent, "Look up the widget price and double it.")
+```
+
+## Composer vs Jido AI
+
+Both libraries are part of the [Jido](https://github.com/agentjido/jido)
+ecosystem and share the same action, signal, and LLM foundations. They solve
+different problems:
+
+- **Composer** — Composable flows: deterministic pipelines, parallel branches,
+  human approval gates, checkpoint/resume. You define the structure; the FSM
+  enforces it.
+- **[Jido AI](https://github.com/agentjido/jido_ai)** — AI reasoning runtime: 8
+  strategy families (ReAct, CoT, ToT, ...), request handles, plugins, skills.
+
+They work together — wrap a Jido AI agent as a node inside a Composer workflow
+to get structured flow control around open-ended reasoning. See the
+[full comparison](guides/composer-vs-jido-ai.md).
+
+## Documentation
+
+- [Composition & Nesting](guides/composition.md) — Nesting patterns, context
+  flow, control spectrum
+- [Human-in-the-Loop](guides/hitl.md) — HumanNode, approval gates, suspension,
+  persistence
+- [Getting Started](guides/getting-started.md) — First workflow in 5 minutes
+- [Workflows Guide](guides/workflows.md) — All DSL options, fan-out, MapNode
+  (traverse), custom outcomes
+- [Orchestrators Guide](guides/orchestrators.md) — LLM config, tool approval,
+  streaming
+- [Observability](guides/observability.md) — OTel spans, tracer setup, span
+  hierarchy
+- [Testing](guides/testing.md) — ReqCassette, LLMStub, test layers
+- [Composer vs Jido AI](guides/composer-vs-jido-ai.md) — When to use which, how
+  they combine
+- Interactive demos in `livebooks/` (ETL, branching, HITL, orchestrators,
+  multi-agent pipelines, observability, Jido AI bridge, dynamic skills)
+
+## License
+
+MIT
+
+---
+
+# Jido.Composer.ApprovalGate
+
+Source: https://jido-composer.hexdocs.pm/Jido.Composer.ApprovalGate.md
+
+# `Jido.Composer.ApprovalGate`
+[🔗](https://github.com/lostbean/jido_composer/blob/main/lib/jido/composer/approval_gate.ex#L1)
+
+Typed sub-state for tracking approval gates in the Orchestrator.
+
+Replaces flat `gated_node_names`, `approval_policy`, `rejection_policy`,
+and `gated_calls` fields in Orchestrator Strategy.
+
+# `t`
+
+```elixir
+@type t() :: %Jido.Composer.ApprovalGate{
+  approval_policy: (map(), map() -&gt; :require_approval | term()) | nil,
+  gated_calls: %{
+    required(String.t()) =&gt; %{
+      request: Jido.Composer.HITL.ApprovalRequest.t(),
+      call: map()
+    }
+  },
+  gated_node_names: MapSet.t(),
+  rejection_policy: :abort_iteration | :cancel_siblings | :continue_siblings
+}
+```
+
+# `gate_calls`
+
+```elixir
+@spec gate_calls(t(), map()) :: t()
+```
+
+Stores gated call entries in the gate state.
+
+# `get`
+
+```elixir
+@spec get(t(), String.t()) :: map() | nil
+```
+
+Retrieves a gated call entry by request_id.
+
+# `has_pending?`
+
+```elixir
+@spec has_pending?(t()) :: boolean()
+```
+
+Returns true when there are pending gated calls.
+
+# `new`
+
+```elixir
+@spec new(keyword()) :: t()
+```
+
+Creates a new ApprovalGate from options.
+
+# `partition_calls`
+
+```elixir
+@spec partition_calls(t(), [map()], Jido.Composer.Context.t()) ::
+  {:ok, [map()], %{required(String.t()) =&gt; map()}} | {:error, term()}
+```
+
+Partitions tool calls into ungated (ready to dispatch) and gated (need approval).
+
+Returns `{ungated_calls, gated_entries_map}` where gated_entries_map is
+`%{request_id => %{request: ApprovalRequest, call: call}}`.
+
+# `remove`
+
+```elixir
+@spec remove(t(), String.t()) :: t()
+```
+
+Removes a gated call by request_id. Returns updated gate.
+
+# `requires_approval?`
+
+```elixir
+@spec requires_approval?(t(), map(), Jido.Composer.Context.t()) :: boolean()
+```
+
+Checks whether a tool call requires approval based on static gating
+and the dynamic approval policy.
+
+---
+
+*Consult [api-reference.md](api-reference.md) for complete listing*
+
+---
+
+# Jido.Composer.Children
+
+Source: https://jido-composer.hexdocs.pm/Jido.Composer.Children.md
+
+# `Jido.Composer.Children`
+[🔗](https://github.com/lostbean/jido_composer/blob/main/lib/jido/composer/children.ex#L1)
+
+Typed sub-state for tracking child agent references and their lifecycle phases.
+
+Replaces the flat `children: %{}` + `child_phases: %{}` maps that were
+previously stored directly in both Workflow and Orchestrator strategy state.
+
+# `t`
+
+```elixir
+@type t() :: %Jido.Composer.Children{
+  phases: %{required(term()) =&gt; :spawning | :awaiting_result},
+  refs: %{required(term()) =&gt; Jido.Composer.ChildRef.t()}
+}
+```
+
+# `get_ref`
+
+```elixir
+@spec get_ref(t(), term()) :: Jido.Composer.ChildRef.t() | nil
+```
+
+Get the ChildRef for a given tag.
+
+# `merge_phases`
+
+```elixir
+@spec merge_phases(t(), %{required(term()) =&gt; :spawning | :awaiting_result}) :: t()
+```
+
+Merge multiple phase entries at once.
+
+# `new`
+
+```elixir
+@spec new() :: t()
+```
+
+# `paused_refs`
+
+```elixir
+@spec paused_refs(t()) :: [{term(), Jido.Composer.ChildRef.t()}]
+```
+
+Returns all ChildRefs with status :paused.
+
+# `record_exit`
+
+```elixir
+@spec record_exit(t(), term(), term()) :: t()
+```
+
+Record that a child process exited.
+
+# `record_hibernation`
+
+```elixir
+@spec record_hibernation(t(), term(), term(), String.t() | nil) :: t()
+```
+
+Record that a child has hibernated (checkpoint).
+
+# `record_result`
+
+```elixir
+@spec record_result(t(), term()) :: t()
+```
+
+Record that a child produced a result (child_result signal).
+
+# `register_started`
+
+```elixir
+@spec register_started(t(), term(), keyword()) :: t()
+```
+
+Register a child that has started (child_started signal).
+
+# `set_phase`
+
+```elixir
+@spec set_phase(t(), term(), :spawning | :awaiting_result) :: t()
+```
+
+Set the phase for a child tag.
+
+# `spawning_tags`
+
+```elixir
+@spec spawning_tags(t()) :: [term()]
+```
+
+Returns tags of children in :spawning phase.
+
+---
+
+*Consult [api-reference.md](api-reference.md) for complete listing*
+
+---
+
+# Jido.Composer.FanOut.State
+
+Source: https://jido-composer.hexdocs.pm/Jido.Composer.FanOut.State.md
+
+# `Jido.Composer.FanOut.State`
+[🔗](https://github.com/lostbean/jido_composer/blob/main/lib/jido/composer/fan_out/state.ex#L1)
+
+Typed sub-state for tracking FanOut branch execution.
+
+Replaces the bare map `pending_fan_out` in Workflow Strategy.
+Encapsulates branch completion, suspension, queueing, and merge logic.
+
+# `t`
+
+```elixir
+@type t() :: %Jido.Composer.FanOut.State{
+  completed_results: %{required(atom()) =&gt; term()},
+  id: String.t(),
+  merge: atom(),
+  node: struct(),
+  on_error: :fail_fast | :collect_partial,
+  pending_branches: MapSet.t(),
+  queued_branches: [{atom(), term()}],
+  suspended_branches: %{
+    required(atom()) =&gt; %{
+      suspension: Jido.Composer.Suspension.t(),
+      partial_result: term()
+    }
+  },
+  total_branches: non_neg_integer() | nil
+}
+```
+
+# `branch_completed`
+
+```elixir
+@spec branch_completed(t(), atom(), term()) :: t()
+```
+
+Record a successful branch completion.
+
+# `branch_error`
+
+```elixir
+@spec branch_error(t(), atom(), term()) :: t()
+```
+
+Record a branch error (for :collect_partial mode).
+
+# `branch_suspended`
+
+```elixir
+@spec branch_suspended(t(), atom(), Jido.Composer.Suspension.t(), term()) :: t()
+```
+
+Record a branch suspension.
+
+# `completion_status`
+
+```elixir
+@spec completion_status(t()) :: :all_done | :suspended | :in_progress
+```
+
+Returns the completion status of the fan-out.
+
+# `do_merge`
+
+```elixir
+@spec do_merge(
+  %{required(atom()) =&gt; term()} | [{atom(), term()}],
+  atom() | function()
+) :: map()
+```
+
+Merges branch results using the specified merge strategy.
+
+Accepts either a map (from strategy tracking) or a keyword list
+(from inline `FanOutNode.run/3`).
+
+# `drain_queue`
+
+```elixir
+@spec drain_queue(t()) :: {t(), [{atom(), term()}]}
+```
+
+Drain queued branches into available slots.
+Returns `{updated_state, to_dispatch}` where `to_dispatch` is a list of
+`{branch_name, directive}` tuples.
+
+# `find_suspended_branch`
+
+```elixir
+@spec find_suspended_branch(t(), String.t()) :: {atom(), map()} | nil
+```
+
+Find a suspended branch by suspension_id.
+
+# `has_suspended_branch?`
+
+```elixir
+@spec has_suspended_branch?(t(), String.t()) :: boolean()
+```
+
+Check if a suspended branch matches the given suspension_id.
+
+# `merge_results`
+
+```elixir
+@spec merge_results(t()) :: map()
+```
+
+Merge completed results using the configured merge strategy.
+
+# `new`
+
+```elixir
+@spec new(String.t(), struct(), MapSet.t(), [{atom(), term()}], keyword()) :: t()
+```
+
+Creates a new FanOut.State from dispatched and queued branches.
+
+# `resume_branch`
+
+```elixir
+@spec resume_branch(t(), atom()) :: t()
+```
+
+Resume a suspended branch by removing it from suspended_branches.
+
+---
+
+*Consult [api-reference.md](api-reference.md) for complete listing*
+
+---
+
+# Jido.Composer.OtelCtx
+
+Source: https://jido-composer.hexdocs.pm/Jido.Composer.OtelCtx.md
+
+# `Jido.Composer.OtelCtx`
+[🔗](https://github.com/lostbean/jido_composer/blob/main/lib/jido/composer/otel_ctx.ex#L1)
+
+Centralized OpenTelemetry context management for jido_composer.
+
+Wraps OTel process-dictionary context save/attach/restore into safe
+higher-order functions with guaranteed cleanup via try/after.
+
+All calls use `apply/3` to avoid compile-time warnings when
+OpenTelemetry is an optional (test-only) dependency.
+
+# `attach`
+
+```elixir
+@spec attach(term() | nil) :: :ok
+```
+
+Attaches the given OTel context. No-op if nil or OpenTelemetry is not loaded.
+
+# `get_current`
+
+```elixir
+@spec get_current() :: term() | nil
+```
+
+Returns the current OTel context, or nil if OpenTelemetry is not loaded.
+
+# `with_parent_context`
+
+```elixir
+@spec with_parent_context(term() | nil, (-&gt; result)) :: result when result: var
+```
+
+Executes `fun` with the given OTel context attached, then restores the
+previous context. If `ctx` is nil or OpenTelemetry is not loaded, just
+calls `fun` directly.
+
+---
+
+*Consult [api-reference.md](api-reference.md) for complete listing*
+
+---
+
+# Jido.Composer.Skill
+
+Source: https://jido-composer.hexdocs.pm/Jido.Composer.Skill.md
+
+# `Jido.Composer.Skill`
+[🔗](https://github.com/lostbean/jido_composer/blob/main/lib/jido/composer/skill.ex#L1)
+
+Reusable capability bundle for runtime agent assembly.
+
+A Skill is pure data: a name, description, prompt fragment, and list of tool
+modules. Skills are composed at runtime via `assemble/2` to create dynamically
+configured Orchestrator agents.
+
+## Example
+
+    math_skill = %Skill{
+      name: "math",
+      description: "Arithmetic operations",
+      prompt_fragment: "Use add and multiply tools for calculations.",
+      tools: [AddAction, MultiplyAction]
+    }
+
+    {:ok, agent} = Skill.assemble([math_skill],
+      base_prompt: "You are a calculator.",
+      model: "anthropic:claude-sonnet-4-20250514"
+    )
+
+# `t`
+
+```elixir
+@type t() :: %Jido.Composer.Skill{
+  description: String.t(),
+  name: String.t(),
+  prompt_fragment: String.t(),
+  tools: [module()]
+}
+```
+
+# `assemble`
+
+```elixir
+@spec assemble(
+  [t()],
+  keyword()
+) :: {:ok, Jido.Agent.t()} | {:error, term()}
+```
+
+Assembles a list of skills into a configured Orchestrator agent.
+
+Composes prompt fragments, deduplicates tools, and returns an agent ready
+for `query_sync/3`.
+
+## Options
+
+  * `:base_prompt` — role instructions prepended to skill fragments
+  * `:model` — LLM model identifier (e.g. `"anthropic:claude-sonnet-4-20250514"`)
+  * `:max_iterations` — ReAct loop limit (passed to configure)
+  * `:temperature` — LLM temperature (passed to configure)
+  * `:max_tokens` — max tokens (passed to configure)
+  * `:req_options` — HTTP options (passed to configure)
+
+---
+
+*Consult [api-reference.md](api-reference.md) for complete listing*
+
+---
+
+# Jido.Composer.ToolConcurrency
+
+Source: https://jido-composer.hexdocs.pm/Jido.Composer.ToolConcurrency.md
+
+# `Jido.Composer.ToolConcurrency`
+[🔗](https://github.com/lostbean/jido_composer/blob/main/lib/jido/composer/tool_concurrency.ex#L1)
+
+Typed sub-state for tracking tool call concurrency in the Orchestrator.
+
+Replaces flat `pending_tool_calls`, `completed_tool_results`,
+`queued_tool_calls`, and `max_tool_concurrency` fields in Orchestrator Strategy.
+
+# `t`
+
+```elixir
+@type t() :: %Jido.Composer.ToolConcurrency{
+  completed: [map()],
+  max_concurrency: non_neg_integer() | nil,
+  max_queue_depth: non_neg_integer() | nil,
+  pending: [String.t()],
+  queued: [map()]
+}
+```
+
+# `add_pending`
+
+```elixir
+@spec add_pending(t(), String.t()) :: t()
+```
+
+Adds a call ID to pending (e.g., when an approved call is dispatched).
+
+# `all_clear?`
+
+```elixir
+@spec all_clear?(t()) :: boolean()
+```
+
+Returns true when no tool calls are pending or queued.
+
+# `at_capacity?`
+
+```elixir
+@spec at_capacity?(t()) :: boolean()
+```
+
+Returns true if at max concurrency capacity.
+
+# `dispatch`
+
+```elixir
+@spec dispatch(t(), [String.t()], [map()]) :: t()
+```
+
+Records dispatched call IDs and queued calls, resetting completed results.
+
+# `drain_queue`
+
+```elixir
+@spec drain_queue(t()) :: {t(), [map()]}
+```
+
+Drains queued calls into available concurrency slots.
+
+Returns `{updated_state, to_dispatch}` where `to_dispatch` is a list of
+call maps ready to be dispatched.
+
+# `enqueue`
+
+```elixir
+@spec enqueue(t(), map()) :: {:ok, t()} | {:error, :queue_full}
+```
+
+Adds a call to the queue (e.g., when approved but at capacity).
+
+Returns `{:ok, state}` on success, or `{:error, :queue_full}` if the queue
+has reached `max_queue_depth`.
+
+# `has_pending?`
+
+```elixir
+@spec has_pending?(t()) :: boolean()
+```
+
+Returns true when there are pending tool calls.
+
+# `new`
+
+```elixir
+@spec new(keyword()) :: t()
+```
+
+Creates a new ToolConcurrency state.
+
+# `record_result`
+
+```elixir
+@spec record_result(t(), String.t(), map()) :: t()
+```
+
+Records a completed tool result and removes its call_id from pending.
+
+# `split_for_dispatch`
+
+```elixir
+@spec split_for_dispatch(t(), [map()]) :: {[map()], [map()]}
+```
+
+Splits calls into those to dispatch immediately and those to queue,
+respecting the concurrency limit.
+
+Returns `{to_dispatch, to_queue}`.
+
+---
+
+*Consult [api-reference.md](api-reference.md) for complete listing*
+
+---
+
+# Jido.Composer.HITL.ChildRef
+
+Source: https://jido-composer.hexdocs.pm/Jido.Composer.HITL.ChildRef.md
+
+# `Jido.Composer.HITL.ChildRef`
+[🔗](https://github.com/lostbean/jido_composer/blob/main/lib/jido/composer/hitl/child_ref.ex#L1)
+
+Backward-compatible alias for `Jido.Composer.ChildRef`.
+
+ChildRef has been promoted to a top-level Composer concept since
+any suspension reason (not just HITL) requires serializable child tracking.
+This module delegates to the new location for backward compatibility.
+
+# `t`
+
+```elixir
+@type t() :: Jido.Composer.ChildRef.t()
+```
+
+# `new`
+
+---
+
+*Consult [api-reference.md](api-reference.md) for complete listing*
+
+---
+
+# Jido.Composer.Node.DynamicAgentNode
+
+Source: https://jido-composer.hexdocs.pm/Jido.Composer.Node.DynamicAgentNode.md
+
+# `Jido.Composer.Node.DynamicAgentNode`
+[🔗](https://github.com/lostbean/jido_composer/blob/main/lib/jido/composer/node/dynamic_agent_node.ex#L1)
+
+Node that assembles and executes a sub-agent from selected skills at runtime.
+
+DynamicAgentNode wraps `Skill.assemble/2` and `query_sync/3` behind the Node
+interface. When used as a tool in an Orchestrator, the parent LLM selects
+skills by name and provides a task description. The node looks up the skills,
+assembles a configured Orchestrator, runs it, and returns the result.
+
+## Fields
+
+  * `name` — node identifier (becomes tool name in orchestrator)
+  * `description` — what this delegation node does
+  * `skill_registry` — list of available `Skill` structs
+  * `assembly_opts` — options passed to `Skill.assemble/2`
+
+# `t`
+
+```elixir
+@type t() :: %Jido.Composer.Node.DynamicAgentNode{
+  assembly_opts: keyword(),
+  description: String.t(),
+  name: String.t(),
+  skill_registry: [Jido.Composer.Skill.t()]
+}
+```
+
+---
+
+*Consult [api-reference.md](api-reference.md) for complete listing*
+
+---
+
+# Jido.Composer.Node.MapNode
+
+Source: https://jido-composer.hexdocs.pm/Jido.Composer.Node.MapNode.md
+
+# `Jido.Composer.Node.MapNode`
+[🔗](https://github.com/lostbean/jido_composer/blob/main/lib/jido/composer/node/map_node.ex#L1)
+
+Applies the same node to each element of a runtime-determined list.
+
+MapNode implements the **traverse** composition constructor — it takes a
+collection from context (resolved via the `over` path) and runs a single
+node against every element. Results are collected as an ordered list
+under `%{results: [...]}`.
+
+Unlike `FanOutNode` (which runs N different branches known at definition
+time), MapNode runs one node N times over a collection discovered at
+runtime.
+
+## Options
+
+- `:name` — state name (required)
+- `:over` — context key or path to the list (`atom()` or `[atom()]`)
+- `:node` — any Node struct, or a bare `Jido.Action` module (auto-wrapped)
+- `:max_concurrency` — limit parallel tasks (default: list length)
+- `:timeout` — per-element timeout in ms (default: 30_000)
+- `:on_error` — `:fail_fast` (default) or `:collect_partial`
+
+## Example
+
+    {:ok, map_node} = MapNode.new(
+      name: :process,
+      over: [:extract, :items],
+      node: DoubleValueAction
+    )
+
+    # Use in a workflow:
+    nodes: %{
+      extract: ExtractAction,
+      process: map_node,
+      aggregate: AggregateAction
+    }
+
+    # After execution:
+    # ctx[:process][:results] => [%{value: 2}, %{value: 4}, %{value: 6}]
+
+## Input Preparation
+
+Each element from the collection is prepared as action params:
+
+- **Map elements** are merged directly into the flattened context
+  (`Map.merge(flat_context, element)`), so the action receives both the
+  element's keys and the upstream context.
+- **Non-map elements** (integers, strings, etc.) are wrapped as
+  `%{item: element}` and merged into the context.
+
+## Edge Cases
+
+- **Empty list**: produces `%{results: []}` and completes with `:ok`.
+- **Missing key**: if the `over` path doesn't resolve to a list (key is
+  missing, value is `nil`, or value is not a list), it's treated as an
+  empty list.
+- **Nested path**: `over: [:step_a, :sub_key, :items]` uses `get_in/2`
+  to traverse arbitrarily deep context structures.
+
+# `t`
+
+```elixir
+@type t() :: %Jido.Composer.Node.MapNode{
+  max_concurrency: pos_integer() | nil,
+  merge: :ordered_list,
+  name: atom(),
+  node: struct(),
+  on_error: :fail_fast | :collect_partial,
+  over: atom() | [atom()],
+  timeout: pos_integer()
+}
+```
+
+# `new`
+
+```elixir
+@spec new(keyword()) :: {:ok, t()} | {:error, term()}
+```
+
+---
+
+*Consult [api-reference.md](api-reference.md) for complete listing*
+
+---
+
+# Jido.Composer.Orchestrator.Obs
+
+Source: https://jido-composer.hexdocs.pm/Jido.Composer.Orchestrator.Obs.md
+
+# `Jido.Composer.Orchestrator.Obs`
+[🔗](https://github.com/lostbean/jido_composer/blob/main/lib/jido/composer/orchestrator/obs.ex#L1)
+
+Observability state and span lifecycle for orchestrator strategies.
+
+Encapsulates all OTel span management, token accumulation, and LLM
+message normalization that was previously scattered across Strategy.
+Strategy stores a single `_obs: %Obs{} | nil` field instead of five
+separate `_obs_*` fields.
+
+# `t`
+
+```elixir
+@type t() :: %Jido.Composer.Orchestrator.Obs{
+  agent_span: term() | nil,
+  cumulative_tokens: %{
+    prompt: non_neg_integer(),
+    completion: non_neg_integer(),
+    total: non_neg_integer()
+  },
+  iteration_span: term() | nil,
+  llm_span: term() | nil,
+  tool_spans: %{optional(String.t()) =&gt; term()}
+}
+```
+
+# `accumulate_tokens`
+
+```elixir
+@spec accumulate_tokens(t(), map()) :: t()
+```
+
+# `agent_name`
+
+```elixir
+@spec agent_name(map()) :: String.t()
+```
+
+Extracts the agent name for obs span metadata.
+
+# `build_llm_measurements`
+
+```elixir
+@spec build_llm_measurements(map()) :: map()
+```
+
+Builds observability measurements from an LLM result instruction params.
+Extracts token usage, finish reason, and output messages from the ReqLLM
+response structures.
+
+# `extract_input_messages`
+
+```elixir
+@spec extract_input_messages(term()) :: [map()] | nil
+```
+
+Extracts input messages from a ReqLLM conversation context, normalizing
+them into plain maps suitable for OTel span attributes.
+
+# `finish_agent_span`
+
+```elixir
+@spec finish_agent_span(t(), map(), map()) :: t()
+```
+
+# `finish_iteration_span`
+
+```elixir
+@spec finish_iteration_span(t(), map()) :: t()
+```
+
+# `finish_llm_span`
+
+```elixir
+@spec finish_llm_span(t(), map()) :: t()
+```
+
+# `finish_tool_span`
+
+```elixir
+@spec finish_tool_span(t(), String.t(), map()) :: t()
+```
+
+# `new`
+
+```elixir
+@spec new() :: t()
+```
+
+Returns a fresh Obs struct.
+
+# `start_agent_span`
+
+```elixir
+@spec start_agent_span(t(), map()) :: t()
+```
+
+# `start_iteration_span`
+
+```elixir
+@spec start_iteration_span(t(), map()) :: t()
+```
+
+# `start_llm_span`
+
+```elixir
+@spec start_llm_span(t(), map()) :: t()
+```
+
+# `start_tool_span`
+
+```elixir
+@spec start_tool_span(t(), map()) :: t()
+```
+
+# `summarize_conversation`
+
+```elixir
+@spec summarize_conversation(map()) :: String.t()
+```
+
+Summarizes the conversation state for span metadata.
+
+---
+
+*Consult [api-reference.md](api-reference.md) for complete listing*
+
+---
+
+# Jido.Composer.Orchestrator.StatusComputer
+
+Source: https://jido-composer.hexdocs.pm/Jido.Composer.Orchestrator.StatusComputer.md
+
+# `Jido.Composer.Orchestrator.StatusComputer`
+[🔗](https://github.com/lostbean/jido_composer/blob/main/lib/jido/composer/orchestrator/status_computer.ex#L1)
+
+Computes orchestrator status from sub-state modules.
+
+Replaces scattered status `cond` blocks in the Orchestrator Strategy.
+
+# `status`
+
+```elixir
+@type status() ::
+  :awaiting_llm
+  | :awaiting_tools
+  | :awaiting_approval
+  | :awaiting_suspension
+  | :awaiting_tools_and_approval
+  | :awaiting_tools_and_suspension
+```
+
+# `compute`
+
+```elixir
+@spec compute(
+  Jido.Composer.ToolConcurrency.t(),
+  Jido.Composer.ApprovalGate.t(),
+  map()
+) :: status()
+```
+
+Computes the orchestrator status based on tool concurrency, approval gate,
+and suspended calls state.
+
+Returns `:awaiting_llm` when all sub-systems are clear, otherwise returns
+a status reflecting what the orchestrator is waiting on.
+
+---
+
+*Consult [api-reference.md](api-reference.md) for complete listing*
+
+---
+
+# Jido.Composer.Workflow.Obs
+
+Source: https://jido-composer.hexdocs.pm/Jido.Composer.Workflow.Obs.md
+
+# `Jido.Composer.Workflow.Obs`
+[🔗](https://github.com/lostbean/jido_composer/blob/main/lib/jido/composer/workflow/obs.ex#L1)
+
+Observability state and span lifecycle for workflow strategies.
+
+Encapsulates agent and node (tool) span management. Strategy stores a
+single `_obs: %Obs{} | nil` field instead of separate `_obs_*` fields.
+
+# `t`
+
+```elixir
+@type t() :: %Jido.Composer.Workflow.Obs{
+  agent_span: term() | nil,
+  node_span: term() | nil
+}
+```
+
+# `agent_name`
+
+```elixir
+@spec agent_name(map()) :: String.t()
+```
+
+Extracts the agent name for obs span metadata.
+
+# `finish_agent_span`
+
+```elixir
+@spec finish_agent_span(t(), map(), map()) :: t()
+```
+
+# `finish_node_span`
+
+```elixir
+@spec finish_node_span(t(), map()) :: t()
+```
+
+# `new`
+
+```elixir
+@spec new() :: t()
+```
+
+Returns a fresh Obs struct.
+
+# `start_agent_span`
+
+```elixir
+@spec start_agent_span(t(), map()) :: t()
+```
+
+# `start_node_span`
+
+```elixir
+@spec start_node_span(t(), map()) :: t()
+```
+
+---
+
+*Consult [api-reference.md](api-reference.md) for complete listing*
+
+---
