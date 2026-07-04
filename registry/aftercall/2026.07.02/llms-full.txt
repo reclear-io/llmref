@@ -1,0 +1,1357 @@
+# aftercall
+
+Source: https://github.com/jchu96/aftercall/blob/main/README.md
+
+# aftercall
+
+> Search and ask questions about your meetings using AI.
+>
+> After a video call, aftercall automatically saves the summary, the full transcript, and any action items. Then you can ask Claude things like _"What did I agree to do for Sarah?"_ or _"What meetings mentioned the budget?"_ — and get real answers back.
+>
+> Every to-do from your calls drops into a Notion checklist so nothing falls through the cracks.
+>
+> **Ongoing cost:** ~$5/mo for hosting + a fraction of a cent per call for AI processing. Needs a Bluedot account (free trial) to record your calls.
+
+```
+ Bluedot call ──▶ Worker ──▶ D1 + Vectorize + Notion ──▶ Claude.ai (MCP)
+   webhook       extract       indexed storage          you ask questions
+```
+
+```mermaid
+flowchart LR
+    B[Bluedot]
+    W{{Cloudflare Worker}}
+    D[(D1)]
+    V[(Vectorize)]
+    N[Notion Followups]
+    C{{Claude.ai}}
+    U((You))
+
+    B -->|webhook| W
+    W -->|upsert| D
+    W -->|embed + upsert| V
+    W -->|create rows| N
+
+    U -->|"what did I promise Pierce?"| C
+    C -->|MCP tools/call| W
+    W -->|read| D
+    W -->|semantic search| V
+    W -->|filter rows| N
+    W -->|answer| C
+    C -->|response| U
+```
+
+## What you get
+
+Every Bluedot recording becomes:
+
+1. **A D1 row** — `transcripts` table, idempotent on `video_id`, holding raw text + structured summary + participants + action items.
+2. **Embedded chunks** in Cloudflare Vectorize (1536d, cosine) for semantic search.
+3. **A Notion Transcripts row** — metadata hub (Date, Participants, Recording URL, link to Bluedot's native summary page). No duplicated summary content — Bluedot's own Notion sync owns that.
+4. **One Followup row per action item** in a Notion inbox — `Status = Inbox`, linked via a `Meeting` relation back to the Transcripts row, ready to triage.
+5. **MCP access from Claude.ai** — six tools for semantic search, per-call Q&A (RAG), detail lookup, followups, and owner-scoped action items.
+
+Then you ask Claude.ai things like:
+
+- _"What did I commit to do for Pierce in the last week?"_
+- _"In my IT hiring call, what starting compensation did we agree on?"_
+- _"Find every action item assigned to Andy since March."_
+- _"Summarize my open Bluedot followups."_
+- _"What calls mention IronRidge?"_
+
+## Setup (10 minutes)
+
+### Prerequisites
+
+| Service | Tier | Purpose |
+|---------|------|---------|
+| [Cloudflare](https://dash.cloudflare.com) | Workers free + Vectorize paid (~$5/mo) | Hosting + D1 + Vectorize + KV |
+| [OpenAI](https://platform.openai.com) | Pay-as-you-go (~$0.001/call) | Extraction (`gpt-5-mini`) + embeddings (`text-embedding-3-small`) |
+| [Notion](https://notion.so) + [integration](https://www.notion.so/profile/integrations) | Free | Transcript pages + Followups inbox |
+| [Bluedot](https://bluedothq.com) | Trial | Source of meeting recordings |
+| [GitHub OAuth App](https://github.com/settings/developers) | Free | MCP auth (optional — only if connecting Claude.ai) |
+| [Claude.ai](https://claude.ai) | Free/paid | MCP client (optional) |
+
+### Run the setup script
+
+```bash
+git clone https://github.com/jchu96/aftercall.git
+cd aftercall
+npm install
+npx wrangler login
+npm run setup
+```
+
+The script walks 10 interactive steps:
+
+1. Verify `wrangler` auth
+2. Provision D1 database (idempotent — reuses existing)
+3. Provision Vectorize index
+4. Write bindings to `wrangler.toml` + apply D1 migrations
+5. Create (or reuse) Notion Followups + Call Transcripts databases
+6. Validate OpenAI API key
+7. Write `.dev.vars` + update `wrangler.toml` vars
+8. Register GitHub OAuth App (opens browser, auto-detects your worker URL) + configure MCP KV + allowlist
+9. Push every secret to Cloudflare (no manual `wrangler secret put` dance)
+10. `wrangler deploy`
+
+Re-runs are safe — the script detects existing values and offers to reuse them instead of recreating.
+
+### Set the Bluedot webhook
+
+After deploy, the script prints your worker URL. In Bluedot:
+
+- **Settings → Webhooks → Add endpoint**
+- URL: `https://<your-worker>.workers.dev/`
+- Events: `meeting.transcript.created`, `meeting.summary.created`
+
+Bluedot shows a signing secret. Save it:
+
+```bash
+npx wrangler secret put BLUEDOT_WEBHOOK_SECRET
+```
+
+### Connect Claude.ai (optional, MCP)
+
+- Claude.ai → **Settings → Connectors** → add a custom MCP server
+- URL: `https://<your-worker>.workers.dev/mcp`
+- Sign in with GitHub; the Worker checks your username against `ALLOWED_USERS` and hands Claude a bearer token
+
+Done. Ask Claude about your calls.
+
+Full OAuth + Bluedot + debug walkthrough: [`docs/auth.md`](./docs/auth.md).
+
+## MCP tools reference
+
+| Tool | What it does |
+|------|---|
+| [`search_calls(query, limit?)`](./docs/tools.md#search_calls) | Semantic search **by topic** over all transcripts via OpenAI embeddings + Vectorize |
+| [`find_call(query, limit?)`](./docs/tools.md#find_call) | Locate a **specific** call by identifier — Meet/Zoom URL, meeting code, hex id, title, or participant (lexical, no embeddings) |
+| [`get_call(video_id)`](./docs/tools.md#get_call) | Full details of one call: summary, participants, action items (normalizes + fuzzy-resolves the id) |
+| [`answer_from_transcript(video_id, question)`](./docs/tools.md#answer_from_transcript) | RAG over a single call — drill-down Q&A grounded in that meeting's transcript |
+| [`list_followups(status?, source?, limit?)`](./docs/tools.md#list_followups) | Query the Notion Followups DB with select filters |
+| [`find_action_items_for(person, since?)`](./docs/tools.md#find_action_items_for) | All action items assigned to a person (substring match on owner) |
+| [`recent_calls(days?)`](./docs/tools.md#recent_calls) | Last N days of calls, newest first |
+
+> **Identifier vs. topic:** `search_calls` is for *what was discussed* (semantic). `find_call` is for *which specific meeting* (a pasted URL, code, title, or name). `video_id` is stored verbatim as Bluedot sends it (URL / schemeless path / hex), so an indexed `meeting_code` column — derived via `resolveMeetingCode()` at ingest — lets any form resolve the same call. Re-derive existing rows with `npx tsx scripts/reindex-vectorize.ts` (also re-embeds with the speaker-aware chunker).
+
+Sample prompts per tool: [`docs/tools.md`](./docs/tools.md).
+
+## Architecture
+
+Three flows compose the system. Each has its own diagram and runbook:
+
+- **Ingestion** — Bluedot webhook → OpenAI extraction + embeddings → D1 + Vectorize + Notion ([diagram](./docs/architecture.md#1-ingestion-pipeline))
+- **OAuth** — Claude.ai → Worker `/authorize` → GitHub → Worker `/auth/github/callback` → Claude.ai ([diagram](./docs/architecture.md#2-oauth-flow-claudeai-↔-github))
+- **Query** — Claude.ai → bearer-protected `/mcp` → tool dispatch → storage → response ([diagram](./docs/architecture.md#3-mcp-query-path))
+
+Deep-dive: [`docs/architecture.md`](./docs/architecture.md).
+
+## Stack
+
+| Layer | Tech |
+|-------|------|
+| Webhook + MCP | Cloudflare Workers + Hono |
+| Transcript store | Cloudflare D1 (SQLite, Drizzle schema) |
+| Embeddings | Cloudflare Vectorize (1536d, cosine, HNSW) |
+| LLM | OpenAI — `gpt-5-mini` (extraction, json_schema) + `text-embedding-3-small` |
+| Output | Notion API (direct `fetch` — **not** `@notionhq/client`) |
+| MCP transport | `@modelcontextprotocol/sdk` Streamable HTTP, stateless mode |
+| MCP auth | `@cloudflare/workers-oauth-provider` + GitHub OAuth |
+
+**Not in the stack:** Anthropic, Neon, Postgres, Redis, SendGrid, Express. One LLM provider, one Notion integration, one GitHub OAuth App.
+
+## Testing
+
+```bash
+npx vitest run       # 110 tests, real D1 via miniflare
+npx vitest           # watch mode
+npx tsc --noEmit     # typecheck
+```
+
+Tests cover Svix verification, payload normalization, OpenAI extraction (mocked), embeddings chunking, D1 idempotency with a **concurrent-retry race test**, Vectorize upsert, Notion page builders, the GitHub OAuth handler + allowlist, the full OAuth provider integration (well-known metadata, `WWW-Authenticate` on 401, bearer revocation), and every MCP tool's business logic against real D1 + mocked OpenAI/Vectorize/Notion.
+
+End-to-end MCP transport (`tools/list`, `tools/call` through Streamable HTTP) is validated by live Claude.ai smoke tests — vitest-pool-workers' ESM shim can't resolve the SDK's `ajv` JSON import.
+
+## Operating
+
+| Task | Command |
+|------|---------|
+| Tail live logs | `npx wrangler tail` |
+| Deploy | `npx wrangler deploy` |
+| Inspect D1 | `npx wrangler d1 execute aftercall-db --remote --command "SELECT ..."` |
+| Query Vectorize | `npx wrangler vectorize get-by-ids aftercall-vectors --ids "1-0,1-1"` |
+| Reprocess a call | `DELETE FROM transcripts WHERE video_id = '...'` then refire Bluedot webhook |
+| List KV (OAuth) | `npx wrangler kv key list --binding OAUTH_KV` |
+| Revoke your bearer | `curl -X POST https://.../auth/revoke -H "Authorization: Bearer <token>"` |
+
+Full runbook: [`docs/architecture.md#operational-runbook`](./docs/architecture.md#operational-runbook).
+
+## Environment variables
+
+<details>
+<summary>Full reference (click to expand)</summary>
+
+Set via `wrangler.toml` `[vars]` for non-secret config and `wrangler secret put` for secrets. `.dev.vars` mirrors secrets for local `wrangler dev`.
+
+### Secrets
+
+| Variable | Required | Notes |
+|----------|----------|-------|
+| `OPENAI_API_KEY` | yes | Extraction + embeddings |
+| `NOTION_INTEGRATION_KEY` | yes | Notion integration token (`ntn_...`) |
+| `BLUEDOT_WEBHOOK_SECRET` | yes | Svix signing secret from Bluedot's webhook config |
+| `GITHUB_CLIENT_ID` | MCP only | GitHub OAuth App client id |
+| `GITHUB_CLIENT_SECRET` | MCP only | GitHub OAuth App client secret |
+| `SENTRY_DSN` | optional | Enables error tracking + pipeline tracing. Leave unset to disable Sentry entirely. |
+
+### Vars (`wrangler.toml`)
+
+| Variable | Default | Notes |
+|----------|---------|-------|
+| `OPENAI_EXTRACTION_MODEL` | `gpt-5-mini` | Override to upgrade |
+| `NOTION_TRANSCRIPTS_DATA_SOURCE_ID` | — | Set by setup script |
+| `NOTION_FOLLOWUPS_DATA_SOURCE_ID` | — | Set by setup script |
+| `BASE_URL` | — | Public worker origin; used for OAuth callback URL construction |
+| `ALLOWED_USERS` | — | Comma-separated GitHub usernames allowed via MCP |
+| `SENTRY_ENVIRONMENT` | `production` | Only read when `SENTRY_DSN` is set |
+| `SENTRY_RELEASE` | auto | Injected by `npm run deploy` when Sentry is configured |
+
+### Bindings
+
+| Binding | Type | Purpose |
+|---------|------|---------|
+| `DB` | D1 | Transcripts |
+| `VECTORIZE` | Vectorize | Chunk embeddings |
+| `OAUTH_KV` | KV | OAuth state + tokens (MCP only) |
+
+### Compatibility flags
+
+| Flag | Why |
+|------|-----|
+| `nodejs_compat` | Bluedot's Svix package needs Node APIs |
+| `global_fetch_strictly_public` | Required by `@cloudflare/workers-oauth-provider` |
+
+</details>
+
+## Repo layout
+
+<details>
+<summary>File-by-file (click to expand)</summary>
+
+```
+src/
+├── index.ts                  # Worker entry — re-exports OAuthProvider
+├── handler.ts                # ingestion pipeline orchestration
+├── env.ts                    # typed Env (D1, Vectorize, KV, secrets)
+├── webhook-verify.ts         # Svix signature verification
+├── bluedot.ts                # Bluedot payload normalization
+├── extract.ts                # OpenAI structured extraction
+├── embeddings.ts             # OpenAI embeddings + chunking
+├── d1.ts                     # transcripts table writes
+├── vectorize.ts              # Vectorize upserts
+├── notion.ts                 # Notion API (transcript pages, followups)
+├── schema.ts                 # Drizzle SQLite schema
+├── logger.ts                 # structured JSON logging
+└── mcp/
+    ├── index.ts              # OAuthProvider wiring + Hono default app
+    ├── handler.ts            # /mcp API handler (bearer required)
+    ├── tools.ts              # McpServer + Streamable HTTP transport
+    ├── auth/
+    │   ├── github.ts         # /authorize + /auth/github/callback
+    │   └── allowlist.ts      # case-insensitive username check
+    ├── resolve.ts            # exact→normalized→fuzzy transcript resolver (shared)
+    └── tools/
+        ├── search_calls.ts
+        ├── find_call.ts
+        ├── get_call.ts
+        ├── list_followups.ts
+        ├── find_action_items_for.ts
+        └── recent_calls.ts
+
+scripts/
+├── setup.ts                  # 10-step interactive provisioning
+├── smoke-vectorize.ts        # Vectorize round-trip smoke test
+└── migrate-from-neon.ts      # historical Neon → D1 migration
+
+drizzle/                      # numbered SQL migrations
+docs/
+├── architecture.md           # three flows + data model + decisions + runbook
+├── tools.md                  # MCP tool reference with sample prompts
+└── auth.md                   # GitHub OAuth setup + troubleshooting
+test/                         # vitest helpers + ProvidedEnv typing
+```
+
+</details>
+
+## Observability (optional)
+
+The Worker ships with [`@sentry/cloudflare`](https://docs.sentry.io/platforms/javascript/guides/cloudflare/) integration for error tracking + pipeline performance tracing. It's **fully optional** — leave `SENTRY_DSN` unset and the SDK is a no-op.
+
+**Enable it** (your own fork, your own Sentry project):
+
+```bash
+# 1. Add DSN as a secret
+npx wrangler secret put SENTRY_DSN
+
+# 2. (optional) enable source map uploads on deploy
+#    - export SENTRY_AUTH_TOKEN from https://sentry.io/settings/account/api/auth-tokens/
+#    - override defaults in scripts/deploy.mjs (SENTRY_ORG, SENTRY_PROJECT envs)
+SENTRY_ORG=my-org SENTRY_PROJECT=my-project SENTRY_AUTH_TOKEN=sntrys_... npm run deploy
+```
+
+What's instrumented:
+- **Pipeline spans** — `bluedot.pipeline.{transcript,summary}` wrap the webhook handlers, with child spans for `openai.extract`, `openai.embed`, `d1.upsert_*`, `vectorize.upsert`, `notion.create_transcript_page`, `notion.create_followup`.
+- **Error capture** — every pipeline catch site calls `Sentry.captureException` with `video_id` + `svix_id` tags. Notion failures are non-fatal but still reported.
+- **MCP + OAuth errors** — `withSentry` wraps the worker entrypoint so any uncaught error in the OAuth or MCP paths auto-reports.
+- **Source maps** — `npm run deploy` uploads them to Sentry automatically when `.sentryclirc` or `SENTRY_AUTH_TOKEN` is present; otherwise the step is skipped with a warning.
+
+Without Sentry configured, `npm run deploy` just runs `wrangler deploy` as before.
+
+## Documentation
+
+| Doc | Read when |
+|-----|-----------|
+| [`docs/architecture.md`](./docs/architecture.md) | Understanding the system, adding features, debugging |
+| [`docs/tools.md`](./docs/tools.md) | Using MCP tools from Claude.ai, adding a new tool |
+| [`docs/auth.md`](./docs/auth.md) | First-time OAuth setup, troubleshooting 401/403/redirect_uri errors |
+| [`CHANGELOG.md`](./CHANGELOG.md) | What changed between versions |
+| [`CLAUDE.md`](./CLAUDE.md) | Conventions + do-nots when using Claude Code in this repo |
+| [`conductor/`](./conductor/) | Product definition, tech stack, workflow, and track specs — the "why" behind the code |
+
+## Roadmap
+
+Not promises — just ideas on the shortlist. File an issue if you want to prioritize one.
+
+- **`delete_call(video_id)` MCP tool** — let Claude.ai prune unwanted calls end-to-end:
+  - Delete the D1 `transcripts` row
+  - Delete the matching Vectorize chunks (by deterministic `{id}-{chunk}` IDs)
+  - Archive the aftercall Transcripts page + every Followup row related via the `Meeting` relation (unlink before archive, or Notion will orphan the relation)
+  - Leave Bluedot's native Notion summary page alone — it's Bluedot's surface, not ours
+  - Needs a confirmation / dry-run guard before landing, since the tool is destructive and Claude can call it without a human in the loop.
+
+## License
+
+MIT — see [LICENSE](./LICENSE).
+
+---
+
+# aftercall
+
+Source: https://github.com/jchu96/aftercall/blob/main/CLAUDE.md
+
+# aftercall
+
+Cloudflare Worker that ingests Bluedot meeting transcripts → OpenAI extraction + embeddings → Cloudflare D1 + Vectorize → Notion (transcript pages + Followups task DB). Exposes an MCP server at `/mcp` with GitHub OAuth so the indexed calls are queryable from Claude.ai.
+
+## Architecture
+
+| Layer | Tech |
+|-------|------|
+| Webhook + processing | Cloudflare Workers |
+| Transcript store | Cloudflare D1 (SQLite, Drizzle schema) |
+| Embeddings | Cloudflare Vectorize (1536d, cosine) |
+| LLM | OpenAI `gpt-5-mini` (structured outputs) + `text-embedding-3-small` |
+| Output | Notion API (direct fetch — NOT `@notionhq/client`, broken in workerd) |
+| MCP server | `@modelcontextprotocol/sdk` Streamable HTTP (stateless mode) |
+| MCP auth | `@cloudflare/workers-oauth-provider` + GitHub OAuth, KV-backed |
+| Observability | `@sentry/cloudflare` (optional — no-op when `SENTRY_DSN` unset) |
+
+Single user (GitHub username allowlist via `ALLOWED_USERS` env). Friends fork to host their own.
+
+## Conventions
+
+- **TDD strict** — failing test first, minimal impl, refactor
+- **Conventional Commits** — `feat:`, `fix:`, `chore:`, `docs:`, etc.
+- **Feature branches, not straight-to-main** — every new feature, fix, or non-trivial chore goes on a branch named `feat/...`, `fix/...`, `chore/...`, or `docs/...`. PR → self-review → squash-merge to `main`. Only the rarest exception (typo fix, one-line docs) merits a direct push. Previous commits on main are grandfathered; new work follows this rule.
+- **Conductor** — project context lives in `conductor/` (product.md, tech-stack.md, workflow.md, tracks.md). New multi-phase features create a track spec before implementation. Setup state (`setup_state.json`) is gitignored; decision artifacts are committed.
+- **Idempotency** is non-negotiable — D1 has `UNIQUE(video_id)`, Vectorize uses deterministic IDs (`{transcript_id}-{chunk_index}`)
+- **D1 write FIRST** in the handler — gates Notion writes so concurrent retries dedupe before any side effects
+- **Notion failures are non-fatal** — D1 is source of truth; Notion is a derived view
+- **Pipeline failures return 500** so Svix retries
+- **MCP transport is stateless** — one transport per request, `enableJsonResponse: true`, no `Mcp-Session-Id`. No cross-request state; simpler to reason about.
+- **MCP tools are pure functions** colocated under `src/mcp/tools/` — each accepts `(args, env, deps?)` and returns a `{ content: [{ type: "text", text }] }` shape. Tests call these directly (no SDK) for fast, isolated unit tests.
+- **`src/mcp/handler.ts` dynamic-imports `./tools`** so loading the OAuth-wrapped worker in non-MCP tests doesn't pull the SDK + ajv into scope (vitest-pool-workers can't resolve ajv's internal JSON import in its ESM shim). If you add new MCP wiring, keep the dynamic-import boundary.
+- **Sentry is optional** — `src/index.ts` calls `Sentry.withSentry` with `enabled: Boolean(env.SENTRY_DSN)` so forkers without a DSN get a no-op. `scripts/deploy.mjs` checks for `.sentryclirc` / `SENTRY_AUTH_TOKEN` before invoking `sentry-cli`; otherwise it just runs `wrangler deploy`. Don't couple new code to Sentry being present — always guard with `enabled`/env checks.
+- **Pipeline tracing lives in `handler.ts`** — `Sentry.startSpan` wraps each stage (`openai.extract`, `openai.embed`, `d1.upsert_*`, `vectorize.upsert`, `notion.*`) plus a top-level `bluedot.pipeline.*` span. Every pipeline catch site calls `Sentry.captureException` with `video_id` + `svix_id` tags before returning 500. When adding new pipeline steps, wrap them in `startSpan` and mirror the capture pattern.
+- **Extraction takes `meetingDate`** — `extractFromSummary()` expects the meeting's date so the model can resolve "Friday" / "Monday" into ISO `YYYY-MM-DD` for Notion's `Due` field. Without it, all `due_date`s fall back to natural-language phrases (which still render in the title but don't populate the Date property). Always pass `normalized.createdAt` from new call sites. Ambiguous phrases ("next week", "soon") are preserved verbatim by design.
+- **Library docs via Context7 MCP** — prefer Context7 over web search / training-data recall when touching any library here. This repo is also indexed as `/jchu96/aftercall` — query it for examples of the patterns below. Optional for forkers — install at [context7.com](https://context7.com) if you want it.
+
+## Common Tasks
+
+| Task | Command |
+|------|---------|
+| Run tests | `npx vitest run` |
+| Typecheck | `npx tsc --noEmit` |
+| Local dev (Vectorize remote) | `npx wrangler dev` |
+| Deploy | `npm run deploy` (wrapper that uploads source maps to Sentry when configured) |
+| Deploy (raw) | `npx wrangler deploy` |
+| Tail logs | `npx wrangler tail` |
+| Generate D1 migration | `npx drizzle-kit generate --name <description>` |
+| Apply D1 migration | `npx wrangler d1 migrations apply aftercall-db --remote` |
+| Set a secret | `npx wrangler secret put <NAME>` |
+| Reprocess a call | `npx wrangler d1 execute aftercall-db --remote --command "DELETE FROM transcripts WHERE video_id = '...'"` then refire |
+| Rotate MCP bearer (yours) | `POST /auth/revoke` with the current bearer → revokes grant |
+| List KV entries (debug OAuth) | `npx wrangler kv key list --binding OAUTH_KV` |
+| Inspect a KV entry | `npx wrangler kv key get <key> --binding OAUTH_KV` |
+
+## Don't
+
+- ❌ Import `@notionhq/client` — fails in workerd (`Cannot read properties of undefined (reading 'call')`). Use direct `fetch`.
+- ❌ Add a Notion `Title` property — Notion's default title property is named `Name`. Use `Name`.
+- ❌ Test against mocked D1 — use `@cloudflare/vitest-pool-workers` so tests hit real SQLite via miniflare. Vectorize must still be mocked (no miniflare support yet).
+- ❌ Forget `--remote` on `wrangler d1 migrations apply` for the prod database.
+- ❌ Re-introduce Anthropic — single LLM provider (OpenAI) is intentional, simplifies deploy + setup story for forkers.
+- ❌ Skip the `global_fetch_strictly_public` compat flag — `@cloudflare/workers-oauth-provider` warns at module load and vitest-pool-workers fails without it.
+- ❌ Import `@modelcontextprotocol/sdk` at the top of any non-MCP module path — its transitive `ajv` dep breaks vitest-pool-workers' ESM shim. Keep SDK imports behind the dynamic-import boundary in `src/mcp/handler.ts`.
+- ❌ Add stateful MCP sessions without a plan — the Streamable HTTP transport's stateful mode carries server memory across requests, which doesn't compose with CF Workers' isolate-per-request model unless you persist session state in KV/DO yourself.
+- ❌ Hard-require Sentry — keep the `enabled: Boolean(env.SENTRY_DSN)` guard in `src/index.ts` and the `.sentryclirc` / `SENTRY_AUTH_TOKEN` check in `scripts/deploy.mjs`. Forkers must be able to clone + deploy without a Sentry account.
+
+## Repo Layout
+
+See [README.md](./README.md) for full structure. Quick map:
+
+```
+src/             # Worker code (handler, extract, d1, vectorize, notion, ...)
+scripts/         # setup.ts (interactive provisioning), smoke-vectorize.ts
+drizzle/         # Numbered SQL migrations
+test/            # vitest setup (D1 migrations + ProvidedEnv typing)
+```
+
+## Plan-reviewer discipline
+
+When making non-trivial changes, run a plan-reviewer pass before implementing. Track major architectural decisions in commit messages.
+
+---
+
+# Architecture
+
+Source: https://github.com/jchu96/aftercall/blob/main/docs/architecture.md
+
+# Architecture
+
+This doc is the "how does this actually work" reference. It covers:
+
+1. [System overview](#system-overview) — one diagram, big picture
+2. [Request routing](#request-routing) — which URL does what
+3. [Ingestion pipeline](#1-ingestion-pipeline) — Bluedot → storage
+4. [OAuth flow](#2-oauth-flow-claudeai--github) — Claude.ai + GitHub
+5. [MCP query path](#3-mcp-query-path) — tool calls → data
+6. [Data model](#data-model) — D1 + Vectorize + Notion + KV
+7. [Component responsibilities](#component-responsibilities) — which file owns what
+8. [Design decisions](#design-decisions) — why X, not Y
+9. [Operational runbook](#operational-runbook) — debug + revoke + refire
+
+## System overview
+
+```mermaid
+flowchart TB
+    subgraph External[External]
+        Bluedot[Bluedot<br/>Meeting recorder]
+        GitHub[GitHub<br/>OAuth IdP]
+        OpenAI[OpenAI<br/>Extraction + embeddings]
+        Notion[Notion<br/>Workspace]
+        Claude[Claude.ai<br/>MCP client]
+        User((User))
+    end
+
+    subgraph Worker[Cloudflare Worker — aftercall]
+        direction TB
+        subgraph AuthLayer[OAuthProvider wrapper]
+            WellKnown["/.well-known/*"]
+            Authorize["/authorize"]
+            GitHubCB["/auth/github/callback"]
+            Token["/token"]
+            Register["/register"]
+            Revoke["/auth/revoke"]
+        end
+        subgraph Ingest[Default handler]
+            Webhook["POST /<br/>webhook"]
+            Health["GET /<br/>health"]
+        end
+        MCP["POST /mcp<br/>bearer required"]
+    end
+
+    subgraph Storage[Cloudflare storage]
+        D1[(D1<br/>transcripts)]
+        Vec[(Vectorize<br/>chunk embeddings)]
+        KV[(KV OAUTH_KV<br/>oauth state + tokens)]
+    end
+
+    Bluedot -->|Svix webhook| Webhook
+    Webhook -->|extract| OpenAI
+    Webhook -->|embed| OpenAI
+    Webhook -->|UPSERT| D1
+    Webhook -->|upsert vectors| Vec
+    Webhook -->|create page + rows| Notion
+
+    User -->|natural-language question| Claude
+    Claude -->|discover| WellKnown
+    Claude -->|DCR| Register
+    Claude -->|OAuth| Authorize
+    Authorize -->|302| GitHub
+    GitHub -->|code| GitHubCB
+    GitHubCB -->|allowlist check| KV
+    GitHubCB -->|mint token| Token
+    Token -->|bearer| Claude
+
+    Claude -->|tools/list, tools/call| MCP
+    MCP -->|query| D1
+    MCP -->|semantic search| Vec
+    MCP -->|filter| Notion
+    MCP -->|JSON-RPC result| Claude
+    Claude -->|answer| User
+```
+
+Two distinct request domains coexist in one Worker, gated by path:
+
+- **Ingestion domain** — `POST /` receives Bluedot webhooks, runs the full extraction → indexing → Notion pipeline. No auth (Svix signature is the auth).
+- **MCP domain** — `POST /mcp` is bearer-protected. Everything under `/.well-known/*`, `/authorize`, `/auth/github/callback`, `/token`, `/register`, `/auth/revoke` is OAuth plumbing wired up via `@cloudflare/workers-oauth-provider`.
+
+The two don't share state at runtime. They share only the underlying data (D1 + Vectorize + Notion).
+
+## Request routing
+
+Every incoming request enters through `OAuthProvider.fetch` in `src/mcp/index.ts`. The provider classifies the request by path prefix:
+
+| Path | Handler | Auth | Notes |
+|------|---------|------|-------|
+| `/.well-known/oauth-protected-resource/mcp` | provider built-in | public | Returns `{ resource, authorization_servers }` |
+| `/.well-known/oauth-authorization-server` | provider built-in | public | Returns `{ authorize, token, register, scopes }` |
+| `POST /register` | provider built-in | public | Dynamic Client Registration (RFC 7591) |
+| `POST /token` | provider built-in | per spec | Token issuance + refresh (RFC 6749) |
+| `GET /authorize` | `createGitHubAuthApp` | public | Stashes Claude's auth request in KV, 302s to GitHub |
+| `GET /auth/github/callback` | `createGitHubAuthApp` | public | Exchanges code, enforces allowlist, mints bearer |
+| `POST /auth/revoke` | default Hono app | bearer | Calls `unwrapToken` + `revokeGrant` |
+| `GET /` | default Hono app | public | Health JSON |
+| `POST /` | default Hono app | Svix | Bluedot webhook → `handleWebhook` |
+| `POST /mcp` | MCP API handler | **bearer** | Streamable HTTP transport → tool dispatch |
+| Any other | Hono catch-all | — | `POST` falls through to webhook, else 404 |
+
+**Why one Worker and not two?** Bluedot already points at one URL; splitting into two Workers would mean two deploy targets, two sets of secrets, and an unnecessary internal call between them. The two domains are isolated by path — adding a new webhook is an orthogonal change from adding a new MCP tool.
+
+## 1. Ingestion pipeline
+
+Runs on every Bluedot webhook. Bluedot fires two events per meeting (~13s apart): `meeting.transcript.created` (raw text) and `meeting.summary.created` (Bluedot's own summary text, which we run through OpenAI to extract structure). Each event upserts the same D1 row.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant B as Bluedot
+    participant W as Worker — POST /
+    participant O as OpenAI
+    participant D as D1
+    participant V as Vectorize
+    participant N as Notion
+
+    B->>W: POST / (Svix-signed)
+    W->>W: verify Svix signature
+    alt transcript event
+        W->>O: embed chunks (1536d)
+        O-->>W: [vectors]
+        W->>D: UPSERT (raw_text, participants)
+        W->>V: upsert by deterministic ID
+    else summary event
+        W->>O: extract (gpt-5-mini, json_schema)
+        O-->>W: {title, summary, action_items[], participants[]}
+        W->>D: UPSERT (summary, action_items)
+    end
+    W->>D: SELECT — both events present? not synced yet?
+    alt both present + not yet synced
+        W->>N: create Transcripts row (metadata + Bluedot link)
+        loop each action item
+            W->>N: create Followup row (Status=Inbox, Meeting relation → Transcripts)
+        end
+        W->>D: UPDATE notion_synced_at
+    end
+    W-->>B: 200 OK
+```
+
+### Invariants
+
+| Invariant | How it's enforced |
+|-----------|-------------------|
+| At most one D1 row per meeting | `UNIQUE(video_id)` + `INSERT ... ON CONFLICT DO NOTHING` |
+| Vector upserts are idempotent | Deterministic vector IDs: `{transcript_id}-{chunk_index}` |
+| Notion writes happen **exactly once** per meeting | Gate: `both_events_present && notion_synced_at IS NULL` → then `UPDATE notion_synced_at` |
+| Partial failures return 5xx | Svix retries; idempotency keys prevent duplicates |
+| Notion failures are non-fatal for D1/Vectorize | D1 is source of truth; Notion is a derived view. Retry-to-fix just re-runs the sync logic. |
+
+### Race conditions handled
+
+- **Two webhooks for the same meeting arrive concurrently.** Both try to INSERT; SQLite enforces `UNIQUE(video_id)` so only one wins. The loser does an UPDATE instead.
+- **Retry after partial failure.** If we wrote to D1 + Vectorize but died before Notion, the next retry re-enters the "both events present, not synced yet" branch and finishes Notion.
+- **Summary event arrives before transcript event.** `both_events_present` is derived from the final row state, not from event order.
+
+## 2. OAuth flow (Claude.ai ↔ GitHub)
+
+One-time flow when a user first adds the MCP server to Claude.ai. After this, Claude holds a 1-hour access token + 30-day refresh token and calls `/mcp` directly.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as User — browser
+    participant C as Claude.ai
+    participant W as Worker
+    participant K as OAUTH_KV
+    participant G as GitHub
+
+    U->>C: add MCP URL
+    C->>W: GET /.well-known/oauth-protected-resource/mcp
+    W-->>C: {resource, authorization_servers}
+    C->>W: GET /.well-known/oauth-authorization-server
+    W-->>C: {endpoints, scopes}
+    C->>W: POST /register (DCR)
+    W-->>C: {client_id, client_secret}
+    C->>U: 302 /authorize?client_id&state&code_challenge&...
+    U->>W: GET /authorize
+    W->>K: PUT gh-state:<uuid> = AuthRequest (TTL 300s)
+    W-->>U: 302 github.com/login/oauth/authorize?state=<uuid>
+    U->>G: sign in + approve
+    G-->>U: 302 worker/auth/github/callback?code&state
+    U->>W: GET /auth/github/callback
+    W->>K: GET gh-state:<uuid>
+    W->>K: DELETE gh-state:<uuid> (one-time)
+    W->>G: POST /login/oauth/access_token
+    G-->>W: {access_token}
+    W->>G: GET /user
+    G-->>W: {login, email, id}
+    W->>W: isAllowed(login, ALLOWED_USERS)?
+    alt allowed
+        W->>W: completeAuthorization()
+        W-->>U: 302 claude.ai/callback?code=...
+        U->>C: resume
+        C->>W: POST /token
+        W-->>C: {access_token, refresh_token, expires_in}
+    else disallowed
+        W-->>U: 403 "Not authorized: <login>"
+    end
+```
+
+### Security properties
+
+| Threat | Mitigation |
+|--------|------------|
+| Forged authorization request | `parseAuthRequest` validates signed params; PKCE enforced by provider |
+| State replay | `gh-state` TTL 300s + deleted on first read |
+| CSRF on login form | N/A — GitHub owns the login UI |
+| Stolen bearer token | Per-request validation against KV-stored token hashes; `POST /auth/revoke` for immediate revocation |
+| Allowlist bypass | `isAllowed` is case-insensitive, trims whitespace, rejects empty CSV (no accidental allow-all), enforced server-side after GitHub confirms identity |
+| Token enumeration | Tokens are opaque 128-bit+ values; storage is hashed |
+
+### Pieces of state involved
+
+- **Claude.ai's PKCE parameters** (`client_id`, `state`, `code_challenge`, etc.) round-trip through KV keyed by a server-generated `gh-state` UUID.
+- **The Claude `state` value** is NOT stored by us — Claude validates it after the redirect completes.
+- **GitHub's `access_token`** is used once to fetch `/user` and then discarded. We don't store it.
+- **The MCP bearer token** is minted by `@cloudflare/workers-oauth-provider` and stored (hashed) in `oauth:*` KV entries.
+
+## 3. MCP query path
+
+Claude.ai's interaction model: call `tools/list` once after OAuth completes, then `tools/call` per user question. Each request is self-contained — we run the transport in **stateless mode** (no `Mcp-Session-Id`).
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as User
+    participant C as Claude.ai
+    participant W as Worker — /mcp
+    participant D as D1
+    participant V as Vectorize
+    participant N as Notion
+    participant O as OpenAI
+
+    U->>C: "What did I commit to Pierce last week?"
+    C->>W: POST /mcp {tools/call: search_calls, args: {query}}
+    W->>W: verify bearer (OAuthProvider)
+    W->>O: embeddings.create(query)
+    O-->>W: [vector]
+    W->>V: query(vector, topK: 5)
+    V-->>W: [{id, score, metadata}]
+    W->>D: SELECT WHERE id IN (...)
+    D-->>W: rows
+    W-->>C: {content: [{type: "text", text: "Found 3 calls..."}]}
+    C->>U: natural-language answer
+
+    opt follow-up
+        U->>C: "What's assigned to Pierce?"
+        C->>W: POST /mcp {tools/call: find_action_items_for, args: {person}}
+        W->>D: SELECT ... FROM transcripts, json_each(action_items)
+        D-->>W: rows
+        W-->>C: {content: [...]}
+        C->>U: answer
+    end
+```
+
+### Request lifecycle inside the Worker
+
+1. `OAuthProvider.fetch` receives the `POST /mcp`.
+2. Provider extracts the bearer from `Authorization: Bearer ...`.
+3. Provider validates the token against its KV-backed store. Expired/invalid → 401 with `WWW-Authenticate: Bearer resource_metadata="..."`.
+4. Provider invokes `mcpApiHandler.fetch` with the decoded auth info attached to `ctx.props`.
+5. `mcpApiHandler` **dynamically imports** `./tools` (keeps the MCP SDK out of the loader graph for non-MCP tests) and calls `handleMcpRequest(request, env)`.
+6. `handleMcpRequest` constructs a fresh `McpServer` and `WebStandardStreamableHTTPServerTransport`, wires them together, and delegates to `transport.handleRequest`.
+7. The SDK parses the JSON-RPC body, dispatches to the registered tool, collects the `{ content: [...] }` result, and writes back either JSON or SSE depending on the `Accept` header.
+
+### Tool contract
+
+Every tool is a pure async function with this shape:
+
+```ts
+type ToolResult = { content: Array<{ type: "text"; text: string }> };
+type Tool = (args: Args, env: Env, deps?: Deps) => Promise<ToolResult>;
+```
+
+`deps` is optional — used by tests to inject mocks. In production, the default deps come from `env` (e.g. a real `OpenAI` client from `env.OPENAI_API_KEY`, `env.VECTORIZE` for Vectorize).
+
+This design lets every tool be unit-tested without loading the MCP SDK — critical because `@modelcontextprotocol/sdk` transitively depends on `ajv`, which has a `require('./refs/data.json')` that breaks `vitest-pool-workers`' ESM shim. Tool logic is covered by fast, isolated tests; the SDK integration is validated via live Claude.ai smoke tests.
+
+## Data model
+
+### D1 `transcripts` table
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | INTEGER PK | autoincrement |
+| `video_id` | TEXT UNIQUE NOT NULL | idempotency key from Bluedot (usually a Meet URL) |
+| `title` | TEXT NOT NULL | meeting title |
+| `raw_text` | TEXT | filled by transcript event |
+| `summary` | TEXT | filled by summary event (our extraction) |
+| `bluedot_summary` | TEXT | Bluedot's original summary text |
+| `participants` | TEXT (JSON) | `[{name, email, role}]` |
+| `action_items` | TEXT (JSON) | `[{task, owner?, due_date?}]` — queried via `json_each` |
+| `language` | TEXT | |
+| `svix_id` | TEXT | latest Svix message id for debugging |
+| `notion_page_id` | TEXT | set once Notion sync succeeds |
+| `notion_synced_at` | TEXT | null until synced — gates the one-time Notion write |
+| `created_at` | TEXT | default `datetime('now')` |
+
+**Columns nullable by design.** Bluedot's two events fire ~13s apart — the row exists before both arrive. `raw_text` and `summary` are both nullable so the partial state is representable without NULL-wrestling in ingestion code.
+
+### Vectorize `aftercall-vectors` index
+
+- Dimensions: **1536** (matches `text-embedding-3-small`)
+- Metric: **cosine**
+- Vector ID format: `{transcript_id}-{chunk_index}` (deterministic → idempotent upserts)
+- Metadata per vector: `{ transcript_id, chunk_index, chunk_text }` — `chunk_text` truncated to 2KB to stay under Vectorize's 10KB metadata cap
+
+### Notion databases
+
+**Call Transcripts** (`NOTION_TRANSCRIPTS_DATA_SOURCE_ID`) — metadata hub, not a summary archive. Bluedot's native Notion sync owns the rich summary page; aftercall's row is the structured layer for filtering + the relation target for Followups.
+
+| Property | Type | Notes |
+|----------|------|-------|
+| `Name` | title | Meeting title |
+| `Date` | date | Recording date |
+| `Participants` | multi_select | Auto-grown as new participants appear |
+| `Video ID` | rich_text | For joining to D1 |
+| `Language` | rich_text | |
+| `Recording URL` | url | Bluedot recording / preview URL |
+| `Bluedot Page` | url | Optional best-effort link to Bluedot's native Notion summary page |
+
+Page body: a single "View on Bluedot" paragraph block when `Recording URL` is set; otherwise empty. No summary content is rendered in the body.
+
+**Followups** (`NOTION_FOLLOWUPS_DATA_SOURCE_ID`)
+
+| Property | Type | Notes |
+|----------|------|-------|
+| `Name` | title | `<task text>` — the action item, verbatim |
+| `Status` | select | `Inbox` / `Triaged` / `Doing` / `Waiting` / `Done` |
+| `Priority` | select | `P0` / `P1` / `P2` (default `P2` at ingest) |
+| `Due` | date | Parsed from OpenAI; only set if ISO-8601 |
+| `Owner` | rich_text | Preserves OpenAI's owner text (may be "Jeremy", "j@x.com", etc.) |
+| `Source` | select | `Bluedot` at ingest |
+| `Source Link` | url | Bluedot meeting URL |
+| `Meeting Title` | rich_text | For quick human-scan in the inbox |
+| `Video ID` | rich_text | For joining to D1 |
+| `Meeting` | relation | Two-way relation to the Transcripts row. Click-through from inbox → meeting context. |
+
+**Bluedot's native Notion sync** (separate — not aftercall's)
+
+Bluedot itself writes a rich summary page per meeting into a "BlueDot Calls" parent page. That page owns the human-readable narrative (`## Overview`, grouped `## Action Items` by person, `## Topics`). aftercall deliberately doesn't duplicate that content — the `Bluedot Page` URL on the Transcripts row is a best-effort pointer to it, and the `answer_from_transcript` MCP tool pulls raw transcript chunks from Vectorize/D1 for Q&A rather than reading Bluedot's rendered page.
+
+### KV `OAUTH_KV`
+
+| Key prefix | Contents | TTL |
+|------------|----------|-----|
+| `gh-state:<uuid>` | JSON-encoded `AuthRequest` stashed during GitHub redirect | 300s (one-time use — deleted on callback) |
+| `oauth:*` | Provider-internal (client records, grants, tokens) | per-object |
+
+## Component responsibilities
+
+| File | Responsibility |
+|------|----------------|
+| `src/index.ts` | Worker entry — `export { default } from "./mcp/index"` |
+| `src/mcp/index.ts` | OAuthProvider wiring + Hono default app; owns /authorize, /auth/github/callback, /auth/revoke, /, webhook fallback |
+| `src/mcp/handler.ts` | `/mcp` API handler; dynamic imports `./tools` to keep SDK out of non-MCP test paths |
+| `src/mcp/tools.ts` | `createMcpServer`, `handleMcpRequest`; registers 6 tools with Zod schemas |
+| `src/mcp/auth/github.ts` | GitHub OAuth handler — state stash, code exchange, user lookup, allowlist check |
+| `src/mcp/auth/allowlist.ts` | Pure `isAllowed(username, csv)` — case/whitespace tolerant |
+| `src/mcp/tools/*.ts` | Pure async tool functions `(args, env, deps?) => ToolResult` |
+| `src/handler.ts` | Ingestion orchestration — verify, extract, embed, D1/Vectorize/Notion writes, idempotency |
+| `src/webhook-verify.ts` | Svix signature verification |
+| `src/bluedot.ts` | Payload normalization (both event types → canonical shape) |
+| `src/extract.ts` | OpenAI structured extraction via json_schema |
+| `src/embeddings.ts` | Chunking + batched embedding calls |
+| `src/d1.ts` | `transcripts` table writes — idempotent upserts + `notion_synced_at` gate |
+| `src/vectorize.ts` | Deterministic-ID upserts in batches of 100 |
+| `src/notion.ts` | Direct-fetch Notion API; builds transcript pages + followup rows |
+| `src/schema.ts` | Drizzle schema + TS types |
+| `src/env.ts` | `Env` interface (bindings + secrets + vars) |
+| `src/logger.ts` | Structured JSON logging |
+| `scripts/setup.ts` | 10-step interactive provisioning |
+| `drizzle/*.sql` | Numbered migrations (applied on setup + in tests) |
+
+## Design decisions
+
+| Decision | Why | Alternative considered |
+|----------|-----|------------------------|
+| Single Worker (not split by domain) | Bluedot already targets one URL; paths cleanly isolate concerns; simpler deploy + secrets story | Separate `ingest` + `mcp` Workers — rejected: extra Svix endpoint + cross-worker call for shared data |
+| GitHub OAuth for MCP auth | No email infra, no CSRF surface, friends already have GitHub, ~40% less code than magic link | Magic link via SendGrid — rejected during plan-review |
+| Stateless MCP transport | Fits Workers' isolate-per-request model; no coordination needed for `Mcp-Session-Id` | Stateful mode — requires persisting session in KV/DO, no clear benefit for single-user tool workload |
+| `enableJsonResponse: true` on transport | Simpler response handling; Claude.ai accepts both JSON and SSE | SSE-only — unnecessary streaming for synchronous tool calls |
+| Dynamic import at `src/mcp/handler.ts` boundary | Keeps `@modelcontextprotocol/sdk` + `ajv` out of non-MCP test paths (vitest-pool-workers ESM shim chokes on ajv's JSON import) | Top-level import — rejected after regression in Phase 1 tests |
+| Direct `fetch` for Notion | `@notionhq/client` SDK fails in workerd (`Cannot read properties of undefined (reading 'call')`) | SDK — rejected after runtime failure in the Neon prototype |
+| Pure functions for tools, Zod schemas at registration | Fast unit tests without loading SDK; MCP contract stays declarative | Class-per-tool pattern — rejected: more ceremony, no benefit |
+| D1 write first in ingestion | Dedupes concurrent retries before any side effects (Notion writes, embeddings) | Notion-first — rejected: risks double-posting followups |
+| Deterministic vector IDs | Retries and re-runs are safe; no orphaned vectors | UUIDs — would require a secondary dedup mechanism |
+| Notion as a derived view, not source of truth | Allows reprocessing / schema changes without touching user data | Notion as SoT — too fragile (no SELECT, no JSON queries, rate limits) |
+| `json_each` over `action_items` column | Single table, no normalization churn, queryable via SQL | Separate `action_items` table — adds migration + join overhead for query-side code we write once |
+| `global_fetch_strictly_public` compat flag | Required by `@cloudflare/workers-oauth-provider` (emits a `console.warn` at module load otherwise, breaking vitest-pool-workers) | Ignore the warning — it actually breaks tests |
+
+### Trade-offs intentionally accepted
+
+- **Single user by default.** `ALLOWED_USERS` is a flat allowlist; there's no multi-tenant boundary. Friends fork + deploy their own.
+- **No MCP resources / prompts capability.** Just `tools`. Revisit when a real use case emerges.
+- **Bearer TTL is fixed at 1h / 30d.** Overridable in `src/mcp/index.ts` if needed; no per-client customization.
+- **Notion API `data_sources` endpoint (2025-09-03).** We commit to the new Notion data model; older Notion-Version values won't work.
+- **OpenAI for everything.** Switching providers would require embedding re-compute across the whole Vectorize index.
+
+## Operational runbook
+
+### Common tasks
+
+| Scenario | Commands |
+|----------|----------|
+| Watch live traffic | `npx wrangler tail` |
+| Re-process a call | `npx wrangler d1 execute aftercall-db --remote --command "DELETE FROM transcripts WHERE video_id = 'meet.google.com/xyz'"` then replay from Bluedot's Svix dashboard |
+| Check a transcript | `npx wrangler d1 execute aftercall-db --remote --command "SELECT id, video_id, title, notion_synced_at FROM transcripts WHERE video_id = '...'"` |
+| Inspect a vector | `npx wrangler vectorize get-by-ids aftercall-vectors --ids "1-0"` |
+| List OAuth KV | `npx wrangler kv key list --binding OAUTH_KV` |
+| Revoke your bearer | `curl -X POST https://<worker>/auth/revoke -H "Authorization: Bearer <token>"` |
+| Purge all OAuth state | `npx wrangler kv key list --binding OAUTH_KV \| jq -r '.[].name' \| xargs -I {} npx wrangler kv key delete "{}" --binding OAUTH_KV` |
+
+### Debug flow when something's wrong
+
+**Webhook fired but nothing in D1.**
+1. Check Bluedot's Svix dashboard — was it delivered? Any retries?
+2. `npx wrangler tail` and replay from Bluedot. Look for `webhook_verify_failed` (bad signing secret) or extraction/embedding errors.
+3. Confirm `BLUEDOT_WEBHOOK_SECRET` matches Bluedot's current secret.
+
+**D1 row but no Notion page.**
+1. Check `notion_synced_at` — is it null? If yes, the sync hasn't run.
+2. Check `both_events_present` — are both `raw_text` and `summary` populated? If not, the second event hasn't arrived (or failed to upsert).
+3. Check Notion: integration shared with the parent page? `NOTION_FOLLOWUPS_DATA_SOURCE_ID` matches the current DB?
+4. To force a retry, clear `notion_synced_at` and refire a webhook.
+
+**Claude.ai says "couldn't connect to MCP server".**
+
+Walk the OAuth flow step by step:
+
+```bash
+# 1. Resource metadata advertises the right URL
+curl -s https://<worker>/.well-known/oauth-protected-resource/mcp | jq .
+# Expect: "resource": "https://<worker>/mcp"
+
+# 2. AS metadata exposes all endpoints
+curl -s https://<worker>/.well-known/oauth-authorization-server | jq .
+# Expect: authorization_endpoint, token_endpoint, registration_endpoint
+
+# 3. /mcp returns 401 + WWW-Authenticate when no bearer
+curl -i -X POST https://<worker>/mcp
+# Expect: 401, www-authenticate: Bearer resource_metadata="..."
+
+# 4. /authorize redirects to github.com with your real client_id
+curl -s -o /dev/null -D - "https://<worker>/authorize?response_type=code&client_id=test&redirect_uri=https://claude.ai/callback&state=x" | grep -i location
+# Expect: Location: https://github.com/login/oauth/authorize?client_id=Iv1...
+# Red flag: client_id=undefined → GITHUB_CLIENT_ID isn't deployed
+```
+
+If step 4 shows `client_id=undefined`: `npx wrangler secret put GITHUB_CLIENT_ID` and redeploy.
+
+**`403 Not authorized: <login>` after GitHub sign-in.**
+
+Your GitHub username isn't in `ALLOWED_USERS`. Fix:
+
+```bash
+# Edit wrangler.toml ALLOWED_USERS, then:
+npx wrangler deploy
+# In Claude.ai, disconnect and reconnect the MCP server.
+```
+
+**Tool returns "Notion API error 401".**
+
+Your Notion integration isn't shared with the target database. Open the DB in Notion → ⋯ → Add Connections → select your integration.
+
+### Revoke an access (all of someone's bearers)
+
+Because allowlist is checked at token-mint time (not per-request), removing someone from `ALLOWED_USERS` doesn't invalidate their existing bearers. To immediately revoke:
+
+1. Remove from `ALLOWED_USERS` in `wrangler.toml`, `npx wrangler deploy`.
+2. Purge that user's OAuth records from KV. Fast way:
+   ```bash
+   npx wrangler kv key list --binding OAUTH_KV | jq -r '.[].name' | xargs -I {} npx wrangler kv key delete "{}" --binding OAUTH_KV
+   ```
+   This nukes every grant/token/client — everyone will need to re-authorize. Fine for a single-user deployment.
+
+### Rolling back a bad deploy
+
+```bash
+npx wrangler deployments list
+npx wrangler rollback <deployment-id>
+```
+
+All provider KV entries survive — existing bearers keep working.
+
+### Schema migration
+
+1. Edit `src/schema.ts`.
+2. `npx drizzle-kit generate --name <description>` creates `drizzle/NNNN_<description>.sql`.
+3. Review the generated SQL. Migrations run alphabetically — Drizzle's numeric prefixes (`0000_`, `0001_`, …) handle ordering.
+4. `npx wrangler d1 migrations apply aftercall-db --remote` applies to prod.
+5. `npx vitest run` applies all migrations locally via `setupD1()` — tests run against the new schema automatically.
+
+### Local dev
+
+```bash
+# Vectorize has no miniflare binding; the toml entry `remote = true`
+# routes local dev calls to the real Vectorize index.
+npx wrangler dev
+
+# In a separate terminal, forward Bluedot to your local worker:
+#   (or use Svix's "Replay to URL" feature with your dev URL)
+```
+
+## See also
+
+- [`../README.md`](../README.md) — setup + high-level overview
+- [`tools.md`](./tools.md) — MCP tool reference with Claude.ai prompts
+- [`auth.md`](./auth.md) — OAuth setup + troubleshooting deep dive
+- [`../CLAUDE.md`](../CLAUDE.md) — conventions for editing this repo
+
+---
+
+# Authentication
+
+Source: https://github.com/jchu96/aftercall/blob/main/docs/auth.md
+
+# Authentication
+
+MCP access is gated by GitHub OAuth + a username allowlist. This doc walks through registering the GitHub OAuth App, configuring the Worker, and diagnosing common failures.
+
+## 1. Register a GitHub OAuth App
+
+1. Go to https://github.com/settings/developers → **OAuth Apps** → **New OAuth App**
+2. Fill in:
+   - **Application name:** anything you'll recognize (e.g. `aftercall MCP`)
+   - **Homepage URL:** your deployed Worker URL, e.g. `https://aftercall.<account>.workers.dev`
+   - **Authorization callback URL:** Homepage URL **+ `/auth/github/callback`** (exact path matters)
+3. Click **Register application**
+4. On the next screen:
+   - Copy the **Client ID** (public, `Iv1.abcdef1234567890`)
+   - Click **Generate a new client secret** and copy it (starts with `ghp_` or similar — you'll only see it once)
+
+> **One app per deployment.** If you fork the repo and deploy your own Worker, register a fresh OAuth App with your Worker's URL as the callback.
+
+## 2. Configure the Worker
+
+The setup script (`npm run setup`) handles this interactively. To do it by hand:
+
+```bash
+# KV namespace for OAuth state + tokens
+npx wrangler kv namespace create OAUTH_KV
+# → copy the printed `id` into wrangler.toml under [[kv_namespaces]]
+
+# Secrets
+npx wrangler secret put GITHUB_CLIENT_ID       # paste Client ID
+npx wrangler secret put GITHUB_CLIENT_SECRET   # paste Client Secret
+
+# wrangler.toml [vars]
+#   ALLOWED_USERS = "your-github-username"
+#   BASE_URL = "https://aftercall.<account>.workers.dev"
+
+# Deploy
+npx wrangler deploy
+```
+
+`ALLOWED_USERS` is comma-separated, case-insensitive, whitespace-tolerant: `"alice, Bob, CAROL"` allows those three.
+
+## 3. Connect Claude.ai
+
+1. Open Claude.ai → **Settings → Connectors** (or your workspace's equivalent)
+2. Add a custom MCP server: `https://<worker>.workers.dev/mcp`
+3. Claude.ai discovers the OAuth endpoints via `/.well-known/oauth-protected-resource/mcp`, performs DCR (Dynamic Client Registration) at `/register`, then bounces you to `/authorize`
+4. You get redirected to GitHub → sign in → approve the OAuth App
+5. GitHub redirects back to `/auth/github/callback`, the Worker checks `ALLOWED_USERS`, mints a bearer token, sends you back to Claude.ai
+6. Claude.ai exchanges the code at `/token` for a 1-hour access token + 30-day refresh token and calls `/mcp` for the first time
+
+After this, Claude.ai auto-refreshes. Until the refresh token expires (30 days of inactivity), you won't be prompted again.
+
+## 4. Troubleshooting
+
+### `redirect_uri_mismatch` from GitHub
+
+The callback URL in the GitHub OAuth App must exactly match `<BASE_URL>/auth/github/callback`. Trailing slashes matter. Re-check the GitHub App's Authorization callback URL.
+
+### `403 Not authorized: <login>`
+
+Your GitHub username isn't in `ALLOWED_USERS`.
+
+- Edit `wrangler.toml` → `ALLOWED_USERS = "..."`
+- `npx wrangler deploy`
+- In Claude.ai, disconnect and reconnect the MCP server to re-trigger the OAuth flow.
+
+### `400 Invalid or expired state`
+
+The OAuth `state` parameter either expired (>5 minutes between `/authorize` and `/auth/github/callback`) or was already consumed. Start over — begin the OAuth flow from Claude.ai again.
+
+### `401 Missing or invalid access token` on every `/mcp` request
+
+Claude.ai's cached token is stale or was revoked.
+
+- Reconnect the MCP server in Claude.ai settings.
+- Or hit `POST /auth/revoke` with the bad bearer to explicitly revoke it, then reconnect.
+
+### `502 GitHub token exchange failed`
+
+Usually one of:
+
+- Wrong `GITHUB_CLIENT_SECRET` (most common — did you regenerate it on GitHub and forget to update the Worker secret?)
+- GitHub rate limit on OAuth (very rare for single users)
+- GitHub OAuth App is disabled or deleted
+
+Tail logs while reproducing: `npx wrangler tail`. The 502 path prints the upstream status.
+
+### Claude.ai says "couldn't connect to MCP server"
+
+Walk the flow step by step:
+
+```bash
+# 1. Well-known metadata should be JSON with the right resource URL
+curl https://<worker>/.well-known/oauth-protected-resource/mcp | jq .
+# Expect: resource == "https://<worker>/mcp"
+
+curl https://<worker>/.well-known/oauth-authorization-server | jq .
+# Expect: authorization_endpoint, token_endpoint, registration_endpoint set
+
+# 2. /mcp should 401 with WWW-Authenticate when no bearer
+curl -i -X POST https://<worker>/mcp
+# Expect: 401 with WWW-Authenticate: Bearer resource_metadata="..."
+
+# 3. /authorize should 302 to github.com
+curl -i "https://<worker>/authorize?response_type=code&client_id=test&redirect_uri=https://claude.ai/callback&state=x"
+# Expect: 302, Location: https://github.com/login/oauth/authorize?client_id=...
+```
+
+If any of these is wrong, the issue is on the Worker side. If all three look right, the issue is usually a `redirect_uri_mismatch` caught by GitHub after you sign in.
+
+### "Mcp-Session-Id" header errors
+
+We run the MCP transport in stateless mode — there's no session. If a client insists on a session ID, check that Claude.ai is using `application/json` responses (via `Accept: application/json, text/event-stream`). The transport's `enableJsonResponse: true` handles both.
+
+## 5. Revoking access
+
+**A specific bearer token (yours):**
+
+```bash
+curl -X POST https://<worker>/auth/revoke \
+  -H "Authorization: Bearer <token>"
+# → { revoked: true }
+```
+
+Next request with that bearer returns 401.
+
+**All of someone's grants:**
+
+Remove them from `ALLOWED_USERS` in `wrangler.toml` and redeploy. Their existing tokens stop working — the token is still valid in the OAuth provider's store, but every `/mcp` call hits the Worker which re-checks the allowlist on each call via the stored grant's `userId`.
+
+Actually — correction — the allowlist is checked only during the GitHub callback (once, at token mint time). Pre-existing tokens persist until Claude.ai refreshes them (every hour) or you manually revoke. If you need immediate revocation:
+
+```bash
+# Purge all OAuth state
+npx wrangler kv key list --binding OAUTH_KV | jq -r '.[].name' | \
+  xargs -I {} npx wrangler kv key delete "{}" --binding OAUTH_KV
+```
+
+This nukes every grant, token, and client record. Claude.ai will need to re-register and re-authorize.
+
+## 6. GitHub OAuth App security notes
+
+- The `scope` requested is `read:user user:email` — minimal. We only need the `login` (username) to check against the allowlist.
+- `client_secret` is stored as a Cloudflare secret (never in the repo).
+- The OAuth `state` parameter has a 5-minute TTL and is deleted on first read; a stolen state token cannot be replayed.
+- Bearer tokens are 1 hour (access) / 30 days (refresh). Override via `accessTokenTTL` / `refreshTokenTTL` in `src/mcp/index.ts` if needed.
+- We do not store the GitHub access token beyond the callback — only the username is persisted (in the OAuth provider's grant record).
+
+## See also
+
+- [README.md](../README.md) — setup + deploy walkthrough
+- [architecture.md](./architecture.md) — full OAuth flow diagram
+- [tools.md](./tools.md) — MCP tool reference
+
+---
+
+# MCP Tools Reference
+
+Source: https://github.com/jchu96/aftercall/blob/main/docs/tools.md
+
+# MCP Tools Reference
+
+Seven tools are exposed at `/mcp`. Every tool returns a single `text` content block — Claude.ai renders the markdown directly.
+
+All tools require a valid bearer token (minted via the GitHub OAuth flow — see [auth.md](./auth.md)).
+
+## `search_calls`
+
+Semantic search over call transcripts using Vectorize (OpenAI `text-embedding-3-small`).
+
+**Input**
+
+| Param | Type | Required | Default | Notes |
+|-------|------|----------|---------|-------|
+| `query` | string | yes | — | Natural-language query. |
+| `limit` | integer (1–25) | no | 5 | Max number of distinct calls returned. |
+
+**Output**
+
+One line per matching call, deduplicated by transcript (best chunk score wins). Includes title, score, `video_id`, and a snippet from the matching chunk.
+
+```
+Found 3 calls matching "IronRidge contract":
+
+• [2026-04-10] **Pierce weekly sync** (score 0.89) — `https://meet.google.com/abc-xyz`
+   > Discussed IronRidge Q2 contract scope and timeline for the amendment…
+• [2026-04-03] **Intro with Renewable Co** (score 0.82) — `https://meet.google.com/def-ghi`
+   > …mentioned IronRidge as a competitor in the quote-to-order tooling space…
+```
+
+**Sample prompts**
+
+- _"Search my calls for IronRidge."_
+- _"Find the call where I talked about compensation with Pilar."_
+- _"What calls mention the Q2 roadmap?"_
+
+## `find_call`
+
+Locate a **specific** call by any identifier — distinct from `search_calls`, which is for topics. Pure lexical (no embeddings): normalizes the input through `resolveMeetingCode()` and matches against the indexed `meeting_code`, the raw `video_id`, the title, and participant names/emails (`json_each`). Ranks exact-identifier hits above title/participant matches.
+
+**Input**
+
+| Param | Type | Required | Default | Notes |
+|-------|------|----------|---------|-------|
+| `query` | string | yes | — | A Meet/Zoom URL, bare meeting code, hex id, title fragment, or participant name/email. Paste verbatim — normalization (scheme/`www.`/query-string stripping) is handled for you. |
+| `limit` | integer (1–25) | no | 10 | Max candidate calls returned. |
+
+**Output**
+
+One line per candidate with its exact `video_id`, ranked. A pasted `https://meet.google.com/www-jjni-xtd` resolves a row stored as the schemeless `meet.google.com/www-jjni-xtd`. On no match, the message names the recovery tool (`search_calls` for topics, `recent_calls` to browse).
+
+```
+Resolved "https://meet.google.com/www-jjni-xtd" → 1 call. Use its `video_id` with get_call or answer_from_transcript:
+
+• [2026-06-12] **Pricing sync** — `meet.google.com/www-jjni-xtd`
+```
+
+**Sample prompts**
+
+- _"Find the call at https://meet.google.com/www-jjni-xtd."_
+- _"Which meeting was the 'Main Service Panel Naming' call?"_
+- _"Pull up my call with Pierce."_
+
+## `get_call`
+
+Fetch one call's full details. Accepts an exact `video_id` and also tolerates a pasted URL / code / title — it runs the exact → normalized (`meeting_code`) → fuzzy chain and returns a disambiguation list if several calls match.
+
+**Input**
+
+| Param | Type | Required | Notes |
+|-------|------|----------|-------|
+| `video_id` | string | yes | Exact `video_id` from another tool, or an identifier to resolve (Meet/Zoom URL, meeting code, or title). |
+
+**Output**
+
+Markdown-formatted block: title, source link, recorded date, summary, participants, action items.
+
+```
+# Weekly sync with Pierce
+**Source:** https://meet.google.com/abc-xyz
+**Recorded:** 2026-04-10 15:00:00
+
+## Summary
+We discussed the Q2 plan and next steps for IronRidge…
+
+## Participants
+- Jeremy Chu <j@example.com>
+- Pierce Somebody <p@example.com>
+
+## Action items
+- Send proposal to Pierce *(owner: Jeremy)* — due 2026-04-21
+- Review spec *(owner: Pierce)*
+```
+
+Returns `"Call not found: <video_id>"` when no row matches.
+
+**Sample prompts**
+
+- _"Pull up the full details of the call with video_id `https://meet.google.com/abc-xyz`."_
+- _"Show the action items from my last call with Pierce."_ (Claude will typically chain with `search_calls` → `get_call`.)
+
+## `list_followups`
+
+Query the Notion **Followups** database (`NOTION_FOLLOWUPS_DATA_SOURCE_ID`) with optional `Status` and `Source` select filters.
+
+**Input**
+
+| Param | Type | Required | Default | Notes |
+|-------|------|----------|---------|-------|
+| `status` | string | no | — | Filter by `Status` select (e.g. `Inbox`, `In Progress`, `Done`). |
+| `source` | string | no | — | Filter by `Source` select (e.g. `Bluedot`). |
+| `limit` | integer (1–100) | no | 25 | Max rows. |
+
+**Output**
+
+```
+Found 4 followups:
+
+• **Send proposal to Pierce** — Inbox · P1 · owner: Jeremy · due 2026-04-21 · from: Weekly sync with Pierce
+   https://notion.so/page-1
+• **Review compensation doc** — Inbox · P2 · owner: Jeremy · from: Comp chat with Pilar
+   https://notion.so/page-2
+…
+```
+
+When `status` + `source` are both set, the filter is an `and` composition. When Notion returns zero rows or a non-2xx error, the tool surfaces that instead of throwing — keeps Claude's response cycle smooth.
+
+**Sample prompts**
+
+- _"What followups are in my inbox?"_
+- _"Show me the Bluedot followups I haven't started yet."_
+- _"List my top 10 open followups."_
+
+## `find_action_items_for`
+
+Find action items assigned to a specific person across all indexed calls. Case-insensitive substring match on the `owner` field using SQLite's `json_each` expansion.
+
+**Input**
+
+| Param | Type | Required | Notes |
+|-------|------|----------|-------|
+| `person` | string | yes | Name or substring. `"Andy"` matches `"Andy Ross"` and `"andy@…"` alike. |
+| `since` | string (`YYYY-MM-DD`) | no | Lower bound on the call's `created_at`. |
+
+**Output**
+
+```
+Found 3 action items for "Andy":
+
+• [2026-04-12] **Follow-up with permitting** — Draft permit application *(owner: Andy Ross)* — due 2026-04-19
+• [2026-04-05] **Intro call** — Send vendor list *(owner: andy)*
+• [2026-03-28] **Weekly team** — Review Q2 planning doc *(owner: Andy)*
+```
+
+Returns `"No action items found for \"<person>\""` when no row matches.
+
+**Sample prompts**
+
+- _"What action items does Andy owe me?"_
+- _"Find everything assigned to Pierce since March."_
+- _"What have I committed to do based on my calls?"_ (with `person: "Jeremy"`)
+
+## `recent_calls`
+
+List calls from the last N days, ordered newest first. Up to 50 rows.
+
+**Input**
+
+| Param | Type | Required | Default | Notes |
+|-------|------|----------|---------|-------|
+| `days` | integer (1–365) | no | 7 | Look-back window. |
+
+**Output**
+
+```
+Found 4 calls in the last 7 day(s):
+
+• [2026-04-14] Sync with Pilar (`https://meet.google.com/...`) — We discussed options for the vision board and next weekend's trip planning…
+• [2026-04-12] IronRidge Q2 kickoff (`...`) — Agreed on scope and the April 30 checkpoint…
+…
+```
+
+Returns `"No calls found in the last N day(s)."` when empty.
+
+**Sample prompts**
+
+- _"What did I do last week?"_
+- _"Summarize my calls from the last 30 days."_
+- _"Which meetings have I had in the past 3 days?"_
+
+## `answer_from_transcript`
+
+Ask a question about a single indexed call. Runs RAG over that call's chunks: embed the question, query Vectorize filtered by `transcript_id`, feed the top-8 chunks + question to `gpt-5-mini`, return a grounded answer.
+
+Where `search_calls` is "which calls mention X?" across the corpus, `answer_from_transcript` is "in _this_ call, what did we decide about X?"
+
+**Input**
+
+| Param | Type | Required | Notes |
+|-------|------|----------|-------|
+| `video_id` | string | yes | The `video_id` of the call to ask about. |
+| `question` | string | yes | The natural-language question. |
+
+**Output**
+
+A single text block with the model's answer. The model is prompted to answer using only the transcript excerpts, and to say so plainly if the answer isn't in the excerpts — it should not invent details.
+
+When Vectorize returns zero chunks (eventual consistency right after ingest, or metadata-index miss), the tool falls back to the full `raw_text` stored in D1 and passes a truncated copy to the model instead. If neither path has content, returns `"Transcript not yet indexed — try again in a moment."`
+
+**Errors**
+
+- Unknown `video_id` → `"Call not found: <video_id>"`
+- No chunks in Vectorize AND empty `raw_text` → `"Transcript not yet indexed — try again in a moment."`
+
+**Sample prompts**
+
+- _"In the IT Hiring call, when did we discuss the €1,500 offer?"_
+- _"What did Jugoslav say about MCP servers?"_
+- _"Summarize the compensation section of the call at `meet.google.com/abc-xyz`."_
+- _"Did we agree on a start date for the new hire?"_
+
+**Prerequisite: metadata index**
+
+This tool uses `filter: { transcript_id }` on Vectorize, which requires a metadata index pre-declared on the `transcript_id` property. `scripts/setup.ts` creates this for new forks; existing deployments run:
+
+```bash
+npx wrangler vectorize create-metadata-index aftercall-vectors \
+  --property-name=transcript_id --type=number
+```
+
+Metadata indexes only apply to vectors inserted _after_ index creation. If you have historical data, `scripts/reindex-vectorize.ts` re-upserts every existing chunk so the filter works across your whole history. See `conductor/tracks/notion-redesign-and-rag-tool/migration.md`.
+
+## Error responses
+
+MCP errors follow JSON-RPC 2.0 conventions:
+
+- Invalid bearer → HTTP 401 with `WWW-Authenticate: Bearer resource_metadata="..."`
+- Unknown tool name → JSON-RPC error `-32601 Method not found`
+- Invalid input (e.g. `limit: -5`) → JSON-RPC error `-32602 Invalid params` (the SDK enforces Zod schemas automatically)
+- Upstream failure (OpenAI/Notion non-2xx) → the tool surfaces the error as a text response rather than throwing, so Claude sees a readable message.
+
+## Adding a new tool
+
+1. Create `src/mcp/tools/<name>.ts` with a pure async function `(args, env, deps?) => ToolResult`.
+2. Write a unit test at `src/mcp/tools/<name>.test.ts` — follow the pattern in existing tests (real D1 via `setupD1()`, mocks for external services).
+3. Register the tool in `src/mcp/tools.ts` with a Zod input schema, `title`, and `description`. Zod runtime validation + schema export is automatic.
+4. Add an entry to this file.
+5. Deploy. Claude.ai picks up the new tool on the next `tools/list` call (usually after a reconnection).
+
+---
