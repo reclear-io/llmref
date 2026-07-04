@@ -1,0 +1,3220 @@
+# open-nfse
+
+Source: https://github.com/fm-s/open-nfse/blob/main/README.md
+
+# open-nfse
+
+Cliente TypeScript/Node.js para o **Padrão Nacional de NFS-e** (nfse.gov.br) — a API unificada da Receita Federal, obrigatória em todo o Brasil a partir de 1º de janeiro de 2026 (LC 214/2025). Fala direto na API oficial, sem gateway intermediário.
+
+
+**📚 Documentação:** [fm-s.github.io/open-nfse](https://fm-s.github.io/open-nfse/) · [API cheat sheet](https://fm-s.github.io/open-nfse/api-cheatsheet) · [API completa](https://fm-s.github.io/open-nfse/api/)
+
+## Status
+
+**v0.9.x — alinhamento ao schema oficial RTC v1.01 + NT-007.** Ciclo fiscal completo: consulta (chave + NSU), emissão segura com `DpsCounter` + `RetryStore`, cancelamento e substituição com máquina de 5 estados, validações locais (XSD / CPF+CNPJ / CEP), parâmetros municipais com cache, DANFSe em PDF (online + fallback local), `NfseClientFake` em `open-nfse/testing`. Pipeline de retry consciente de 429 (`TooManyRequestsError` → `retry_pending` com `notBefore` honrando `Retry-After`; `RetryPolicy` pluggable).
+
+**Novidades em v0.9** — o validador passou a ser gerado dos schemas oficiais `schemas/1.01/` e a lib foi auditada **campo a campo** contra eles: domínio completo do `CST` PIS/COFINS e `TipoRetPisCofins` (NT-007, em produção desde 2026-02-09), `cNBS` opcional, remoção de elementos inexistentes no RTC v1.01 (`lsadppu`/`explRod`), correção do parsing de eventos de rejeição/anulação e de campos `minOccurs="0"` lidos como obrigatórios. Inclui **breaking renames** pré-1.0 (`fetchDanfse`→`consultarDanfse`, `EmitManyOptions`→`EmitLoteOptions`, `InvalidIdDpsError`→`InvalidDpsIdError`, enums de PIS/COFINS, `xOutInf` movido para `InfNFSe`). Veja [CHANGELOG](./CHANGELOG.md) para a lista completa.
+
+**v0.9.1** — segunda auditoria de conformidade (o bundle oficial não mudou): confirmada conformante, com o valor faltante `RegimeEspecialTributacao.Outros` (`'9'`) e novos enums para campos antes `string` (`SituacaoNfse`/`cStat`, `IndicadorDestinatario`/`indDest`, `MecanismoApoioComExPrestador`/`Tomador`/`mecAFComex*`), `verAplic` de evento obrigatório, e cinco correções no cheat sheet da API.
+
+Foco até 1.0 é estabilização; a API pública pode receber ajustes, sem breaking changes sem aviso em CHANGELOG.
+
+## Instalar
+
+```bash
+npm install open-nfse
+```
+
+Requer Node.js 20+ e certificado digital A1 (ICP-Brasil) em `.pfx` ou `.p12` do CNPJ emitente habilitado no Emissor Nacional.
+
+## Exemplo mínimo
+
+Setup do cliente com counter atômico de `nDPS` e store de retry (in-memory para início rápido; produção usa Postgres):
+
+```typescript
+import {
+  NfseClient, Ambiente,
+  createInMemoryDpsCounter, createInMemoryRetryStore,
+} from 'open-nfse';
+import { readFileSync } from 'node:fs';
+
+const cliente = new NfseClient({
+  ambiente: Ambiente.ProducaoRestrita,
+  certificado: { pfx: readFileSync('./cert.pfx'), password: process.env.CERT_PASSWORD! },
+  dpsCounter: createInMemoryDpsCounter(),
+  retryStore: createInMemoryRetryStore(),
+});
+```
+
+Emissão com resultado discriminado (`ok` autorizada, `retry_pending` salvo no store, throw em rejeição permanente):
+
+```typescript
+import {
+  OpcaoSimplesNacional, RegimeApuracaoSimplesNacional, RegimeEspecialTributacao,
+  ReceitaRejectionError,
+} from 'open-nfse';
+
+try {
+  const r = await cliente.emitir({
+    emitente: {
+      cnpj: '00574753000100',
+      codMunicipio: '2111300',
+      regime: {
+        opSimpNac: OpcaoSimplesNacional.MeEpp,
+        regApTribSN: RegimeApuracaoSimplesNacional.FederalEMunicipalPeloSN,
+        regEspTrib: RegimeEspecialTributacao.Nenhum,
+      },
+    },
+    serie: '1',
+    servico: { cTribNac: '010101', cNBS: '123456789', descricao: 'Consultoria' },
+    valores: { vServ: 1500.0, aliqIss: 2.5 },
+    // Simples Nacional? informe a alíquota aproximada:
+    // valores: { vServ: 1500.0, pTotTribSN: 6.0 },
+    tomador: { documento: { CNPJ: '11222333000181' }, nome: 'Acme Ltda' },
+  });
+
+  if (r.status === 'ok') {
+    console.log('autorizada:', r.nfse.chaveAcesso);
+  } else {
+    console.warn('pendente no store:', r.pending.id);
+  }
+} catch (err) {
+  if (err instanceof ReceitaRejectionError) {
+    console.error(`rejeitada [${err.codigo}]: ${err.descricao}`);
+  } else {
+    throw err;
+  }
+}
+```
+
+Cron de retry (mesma função cobre `emitir`, `cancelar`, `substituir`):
+
+```typescript
+// schedule: a cada 1-5 minutos, um worker só
+const items = await cliente.replayPendingEvents();
+for (const item of items) {
+  if (item.status === 'success_emission') await persistirNfse(item.emission);
+  if (item.status === 'success')          await persistirEvento(item.evento);
+  if (item.status === 'failed_permanent') alertar(item);
+  // still_pending fica no store para próxima rodada
+}
+```
+
+Exemplos runnables em [`examples/emit-nfse/`](./examples/emit-nfse/). Padrão completo de produção (persistência, bulk com counter+retry, reconciliação) em [Emitir NFS-e](https://fm-s.github.io/open-nfse/guide/emitir).
+
+## O que a lib cobre
+
+| Escopo                                  | Guia                                                                 |
+|-----------------------------------------|----------------------------------------------------------------------|
+| Consulta por chave + distribuição por NSU | [Consultar](https://fm-s.github.io/open-nfse/guide/consultar)      |
+| Emissão segura com counter + retry store | [Emitir](https://fm-s.github.io/open-nfse/guide/emitir)             |
+| Cancelamento e substituição (5 estados) | [Substituir e cancelar](https://fm-s.github.io/open-nfse/guide/substituir-cancelar) |
+| Validações XSD + CPF/CNPJ + CEP         | [Validações](https://fm-s.github.io/open-nfse/guide/validacoes)     |
+| Parâmetros municipais com cache         | [Parâmetros](https://fm-s.github.io/open-nfse/guide/parametros)     |
+| DANFSe em PDF (online + local)          | [DANFSe](https://fm-s.github.io/open-nfse/guide/danfse)             |
+| Dublê em memória para testes            | [Testing](https://fm-s.github.io/open-nfse/guide/testing)           |
+| Schema SQL sugerido para integração     | [Integração em serviços](https://fm-s.github.io/open-nfse/guide/integracao) |
+
+## Arquitetura
+
+```
+┌────────────────────────────────────────────────────────────┐
+│   API pública (NfseClient + open-nfse/testing)             │
+├────────────────────────────────────────────────────────────┤
+│  Leitura            │  Emissão        │  Eventos            │
+│  fetch-by-chave     │  emitir         │  cancelar           │
+│  fetch-by-nsu       │  emitir-em-lote │  substituir (4-st)  │
+│                     │  emitirDpsPronta│  replayPendingEvents│
+│                                                            │
+│  Retry pipeline (429-aware): PendingEvent + RetryStore +   │
+│   RetryPolicy (notBefore + attempts + safe-wrap)           │
+│                                                            │
+│  parse-xml ↔ build-xml + sign-xml (RTC v1.01 ↔ DTO)         │
+│  build-dps (helper) + dps-id + validate-xml (XSD WASM)      │
+├────────────────────────────────────────────────────────────┤
+│  Validações: CPF/CNPJ DV · CEP (ViaCEP)                    │
+│  Parâmetros municipais (6× consultar + cache)              │
+│  DANFSe: fetch (ADN) + gerar (pdfkit local)                │
+├────────────────────────────────────────────────────────────┤
+│  HTTP client (undici + mTLS + HTTP/1.1, GZip/Base64, PDF)  │
+│  · TooManyRequestsError (429) + getRetryAfterMs()          │
+├────────────────────────────────────────────────────────────┤
+│  Certificado A1 (node-forge, ICP-Brasil, pluggable)        │
+└────────────────────────────────────────────────────────────┘
+```
+
+A API oficial está dividida em **quatro hosts distintos** (SEFIN Nacional, ADN Contribuintes, ADN DANFSe, ADN Parâmetros Municipais) com contratos wire diferentes — camelCase vs PascalCase, `tipoAmbiente` int vs string. O `NfseClient` resolve o host por chamada; DTOs públicos normalizam.
+
+## Princípios
+
+DTO in, DTO out. Erros tipados em 3 níveis. Sem estado interno, com primitives de orquestração (`emitirEmLote`, máquina de 5 estados de `substituir`) e retry (`RetryStore` + `RetryPolicy` + `replayPendingEvents`). Types derivados dos XSDs RTC v1.01 oficiais; `xs:choice` vira discriminated union. Identificadores fiscais como `string` para preservar zeros. Builder de DPS separável do transporte (dry-run). Detalhes em [Princípios de design](https://fm-s.github.io/open-nfse/guide/principios).
+
+## Ambientes
+
+| Serviço                        | Produção Restrita (homologação)                    | Produção (notas válidas)                  |
+|--------------------------------|----------------------------------------------------|-------------------------------------------|
+| SEFIN Nacional                 | `sefin.producaorestrita.nfse.gov.br/SefinNacional` | `sefin.nfse.gov.br/SefinNacional`         |
+| ADN Contribuintes              | `adn.producaorestrita.nfse.gov.br/contribuintes`   | `adn.nfse.gov.br/contribuintes`           |
+| ADN DANFSe                     | `adn.producaorestrita.nfse.gov.br/danfse`          | `adn.nfse.gov.br/danfse`                  |
+| ADN Parâmetros Municipais      | `adn.producaorestrita.nfse.gov.br/parametrizacao`  | `adn.nfse.gov.br/parametrizacao`          |
+
+## Status dos municípios
+
+Todo município é obrigado a aderir ao Padrão Nacional, mas a migração é gradual ao longo de 2026. A lib funciona com qualquer município aderente — a API é a mesma. Municípios ainda não aderentes continuam no sistema municipal até a migração.
+
+## Escopo explícito
+
+**Suportado:** consulta (chave + NSU), emissão segura (`emitir(params)`), eventos 101101 e 105102 (cancelamento + substituição) como emissão; parse de todos os 16 tipos de eventos via NSU distribuição (inclusive confirmação/rejeição P/T/I, cancelamento por ofício); validações locais; parâmetros municipais; DANFSe PDF; `fetchDpsStatus` para reconciliação.
+
+**Fora de escopo** (intencional):
+- **`POST /decisao-judicial/nfse`** — backs the **Emissor Público Web UI** per Guia v1.2 §4.3, não é uma API de contribuinte. Emissão por decisão judicial acontece via UI Web da Receita, não via lib.
+- **CNC** (Cadastro Nacional de Contribuintes) — schemas `CNC_v1.00.xsd` / `tiposCnc_v1.00.xsd` não são referenciados pelo fluxo NFS-e; fora do escopo.
+- **Emissão dos 14 tipos de evento "não-cancelamento"** (202201 etc.) — parseamos quando chegam via NSU, mas não há builders públicos. Município-only em sua maioria; abra uma issue se precisar.
+- **ADN Parâmetros Municipais — endpoints POST** (`beneficiomunicipal/{idManut}`, `regimes_especiais/{idManut}`, `retencoes/{idManut}`) — admin-only da municipalidade.
+
+**Backlog** (worth wrapping antes de 1.0):
+- `GET /nfse/{chave}/eventos/{tipoEvento}/{numSeqEvento}` (SEFIN) — fetch específico de evento
+- `GET /NFSe/{chave}/Eventos` (ADN Contribuintes) — event list por chave sem passar por NSU
+
+## Contribuindo
+
+Bugs e sugestões: [issues](https://github.com/fm-s/open-nfse/issues). PRs bem-vindos — rode `npm run lint && npm run typecheck && npm test` antes de abrir. Histórico de versões no [CHANGELOG.md](./CHANGELOG.md).
+
+## Links
+
+- [Portal oficial NFS-e Nacional](https://www.gov.br/nfse/pt-br)
+- [Documentação técnica da Receita](https://www.gov.br/nfse/pt-br/biblioteca/documentacao-tecnica)
+- [Manual do Contribuinte v1.2](https://www.gov.br/nfse/pt-br/biblioteca/documentacao-tecnica/documentacao-atual/manual-contribuintes-emissor-publico-api-sistema-nacional-nfs-e-v1-2-out2025.pdf)
+- [Lei Complementar 214/2025](https://www.planalto.gov.br/)
+
+## Aviso legal
+
+Biblioteca **não oficial**, sem vínculo com a Receita Federal do Brasil. Software open source, distribuído sob licença MIT, sem garantias. Homologação e conformidade fiscal são responsabilidade de quem utiliza.
+
+---
+
+# CLAUDE.md
+
+Source: https://github.com/fm-s/open-nfse/blob/main/CLAUDE.md
+
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Repository status
+
+**v0.9.x shipped — see CHANGELOG for the current patch.** Full fiscal lifecycle covered:
+
+- **v0.1** — `fetchByChave`, `fetchByNsu`, parser RTC v1.01.
+- **v0.2** — `emitirDpsPronta` / `emitirEmLote`, dry-run, XMLDSig, XSD WASM, CPF/CNPJ DV, ViaCEP, `buildDps`.
+- **v0.3** — `cancelar` (101101) + `substituir` (105102) with 5-state compensation machine (`ok` / `retry_pending` / `rolled_back` / `rollback_pending` / `rollback_failed`), pluggable `RetryStore`, `replayPendingEvents`.
+- **v0.4** — safe emit flow: `emitir(params)` with `DpsCounter`. Counter only consumes after offline validations pass; transient errors go to `RetryStore` instead of throwing. Old API preserved as `emitirDpsPronta(dps)` escape hatch.
+- **v0.5** — 6 `consultar*` methods against ADN `/parametrizacao`, with pluggable `ParametrosCache` (default in-memory + TTL).
+- **v0.6** — `NfseClientFake` in `open-nfse/testing` subpath, structurally compatible via `NfseClientLike`.
+- **v0.7** — DANFSe PDF: `gerarDanfse(nfse, options)` with strategy `'auto' | 'online' | 'local'` (default `'auto'` = ADN online + fallback to local pdfkit renderer); `fetchDanfse(chave)` online-only.
+- **v0.8.0** — 429 handling: typed `TooManyRequestsError`, classified as transient, persisted in `RetryStore` with `notBefore` (from `Retry-After`) and `attempts`. Pluggable `RetryPolicy` (interface + `createDefaultRetryPolicy`); the lib wraps every configured policy via internal `makeSafePolicy` so a buggy custom policy can't mask the original fiscal error. **Fixed** a critical pre-existing bug from v0.7.2: events persisted to `RetryStore` were unsigned (replay rejected by SEFIN); legacy data rescued automatically.
+- **v0.8.1–0.8.6** — XSD/serialization conformance hardening (enums, types), `buildDps` business-rule guards, and **alignment with Anexo II SEFIN_ADN v1.00-20251226**: the `infPedReg` `Id` dropped `nPedRegEvento` (now `PRE` + chave(50) + tipoEvento(6) = 59 chars, `PRE[0-9]{56}`), the `<nPedRegEvento>` element was removed from the event body, and event dedup is now `(chave, tipoEvento)`. `nPedRegEvento` no longer exists anywhere in the API — **do not re-introduce it.** See CHANGELOG for the full per-patch list.
+
+Docs site: VitePress + TypeDoc → https://fm-s.github.io/open-nfse/. Roadmap ahead: stabilization until 1.0 — public API may still receive tweaks. Details per-version in CHANGELOG.
+
+## Commands
+
+```
+npm test             # run vitest once
+npm run test:watch   # vitest in watch
+npm run test:coverage
+npm run typecheck    # tsc --noEmit on the whole tree (tests included)
+npm run build        # tsc -p tsconfig.build.json → emits dist/ without tests
+npm run lint         # biome check
+npm run lint:fix     # biome check --write (safe fixes; some rules need --unsafe)
+```
+
+`prepublishOnly` chains lint + typecheck + tests + clean + build. Don't publish without it passing.
+
+- Single test file: `npx vitest run src/nfse/parse-xml.test.ts`
+- Single test by name: `npx vitest run -t 'parses exterior tomador'`
+
+## What this library is
+
+TypeScript/Node client for **NFS-e Padrão Nacional** (nfse.gov.br) — the unified Brazilian service-invoice API operated by the Receita Federal, sole standard from **2026-01-01** (LC 214/2025). Talks directly to the official API; not a wrapper over a commercial gateway.
+
+**Canonical Portuguese domain terms** — do not translate:
+
+- **DPS** — Declaração de Prestação de Serviços (what the emitente submits)
+- **NFS-e** — the authorized document returned by the Receita
+- **DF-e** — Documentos Fiscais Eletrônicos (umbrella for distribution by NSU)
+- **NSU** — Número Sequencial Único (cursor for incremental DF-e sync, per CPF/CNPJ)
+- **DANFSe** — PDF representation of an NFS-e
+- **IBS / CBS / NBS / cClassTrib** — Reforma Tributária tax codes
+- **Sefin Nacional** — federal emission endpoint host; **ADN** (Ambiente de Dados Nacional) — federal distribution endpoint host
+
+## Architecture — actual shipped shape
+
+The API is split across **two base URLs**, not one:
+
+| Service | Path on `Ambiente` | Endpoints used |
+|---|---|---|
+| **SEFIN Nacional** | `endpoints.sefin` | `POST /nfse` ✓, `GET /nfse/{chave}` ✓, events on `/nfse/{chave}/eventos` ✓, `GET/HEAD /dps/{id}` ✓ (v0.7.2). **Out of scope:** `POST /decisao-judicial/nfse` (backs the Emissor Público Web UI per Guia v1.2 §4.3, not a contribuinte API); `GET /nfse/{chave}/eventos/{tipoEvento}/{numSeqEvento}` (backlog). |
+| **ADN Contribuintes** | `endpoints.adn` | `GET /DFe/{NSU}` ✓, `GET /NFSe/{ChaveAcesso}/Eventos` (not yet wrapped) |
+| **ADN DANFSe** | `endpoints.danfse` | `GET /{chaveAcesso}` → PDF ✓ |
+| **ADN Parâmetros Municipais** | `endpoints.parametrosMunicipais` | `GET /aliquotas/{cMun}/{cServ}/{competencia}` + 5 more ✓ |
+
+Crucially, **SEFIN uses camelCase + int `tipoAmbiente`** while **ADN uses PascalCase + string `TipoAmbiente`** — wire-format types stay private per module and the public DTOs normalize to a single convention. Don't ever "unify" the wire formats at the HTTP layer; they're genuinely different contracts.
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│  Public API — NfseClient + open-nfse/testing (NfseClientFake)  │
+├────────────────────────────────────────────────────────────────┤
+│  Leitura                │  Emissão seg.     │  Eventos          │
+│  nfse/fetch-by-chave    │  nfse/emit        │  eventos/cancelar │
+│  dfe/fetch-by-nsu       │  (emitSeguro,     │  (substituir 5-st)│
+│  nfse/parse-xml         │   emitDpsPronta,  │eventos/post-evento│
+│                         │   emitMany)       │                   │
+│                                                                │
+│  Retry pipeline (v0.8): retry/{store, transient, policy}       │
+│   · store         — PendingEvent shape + RetryStore interface  │
+│   · transient     — defaultIsTransient classifier              │
+│   · policy        — RetryPolicy + createDefaultRetryPolicy +   │
+│                     makeSafePolicy (internal)                  │
+│   replayPendingEvents (in NfseClient) drives the recovery.     │
+│                                                                │
+│  Helpers: buildDps · buildDpsXml · signDpsXml · dps-id         │
+│  Validations: validate-xml (XSD WASM) · fiscal DV · cep/viacep │
+│  Parâmetros: parametros-municipais/{fetch, cache, parse}       │
+│  DANFSe: danfse/{fetch ADN, gerar pdfkit+qrcode}               │
+├────────────────────────────────────────────────────────────────┤
+│  http/client (undici + mTLS + HTTP/1.1, JSON/gzip/base64, PDF) │
+│  · mapStatusError → typed errors incl. TooManyRequestsError    │
+│  · HttpStatusError.getRetryAfterMs() (RFC 7231)                │
+├────────────────────────────────────────────────────────────────┤
+│  certificate (ICP-Brasil A1, node-forge, pluggable)            │
+└────────────────────────────────────────────────────────────────┘
+```
+
+**Invariants that are easy to accidentally break**:
+
+- **`HttpClient` knows nothing about NFS-e semantics** — it's just "mTLS JSON + status mapping." Domain knowledge (XML parsing, rejection codes, NSU pagination) lives upstream.
+- **`NfseClient.close()` only closes dispatchers it owns.** When a user (or test) injects a `dispatcher`, we don't close it — they own the lifecycle. `ownsDispatcher` flag tracks this.
+- **XML values stay as strings through the low-level parser.** `src/xml/parser.ts` never coerces; coercion (`"2"` → `2`, ISO string → `Date`) happens in `src/nfse/parse-xml.ts` because only the domain layer knows semantic types.
+- **XSD `xs:choice` → TS discriminated union.** `IdentificadorPessoa`, `LocPrest`, `TribTotal`, `InfoDedRed`, `ReferenciaDocDedRed`, `EnderecoLocalidade` (and more) are unions where consumers narrow via `in` operator. Never collapse a choice to "optional fields" — you lose exhaustiveness.
+- **Identifiers stay `string` (CNPJ, CPF, CEP, cMun, cTribNac)** to preserve leading zeros. **Decimals → `number`** (document this precision tradeoff; consumers needing exact fiscal math wrap in Decimal.js). **Dates → `Date`**.
+- **Some Receita endpoints return 4xx with meaningful bodies.** ADN Contribuintes `/DFe/{NSU}` returns **400 with the full response body** for rejeição and **404 with the full body** for "nenhum documento localizado". These are NOT HTTP errors — the real status is in `body.StatusProcessamento`. `HttpClient.get/post` accepts a `RequestOptions.acceptedStatuses: number[]` list; statuses in the list bypass `mapStatusError` and are parsed normally. `fetchByNsu` uses `[400, 404]`. When implementing v0.2 emission, `POST /nfse` 400 also carries a rejection body (`NFSePostResponseErro`) — same pattern, use `acceptedStatuses: [400]`.
+- **Force HTTP/1.1 — SEFIN Nacional rejects HTTP/2.** The server responds `HTTP_1_1_REQUIRED` on H2 streams for authenticated paths. undici's Agent must be constructed with `allowH2: false` AND `ALPNProtocols: ['http/1.1']` in `connect` — without both, undici may hang silently when the server kills H2 streams (the error closes the socket in a way that doesn't surface as a promise rejection). Both `createMtlsDispatcher` and the inline Agent construction inside `NfseClient.ensureState` already do this; don't remove it.
+- **`PendingEvent.xmlAssinado` MUST always be signed before persistence.** A pre-existing bug (v0.7.2–v0.7.3) stored unsigned XML for transient cancellation/substitution failures — replay sent unsigned bytes, SEFIN rejected with a signature error, `defaultIsTransient` classified the rejection as permanent → entry deleted, operation silently lost. Fixed in v0.8.0 by signing up-front in `cancelar` / `substituir` and passing `xmlJaAssinado: true` to `postEvento`. The pattern mirrors `emitSeguro`, which always signed up-front. Don't re-introduce the postEvento-signs-internally pattern in `src/eventos/`. `replayPendingEvents` also rescues legacy unsigned event data (re-signs before POST + logs `warn`) — keep that path until 1.0.
+- **`RetryPolicy.computeNotBefore` must NOT throw — but the lib wraps defensively anyway.** `NfseClient` constructor wraps the configured (or default) policy via internal `makeSafePolicy(inner, logger)`. Exceptions in `computeNotBefore` are caught + logged + degraded to `notBefore: undefined` (entry stays eligible on next sweep). The wrap is idempotent for `emitSeguro` consumers (not exported, only NfseClient calls it), but advanced users importing `cancelar` / `substituir` directly receive the unwrapped policy. Document the contract loudly.
+- **`replayPendingEvents` is single-threaded.** Two concurrent calls would double SEFIN's rate-limit consumption — replay reads the full list at the start, iterates serially, and saves back on transient catches. JSDoc on the method says this; if you change the contract (e.g., add internal locking) update the doc and the integration guide.
+- **`Retry-After` parsing is intentionally lenient.** `HttpStatusError.getRetryAfterMs()` accepts both RFC delta-seconds (`120`) and HTTP-date forms, plus decimal seconds (`12.5` → 13s via `Math.ceil`) for servers that send fractional values. Rejects signed values (`+60`, `-5`) explicitly — `Date.parse('-5')` returns `0` on V8 which would silently route to the past-date branch. The default `RetryPolicy` clamps absurd values to `maxRetryAfterMs` (1h default).
+
+## Schema provenance
+
+- **Canonical XSDs**: `schemas/1.01/` — the 10 official XSDs (RTC v1.01). `scripts/generate-schemas.mjs` inlines them into `src/nfse/_rtc-schemas.generated.ts` for the WASM validator; rerun it after any schema edit. `schemas/1.00/` is the obsolete 2022 base, kept for reference only. **One deliberate libxml-compat deviation** from the official bundle: `TSSerieDPS`'s pattern had literal `^`/`$` (`^0{0,4}\d{1,5}$`) — invalid as XSD-1.0 anchors, so stripped to `0{0,4}\d{1,5}`; re-apply if you re-download the official schema.
+- **OpenAPI specs**: `specs/*.openapi.json` — Swagger specs for SEFIN Nacional, ADN Contribuinte, ADN DANFSe. Extracted from Produção Restrita Swagger UIs (cert-gated) on 2026-04-16. When the Receita updates a spec, drop the new JSON here.
+- **Sample responses**: `specs/samples/*.xml` — real captured NFS-e XMLs from Produção Restrita. Used as fixture in `parse-xml.test.ts`. Add more samples as they're captured; parser coverage grows with them.
+
+`schemas/` and `specs/` are reference material, not shipped. `biome.json` ignores both. The `files: ["dist"]` whitelist keeps them out of the npm tarball.
+
+## Design principles (binding)
+
+Public commitments — changes need explicit user sign-off:
+
+1. **DTO in, DTO out.** Callers never see XML, GZip, Base64, mTLS plumbing, or XMLDSig. Everything is plain typed objects. (The raw `xmlNfse` string is still exposed on `NfseQueryResult` as an escape hatch, not a replacement.)
+2. **Typed errors, one class per failure mode.** `ExpiredCertificateError`, `NotFoundError`, `ReceitaRejectionError`, etc. Hierarchy: `Error` → `OpenNfseError` → intermediate group (`HttpError`, `CertificateError`, `ValidationError`) → concrete. The HTTP-status subtree adds a fourth, load-bearing level: `HttpError` → `HttpStatusError` → `NotFoundError`/`TooManyRequestsError`/… — `instanceof HttpStatusError` drives transient classification, so don't flatten it.
+3. **No internal state, but yes to orchestration/retry primitives.** No database, no hidden cache, no singleton — but `emitirEmLote` orchestrates concurrency, `substituir` runs a 5-state compensation machine, and `RetryStore` + `replayPendingEvents` provide pluggable retry infrastructure. Durable persistence is the consumer's job.
+4. **Schema-driven types.** Every TS interface in `src/nfse/domain.ts` maps to a TCxxx complex type in the XSD. When a Nota Técnica lands, walk the XSD diff → update domain types + parser + add fixture → bump MINOR.
+5. **DPS builder (v0.2) will be separable from transport.** A caller must be able to build + validate + get signed XML without sending (dry-run / preview / offline tests).
+6. **Pluggable certificate provider.** `CertificateProvider` is an interface; concrete providers (file, buffer, and future KMS/Vault/env) implement it. `NfseClientConfig.certificado` also accepts the simple `{ pfx, password }` shape for the common case.
+
+## Naming conventions (binding)
+
+Keep new public symbols consistent with these rules — they were ratified in the v0.8.x API-consistency pass:
+
+- **Verbs follow the operation's nature, by language.** Fiscal/domain operations use Portuguese verbs (`emitir`, `cancelar`, `substituir`, `consultar*`, `gerarDanfse`, `consultarDanfse`). Generic transport reads use the English `fetch*` family (`fetchByChave`, `fetchByNsu`, `fetchDpsStatus`). DANFSe operations are uniformly PT: `gerarDanfse` (produces a PDF, local/online) + `consultarDanfse` (online-only GET) — the old `fetchDanfse` was renamed to remove the PT/EN clash on one noun.
+- **`*Params` vs `*Options`.** `*Params` is the **full input object** for a high-level client method — required fields included (`FetchByNsuParams`, `CancelarParams`, `EmitirParams`). `*Options` is an **optional-only config bag**, typically for a low-level free function (`FetchByNsuOptions`, `EmitOptions`, `EmitLoteOptions`, `ConsultaOptions`). `FetchByNsuParams extends FetchByNsuOptions` is the canonical example: the method bundles the required `ultimoNsu` on top of the optional bag — not drift.
+- **One stem per feature.** Batch emission is the `EmitLote*` stem throughout: method `emitirEmLote`, types `EmitLoteResult` / `EmitLoteItem` / `EmitLoteOptions`. Don't introduce a parallel `EmitMany*` / `Lote*` synonym.
+- **Error word-order is `DpsId`, not `IdDps`.** Matches `buildDpsId`. `InvalidDpsIdError` (invalid `infDPS.Id`), `InvalidDpsIdParamError` (bad `buildDpsId` args), `InvalidEventoPedidoIdParamError` (bad `buildEventoPedidoId` args).
+- **`create*` factories vs `new` for clients.** Pluggable, stateless primitives are built by `create*` factories (`createInMemoryRetryStore`, `createInMemoryDpsCounter`, `createInMemoryParametrosCache`, `createDefaultRetryPolicy`, `createViaCepValidator`) — they return a plain interface impl with no lifecycle. The two clients (`new NfseClient`, `new NfseClientFake`) use `new` deliberately: they own a lifecycle (an mTLS dispatcher + single-shot `close()`), which a factory would obscure. Don't add a `createNfseClient` factory.
+- **Module-local error classes.** Most typed errors live in `src/errors/`, but a few are declared next to the only code that throws them (`ClientClosedError` in `client.ts`, `DpsAlreadySignedError` in `sign-xml.js`, `MissingRetryStoreError`/`MissingDpsCounterError` near their stores). This is an accepted pattern for errors with a single throw site — keep it; don't relocate them to `src/errors/` just for uniformity.
+
+## Roadmap ordering — why reads came before writes (historical)
+
+- **v0.1 (shipped) = consulta/distribuição only.** A broken read just needs a retry.
+- **v0.2 = emissão síncrona** (write-side). A broken emission can produce invalid fiscal documents in production, so it shipped only after reads, mTLS, cert loading, and error typing were proven.
+
+The ordering was risk management, not schedule. All versions through v0.8 are now shipped — focus until 1.0 is stabilization, not new features. New features warrant explicit scope discussion.
+
+## Scope fences
+
+Explicitly out of scope — flag if a request pushes into these:
+
+- ERP integrations (Bling, Omie, Tiny, etc.) — belong in separate packages built on top.
+- Web UI / dashboard — this is a library, not a product.
+- Persistence of emitted notes, retry queues, orchestration — consumer's responsibility.
+- Legacy municipal ABRASF emitters — obsolete in 2026.
+- NF-e (produto) — different standard, different project.
+
+## Tax-reform timeline
+
+IBS/CBS transition 2026–2033 with annual Notas Técnicas. Workflow when one lands:
+
+1. Download the new XSD bundle, drop in `schemas/X.YZ/` and point `generate-schemas.mjs` at it.
+2. Diff against current schemas — identify new/renamed/changed TCxxx types.
+3. Update `src/nfse/domain.ts` (interfaces), `src/nfse/enums.ts` (any new fixed-value simple types), `src/nfse/parse-xml.ts` (walkers + discriminant branches).
+4. Prefer optional fields over required — additive-friendly types reduce breaking-change blast radius.
+5. Add a captured real sample covering the new fields to `specs/samples/`.
+6. Bump MINOR (0.X.0 → 0.Y.0 pre-1.0; 1.Y → 1.Z after 1.0).
+
+---
+
+# API cheat sheet
+
+Source: https://github.com/fm-s/open-nfse/blob/main/docs/api-cheatsheet.md
+
+# API cheat sheet
+
+Assinaturas compactas de toda a superfície pública. Para parâmetros completos, tipos aninhados e JSDoc, clique em cada link para a [API completa (TypeDoc)](/api/).
+
+## Cliente
+
+### `NfseClient`
+
+```ts
+new NfseClient(config: NfseClientConfig): NfseClient
+```
+
+Todos os métodos abaixo retornam `Promise<T>`. Referência: [`NfseClient`](/api/classes/NfseClient).
+
+#### Leitura
+| Método                | Assinatura                                          | Lança                                                         |
+|-----------------------|-----------------------------------------------------|---------------------------------------------------------------|
+| `fetchByChave`        | `(chaveAcesso: string) → NfseQueryResult`           | `InvalidChaveAcessoError`, `NotFoundError`, `HttpError*`       |
+| `fetchByNsu`          | `(params: FetchByNsuParams) → NsuQueryResult`       | `HttpError*` (404/400 **não** lançam — viram `status`)         |
+| `fetchDpsStatus`      | `(idDps: string) → DpsStatusResult`                 | `InvalidDpsIdError`, `NotFoundError` (sem NFS-e gerada), `HttpError*` |
+| `existsDpsStatus`     | `(idDps: string) → boolean`                         | `InvalidDpsIdError`, `HttpError*` (HEAD; 404 → `false`)        |
+
+#### Emissão
+| Método                | Assinatura                                                                                         | Comportamento                                                  |
+|-----------------------|----------------------------------------------------------------------------------------------------|----------------------------------------------------------------|
+| `emitir`              | `(params: EmitirParams) → EmitirResult \| DpsDryRunResult`                                          | Counter após validação; transiente → `retry_pending`; permanente → throw |
+| `emitirDpsPronta`     | `(dps: DPS, options?: EmitOptions) → NfseEmitResult \| DpsDryRunResult`                             | Escape hatch: sem counter, sem retry store, throw em tudo      |
+| `emitirEmLote`        | `(dpsList: readonly DPS[], options?: EmitLoteOptions) → EmitLoteResult`                             | Worker pool client-side; `stopOnError` opcional                |
+
+#### Eventos
+| Método                | Assinatura                                          | Comportamento                                                  |
+|-----------------------|-----------------------------------------------------|----------------------------------------------------------------|
+| `cancelar`            | `(params: CancelarParams) → CancelarResult`         | Evento 101101; discriminated `ok` / `retry_pending`            |
+| `substituir`          | `(params: SubstituirParams) → SubstituirResult`     | Emit+cancel 105102; 5 estados + rollback automático            |
+| `replayPendingEvents` | `(override?: RetryStore) → ReplayItem[]`            | Cron-friendly; SEFIN dedupa → idempotente                      |
+
+#### Parâmetros municipais
+
+Todas aceitam `options?: ConsultaOptions` e retornam `Consulta*Result`.
+
+| Método                         | Args                                                                | TTL default |
+|--------------------------------|---------------------------------------------------------------------|-------------|
+| `consultarAliquota`            | `(codMunicipio, codServico, competencia: Date \| string)`            | 6h          |
+| `consultarHistoricoAliquotas`  | `(codMunicipio, codServico)`                                        | 24h         |
+| `consultarBeneficio`           | `(codMunicipio, numeroBeneficio, competencia)`                      | 6h          |
+| `consultarConvenio`            | `(codMunicipio)`                                                    | 24h         |
+| `consultarRegimesEspeciais`    | `(codMunicipio, codServico, competencia)`                           | 6h          |
+| `consultarRetencoes`           | `(codMunicipio, competencia)`                                       | 6h          |
+
+#### DANFSe
+| Método                | Assinatura                                                                                         |
+|-----------------------|----------------------------------------------------------------------------------------------------|
+| `gerarDanfse`         | `(nfse: NFSe, options?: GerarDanfseOptions & { strategy?: 'auto' \| 'online' \| 'local' }) → Buffer` |
+| `consultarDanfse`         | `(chaveAcesso: string) → Buffer`                                                                   |
+
+`'auto'` (default) tenta online e cai para local **só em transientes** (`NetworkError`/`TimeoutError`/`ServerError`); permission/404 propagam. `consultarDanfse` valida `/^\d{50}$/` upfront.
+
+#### Lifecycle
+| Método                | Assinatura                                           |
+|-----------------------|------------------------------------------------------|
+| `close`               | `() → void` — libera dispatcher mTLS; idempotente    |
+
+Após `close()`, qualquer método lança `ClientClosedError`.
+
+### `NfseClientConfig`
+
+| Campo              | Tipo                              | Default                         | Obrigatório para                       |
+|--------------------|-----------------------------------|---------------------------------|----------------------------------------|
+| `ambiente`         | `Ambiente`                        | —                               | sempre                                 |
+| `certificado`      | `CertificateInput`                | —                               | sempre                                 |
+| `emitente`         | `EmitenteConfig?`                 | —                               | (reservado)                            |
+| `timeoutMs`        | `number?`                         | `60_000`                        | —                                      |
+| `logger`           | `Logger?`                         | `noopLogger`                    | —                                      |
+| `dispatcher`       | `Dispatcher?`                     | auto (undici Agent mTLS)        | testes com `MockAgent`                 |
+| `cepValidator`     | `CepValidator?`                   | `createViaCepValidator()`       | override ViaCEP                        |
+| `retryStore`       | `RetryStore?`                     | —                               | `emitir`/`cancelar`/`substituir` transientes |
+| `dpsCounter`       | `DpsCounter?`                     | —                               | `emitir(params)` sem `nDPS` explícito  |
+| `parametrosCache`  | `ParametrosCache?`                | `createInMemoryParametrosCache()`| —                                     |
+| `retryPolicy`      | `RetryPolicy?`                    | `createDefaultRetryPolicy()`    | override de timing (backoff exponencial, jitter, etc.) |
+
+## Helpers standalone
+
+Reexportados do pacote raiz; não precisam de `NfseClient`.
+
+| Função                     | Assinatura                                                                          | Para quê                                                 |
+|----------------------------|-------------------------------------------------------------------------------------|----------------------------------------------------------|
+| `buildDps`                 | `(params: BuildDpsParams) → DPS`                                                    | Monta DPS completa a partir de ~10 campos; aceita `pTotTribSN` para Simples Nacional |
+| `buildDpsId`               | `(params: BuildDpsIdParams) → string`                                               | Gera os 45 chars do `infDPS.Id`                          |
+| `buildDpsXml`              | `(dps: DPS, options?: BuildDpsXmlOptions) → string`                                 | Serializa DPS em XML (sem assinar)                       |
+| `signDpsXml`               | `(xml: string, cert: A1Certificate) → string`                                       | XMLDSig (RSA-SHA256 + exc-c14n + enveloped)              |
+| `parseNfseXml`             | `(xml: string) → NFSe`                                                              | XML → DTO tipado                                          |
+| `parseEventoXml`           | `(xml: string) → EventoProcessado`                                                  | XML de evento → DTO tipado                                |
+| `validateDpsXml`           | `(xml: string, options?: ValidateDpsXmlOptions) → ValidateDpsXmlResult \| void`     | XSD RTC v1.01 via libxml2 WASM                           |
+| `validateCnpj`             | `(cnpj: string) → void`                                                             | Formato + DV; lança `InvalidCnpjError`                   |
+| `validateCpf`              | `(cpf: string) → void`                                                              | Formato + DV; lança `InvalidCpfError`                    |
+| `createViaCepValidator`    | `(options?: ViaCepOptions) → CepValidator`                                          | ViaCEP com cache em memória                              |
+| `createInMemoryDpsCounter` | `(initial?: number) → DpsCounter`                                                   | Counter em memória (testes/demos)                        |
+| `createInMemoryRetryStore` | `() → RetryStore`                                                                   | Store em memória (testes/demos)                          |
+| `createInMemoryParametrosCache` | `() → ParametrosCache`                                                         | Cache em memória (default do client)                     |
+| `gerarDanfse`              | `(nfse: NFSe, options?: GerarDanfseOptions) → Buffer`                               | PDF local (pdfkit + QR code)                             |
+| `consultarDanfse`              | `(httpClient: HttpClient, chaveAcesso: string) → Buffer`                            | GET /danfse/{chave} raw (uso interno do cliente)         |
+| `buildCancelamentoXml`     | `(params: BuildCancelamentoXmlParams, options?) → string`                           | XML do pedRegEvento 101101                               |
+| `buildSubstituicaoXml`     | `(params: BuildSubstituicaoXmlParams, options?) → string`                           | XML do pedRegEvento 105102                               |
+| `buildEventoPedidoId`      | `(params: BuildEventoPedidoIdParams) → string`                                      | `infPedReg.Id` canônico                                  |
+| `signPedRegEventoXml`      | `(xml: string, cert: A1Certificate) → string`                                       | XMLDSig para eventos                                     |
+| `postEvento`               | `(httpClient, cert, chave, xml, options) → EventoResult`                            | POST /nfse/{chave}/eventos raw                           |
+| `cancelar`                 | `(httpClient, cert, retryPolicy: RetryPolicy, params: CancelarParams) → CancelarResult`     | Impl pura; use `cliente.cancelar` em app code (passe `createDefaultRetryPolicy()`) |
+| `substituir`               | `(httpClient, cert, retryPolicy: RetryPolicy, params: SubstituirParams) → SubstituirResult` | Impl pura; use `cliente.substituir` em app code (passe `createDefaultRetryPolicy()`) |
+| `providerFromFile`         | `(path: string, password: string) → CertificateProvider`                            | Provider que lê .pfx do disco                            |
+| `collectCepsFromDps`       | `(dps: DPS) → readonly CollectedCep[]`                                              | Extrai todos CEPs (debug, dashboards)                    |
+| `collectIdentifiersFromDps`| `(dps: DPS) → readonly CollectedIdentifier[]`                                       | Extrai CNPJs/CPFs (debug, dashboards)                    |
+| `defaultIsTransient`       | `(err: unknown) → boolean`                                                          | Classificação default de erro transiente                 |
+| `createDefaultRetryPolicy` | `(options?: DefaultRetryPolicyOptions) → RetryPolicy`                               | Policy default: respeita Retry-After + cap 1h            |
+
+## Fake (testing)
+
+```ts
+import { NfseClientFake, type NfseClientLike } from 'open-nfse/testing';
+```
+
+Structurally compat com `NfseClient` via `NfseClientLike`. API de seeding documentada em [Testando com o fake](/guide/testing).
+
+## Interfaces pluggable
+
+```ts
+interface DpsCounter {
+  next(scope: { emitenteCnpj: string; serie: string }): Promise<string>;
+}
+
+interface RetryStore {
+  save(entry: PendingEvent): Promise<void>;
+  list(): Promise<readonly PendingEvent[]>;       // MUST return Date (não string)
+  delete(id: string): Promise<void>;
+}
+
+interface RetryPolicy {
+  computeNotBefore(err: Error, now: Date, context?: RetryContext): Date | undefined;
+}
+
+interface RetryContext {
+  readonly attempt: number;        // 1+ (incl. a tentativa que acabou de falhar)
+  readonly firstAttemptAt: Date;   // primeira persistência da entrada
+}
+
+interface DefaultRetryPolicyOptions {
+  readonly defaultRetryAfterMs?: number;  // fallback p/ 429/503 sem header (default 60_000)
+  readonly maxRetryAfterMs?: number;      // cap defensivo (default 3_600_000 = 1h)
+}
+
+interface ParametrosCache {
+  get<T>(key: string): Promise<T | undefined>;
+  set<T>(key: string, value: T, ttlMs: number): Promise<void>;
+}
+
+interface CepValidator {
+  validate(cep: string): Promise<CepInfo>;
+}
+
+interface CertificateProvider {
+  load(): Promise<A1Certificate>;
+}
+
+interface Logger {
+  debug(msg: string, ctx?: LogContext): void;
+  info(msg: string, ctx?: LogContext): void;
+  warn(msg: string, ctx?: LogContext): void;
+  error(msg: string, ctx?: LogContext): void;
+}
+```
+
+## Enums
+
+Exportados da raiz. Usados como tipos nos DTOs e como valor quando se monta params manualmente.
+
+| Enum                              | Valores (amostra)                                                                                   |
+|-----------------------------------|------------------------------------------------------------------------------------------------------|
+| `Ambiente`                        | `Producao`, `ProducaoRestrita`                                                                       |
+| `TipoAmbiente`                    | `Producao='PRODUCAO'`, `Homologacao='HOMOLOGACAO'` (≠ `TipoAmbienteDps`, que é `'1'`/`'2'`)          |
+| `OpcaoSimplesNacional`            | `Nao`, `MeEpp`, `Mei`, ...                                                                            |
+| `RegimeEspecialTributacao`        | `Nenhum='0'`, ..., `SociedadeProfissionais='6'`, `Outros='9'`                                         |
+| `TipoEmitenteDps`                 | `Prestador='1'`, `Tomador='2'`, `Intermediario='3'`                                                  |
+| `TipoAmbienteDps`                 | `Producao='1'`, `Homologacao='2'`                                                                    |
+| `CST` (PIS/COFINS)                | `'00'`...`'09'`                                                                                       |
+| `TipoRetISSQN`, `TipoTribISSQN`, `IndicadorTotalTributos` | flags numéricos string                                                        |
+| `JustificativaCancelamento`       | `ErroEmissao='1'`, `ServicoNaoPrestado='2'`, `Outros='9'`                                            |
+| `JustificativaSubstituicao`       | `DesenquadramentoSN='01'`, `EnquadramentoSN='02'`, ...                                                |
+| `TipoEventoNfse`                  | `Cancelamento='101101'`, `Substituicao='105102'`, ...                                                |
+| `StatusDistribuicao`              | `DocumentosEncontrados`, `NenhumDocumento`, `Rejeicao`                                                |
+| `TipoDocumento`, `TipoEvento`     | enums de distribuição NSU                                                                             |
+
+Lista completa no código-fonte: [`src/nfse/enums.ts`](https://github.com/fm-s/open-nfse/blob/main/src/nfse/enums.ts) + [`src/dfe/types.ts`](https://github.com/fm-s/open-nfse/blob/main/src/dfe/types.ts).
+
+## Erros
+
+Todos herdam de `OpenNfseError`. Árvore e comportamento por método em [Erros tipados](/guide/erros).
+
+| Classe                            | Quando é lançado                                                            |
+|-----------------------------------|------------------------------------------------------------------------------|
+| `NetworkError`                    | Rede abaixo, DNS, socket fechado                                             |
+| `TimeoutError`                    | `timeoutMs` excedido                                                         |
+| `UnauthorizedError` (401)         | Certificado inválido ou não apresentado                                      |
+| `ForbiddenError` (403)            | CNPJ sem permissão                                                           |
+| `NotFoundError` (404)             | Recurso inexistente (chave, etc.)                                            |
+| `ServerError` (5xx)               | Erro do lado da Receita                                                      |
+| `TooManyRequestsError` (429)      | Rate limit; transiente — vira `retry_pending` com `notBefore` do Retry-After |
+| `HttpStatusError`                 | Base genérica + método `getRetryAfterMs()` (RFC 7231)                        |
+| `ExpiredCertificateError`         | A1 vencido (detectado no load)                                               |
+| `InvalidCertificateError`         | A1 malformado / PKCS#12 corrompido                                           |
+| `InvalidCertificatePasswordError` | Senha errada do .pfx                                                         |
+| `InvalidChaveAcessoError`         | Chave fora de `/^\d{50}$/`                                                    |
+| `InvalidXmlError`                 | XML estruturalmente inválido                                                 |
+| `XsdValidationError`              | XSD RTC v1.01 violado; carrega `violations[]`                                 |
+| `InvalidCepError`                 | Formato inválido / ViaCEP 404                                                |
+| `InvalidCnpjError` / `InvalidCpfError` | DV incorreto ou formato                                                |
+| `InvalidDpsIdParamError`          | Params de `buildDpsId` fora do formato                                       |
+| `InvalidEventoPedidoIdParamError` | Params de `buildEventoPedidoId` fora do formato                              |
+| `DpsAlreadySignedError`           | Tentativa de assinar um XML que já tem `<Signature>`                         |
+| `MissingRetryStoreError`          | Transiente sem `retryStore` configurado                                      |
+| `MissingDpsCounterError`          | `emitir(params)` sem `params.nDPS` e sem `dpsCounter`                         |
+| `ReceitaRejectionError`           | HTTP 400 com body de rejeição; `codigo`, `descricao`, `mensagens[]`          |
+| `ClientClosedError`               | Chamada após `cliente.close()`                                               |
+
+## Types principais
+
+Todos os DTOs de domínio (RTC v1.01) em `src/nfse/domain.ts` são reexportados. Fluxos de resultado:
+
+| Tipo                         | Variantes / forma                                                                                  |
+|------------------------------|----------------------------------------------------------------------------------------------------|
+| `NfseQueryResult`             | `{ chaveAcesso, xmlNfse, nfse: NFSe, tipoAmbiente, versaoAplicativo, dataHoraProcessamento }`      |
+| `NsuQueryResult`              | `{ status, documentos[], alertas[], erros[], ultimoNsu, ... }`                                      |
+| `NfseEmitResult`              | `{ chaveAcesso, idDps, xmlNfse, nfse, alertas[], ... }`                                             |
+| `EmitirResult` (discriminated)| `{ status: 'ok', nfse: NfseEmitResult }` \| `{ status: 'retry_pending', pending, error }`          |
+| `DpsDryRunResult`             | `{ dryRun: true, xmlDpsAssinado, xmlDpsGZipB64 }`                                                   |
+| `EmitLoteResult`              | `{ items: EmitLoteItem[], successCount, failureCount, skippedCount }`                               |
+| `CancelarResult` (discriminated) | `'ok'` \| `'retry_pending'`                                                                     |
+| `SubstituirResult` (discriminated) | `'ok'` \| `'retry_pending'` \| `'rolled_back'` \| `'rollback_pending'` \| `'rollback_failed'`  |
+| `ReplayItem`                  | `'success'` \| `'success_emission'` \| `'still_pending'` \| `'failed_permanent'`                   |
+| `PendingEvent` (discriminated)| `kind: 'emission' \| 'cancelamento_simples' \| 'cancelamento_por_substituicao' \| 'rollback_cancelamento'` |
+| `ConsultaAliquotasResult`, `ConsultaBeneficioResult`, `ConsultaConvenioResult`, `ConsultaRegimesEspeciaisResult`, `ConsultaRetencoesResult` | parâmetros municipais normalizados |
+
+Types detalhados, incluindo RTC / IBS / CBS (`RtcInfoTributosSitClas`, `RtcTotalIbs`, etc.): [API completa](/api/).
+
+---
+
+# Ambientes e endpoints
+
+Source: https://github.com/fm-s/open-nfse/blob/main/docs/guide/ambientes.md
+
+# Ambientes e endpoints
+
+## Enum `Ambiente`
+
+```typescript
+import { Ambiente } from 'open-nfse';
+
+Ambiente.ProducaoRestrita   // homologação oficial da Receita
+Ambiente.Producao           // produção real — notas com valor fiscal
+```
+
+## Hosts por ambiente
+
+A API oficial está **dividida em hosts distintos**. O `NfseClient` resolve automaticamente qual host usar por endpoint:
+
+| Serviço                      | ProducaoRestrita                                            | Producao                                |
+|------------------------------|-------------------------------------------------------------|-----------------------------------------|
+| **SEFIN Nacional**           | `sefin.producaorestrita.nfse.gov.br/SefinNacional`          | `sefin.nfse.gov.br/SefinNacional`       |
+| **ADN Contribuintes**        | `adn.producaorestrita.nfse.gov.br/contribuintes`            | `adn.nfse.gov.br/contribuintes`         |
+| **ADN DANFSe**               | `adn.producaorestrita.nfse.gov.br/danfse`                   | `adn.nfse.gov.br/danfse`                |
+| **ADN Parâmetros Municipais**| `adn.producaorestrita.nfse.gov.br/parametrizacao`           | `adn.nfse.gov.br/parametrizacao`        |
+
+::: warning Contratos diferentes por host
+**SEFIN** usa camelCase + `tipoAmbiente: int`. **ADN** usa PascalCase + `TipoAmbiente: string`. Essa diferença é proposital e a lib normaliza tudo para o shape público tipado — você nunca vê essas inconsistências no seu código.
+:::
+
+## Endpoints usados hoje
+
+| Operação                               | Método | Endpoint                                                      | Host                        |
+|----------------------------------------|--------|---------------------------------------------------------------|-----------------------------|
+| `fetchByChave`                         | GET    | `/nfse/{chaveAcesso}`                                         | SEFIN                       |
+| `emitir`, `emitirDpsPronta`, `emitirEmLote` | POST | `/nfse`                                                  | SEFIN                       |
+| `cancelar`, `substituir`, `replayPendingEvents` | POST | `/nfse/{chaveAcesso}/eventos`                        | SEFIN                       |
+| `fetchByNsu`                           | GET    | `/DFe/{NSU}`                                                  | ADN Contribuintes           |
+| `consultarDanfse`, `gerarDanfse` (online)  | GET    | `/{chaveAcesso}`                                              | ADN DANFSe                  |
+| `consultarAliquota`, `consultarHistoricoAliquotas` | GET | `/aliquotas/...`                                   | ADN Parâmetros Municipais   |
+| `consultarBeneficio`                   | GET    | `/beneficios/...`                                             | ADN Parâmetros Municipais   |
+| `consultarConvenio`                    | GET    | `/convenios/{codMunicipio}`                                   | ADN Parâmetros Municipais   |
+| `consultarRegimesEspeciais`            | GET    | `/regimesespeciais/...`                                       | ADN Parâmetros Municipais   |
+| `consultarRetencoes`                   | GET    | `/retencoes/...`                                              | ADN Parâmetros Municipais   |
+
+## `TipoAmbiente` — o enum do resultado
+
+Separado do `Ambiente` (que é a *escolha* de endpoint). `TipoAmbiente` é o que **a Receita retorna** nos resultados:
+
+```typescript
+import { TipoAmbiente } from 'open-nfse';
+
+TipoAmbiente.Producao     // '1'
+TipoAmbiente.Homologacao  // '2'
+
+const r = await cliente.fetchByChave(chave);
+if (r.tipoAmbiente === TipoAmbiente.Producao) {
+  // essa é uma nota com valor fiscal
+}
+```
+
+## mTLS e HTTP/1.1
+
+O SEFIN autentica via **mTLS** (mutual TLS) — o cliente apresenta seu certificado A1 na conexão. A lib constrói um `undici.Agent` com o certificado carregado e força **HTTP/1.1** (SEFIN rejeita HTTP/2 com `HTTP_1_1_REQUIRED` em paths autenticados):
+
+```typescript
+new Agent({
+  allowH2: false,                      // desabilita HTTP/2
+  connect: {
+    key: cert.keyPem,
+    cert: cert.certPem,
+    ALPNProtocols: ['http/1.1'],       // recusa H2 já na negociação TLS
+  },
+});
+```
+
+::: tip Se esquecer `ALPNProtocols: ['http/1.1']`
+A request trava silenciosamente — undici não surfaces o `HTTP_1_1_REQUIRED` como uma promise rejection. A lib já garante essa config; se você for construir um dispatcher customizado via `NfseClientConfig.dispatcher`, replique o mesmo padrão.
+:::
+
+## Timeout
+
+Default 60s (`timeoutMs: 60_000`). Ajuste via config:
+
+```typescript
+new NfseClient({
+  ambiente: Ambiente.Producao,
+  certificado,
+  timeoutMs: 120_000,   // 2 min — SEFIN pode ser lento em horário de pico
+});
+```
+
+Timeouts viram `TimeoutError` (transiente) — seguros para retry.
+
+## Dispatcher customizado (avançado)
+
+Use só em testes ou setups exóticos. Ao passar um dispatcher:
+
+- A lib **não fecha** ele em `close()` (você mantém o lifecycle)
+- A lib **ainda carrega o certificado** (precisa para assinar a DPS)
+- `MockAgent` do undici é o caso típico em testes
+
+```typescript
+import { MockAgent } from 'undici';
+
+const mock = new MockAgent();
+mock.disableNetConnect();
+
+const cliente = new NfseClient({
+  ambiente: Ambiente.ProducaoRestrita,
+  certificado: { pfx, password },
+  dispatcher: mock,
+});
+```
+
+## `AmbienteEndpoints` — acesso direto
+
+Se precisar dos URLs (ex: um dashboard mostrando para qual host está apontando):
+
+```typescript
+import { AMBIENTE_ENDPOINTS, Ambiente } from 'open-nfse';
+
+const endpoints = AMBIENTE_ENDPOINTS[Ambiente.Producao];
+endpoints.sefin;                  // "https://sefin.nfse.gov.br/SefinNacional"
+endpoints.adn;                    // "https://adn.nfse.gov.br/contribuintes"
+endpoints.danfse;
+endpoints.parametrosMunicipais;
+```
+
+## Checklist para passar de `ProducaoRestrita` para `Producao`
+
+1. ✅ Certificado A1 **do CNPJ real** (o de produção, não o de testes).
+2. ✅ CNPJ habilitado no Emissor Nacional com IM ativa no município aderente.
+3. ✅ Fechou ciclo completo em Produção Restrita: emitir → consultar → cancelar → substituir → distribuição por NSU.
+4. ✅ Schema SQL de [integração](./integracao) implementado e testado.
+5. ✅ Retry/reconciliação cron rodando (em `replayPendingEvents` para eventos; em `fetchByChave` para emit `status = error`).
+6. ✅ Monitoramento: taxa de rejeição por código, latência, alerta de expiração de certificado.
+7. ✅ Base legal LGPD documentada para retenção dos XMLs fiscais.
+8. ✅ Base encriptada / acesso ao PFX limitado.
+
+Só então troque `Ambiente.ProducaoRestrita` → `Ambiente.Producao`. **Cada emissão em produção é um documento fiscal oficial.**
+
+---
+
+# Consultar NFS-e
+
+Source: https://github.com/fm-s/open-nfse/blob/main/docs/guide/consultar.md
+
+# Consultar NFS-e
+
+Dois modos: **por chave de acesso** (aleatória, idempotente) e **por NSU** (paginação incremental).
+
+## Por chave de acesso — `fetchByChave`
+
+```typescript
+const resultado = await cliente.fetchByChave(
+  '21113002200574753000100000000000146726037032711025',
+);
+
+resultado.chaveAcesso;                          // string
+resultado.xmlNfse;                               // XML cru assinado (escape hatch)
+resultado.nfse;                                  // NFSe completa, tipada
+resultado.tipoAmbiente;                          // TipoAmbiente.Producao | .Homologacao
+resultado.versaoAplicativo;                     // versão do app SEFIN
+resultado.dataHoraProcessamento;                // Date
+```
+
+### Navegando o `NFSe` parseado
+
+Toda a árvore RTC v1.01 está tipada:
+
+```typescript
+const inf = resultado.nfse.infNFSe;
+
+// Identificação
+inf.Id;                                // "NFS..." (concatenado com a chave)
+inf.chaveAcesso;                       // 50 dígitos
+inf.nNFSe;                             // número municipal sequencial
+inf.cStat;                             // "100" = autorizado
+inf.dhProc;                            // Date
+
+// Emitente
+inf.emit.xNome;                        // razão social
+if ('CNPJ' in inf.emit.identificador) {
+  console.log(inf.emit.identificador.CNPJ);
+}
+
+// Serviço
+inf.DPS.infDPS.serv.cServ.cTribNac;
+inf.DPS.infDPS.serv.cServ.xDescServ;
+
+// Tomador (opcional — discriminated union)
+const toma = inf.DPS.infDPS.toma;
+if (toma && 'CPF' in toma.identificador) {
+  console.log('Tomador PF:', toma.identificador.CPF);
+}
+
+// Valores
+inf.valores.vLiq;
+inf.valores.vISSQN;
+inf.valores.vTotalRet;
+
+// IBS/CBS (Reforma Tributária, quando presente)
+if (inf.IBSCBS) {
+  console.log(inf.IBSCBS.totCIBS.vTotNF);
+}
+```
+
+### Erros possíveis
+
+```typescript
+try {
+  const r = await cliente.fetchByChave(chave);
+} catch (err) {
+  if (err instanceof InvalidChaveAcessoError) {
+    // chave com formato inválido (não tem 50 dígitos)
+  } else if (err instanceof NotFoundError) {
+    // HTTP 404 — chave não existe na Receita
+  } else if (err instanceof UnauthorizedError) {
+    // HTTP 401 — certificado inválido/não apresentado
+  } else if (err instanceof ForbiddenError) {
+    // HTTP 403 — CNPJ não autorizado a consultar essa chave
+  }
+}
+```
+
+## Por NSU — `fetchByNsu`
+
+**NSU** (Número Sequencial Único) é um cursor por CPF/CNPJ. A cada NFS-e emitida **onde seu CNPJ é prestador, tomador ou intermediário**, a Receita incrementa o NSU e guarda o documento em `/DFe/{NSU}`.
+
+::: warning NSU é por município-ator, não por CNPJ
+Conforme Anexo IV do Manual v1.2, a **mesma NFS-e gera múltiplos NSUs** — um para cada município distinto envolvido (emissor, tomador, intermediário, prestação, incidência). O cursor que você busca é por **seu CNPJ**, mas a Receita roteia eventos para o município de cada ator. Consequências práticas:
+
+- Um CNPJ matriz **não vê** documentos roteados exclusivamente ao município de uma filial.
+- Se você tem múltiplos estabelecimentos em municípios diferentes, paginar por um único cursor pode perder eventos — considere um `nsu_cursors` por (CNPJ, município) se o cenário exigir.
+- NFS-e recebidas aparecem tanto no cursor do prestador quanto no do tomador (com NSUs diferentes).
+:::
+
+### Loop básico
+
+```typescript
+let ultimoNsu = Number(await db.getUltimoNsu(cnpj) ?? 0);
+
+while (true) {
+  const r = await cliente.fetchByNsu({ ultimoNsu });
+
+  for (const doc of r.documentos) {
+    await db.salvar(doc);                       // persista antes de avançar o cursor
+    console.log(doc.nsu, doc.tipoDocumento, doc.chaveAcesso);
+    console.log(doc.xmlDocumento);              // já descomprimido
+  }
+
+  await db.setUltimoNsu(cnpj, r.ultimoNsu);
+
+  if (r.status === 'NENHUM_DOCUMENTO_LOCALIZADO' || r.ultimoNsu === ultimoNsu) break;
+  ultimoNsu = r.ultimoNsu;
+}
+```
+
+### Parâmetros
+
+```typescript
+await cliente.fetchByNsu({
+  ultimoNsu: 12345,
+  cnpjConsulta: '00574753000100',    // opcional — consulta em nome de outro CNPJ
+  lote: true,                         // opcional — pede lote completo
+});
+```
+
+### Status retornados
+
+| Status                           | Significado                                                                 |
+|----------------------------------|-----------------------------------------------------------------------------|
+| `DOCUMENTOS_LOCALIZADOS`         | Há documentos no lote — consuma `documentos[]` e avance `ultimoNsu`         |
+| `NENHUM_DOCUMENTO_LOCALIZADO`    | Caught up — sem novos documentos pendentes                                  |
+| `REJEICAO`                       | A requisição foi rejeitada (veja `erros[]`)                                 |
+
+::: warning Comportamento do ADN
+`/DFe/{NSU}` devolve **HTTP 404 com body** quando caught up e **HTTP 400 com body** em rejeição — nenhum dos dois é erro HTTP. A lib trata automaticamente (`acceptedStatuses: [400, 404]`) e retorna `NsuQueryResult` normalmente. **Você nunca vê `NotFoundError` em `fetchByNsu`** — veja `status === 'NENHUM_DOCUMENTO_LOCALIZADO'`.
+
+Mesmo no caminho "caught up", a Receita inclui uma mensagem em `erros` (ex: `E2220`). A fonte de verdade é `status`; `erros[]` é informativo.
+
+**Guarda de sanidade:** se o response 400/404 não trouxer o campo `StatusProcessamento` (por exemplo, um proxy/WAF na frente do ADN devolveu um HTML genérico), a lib lança `NetworkError` ao invés de silenciosamente parsear como "nenhum documento". Assim você vê o problema de infra em vez de cursor parado.
+:::
+
+### Tipos de documento
+
+```typescript
+import { TipoDocumento, TipoEvento } from 'open-nfse';
+
+for (const doc of r.documentos) {
+  if (doc.tipoDocumento === TipoDocumento.Nfse) {
+    // XML de NFS-e completa
+  } else if (doc.tipoDocumento === TipoDocumento.Evento) {
+    // XML de evento (cancelamento, substituição, etc.)
+    console.log(doc.tipoEvento);   // "101101" etc
+  }
+}
+```
+
+## Exemplo runnable
+
+Em [`examples/fetch-nfse/`](https://github.com/fm-s/open-nfse/tree/main/examples/fetch-nfse) — script `npm start` que consulta por chave + pagina por NSU usando certificado A1 real.
+
+---
+
+# DANFSe — PDF oficial da nota
+
+Source: https://github.com/fm-s/open-nfse/blob/main/docs/guide/danfse.md
+
+# DANFSe — PDF oficial da nota
+
+Duas formas de obter o DANFSe (Documento Auxiliar da NFS-e) em PDF:
+
+1. **Online** — baixa o PDF oficial direto do ADN (`GET /{chaveAcesso}` no host DANFSe, `endpoints.danfse`).
+2. **Local** — renderiza com `pdfkit` + QR code, sem network.
+
+A lib oferece ambas e um **modo auto** que tenta online e cai pro local em falha — o padrão que você quer em produção.
+
+## `cliente.gerarDanfse(nfse)` — default `auto`
+
+```typescript
+const r = await cliente.emitir(params);
+if (r.status === 'ok') {
+  const pdf = await cliente.gerarDanfse(r.nfse.nfse);
+  await fs.writeFile(`nfse-${r.nfse.chaveAcesso}.pdf`, pdf);
+}
+```
+
+Ordem de tentativa:
+1. `GET /{chaveAcesso}` no host DANFSe do ADN (`endpoints.danfse`)
+2. **Apenas falhas transientes** (`NetworkError`, `TimeoutError`, `ServerError`/5xx) → cai no renderer local
+3. Log `danfse.online.fallback` no logger configurado para rastreabilidade
+
+::: warning Erros permanentes sobem
+`ForbiddenError` (CNPJ sem acesso à nota), `UnauthorizedError` (certificado expirado/inválido), `NotFoundError` (chave inexistente) e `InvalidChaveAcessoError` (formato errado) **não** caem para local — eles propagam para o caller. Mascarar esses erros com um PDF local degradado esconderia um problema real (cert vencido, typo na chave, permissão errada no CNPJ).
+:::
+
+### Forçar estratégia
+
+```typescript
+// Só ADN — lança se falhar (sem fallback):
+await cliente.gerarDanfse(nfse, { strategy: 'online' });
+
+// Só local — não toca rede:
+await cliente.gerarDanfse(nfse, { strategy: 'local' });
+```
+
+### Opções de layout (modo local)
+
+```typescript
+await cliente.gerarDanfse(nfse, {
+  strategy: 'local',
+  urlConsultaPublica: 'https://minha.prefeitura.gov.br/consulta',  // override do QR + link
+  ambiente: Ambiente.ProducaoRestrita,                              // adiciona watermark HOMOLOGAÇÃO
+  observacoes: 'Pagamento via PIX. Data limite: 10/04/2026.',       // aparece em "Outras informações"
+});
+```
+
+No modo `online` essas opções são ignoradas — a Receita usa o template próprio dela.
+
+## `cliente.consultarDanfse(chave)` — só online
+
+Quando você só tem a chave (sem o objeto `NFSe`), ou quer garantir que é o PDF oficial:
+
+```typescript
+try {
+  const pdf = await cliente.consultarDanfse('21113002200574753000100000000000146726037032711025');
+  await fs.writeFile('nfse.pdf', pdf);
+} catch (err) {
+  if (err instanceof InvalidChaveAcessoError) console.error('Chave com formato inválido');
+  if (err instanceof NotFoundError) console.error('Chave não existe na Receita');
+  if (err instanceof ForbiddenError) console.error('CNPJ do cert não autorizado a consultar');
+  throw err;
+}
+```
+
+Sem fallback — erros lançam. Use quando quiser falhar alto.
+
+::: tip Validação upfront
+`consultarDanfse` valida `/^\d{50}$/` antes de tocar a rede e lança `InvalidChaveAcessoError` se a chave estiver fora do formato — mesmo comportamento de `fetchByChave`. Protege contra round-trips desperdiçados e input injection via URL.
+:::
+
+## `gerarDanfse(nfse)` standalone — função pura
+
+Exportada pra quem não quer depender do `NfseClient`:
+
+```typescript
+import { gerarDanfse } from 'open-nfse';
+import { parseNfseXml } from 'open-nfse';
+
+const nfse = parseNfseXml(xmlFromDatabase);
+const pdf = await gerarDanfse(nfse, { observacoes: '...' });
+```
+
+Útil pra regerar DANFSe a partir do XML salvo no seu banco (ver [integração](./integracao#schema-sql)) sem precisar de cliente configurado.
+
+## Layout do PDF local
+
+A4 portrait, uma página, com os seguintes blocos:
+
+1. **Cabeçalho** — "DANFS-e", chave de acesso (50 dígitos agrupados em 4), nº NFS-e, protocolo
+2. **Prestador de Serviços** — CNPJ/CPF, IM, razão social, endereço completo
+3. **Tomador de Serviços** — documento (CNPJ/CPF/NIF/cNaoNIF), nome, endereço (ou "não identificado")
+4. **Descrição do Serviço** — cTribNac, cNBS, cTribMun, local de incidência, discriminação longa
+5. **Valores** — vServ, BC, alíquota, vISSQN, retenções + **valor líquido em destaque**
+6. **IBS/CBS** — quando presente (Reforma Tributária 2026+)
+7. **Outras Informações** — quando `observacoes` foi passado
+8. **Consulta da Autenticidade** — QR code + URL do portal público
+9. **Autorização** — chave formatada, cStat, dhProc, verAplic, nDFSe
+
+Watermark **HOMOLOGAÇÃO** em vermelho translúcido quando `ambiente: Ambiente.ProducaoRestrita`.
+
+## Trade-offs conhecidos
+
+- **Template não é pixel-perfect** com o oficial. Cobre todos os campos obrigatórios mas a disposição difere em margens/tipografia. Se sua prefeitura exige layout idêntico à especificação, use `strategy: 'online'`.
+- **Sem logo de município nem brasão RFB** — a lib não carrega ativos visuais. Consumidores que queiram podem parsear o XML e gerar PDF próprio com a identidade visual que precisam.
+- **Fontes Helvetica built-in do PDF** — universal mas genéricas. Fontes embedadas customizadas ficam para melhoria futura.
+
+## Salvando + anexando em email
+
+Fluxo comum: emitir → gerar PDF → enviar pro tomador.
+
+```typescript
+const r = await cliente.emitir(params);
+if (r.status !== 'ok') throw new Error('emissão falhou');
+
+const pdf = await cliente.gerarDanfse(r.nfse.nfse);
+
+await mailer.send({
+  to: tomador.email,
+  subject: `NFS-e ${r.nfse.nfse.infNFSe.nNFSe}`,
+  text: 'Segue o DANFSe da nota emitida.',
+  attachments: [
+    {
+      filename: `nfse-${r.nfse.chaveAcesso}.pdf`,
+      content: pdf,
+      contentType: 'application/pdf',
+    },
+  ],
+});
+```
+
+---
+
+# Emitir NFS-e
+
+Source: https://github.com/fm-s/open-nfse/blob/main/docs/guide/emitir.md
+
+# Emitir NFS-e
+
+`emitir(params)` é o fluxo primário. Recebe params de alto nível (sem `nDPS`), roda as validações offline, consulta o `DpsCounter` **só depois** que tudo passa, e retorna um resultado discriminado. Falha de rede nunca duplica (replay idempotente via `RetryStore` + SEFIN dedup no `infDPS.Id`); DPS quebrada nunca queima número da série.
+
+```
+params → valida CPF/CNPJ → XSD → CEP
+   ↓ (se tudo passou)
+counter.next() → nDPS real → sign → POST /nfse
+   ↓
+{ status: 'ok', nfse }                 ← autorizada
+{ status: 'retry_pending', pending }   ← transiente, salvo no RetryStore
+throw ReceitaRejectionError            ← regra fiscal violada (nDPS consumido)
+```
+
+Erros transientes cobrem `NetworkError`, `TimeoutError`, `ServerError` (5xx) e `TooManyRequestsError` (429). O 429 respeita o cabeçalho `Retry-After` do servidor — a entrada fica no `RetryStore` com `notBefore` calculado pela `RetryPolicy` configurada e o cron de replay só toca nela quando elegível. Detalhes em [Erros tipados](./erros#429-e-retrypolicy).
+
+**Não envolva esta chamada em retry loop próprio para 429/5xx.** Cada `emitir()` consome um `nDPS` antes do POST; um wrapper externo que recapta e retenta queima números da série e cria buracos permanentes no sequencial. A lib já persiste o pendente — use `replayPendingEvents` (ver seção 4).
+
+## Setup
+
+`dpsCounter` é obrigatório (ou passe `nDPS` explícito em cada chamada); `retryStore` é obrigatório se você quiser que falhas transientes sejam persistidas em vez de lançar:
+
+```typescript
+import {
+  NfseClient, Ambiente,
+  createInMemoryDpsCounter, createInMemoryRetryStore,
+} from 'open-nfse';
+
+const cliente = new NfseClient({
+  ambiente: Ambiente.ProducaoRestrita,
+  certificado: { pfx, password },
+  dpsCounter: createInMemoryDpsCounter(),   // produção: UPDATE ... RETURNING
+  retryStore: createInMemoryRetryStore(),   // produção: tabela nfse_pending_events
+});
+```
+
+Impls Postgres completas dos dois: [Integração em serviços](./integracao).
+
+## 1. Emissão mínima
+
+```typescript
+import {
+  OpcaoSimplesNacional, RegimeApuracaoSimplesNacional, RegimeEspecialTributacao,
+} from 'open-nfse';
+
+const resultado = await cliente.emitir({
+  emitente: {
+    cnpj: '00574753000100',
+    codMunicipio: '2111300',
+    regime: {
+      opSimpNac: OpcaoSimplesNacional.MeEpp,
+      regApTribSN: RegimeApuracaoSimplesNacional.FederalEMunicipalPeloSN,
+      regEspTrib: RegimeEspecialTributacao.Nenhum,
+    },
+  },
+  serie: '1',
+  servico: { cTribNac: '010101', cNBS: '123456789', descricao: 'Consultoria' },
+  valores: { vServ: 1500.0, aliqIss: 2.5 },
+  // Simples Nacional? informe a alíquota aproximada:
+  // valores: { vServ: 1500.0, pTotTribSN: 6.0 },
+});
+
+if (resultado.status === 'ok') {
+  console.log(resultado.nfse.chaveAcesso);
+}
+```
+
+`tomador` é opcional — se você não informar, a nota é emitida sem tomador identificado (legal em casos específicos, tipicamente varejo presencial).
+
+## 2. Com tomador identificado
+
+```typescript
+await cliente.emitir({
+  emitente: { /* ... */ },
+  serie: '1',
+  servico: { cTribNac: '010101', cNBS: '123456789', descricao: 'Consultoria' },
+  valores: { vServ: 1500.0, aliqIss: 2.5 },
+  tomador: {
+    documento: { CNPJ: '11222333000181' },     // ou { CPF: '01075595363' }
+    nome: 'Acme Ltda',
+    email: 'financeiro@acme.test',
+    endereco: {
+      codMunicipio: '3550308',
+      cep: '01310100',
+      logradouro: 'Avenida Paulista',
+      numero: '1578',
+      bairro: 'Bela Vista',
+      complemento: 'conj 12',                   // opcional
+    },
+  },
+});
+```
+
+O CEP é validado contra ViaCEP por default. Desligue com `skipCepValidation: true` se estiver emitindo em lote e quiser cache próprio (ou passe um `cepValidator` custom).
+
+## 3. Lidando com cada resultado
+
+A chave está em **tratar os três desfechos como cenários distintos**, não como variações do mesmo:
+
+```typescript
+import { ReceitaRejectionError } from 'open-nfse';
+
+try {
+  const r = await cliente.emitir(params);
+
+  if (r.status === 'ok') {
+    // Autorizada. Persista como documento fiscal oficial.
+    await db.tx(async (tx) => {
+      await tx.insert('nfse_autorizadas', {
+        chave_acesso: r.nfse.chaveAcesso,
+        id_dps: r.nfse.idDps,
+        xml_nfse: r.nfse.xmlNfse,
+        nnfse: r.nfse.nfse.infNFSe.nNFSe,
+        valor_liquido: r.nfse.nfse.infNFSe.valores.vLiq,
+        dh_proc: r.nfse.dataHoraProcessamento,
+        tipo_ambiente: r.nfse.tipoAmbiente,
+      });
+      for (const alerta of r.nfse.alertas) {
+        await tx.insert('nfse_alertas', { chave: r.nfse.chaveAcesso, ...alerta });
+      }
+    });
+    return;
+  }
+
+  if (r.status === 'retry_pending') {
+    // Transiente. Já persistido no retryStore pela lib.
+    // Um cron de replayPendingEvents() cuida do resto.
+    logger.warn('emit transient', { pendingId: r.pending.id, err: r.error.message });
+    return;
+  }
+} catch (err) {
+  if (err instanceof ReceitaRejectionError) {
+    // Permanente. nDPS foi consumido; a nota foi definitivamente rejeitada.
+    await db.insert('nfse_rejeicoes', {
+      id_dps: err.idDps,
+      codigo: err.codigo,
+      descricao: err.descricao,
+      mensagens: err.mensagens,
+    });
+    logger.error('emit rejeitada', { codigo: err.codigo, descricao: err.descricao });
+    return;
+  }
+  throw err;
+}
+```
+
+Três regras que emergem dessa estrutura:
+
+- **`ok`** é o único caminho que cria linha em `nfse_autorizadas`.
+- **`retry_pending`** não precisa de ação imediata — a lib já salvou o pendente. Você pode opcionalmente registrar um log para dashboard, mas o replay cron é quem fecha o ciclo.
+- **Permanente** (throw) consumiu o `nDPS` mas não vai virar NFS-e autorizada. Registre para auditoria e siga.
+
+## 4. Cron de replay
+
+Tudo que cai em `retry_pending` (e em `rollback_pending` vindo de `substituir`) é persistido no `RetryStore`. Um cron que chama `replayPendingEvents` re-posta cada um; SEFIN deduplica no `infDPS.Id` (emissões) e em `(chave, tipoEvento)` (eventos), então chamar N vezes é idempotente.
+
+Entradas com `notBefore` no futuro (caso clássico: 429 com `Retry-After: 120`) são puladas silenciosamente — não aparecem no resultado e ficam no store até `notBefore <= now`. A cada falha transiente no replay, `notBefore` é recalculado pela `RetryPolicy` e `attempts` incrementado. **`replayPendingEvents` é single-threaded** — dois processos chamando concorrentemente duplicariam o tráfego para o SEFIN. Garanta exclusão mútua no caller (cron single-instance ou lock distribuído).
+
+```typescript
+// schedule: a cada 1-5 minutos, um worker só
+const items = await cliente.replayPendingEvents();
+
+for (const item of items) {
+  switch (item.status) {
+    case 'success_emission':
+      await db.insert('nfse_autorizadas', {
+        chave_acesso: item.emission.chaveAcesso,
+        id_dps: item.emission.idDps,
+        xml_nfse: item.emission.xmlNfse,
+        /* ... */
+      });
+      logger.info('replay emissão ok', { id: item.id });
+      break;
+
+    case 'success':
+      // Evento (cancelamento/substituição/rollback) bem sucedido
+      await db.insert('nfse_eventos', {
+        chave_acesso: item.evento.chaveNfse,
+        tipo_evento: item.evento.tipoEvento,
+        xml_evento: item.evento.xmlEvento,
+        /* ... */
+      });
+      logger.info('replay evento ok', { id: item.id });
+      break;
+
+    case 'still_pending':
+      // Transiente de novo — fica no store, próxima rodada tenta
+      logger.warn('replay transient', { id: item.id, err: item.error.message });
+      break;
+
+    case 'failed_permanent':
+      // Permanente — lib removeu do store. Caller decide (alerta, ticket, etc).
+      logger.error('replay permanent', { id: item.id, err: item.error.message });
+      break;
+  }
+}
+```
+
+O worker deve ser **único por processo** — concorrência entre crons pode causar re-posts simultâneos (tolerado pelo SEFIN dedup, mas desperdiça quota).
+
+## 5. Bulk com o mesmo fluxo seguro
+
+`emitir(params)` é uma chamada por vez, mas um worker pool simples paraleliza sem perder a segurança do counter + retry store:
+
+```typescript
+async function emitirBulk(lote: readonly EmitirParams[], concurrency = 4) {
+  const cursor = { i: 0 };
+  const resultados = new Array(lote.length);
+
+  async function worker() {
+    while (cursor.i < lote.length) {
+      const idx = cursor.i++;
+      try {
+        resultados[idx] = await cliente.emitir(lote[idx]);
+      } catch (err) {
+        resultados[idx] = { status: 'throw', error: err as Error };
+      }
+    }
+  }
+
+  await Promise.all(Array.from({ length: concurrency }, worker));
+  return resultados;
+}
+
+const lote = pedidosDoMes.map((p) => paramsParaEmissao(p));   // sua função
+const rs = await emitirBulk(lote, 4);
+
+for (const r of rs) {
+  if (r.status === 'ok')              await persistirAutorizada(r);
+  else if (r.status === 'retry_pending') logger.warn('pendente', r.pending.id);
+  else if (r.status === 'throw')      await persistirRejeicao(r.error);
+}
+```
+
+Cada `emitir(params)` individual ainda:
+- Consulta o `DpsCounter` atomicamente (sua impl Postgres garante isso)
+- Persiste `retry_pending` no `RetryStore` em falha transiente
+- Lança em rejeição permanente
+
+Sem surpresas ao paralelizar.
+
+::: tip Cache de CEP em lote
+Se os pedidos têm CEPs repetidos, passe um `cepValidator` com cache compartilhado em `NfseClientConfig` — `createViaCepValidator()` já dedupa lookups internamente, reduzindo hits no ViaCEP em N× na primeira rodada.
+:::
+
+## 6. Dry-run — preview sem enviar
+
+Monta e assina o XML sem tocar a rede e **sem consumir o counter**. Ideal para CI, auditoria de payload ou debug offline:
+
+```typescript
+const dry = await cliente.emitir({ ...params, dryRun: true });
+
+dry.xmlDpsAssinado;   // XML assinado (RSA-SHA256 + exc-c14n + enveloped)
+dry.xmlDpsGZipB64;    // payload gzip+base64, pronto para POST manual se quiser
+```
+
+Placeholder `nDPS: '1'` é usado no dry-run (ou passe `params.nDPS` explícito).
+
+## 7. Opções (flags)
+
+`EmitirParams extends EmitOptions` — as flags viajam junto no mesmo objeto:
+
+```typescript
+await cliente.emitir({
+  ...params,
+  dryRun: false,                  // preview sem enviar
+  skipValidation: false,          // pula XSD RTC v1.01
+  skipCepValidation: false,       // pula lookup ViaCEP
+  skipCpfCnpjValidation: false,   // pula DV CPF/CNPJ
+  cepValidator: brasilApi,        // override do validador default
+  nDPS: '999',                    // override — counter NÃO é chamado
+});
+```
+
+Validações rodam nesta ordem: CPF/CNPJ (sync) → XSD (WASM) → CEP (HTTP). Desligar é útil em cenários específicos (alta-frequência com cache próprio, debug) — mais detalhes em [Validações](./validacoes).
+
+## Errors de validação local (throw imediato)
+
+Com defaults, essas falhas **nem chegam** à Receita:
+
+| Erro                           | Causa                                                       |
+|--------------------------------|-------------------------------------------------------------|
+| `InvalidCnpjError`             | DV do CNPJ incorreto ou formato fora de `^\d{14}$`           |
+| `InvalidCpfError`              | Mesmo, para CPF                                             |
+| `InvalidCepError`              | Formato inválido ou ViaCEP retornou 404                     |
+| `XsdValidationError`           | DPS não bate com RTC v1.01 (campo faltando, pattern errado) |
+| `InvalidDpsIdParamError`       | cMun/CNPJ/série/nDPS fora do formato do `TSIdDPS`            |
+| `RuleViolationError`           | Regra de negócio local (e.g. E0078 para `cMotivo=99` em eventos) |
+| `MissingDpsCounterError`       | `emitir(params)` sem `params.nDPS` e sem `dpsCounter` configurado |
+| `MissingRetryStoreError`       | Transiente ocorreu mas não há `retryStore` para persistir   |
+
+Todos herdam de `OpenNfseError` — [hierarquia completa](./erros).
+
+::: tip IBS / CBS e data de competência
+Rule E0850 do Anexo I: campos IBS/CBS só são aceitos a partir de `dCompet ≥ 2026-01-01`. Se você está emitindo retroativamente para competência anterior, omita o grupo `IBSCBS` — a Receita rejeita `E0850` caso contrário. E0942 é o espelho: `OutrosDocumentos` (dedução/redução) só até 2025-12-31.
+:::
+
+## Reconciliação pós-timeout — `fetchDpsStatus`
+
+Se um `emitir()` não retornou (processo morreu, timeout sem `retry_pending` capturado), você pode consultar o status pelo `idDps` usando `GET /dps/{id}`:
+
+```typescript
+try {
+  const status = await cliente.fetchDpsStatus('DPS211130010057475300010000001000000000000001');
+  // NFS-e existe — reconcilia com seu DB usando status.chaveAcesso
+  console.log('recuperada:', status.chaveAcesso);
+} catch (err) {
+  if (err instanceof NotFoundError) {
+    // nenhuma NFS-e gerada com esse idDps — pode reemitir com novo idDps
+  } else {
+    throw err;
+  }
+}
+```
+
+Para reconciliação em lote, use `existsDpsStatus(idDps)` (HEAD, sem body) e busque detalhes só nos que existem:
+
+```typescript
+const pendentes = await db.query(`SELECT id_dps FROM dps_submissions WHERE status='in_flight'`);
+for (const { id_dps } of pendentes) {
+  if (await cliente.existsDpsStatus(id_dps)) {
+    const s = await cliente.fetchDpsStatus(id_dps);
+    await persistirAutorizada(s);
+  } else {
+    await db.query(`UPDATE dps_submissions SET status='pending' WHERE id_dps = $1`, [id_dps]);
+  }
+}
+```
+
+---
+
+## Escape hatch: `emitirDpsPronta(dps)`
+
+Quando você precisa controlar a pipeline inteira (replay determinístico, pré-assinatura externa, migração de sistema legado, integração com HSM custom), use `cliente.emitirDpsPronta(dps)`. Ele **bypassa counter e retry store** — throw em tudo, nenhum `retry_pending`.
+
+```typescript
+import { buildDps } from 'open-nfse';
+
+const dps = buildDps({
+  emitente: { /* ... */ },
+  serie: '1', nDPS: '42',                        // obrigatório
+  servico: { /* ... */ },
+  valores: { /* ... */ },
+});
+
+const nfseAutorizada = await cliente.emitirDpsPronta(dps);
+console.log(nfseAutorizada.chaveAcesso);
+```
+
+`buildDps` monta DPS completa a partir de ~10 campos semânticos (vs 50+ manuais). Defaults aplicados: `versao='1.01'`, `tpAmb='2'`, `tpEmit='1'`, `dhEmi=now`, `dCompet=now`, `tribISSQN='1'`, `tpRetISSQN='1'`, `indTotTrib='0'`, `locPrest=emitente.codMunicipio`. Contribuintes do **Simples Nacional** podem informar `valores: { vServ, pTotTribSN: 6.0 }` — quando `pTotTribSN` é fornecido, prevalece sobre `indTotTrib`. Cobre ~85% dos casos; para **tomador exterior, obra, atividade-evento, dedução/redução, IBS/CBS**, construa `InfDPS` manualmente (todos os tipos RTC estão exportados).
+
+`emitirEmLote(dpsList, options)` segue o mesmo contrato — worker pool client-side sobre `DPS[]` pré-montado. A seção **5. Bulk com o mesmo fluxo seguro** acima é o equivalente idiomático para quem quer manter o `DpsCounter` + `RetryStore` no caminho.
+
+## Exemplo runnable
+
+[`examples/emit-nfse/`](https://github.com/fm-s/open-nfse/tree/main/examples/emit-nfse) — `npm start` (emissão única) e `npm run bulk` (lote), ambos com dry-run por default.
+
+---
+
+# Erros tipados
+
+Source: https://github.com/fm-s/open-nfse/blob/main/docs/guide/erros.md
+
+# Erros tipados
+
+Hierarquia de 3 níveis: `Error → OpenNfseError → grupo → concreto`. Toda exceção da lib herda de `OpenNfseError`, permitindo ao caller escolher a granularidade do catch.
+
+## Hierarquia
+
+```
+Error
+ └─ OpenNfseError                   (abstract base)
+      ├─ HttpError                  (grupo)
+      │    ├─ NetworkError
+      │    ├─ TimeoutError
+      │    ├─ HttpStatusError       (genérico — método getRetryAfterMs())
+      │    ├─ UnauthorizedError     (HTTP 401)
+      │    ├─ ForbiddenError        (HTTP 403)
+      │    ├─ NotFoundError         (HTTP 404)
+      │    ├─ TooManyRequestsError  (HTTP 429)
+      │    └─ ServerError           (HTTP 5xx)
+      ├─ CertificateError           (grupo)
+      │    ├─ ExpiredCertificateError
+      │    ├─ InvalidCertificateError
+      │    └─ InvalidCertificatePasswordError
+      ├─ ValidationError            (grupo)
+      │    ├─ InvalidChaveAcessoError
+      │    ├─ InvalidDpsIdError
+      │    ├─ InvalidXmlError
+      │    ├─ XsdValidationError          (com violations[])
+      │    ├─ InvalidCepError             (com reason + cep)
+      │    ├─ InvalidCpfError             (com reason + cpf)
+      │    ├─ InvalidCnpjError            (com reason + cnpj)
+      │    ├─ InvalidDpsIdParamError
+      │    ├─ InvalidEventoPedidoIdParamError
+      │    ├─ DpsAlreadySignedError
+      │    ├─ MissingRetryStoreError
+      │    ├─ MissingDpsCounterError
+      │    └─ RuleViolationError          (com rule código E...)
+      ├─ ReceitaRejectionError      (concreto — com mensagens[], idDps, codigo, descricao)
+      └─ ClientClosedError          (concreto — pós cliente.close())
+```
+
+## Reagindo por categoria
+
+```typescript
+try {
+  await cliente.emitir(params);
+} catch (err) {
+  if (err instanceof ReceitaRejectionError) {
+    // rejeição fiscal — dispatch por err.codigo; nDPS foi consumido
+    logger.warn(`[${err.codigo}] ${err.descricao}`);
+  } else if (err instanceof ServerError || err instanceof NetworkError || err instanceof TimeoutError) {
+    // transiente — retry
+  } else if (err instanceof ExpiredCertificateError) {
+    alerts.send('Certificado A1 expirou', { expiresOn });
+  } else if (err instanceof XsdValidationError) {
+    logger.error('DPS malformada', { violations: err.violations });
+  } else if (err instanceof OpenNfseError) {
+    throw new MyAppError('Falha open-nfse', { cause: err });
+  } else {
+    throw err;
+  }
+}
+```
+
+## Classes-chave — propriedades
+
+```typescript
+class ReceitaRejectionError extends OpenNfseError {
+  readonly mensagens: readonly MensagemProcessamento[];
+  readonly idDps: string | undefined;
+  readonly tipoAmbiente: TipoAmbiente | undefined;
+  readonly versaoAplicativo: string | undefined;
+  readonly dataHoraProcessamento: Date | undefined;
+  // shortcuts para mensagens[0]:
+  readonly codigo: string;
+  readonly descricao: string;
+  readonly complemento: string | undefined;
+}
+
+class XsdValidationError extends ValidationError {
+  readonly violations: readonly XsdViolation[]; // { message: string; line?: number }
+}
+
+class HttpStatusError extends HttpError {
+  readonly status: number;
+  readonly body: string | undefined;
+  readonly headers: Record<string, string>;
+  /**
+   * Parse RFC 7231 `Retry-After`. Retorna o delay em ms ou `undefined`
+   * (header ausente/malformado/com sinal). Aceita delta-seconds (incl.
+   * decimais, arredondados pra cima via `Math.ceil`) e HTTP-date.
+   * Datas no passado → 0ms.
+   */
+  getRetryAfterMs(): number | undefined;
+}
+
+class TooManyRequestsError extends HttpStatusError {
+  // status sempre 429. Classificada como transiente — emissões e eventos
+  // viram `retry_pending` automaticamente, com `notBefore` calculado pela
+  // `RetryPolicy` configurada (default respeita Retry-After).
+}
+
+class InvalidCepError extends ValidationError {
+  readonly cep: string;
+  readonly reason: 'format' | 'not_found' | 'api_unavailable';
+}
+
+// InvalidCpfError e InvalidCnpjError seguem o mesmo shape (campo + reason).
+// reason em CPF/CNPJ: 'format' | 'check_digit' | 'known_invalid'.
+```
+
+## Comportamento específico
+
+- **`fetchByNsu` nunca lança `NotFoundError`** — 404 carrega body e vira `status: 'NENHUM_DOCUMENTO_LOCALIZADO'`. Lança apenas erros de transporte/certificado.
+- **`emitir(params)` não lança em transiente** — retorna `{ status: 'retry_pending', pending, error }`. Lança em permanente (rejeição) ou validação local.
+- **`emitirDpsPronta(dps)` lança em tudo** — escape hatch, sem `retryStore`.
+- **`substituir` só lança no step 1** — falhas pós-emit são observáveis via `result.status` (`retry_pending` / `rolled_back` / `rollback_pending` / `rollback_failed`).
+- **`MissingDpsCounterError`** — `emitir(params)` sem `params.nDPS` e sem `dpsCounter` configurado.
+- **`MissingRetryStoreError`** — transiente em `emitir`/`cancelar`/`substituir` sem `retryStore`.
+- **`ClientClosedError`** — qualquer método após `cliente.close()`. Single-shot por design; para reconectar, instancie um novo cliente.
+- **`gerarDanfse('auto')` só cai para local em `NetworkError`/`TimeoutError`/`ServerError`** — permission/404/invalid-chave propagam.
+
+### Classificação padrão transiente vs permanente
+
+`defaultIsTransient` (de `src/retry/transient.ts`) decide o que vai para `retry_pending` vs lançar. Resumo:
+
+- **Sempre transiente**: `NetworkError`, `TimeoutError`, `ServerError` (5xx), `TooManyRequestsError` (429).
+- **Transiente por código** (em `ReceitaRejectionError`): `E1217` (manutenção SEFIN), `E1206` (erro de acesso a LCR) — dois códigos da camada de recepção que são intermitentes.
+- **Permanente**: qualquer outro `ReceitaRejectionError` (426 dos 428 códigos do Anexo I) e tudo o mais.
+
+Sobrescreva passando `isTransient: (err) => boolean` em `CancelarParams` ou `SubstituirParams` (não disponível em `EmitirParams`).
+
+### 429 e RetryPolicy
+
+429 vira `retry_pending` no `RetryStore` com um `notBefore` calculado pela `RetryPolicy` configurada. A default (`createDefaultRetryPolicy()`):
+
+- Respeita o cabeçalho `Retry-After` quando presente — delta-seconds ou HTTP-date.
+- Fallback de 60s para 429/503 sem header.
+- Cap de 1h para valores absurdos (servidor mandando dias/semanas).
+- Decimais (`12.5`) arredondados para cima via `Math.ceil` (servidor disse "pelo menos X segundos").
+
+Para backoff exponencial, jitter, ou política específica, implemente `RetryPolicy` e passe em `NfseClientConfig.retryPolicy`:
+
+```typescript
+import type { RetryPolicy, RetryContext } from 'open-nfse';
+
+const exponentialPolicy: RetryPolicy = {
+  computeNotBefore(err, now, ctx?: RetryContext) {
+    if (!ctx) return undefined;
+    const baseMs = 1_000;
+    const jitter = Math.random() * 500;
+    const delay = Math.min(baseMs * 2 ** (ctx.attempt - 1) + jitter, 3_600_000);
+    return new Date(now.getTime() + delay);
+  },
+};
+
+const cliente = new NfseClient({ /* ... */, retryPolicy: exponentialPolicy });
+```
+
+A lib embrulha a sua policy num wrapper defensivo: se `computeNotBefore` lançar, captura, loga `warn`, e cai para `notBefore: undefined` — a entrada permanece no store, elegível na próxima passada. Não confie no wrapper como rede de segurança; faça a sua policy à prova de bala.
+
+Signatures e parâmetros exatos: veja o [API cheat sheet](../api-cheatsheet) ou [API completa (TypeDoc)](../api/).
+
+## Relançando com contexto
+
+```typescript
+try {
+  await cliente.emitir(params);
+} catch (err) {
+  if (err instanceof OpenNfseError) {
+    throw new MyAppError(`emissão da nota ${order.id} falhou`, { cause: err });
+  }
+  throw err;
+}
+```
+
+`err.cause` preserva a chain original — Node exibe o stack trace completo.
+
+---
+
+# Começando
+
+Source: https://github.com/fm-s/open-nfse/blob/main/docs/guide/getting-started.md
+
+# Começando
+
+Este guia cobre instalação, configuração de certificado A1 e a primeira chamada em **Produção Restrita** (homologação).
+
+## Requisitos
+
+- **Node.js 20+**
+- **Certificado digital A1** (ICP-Brasil, arquivo `.pfx` ou `.p12`) emitido pelo CNPJ que emitirá notas
+- **CNPJ habilitado** no Emissor Nacional com Inscrição Municipal ativa no município aderente ao Padrão Nacional
+
+## Instalação
+
+::: code-group
+```bash [npm]
+npm install open-nfse
+```
+```bash [pnpm]
+pnpm add open-nfse
+```
+```bash [yarn]
+yarn add open-nfse
+```
+:::
+
+## Configuração mínima
+
+```typescript
+import { readFileSync } from 'node:fs';
+import { NfseClient, Ambiente } from 'open-nfse';
+
+const cliente = new NfseClient({
+  ambiente: Ambiente.ProducaoRestrita,     // ou Ambiente.Producao
+  certificado: {
+    pfx: readFileSync('./certificado.pfx'),
+    password: process.env.CERT_PASSWORD!,
+  },
+});
+```
+
+::: tip Certificado no lugar certo
+Nunca commite o `.pfx` nem a senha. Use variáveis de ambiente, KMS ou Vault. O `.gitignore` padrão já bloqueia `*.pfx` / `*.p12` / `*.pem`.
+:::
+
+Esse shape já basta para **consulta** e **DANFSe**. Para emitir, vale também configurar um `DpsCounter` (gera `nDPS` atomicamente) e um `RetryStore` (persiste falhas transientes):
+
+```typescript
+import {
+  NfseClient, Ambiente,
+  createInMemoryDpsCounter, createInMemoryRetryStore,
+} from 'open-nfse';
+
+const cliente = new NfseClient({
+  ambiente: Ambiente.ProducaoRestrita,
+  certificado: { pfx, password },
+  dpsCounter: createInMemoryDpsCounter(),  // em prod: wrap Postgres UPDATE ... RETURNING
+  retryStore: createInMemoryRetryStore(),  // em prod: wrap sua tabela de pendentes
+});
+```
+
+Em produção, troque as impls in-memory por impls que conversam com seu banco. Veja [Integração em serviços](./integracao) para o schema SQL.
+
+## Primeira chamada — consulta
+
+```typescript
+const resultado = await cliente.fetchByChave(
+  '21113002200574753000100000000000146726037032711025',
+);
+
+console.log(resultado.nfse.infNFSe.emit.xNome);       // "VOGA LTDA"
+console.log(resultado.nfse.infNFSe.valores.vLiq);     // 51.60
+```
+
+Consulta não exige `dpsCounter` nem `retryStore` — a configuração mínima já basta.
+
+## Primeira emissão
+
+`emitir(params)` retorna um resultado **discriminated**: `ok` se autorizada, `retry_pending` se a rede falhou (a lib salva no store e um cron replay fecha depois), e lança `ReceitaRejectionError` em rejeições permanentes.
+
+```typescript
+import {
+  OpcaoSimplesNacional, RegimeApuracaoSimplesNacional, RegimeEspecialTributacao,
+  ReceitaRejectionError,
+} from 'open-nfse';
+
+try {
+  const r = await cliente.emitir({
+    emitente: {
+      cnpj: '00574753000100',
+      codMunicipio: '2111300',
+      regime: {
+        opSimpNac: OpcaoSimplesNacional.MeEpp,
+        regApTribSN: RegimeApuracaoSimplesNacional.FederalEMunicipalPeloSN,
+        regEspTrib: RegimeEspecialTributacao.Nenhum,
+      },
+    },
+    serie: '1',
+    servico: { cTribNac: '010101', cNBS: '123456789', descricao: 'Consultoria' },
+    valores: { vServ: 1500.0, aliqIss: 2.5 },
+    tomador: { documento: { CNPJ: '11222333000181' }, nome: 'Acme Ltda' },
+  });
+
+  if (r.status === 'ok') {
+    console.log('Chave autorizada:', r.nfse.chaveAcesso);
+    console.log('Número municipal:', r.nfse.nfse.infNFSe.nNFSe);
+  } else {
+    // r.status === 'retry_pending' — já persistido no retryStore pela lib
+    console.warn('Transiente, pendente:', r.pending.id);
+  }
+} catch (err) {
+  if (err instanceof ReceitaRejectionError) {
+    console.error(`Rejeitada: [${err.codigo}] ${err.descricao}`);
+  } else {
+    throw err;
+  }
+}
+```
+
+Três coisas importantes sobre esse fluxo:
+
+1. **Validações offline rodam antes do counter** — DPS com CPF/CNPJ inválido, XSD quebrado ou CEP inexistente não queima `nDPS`.
+2. **Transiente nunca duplica** — o pendente no store tem o XML já assinado; replay posta de novo e SEFIN deduplica via `infDPS.Id`.
+3. **Rejeição permanente consome o `nDPS`** — o número foi gasto, mas a nota não virou NFS-e. Registre para auditoria e siga.
+
+Produção em mais detalhe: [Emitir NFS-e](./emitir). Schema SQL do store: [Integração em serviços](./integracao).
+
+## Fechando o cliente
+
+```typescript
+await cliente.close();
+```
+
+::: tip `close()` é single-shot
+O `NfseClient` é de vida única. Após `close()`, qualquer chamada subsequente lança `ClientClosedError`. Se o processo é longo-lived (servidor, worker) e você não precisa liberar o dispatcher, simplesmente não chame `close()`. Para reconectar (rotação de certificado), instancie um novo `NfseClient`.
+:::
+
+## Provider de certificado pluggable
+
+Para KMS, Vault, ou qualquer outra origem, implemente `CertificateProvider`:
+
+```typescript
+import { parsePfx } from 'open-nfse';
+import type { CertificateProvider } from 'open-nfse';
+
+const provider: CertificateProvider = {
+  async load() {
+    const pfx = await kms.getSecretBinary('nfse-cert-pfx');
+    const password = await kms.getSecretString('nfse-cert-password');
+    return parsePfx(pfx, password);
+  },
+};
+
+const cliente = new NfseClient({ ambiente: Ambiente.Producao, certificado: provider });
+```
+
+Ou use `providerFromFile` para o caso comum:
+
+```typescript
+import { providerFromFile } from 'open-nfse';
+
+const provider = providerFromFile('/secure/cert.pfx', process.env.CERT_PASSWORD!);
+```
+
+## Logger estruturado
+
+```typescript
+import type { Logger } from 'open-nfse';
+
+const logger: Logger = {
+  debug: (msg, ctx) => console.log(`[DEBUG ${msg}]`, ctx),
+  info: (msg, ctx) => console.log(`[INFO ${msg}]`, ctx),
+  warn: (msg, ctx) => console.warn(`[WARN ${msg}]`, ctx),
+  error: (msg, ctx) => console.error(`[ERROR ${msg}]`, ctx),
+};
+
+const cliente = new NfseClient({ ambiente, certificado, logger });
+```
+
+Eventos emitidos: `http.request`, `http.response` com `method`, `url`, `status`, `latencyMs`.
+
+## Próximos passos
+
+- [Consultar NFS-e](./consultar) — fetch por chave + distribuição por NSU
+- [Emitir NFS-e](./emitir) — `emitir(params)` com counter + retry store
+- [Substituir e cancelar](./substituir-cancelar) — eventos com máquina de 5 estados
+- [Parâmetros municipais](./parametros) — alíquotas, benefícios, convênio etc.
+- [DANFSe (PDF)](./danfse) — online com fallback local
+- [Testando com o fake](./testing) — `NfseClientFake`
+
+---
+
+# Integração em serviços
+
+Source: https://github.com/fm-s/open-nfse/blob/main/docs/guide/integracao.md
+
+# Integração em serviços
+
+A lib não persiste nada — oferece as interfaces (`DpsCounter`, `RetryStore`, `ParametrosCache`) e o fluxo. O banco fica com você. Este guia cobre o **schema SQL mínimo** e o fluxo recomendado de produção.
+
+> **Mental model:** a lib roda validações offline, **só depois consulta o counter**, e falhas de rede viram `retry_pending` no store com replay idempotente (SEFIN dedupa via `infDPS.Id`). Rejeições permanentes lançam — aí o `nDPS` foi consumido.
+
+## 1. Tabelas (PostgreSQL)
+
+Traduzível para MySQL (`CHAR`/`VARCHAR` iguais, `BIGSERIAL` → `BIGINT AUTO_INCREMENT`, `TIMESTAMPTZ` → `DATETIME(3)`, `TEXT` → `MEDIUMTEXT`) ou SQL Server (`IDENTITY`, `DATETIME2`, `NVARCHAR(MAX)`).
+
+### 1.1. `emitentes`
+
+Uma linha por CNPJ que você opera. Certificado **fora do banco** — KMS/Vault, coluna guarda só referência opaca.
+
+```sql
+CREATE TABLE emitentes (
+  id                     BIGSERIAL PRIMARY KEY,
+  cnpj                   CHAR(14) NOT NULL UNIQUE CHECK (cnpj ~ '^\d{14}$'),
+  inscricao_municipal    VARCHAR(30) NOT NULL,
+  cod_municipio          CHAR(7)  NOT NULL CHECK (cod_municipio ~ '^\d{7}$'),
+  razao_social           TEXT NOT NULL,
+  ambiente               SMALLINT NOT NULL CHECK (ambiente IN (1, 2)),  -- 1=Prod, 2=Homolog
+  certificate_ref        TEXT NOT NULL,          -- KMS ARN, Vault path, etc.
+  certificate_expires_on DATE,                   -- para alerta proativo
+  created_at             TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+```
+
+### 1.2. `dps_counters` — backing store para `DpsCounter`
+
+`nDPS` é sequencial por `(emitente, série)`. A Receita rejeita duplicados ou fora de ordem — **use sempre `UPDATE ... RETURNING`**, nunca `SELECT` + `UPDATE`.
+
+```sql
+CREATE TABLE dps_counters (
+  emitente_id  BIGINT NOT NULL REFERENCES emitentes(id) ON DELETE RESTRICT,
+  serie        VARCHAR(5) NOT NULL CHECK (serie ~ '^\d{1,5}$'),
+  proximo_ndps BIGINT NOT NULL DEFAULT 1 CHECK (proximo_ndps BETWEEN 1 AND 999999999999999),
+  PRIMARY KEY (emitente_id, serie)
+);
+```
+
+Impl mínima:
+
+```typescript
+import type { DpsCounter } from 'open-nfse';
+
+const pgDpsCounter: DpsCounter = {
+  async next({ emitenteCnpj, serie }) {
+    const { rows: [row] } = await db.query(
+      `INSERT INTO dps_counters (emitente_id, serie, proximo_ndps)
+       VALUES ((SELECT id FROM emitentes WHERE cnpj = $1), $2, 2)
+       ON CONFLICT (emitente_id, serie) DO UPDATE
+         SET proximo_ndps = dps_counters.proximo_ndps + 1
+       RETURNING proximo_ndps - 1 AS ndps`,
+      [emitenteCnpj, serie],
+    );
+    return String(row.ndps);
+  },
+};
+```
+
+### 1.3. `nfse_autorizadas` — NFS-e aceitas
+
+Documento fiscal oficial assinado pela Sefin. **Retenção mínima 5 anos** (CTN art. 173); a maioria das empresas guarda indefinidamente.
+
+```sql
+CREATE TABLE nfse_autorizadas (
+  chave_acesso          CHAR(50) PRIMARY KEY CHECK (chave_acesso ~ '^\d{50}$'),
+  emitente_id           BIGINT NOT NULL REFERENCES emitentes(id),
+  id_dps                CHAR(45) NOT NULL UNIQUE,
+  nnfse                 VARCHAR(30) NOT NULL,     -- número municipal
+  ndfse                 VARCHAR(30),              -- número nacional (DFe)
+  xml_nfse              TEXT NOT NULL,            -- documento fiscal assinado
+  dh_proc               TIMESTAMPTZ NOT NULL,
+  valor_liquido         NUMERIC(15, 2) NOT NULL,
+  tomador_identificador TEXT,                     -- CNPJ/CPF (útil para queries)
+  tipo_ambiente         SMALLINT NOT NULL CHECK (tipo_ambiente IN (1, 2)),
+  created_at            TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX ix_nfse_emitente_dhproc ON nfse_autorizadas (emitente_id, dh_proc DESC);
+CREATE INDEX ix_nfse_tomador         ON nfse_autorizadas (tomador_identificador);
+```
+
+### 1.4. `nfse_rejeicoes` — rejeições permanentes
+
+```sql
+CREATE TABLE nfse_rejeicoes (
+  id         BIGSERIAL PRIMARY KEY,
+  id_dps     CHAR(45) NOT NULL,
+  codigo     VARCHAR(20) NOT NULL,
+  descricao  TEXT NOT NULL,
+  mensagens  JSONB NOT NULL,    -- array completo de MensagemProcessamento
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX ix_rejeicoes_codigo ON nfse_rejeicoes (codigo);
+```
+
+### 1.5. `nsu_cursors` — cursor de distribuição por CNPJ
+
+`fetchByNsu` é incremental. Salve o `ultimoNsu` antes de processar o próximo lote.
+
+```sql
+CREATE TABLE nsu_cursors (
+  cnpj       CHAR(14) PRIMARY KEY CHECK (cnpj ~ '^\d{14}$'),
+  ultimo_nsu BIGINT NOT NULL DEFAULT 0,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+```
+
+### 1.6. `dfe_recebidos` — DF-e recebidos (lado tomador)
+
+```sql
+CREATE TABLE dfe_recebidos (
+  id             BIGSERIAL PRIMARY KEY,
+  cnpj_consulta  CHAR(14) NOT NULL,
+  nsu            BIGINT NOT NULL,
+  tipo_documento TEXT NOT NULL,              -- NFSE | EVENTO_NFSE | ...
+  chave_acesso   CHAR(50),
+  tipo_evento    VARCHAR(10),
+  xml_documento  TEXT NOT NULL,
+  received_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (cnpj_consulta, nsu)
+);
+CREATE INDEX ix_dfe_chave ON dfe_recebidos (chave_acesso);
+```
+
+### 1.7. `nfse_eventos` — cancelamento, substituição, etc.
+
+Registre uma linha quando `cliente.cancelar()` ou `cliente.substituir()` retornar sucesso.
+
+```sql
+CREATE TABLE nfse_eventos (
+  id             BIGSERIAL PRIMARY KEY,
+  chave_acesso   CHAR(50) NOT NULL REFERENCES nfse_autorizadas(chave_acesso),
+  tipo_evento    VARCHAR(10) NOT NULL,          -- 101101, 105102, ...
+  num_seq_evento INT NOT NULL,
+  xml_evento     TEXT NOT NULL,
+  dh_registro    TIMESTAMPTZ NOT NULL,
+  origem         TEXT NOT NULL CHECK (origem IN ('emitido', 'recebido_dfe')),
+  UNIQUE (chave_acesso, tipo_evento, num_seq_evento)
+);
+```
+
+### 1.8. `nfse_pending_events` — backing store para `RetryStore`
+
+`PendingEvent` é discriminated union. Uma tabela com colunas nullable cobre todos os kinds:
+
+| `kind`                          | Origem                                                            |
+|---------------------------------|-------------------------------------------------------------------|
+| `emission`                      | `emitir(params)` transiente                                       |
+| `cancelamento_simples`          | `cancelar()` transiente                                           |
+| `cancelamento_por_substituicao` | `substituir()` — emit ok, cancel 105102 transiente                |
+| `rollback_cancelamento`         | `substituir()` — rollback do emit (via 101101) transiente          |
+
+```sql
+CREATE TABLE nfse_pending_events (
+  id                   TEXT PRIMARY KEY,
+  kind                 TEXT NOT NULL CHECK (kind IN (
+                         'emission', 'cancelamento_simples',
+                         'cancelamento_por_substituicao', 'rollback_cancelamento'
+                       )),
+  -- emission:
+  id_dps               CHAR(45),
+  emitente_cnpj        CHAR(14),
+  serie                VARCHAR(5),
+  ndps                 BIGINT,
+  -- eventos:
+  chave_nfse           CHAR(50),
+  chave_substituta     CHAR(50),
+  tipo_evento          VARCHAR(10),
+  c_motivo             VARCHAR(2),
+  x_motivo             TEXT,
+  -- comum:
+  xml_assinado         TEXT NOT NULL,
+  first_attempt_at     TIMESTAMPTZ NOT NULL,
+  last_attempt_at      TIMESTAMPTZ NOT NULL,
+  not_before           TIMESTAMPTZ,                       -- v0.8: backoff até esse instante
+  attempts             INT NOT NULL DEFAULT 1 CHECK (attempts >= 1),  -- v0.8: tentativas até agora
+  last_error_msg       TEXT NOT NULL,
+  last_error_name      TEXT NOT NULL,
+  last_error_transient BOOLEAN NOT NULL,
+  CHECK (
+    (kind = 'emission' AND id_dps IS NOT NULL AND emitente_cnpj IS NOT NULL)
+    OR (kind <> 'emission' AND chave_nfse IS NOT NULL AND tipo_evento IS NOT NULL)
+  )
+);
+
+CREATE INDEX ix_pending_kind         ON nfse_pending_events (kind);
+CREATE INDEX ix_pending_chave        ON nfse_pending_events (chave_nfse) WHERE chave_nfse IS NOT NULL;
+CREATE INDEX ix_pending_emitente     ON nfse_pending_events (emitente_cnpj) WHERE emitente_cnpj IS NOT NULL;
+CREATE INDEX ix_pending_last_attempt ON nfse_pending_events (last_attempt_at);
+CREATE INDEX ix_pending_not_before   ON nfse_pending_events (not_before) WHERE not_before IS NOT NULL;
+```
+
+> **Migração de v0.7.x →** Se você está atualizando uma instalação que já tem a tabela:
+>
+> ```sql
+> ALTER TABLE nfse_pending_events
+>   ADD COLUMN not_before TIMESTAMPTZ,
+>   ADD COLUMN attempts   INT NOT NULL DEFAULT 1 CHECK (attempts >= 1);
+> CREATE INDEX ix_pending_not_before ON nfse_pending_events (not_before) WHERE not_before IS NOT NULL;
+> ```
+>
+> Linhas existentes ficam com `not_before NULL` (elegíveis imediatamente no próximo sweep) e `attempts = 1` — comportamento idêntico ao anterior. **Drene o store via `replayPendingEvents()` antes de upgradar** se você tem pendentes de eventos: v0.7.2/v0.7.3 persistia XML não-assinado no caminho transiente (bug, corrigido em 0.8.0). A v0.8 detecta e re-assina entradas legadas automaticamente, mas planeje desligar o tráfego durante a primeira passada.
+
+Impl do `RetryStore`:
+
+```typescript
+import type { RetryStore, PendingEvent } from 'open-nfse';
+import { isPendingEmission } from 'open-nfse';
+
+const pgStore: RetryStore = {
+  async save(e: PendingEvent) {
+    const common = {
+      id: e.id, kind: e.kind, xml_assinado: e.xmlAssinado,
+      first_attempt_at: e.firstAttemptAt, last_attempt_at: e.lastAttemptAt,
+      not_before: e.notBefore ?? null,
+      attempts: e.attempts ?? 1,
+      last_error_msg: e.lastError.message,
+      last_error_name: e.lastError.errorName,
+      last_error_transient: e.lastError.transient,
+    };
+    const row = isPendingEmission(e)
+      ? { ...common, id_dps: e.idDps, emitente_cnpj: e.emitenteCnpj, serie: e.serie, ndps: e.nDPS }
+      : { ...common, chave_nfse: e.chaveNfse, chave_substituta: e.chaveSubstituta ?? null,
+          tipo_evento: e.tipoEvento,
+          c_motivo: e.cMotivo, x_motivo: e.xMotivo ?? null };
+    await db.insertOrUpdate('nfse_pending_events', row, { onConflict: 'id' });
+  },
+  async list() {
+    // SELECT * → map por kind como no narrow inverso acima.
+    // IMPORTANTE: certifique-se de retornar Date objects (não strings ISO)
+    // para os três campos de timestamp — a lib compara `notBefore > now`
+    // com Date e string-vs-Date faz coerção JS imprevisível. node-postgres
+    // já retorna Date para TIMESTAMPTZ; verifique o driver que você usa.
+  },
+  async delete(id) { await db.query(`DELETE FROM nfse_pending_events WHERE id = $1`, [id]); },
+};
+```
+
+## 2. Fluxo de emissão
+
+```typescript
+const r = await cliente.emitir({ emitente: {...}, serie: '1', servico: {...}, valores: {...}, tomador: {...} });
+
+if (r.status === 'ok') {
+  await db.insert('nfse_autorizadas', {
+    chave_acesso: r.nfse.chaveAcesso,
+    id_dps: r.nfse.idDps,
+    xml_nfse: r.nfse.xmlNfse,
+    nnfse: r.nfse.nfse.infNFSe.nNFSe,
+    dh_proc: r.nfse.dataHoraProcessamento,
+    tipo_ambiente: r.nfse.tipoAmbiente,
+    // ...
+  });
+}
+// r.status === 'retry_pending' já foi persistido pelo retryStore (a lib chamou save).
+// Rejeições permanentes lançam ReceitaRejectionError — persistir em nfse_rejeicoes pra auditoria.
+```
+
+### Cron de retry
+
+```typescript
+// A cada 1–5 min:
+const results = await cliente.replayPendingEvents();
+for (const r of results) {
+  if (r.status === 'success_emission') await db.insert('nfse_autorizadas', { ...r.emission });
+  if (r.status === 'success')          await db.insert('nfse_eventos', { ...r.evento });
+  if (r.status === 'failed_permanent') logger.error('permanent fail', r.id, r.error);
+  // still_pending fica no store; entradas com notBefore no futuro nem aparecem
+}
+```
+
+**Contratos críticos do cron:**
+
+- **Single-instance.** `replayPendingEvents` não é concorrência-safe — dois processos chamando ao mesmo tempo veriam a mesma lista e duplicariam o tráfego para o SEFIN. Garanta exclusão mútua: cron single-instance (Vercel/Railway cron, `node-cron` num worker dedicado), lock distribuído via Redis se múltiplos serviços compartilham o `RetryStore`, ou a coluna `pg_try_advisory_lock(987654321)` no início do cron.
+- **`notBefore` é honrado.** Entradas com `notBefore > now` são puladas silenciosamente (não aparecem em `results`). 429 com `Retry-After: 120` fica invisível pro cron por 2 min, sem chamadas perdidas pro SEFIN.
+- **`attempts` cresce a cada falha transiente no replay.** Útil pra dashboards: pendente com `attempts > 10` provavelmente é problema de configuração, não rede. Veja [Erros tipados — RetryPolicy](./erros#429-e-retrypolicy) para backoff customizado baseado em `attempts`.
+
+### Reconciliação residual
+
+Um caso fica fora: processo cai **entre** `emitir` resolver `ok` e seu `INSERT nfse_autorizadas` commitar. Defesas:
+
+- **Bracket antes da chamada**: `INSERT dps_submissions (id_dps, status='in_flight')` em tx separada; no startup, consulte `fetchByChave(chave_derivada)` para linhas em `in_flight` — se existe, complete; se 404, reemita com novo `idDps`.
+- **Derive a chave do `idDps`**: layout é `cLocEmi(7) + AA(2) + MM(2) + tpInsc(1) + inscFederal(14) + serie(5) + nDPS(15) + tpEmis(1) + cDV(1)`. Helper dedicado ainda não exposto; por ora consulte/derive manualmente.
+
+## 3. Considerações de produção
+
+### 3.1. Retenção fiscal e LGPD
+
+`xml_nfse` contém CPF/CNPJ + nome + endereço do tomador. Base legal: obrigação fiscal (LGPD art. 7º, II) durante o prazo decadencial (≥5 anos); direito ao esquecimento não se aplica nesse período. Evite XML inteiro em logs — use hash truncado.
+
+### 3.2. Volume e armazenamento
+
+- XML típico ~5–15 KB. Postgres faz TOAST automático acima de 2 KB.
+- Milhões de notas/ano → particione `nfse_autorizadas` e `dfe_recebidos` por mês (`dh_proc` / `received_at`).
+- Para compressão agressiva considere `pg_zstd` ou S3 com ponteiro no DB.
+
+### 3.3. Segredos
+
+Nunca plaintext no banco. Use AWS Secrets Manager / Vault / GCP SM. A **senha do `.pfx`** é tão sensível quanto o arquivo. `cliente.close()` no shutdown libera o key material do undici.
+
+### 3.4. Monitoramento mínimo
+
+- Taxa de rejeição por `codigo` (`nfse_rejeicoes`) — códigos transientes vs bugs seus têm perfis diferentes.
+- Latência SEFIN: normal é 1–3s; acima disso aumente timeout e prepare reconciliação.
+- `emitentes.certificate_expires_on < now() + 30 days` — alerta crítico.
+- Tamanho de `nfse_pending_events` — cresceu e não drena? Transient virou permanente silenciosamente.
+
+### 3.5. Backfill / DR
+
+Se o banco for perdido, distribuição por NSU (`fetchByNsu({ ultimoNsu: 0 })`) reconstrói todas as NFS-e emitidas e recebidas pelo CNPJ — a Receita é a fonte de verdade. `dps_submissions` anteriores não são recuperáveis (estado local), mas autorizadas sim.
+
+### 3.6. Caps de transporte
+
+A lib aplica dois limites defensivos não configuráveis:
+
+- **Response body: 10 MB.** Leitura em chunks; aborta lançando `NetworkError` se passar.
+- **Gunzip output: 50 MB** (`maxOutputLength`). Defende contra gzip-bomb.
+
+Nunca disparam em operação normal. Se dispararem, investigue a infra entre seu serviço e a Receita (proxy, WAF com interceptação).
+
+### 3.7. Teste de integração
+
+1. Cert de Produção Restrita habilitado para o CNPJ.
+2. `examples/emit-nfse/` como smoke test.
+3. Cenários: emissão normal, rejeição por CNPJ inválido, timeout simulado, NSU com paginação real, `substituir` cobrindo os 5 estados.
+4. Só vá para `Ambiente.Producao` depois do ciclo completo em homologação — cada nota em produção é documento fiscal oficial.
+
+Signatures e parâmetros exatos: [API cheat sheet](../api-cheatsheet) · [API completa (TypeDoc)](../api/).
+
+---
+
+# Introdução
+
+Source: https://github.com/fm-s/open-nfse/blob/main/docs/guide/introducao.md
+
+# Introdução
+
+`open-nfse` é um cliente TypeScript/Node.js para o **Padrão Nacional de NFS-e** (nfse.gov.br), a API unificada de emissão de nota fiscal de serviço operada pela Receita Federal brasileira.
+
+## Contexto regulatório
+
+Até 2025, cada um dos **~5.570 municípios** brasileiros operava seu próprio sistema de NFS-e, cada um com layout e protocolo próprios. A partir de **1º de janeiro de 2026**, conforme a [LC 214/2025](https://www.planalto.gov.br/), toda NFS-e passa obrigatoriamente pelo Padrão Nacional — uma única API REST operada pela Receita Federal.
+
+## O que esta lib cobre
+
+- **Consulta** — NFS-e por chave de acesso, distribuição de DF-e por NSU.
+- **Emissão segura** — `emitir(params)` roda validações offline, consulta o `DpsCounter` só depois que tudo passa, e persiste falhas transientes (rede, timeout, 5xx, **429**) no `RetryStore` para replay idempotente via `replayPendingEvents`. Escape hatch `emitirDpsPronta(dps)` para pipelines manuais.
+- **Emissão em lote** — `emitirEmLote` paraleliza no cliente, com concorrência configurável.
+- **Cancelamento e substituição** — eventos 101101 e 105102, com máquina de 5 estados para compensação em falhas transitórias/permanentes.
+- **Rate-limit (429) pluggable** — `RetryPolicy` decide `notBefore` para cada erro transiente. Default respeita `Retry-After` (RFC 7231); customize para backoff exponencial / linear / com jitter usando `RetryContext.attempt`.
+- **Validações pré-envio** — XSD local (RTC v1.01 via libxml2 WASM), CPF/CNPJ check-digit, lookup de CEP (ViaCEP por default, pluggable).
+- **Parâmetros municipais** — seis métodos `consultar*` (alíquotas, benefícios, convênio, regimes especiais, retenções) com cache pluggable e TTLs sensatos.
+- **DANFSe PDF** — `gerarDanfse(nfse)` tenta o PDF oficial do ADN e cai num renderer local (`pdfkit` + QR code) quando o ADN falha. Estratégia `'auto' | 'online' | 'local'`.
+- **Helper `buildDps`** — constrói uma DPS completa a partir de ~10 campos em vez de 50+ manuais.
+- **Erros tipados** em 3 níveis, incluindo rejeições específicas da Receita.
+- **`NfseClientFake`** em `open-nfse/testing` — dublê em memória estruturalmente compatível (`NfseClientLike`).
+
+## O que NÃO faz (e por quê)
+
+Escopo deliberadamente limitado para manter a biblioteca focada e auditável:
+
+- ❌ **Não tem persistência durável** — a lib provê `RetryStore`, `DpsCounter` e `ParametrosCache` (interfaces pluggable) + `replayPendingEvents` (cron-friendly), mas **os backing stores são seus**. Também não trazemos ORM ou esquema próprio. [Esquema SQL sugerido aqui](./integracao).
+- ❌ **Não cobre NF-e** (nota de produto) — padrão totalmente diferente, outro projeto.
+- ❌ **Não integra com ERPs específicos** (Bling, Omie, Tiny) — construa um wrapper sobre `open-nfse` no seu próprio projeto.
+- ❌ **Não orquestra cron/scheduler** — você chama `replayPendingEvents` em whatever job runner preferir (node-cron, BullMQ, Temporal, Lambda scheduled, etc).
+
+## Arquitetura
+
+```
+┌────────────────────────────────────────────────────────────┐
+│  API pública — NfseClient + open-nfse/testing              │
+├────────────────────────────────────────────────────────────┤
+│  Leitura        │  Emissão seg.     │  Eventos              │
+│  fetchByChave   │  emitir           │  cancelar             │
+│  fetchByNsu     │  emitirEmLote     │  substituir (5 estados)│
+│                 │  emitirDpsPronta  │  replayPendingEvents  │
+│                                                            │
+│  Retry pipeline: PendingEvent + RetryStore + RetryPolicy   │
+│   · notBefore (Retry-After) + attempts + safe-wrap         │
+│                                                            │
+│  parse-xml ↔ build-xml + sign-xml (RTC v1.01 ↔ DTO)         │
+│  buildDps · validate-xml (XSD WASM) · CPF/CNPJ DV · ViaCEP  │
+│  Parâmetros municipais (6× consultar + cache pluggable)    │
+│  DANFSe (fetch ADN + renderer local pdfkit)                │
+├────────────────────────────────────────────────────────────┤
+│  HTTP client (undici + mTLS + HTTP/1.1, GZip/Base64, PDF)  │
+│  · TooManyRequestsError (429) + getRetryAfterMs()          │
+├────────────────────────────────────────────────────────────┤
+│  Certificado A1 (node-forge, ICP-Brasil, pluggable)        │
+└────────────────────────────────────────────────────────────┘
+```
+
+## Próximos passos
+
+- [Começando](./getting-started) — instalar, configurar certificado, primeira chamada.
+- [Princípios de design](./principios) — o que a API promete e como ela se mantém compacta.
+- [Emissão](./emitir) — `emitir(params)` com `DpsCounter` + `RetryStore` end-to-end.
+- [Substituir e cancelar](./substituir-cancelar) — máquina de 5 estados + rollback automático.
+- [Parâmetros municipais](./parametros) — alíquotas, benefícios, convênio, regimes, retenções.
+- [DANFSe (PDF)](./danfse) — fetch oficial com fallback para renderer local.
+- [Testando com o fake](./testing) — `NfseClientFake` + `NfseClientLike`.
+- [Integração em serviços](./integracao) — schema SQL sugerido e fluxo recomendado para persistência.
+
+---
+
+# Parâmetros municipais
+
+Source: https://github.com/fm-s/open-nfse/blob/main/docs/guide/parametros.md
+
+# Parâmetros municipais
+
+A API `/parametrizacao` do ADN expõe, para cada município aderente, os dados fiscais parametrizados: alíquotas de ISSQN, benefícios, regimes especiais, retenções, status do convênio. A partir de **v0.5** o `NfseClient` tem 6 métodos `consultar*` que envelopam esses endpoints com:
+
+- **Cache pluggable** (default in-memory com TTLs sensatos).
+- **PascalCase → camelCase** normalizado (o wire do ADN é inconsistente).
+- **Dates → `Date`**, enums integer → string (alinhado ao resto da lib).
+- **400/404 com body não são erro** — retornam o resultado com `mensagem` populada.
+
+## Métodos
+
+### `consultarAliquota(codMunicipio, codServico, competencia)`
+
+Alíquota de ISSQN parametrizada para o trio município + serviço + competência.
+
+```typescript
+const r = await cliente.consultarAliquota('2111300', '250101', '2026-03-01');
+
+// r.aliquotas é um Record<codServico, Aliquota[]>
+for (const aliq of r.aliquotas['250101'] ?? []) {
+  console.log(aliq.incidencia, aliq.aliquota, aliq.dataInicioVigencia);
+}
+```
+
+TTL default: **6h**.
+
+### `consultarHistoricoAliquotas(codMunicipio, codServico)`
+
+Todas as alíquotas já parametrizadas para o serviço, do passado ao futuro.
+
+```typescript
+const { aliquotas } = await cliente.consultarHistoricoAliquotas('2111300', '250101');
+```
+
+TTL default: **24h** — histórico não muda.
+
+### `consultarBeneficio(codMunicipio, numeroBeneficio, competencia)`
+
+Detalhes de um benefício fiscal municipal (imunidade, redução de BC, alíquota diferenciada):
+
+```typescript
+const { beneficio } = await cliente.consultarBeneficio('2111300', 'B42', '2026-03-01');
+
+console.log(beneficio?.descricao, beneficio?.tipoBeneficio);
+console.log(beneficio?.servicos);       // linhas de serviço beneficiadas
+console.log(beneficio?.contribuintes);  // inscrições restritas (se aplicável)
+```
+
+TTL default: **1h**.
+
+### `consultarConvenio(codMunicipio)`
+
+Status do convênio do município com a Sefin Nacional:
+
+```typescript
+const { parametrosConvenio } = await cliente.consultarConvenio('2111300');
+
+parametrosConvenio?.tipoConvenio;                         // '1' = Pleno, '2' = Simplificado
+parametrosConvenio?.aderenteAmbienteNacional;             // '0' | '1' | '-1'
+parametrosConvenio?.situacaoEmissaoPadraoContribuintesRFB;
+parametrosConvenio?.permiteAproveitamentoDeCreditos;
+```
+
+TTL default: **24h**.
+
+### `consultarRegimesEspeciais(codMunicipio, codServico, competencia)`
+
+Regimes especiais ativos (permitido, vedado, obrigatório) para cada combinação:
+
+```typescript
+const { regimesEspeciais } = await cliente.consultarRegimesEspeciais(
+  '2111300',
+  '250101',
+  '2026-03-01',
+);
+
+// estrutura aninhada: regime → variante → RegimeEspecial[]
+const simplesMeEpp = regimesEspeciais.SimplesNacional?.MeEpp?.[0];
+simplesMeEpp?.situacao;   // '1' Permitido | '2' Vedado | '3' Obrigatório
+```
+
+TTL default: **12h**.
+
+### `consultarRetencoes(codMunicipio, competencia)`
+
+Configuração de retenções de ISSQN do município:
+
+```typescript
+const { retencoes } = await cliente.consultarRetencoes('2111300', '2026-03-01');
+
+retencoes?.artigoSexto.habilitado;                    // retenção por art.6º LC 116
+for (const rm of retencoes?.retencoesMunicipais ?? []) {
+  rm.descricao;
+  rm.tiposRetencao;                                   // ['1','2','3']
+  rm.servicos;                                        // serviços alcançados
+}
+```
+
+TTL default: **12h**.
+
+## Cache pluggable
+
+Interface:
+
+```typescript
+export interface ParametrosCache {
+  get<T>(key: string): Promise<T | undefined>;
+  set<T>(key: string, value: T, ttlMs: number): Promise<void>;
+}
+```
+
+Default shipped: `createInMemoryParametrosCache()` (Map com TTL, por processo). Produção normalmente quer cache compartilhado — implemente contra Redis:
+
+```typescript
+import type { ParametrosCache } from 'open-nfse';
+
+const redisCache: ParametrosCache = {
+  async get(key) {
+    const v = await redis.get(`nfse-param:${key}`);
+    return v ? JSON.parse(v) : undefined;
+  },
+  async set(key, value, ttlMs) {
+    await redis.set(`nfse-param:${key}`, JSON.stringify(value), 'PX', ttlMs);
+  },
+};
+
+const cliente = new NfseClient({ ..., parametrosCache: redisCache });
+```
+
+## Opções por chamada
+
+Cada `consultar*` aceita um objeto de opções:
+
+```typescript
+await cliente.consultarAliquota('2111300', '250101', new Date(), {
+  useCache: false,      // força miss (bate direto no ADN)
+  ttlMs: 60 * 60_000,   // override do TTL desta chamada
+  cache: outra,         // cache específica (override do cliente)
+});
+```
+
+## Erros vs dados ausentes
+
+O ADN é peculiar: **400 e 404 retornam o mesmo shape** dos 200s, com o campo `mensagem` populado. A lib aceita esses statuses (`acceptedStatuses: [400, 404]`) e devolve o resultado com `mensagem` — **não lança**:
+
+```typescript
+const r = await cliente.consultarAliquota('9999999', 'xyz', '2026-03-01');
+if (r.mensagem) {
+  console.warn('Município ou serviço não encontrado:', r.mensagem);
+  // r.aliquotas é {} aqui
+}
+```
+
+`HttpError` sobe apenas em 401/403 (certificado), 5xx (instabilidade) ou timeout.
+
+## Exemplo — alíquota aplicada
+
+Para calcular o ISS devido de uma nota antes de emiti-la:
+
+```typescript
+async function aliquotaDevida(
+  cliente: NfseClient,
+  emitenteMunicipio: string,
+  codServico: string,
+  competencia: Date,
+): Promise<number | undefined> {
+  const { aliquotas } = await cliente.consultarAliquota(
+    emitenteMunicipio,
+    codServico,
+    competencia,
+  );
+  // pega a primeira alíquota vigente (ADN devolve ativas para a competência)
+  return aliquotas[codServico]?.[0]?.aliquota;
+}
+
+// emissão com alíquota auto-preenchida:
+const aliq = await aliquotaDevida(cliente, '2111300', '250101', new Date());
+await cliente.emitir({
+  ...params,
+  valores: { vServ: 1500, aliqIss: aliq ?? 0 },
+});
+```
+
+## Avisos de cache
+
+Alguns estados são **voláteis** e merecem TTL curto (ou bypass do cache) quando o município não está em operação normal:
+
+- **Município pode ficar suspenso ou inativo.** Rules `E2003` (suspenso) e `E2004` (inativo há mais de X dias) devolvem o status do município junto dos parâmetros. Se sua aplicação vai emitir nesse município, use `useCache: false` ou um TTL < 1 h para decisões sensíveis.
+- **Inscrição Municipal pode ser revogada mid-month.** Rules `E0023`/`E0025`/`E0119`/`E0124` invalidam IMs a qualquer momento. Não cacheie o status de IM por longos períodos — consulte próximo à emissão, não no startup do processo.
+- **Convênio do município com a Sefin Nacional muda raramente** mas também não é imutável — o default de 24 h para `consultarConvenio` está calibrado pra isso.
+
+Se você precisar invalidar cache manualmente (e.g., após uma rejeição `E2003`), passe `useCache: false` na próxima chamada ou destrua o cache externamente (`ParametrosCache.set` em impls próprias).
+
+---
+
+# Princípios de design
+
+Source: https://github.com/fm-s/open-nfse/blob/main/docs/guide/principios.md
+
+# Princípios de design
+
+Compromissos da API pública. Mudanças aqui exigem bump de MINOR; histórico no [CHANGELOG](https://github.com/fm-s/open-nfse/blob/main/CHANGELOG.md).
+
+## 1. DTO in, DTO out
+
+Callers não veem XML, GZip, Base64, mTLS, XMLDSig — tudo entra e sai tipado. O campo `xmlNfse` cru é exposto como **escape hatch** (arquivar, re-assinar externamente), não como API primária.
+
+## 2. Erros tipados em 3 níveis
+
+`Error → OpenNfseError → grupo (HttpError/CertificateError/ValidationError) → concreto`. O caller escolhe a granularidade do catch (`ReceitaRejectionError` específico, `ServerError` para retry, `OpenNfseError` para re-throw com contexto). Hierarquia completa + exemplos em [Erros tipados](./erros).
+
+## 3. Sem estado interno, com primitives de orquestração e retry
+
+Sem banco, cache global ou singleton. Mas a lib oferece:
+
+- **`emitirEmLote`** — worker pool client-side (SEFIN não tem endpoint batch).
+- **`substituir`** — máquina de 5 estados com rollback automático no cancel pós-emit.
+- **`RetryStore` + `replayPendingEvents`** — interface plugável para transientes + método cron-friendly. SEFIN deduplica via `infDPS.Id` / `(chave, tipoEvento)`, então replay é idempotente.
+- **`DpsCounter`** — provider atômico de `nDPS`, consultado só depois das validações offline.
+
+Persistência durável, cron e reconciliação ficam com o consumidor. Schema SQL sugerido em [Integração em serviços](./integracao).
+
+## 4. Schema-driven
+
+Tipos em `src/nfse/domain.ts` derivam dos XSDs RTC v1.01. `xs:choice` vira discriminated union — nunca campos opcionais se excluindo:
+
+```typescript
+// ✅ modelado como union (caller narrow via `in`)
+type IdentificadorPessoa =
+  | { CNPJ: string }
+  | { CPF: string }
+  | { NIF: string }
+  | { cNaoNIF: CodigoNaoNif };
+```
+
+## 5. Identificadores como `string`, decimais como `number`
+
+CNPJ, CPF, CEP, cMun, cTribNac, chaveAcesso — `string` para preservar zeros à esquerda. Decimais (`vServ`, `pAliq`) — `number`, com a ressalva de que JS floats não fazem aritmética fiscal exata. Consumidores que precisam de precisão (soma de centavos, ABNT NBR 5891) envolvem em `Decimal.js`.
+
+## 6. Builder separável do transporte
+
+`emitir({ ...params, dryRun: true })` ou `emitirDpsPronta(dps, { dryRun: true })` montam + assinam + comprimem sem enviar e sem consumir `DpsCounter`. Usado para preview em staging, CI e auditoria de payload.
+
+## 7. Validações opt-out, não opt-in
+
+XSD, CEP e CPF/CNPJ rodam **por default** antes de qualquer round-trip. Desligar é deliberado (`skipValidation`, `skipCepValidation`, `skipCpfCnpjValidation`) — a semântica é "mostre falhas óbvias localmente antes de gastar a Receita".
+
+## 8. Ambientes isolados
+
+`Ambiente.ProducaoRestrita` para homologação, `Ambiente.Producao` para valor fiscal. Feche o ciclo completo (emitir → consultar → cancelar → substituir) em homologação antes de trocar.
+
+---
+
+# Substituir e cancelar
+
+Source: https://github.com/fm-s/open-nfse/blob/main/docs/guide/substituir-cancelar.md
+
+# Substituir e cancelar
+
+| Operação     | Evento  | Quando usar                                                               |
+|--------------|---------|---------------------------------------------------------------------------|
+| `cancelar`   | 101101  | Nota emitida por erro ou serviço não prestado — sem reemissão             |
+| `substituir` | 105102  | Nota precisa ser trocada (correção de valor, regime, imunidade)           |
+
+Ambos usam o mesmo `RetryStore` do `emitir` — falhas transientes entram no mesmo pipeline de replay (cron de `replayPendingEvents`).
+
+## `cancelar` — evento 101101
+
+### 1. Chamada básica
+
+```typescript
+import { JustificativaCancelamento } from 'open-nfse';
+
+const r = await cliente.cancelar({
+  chaveAcesso: '21113002200574753000100000000000146726037032711025',
+  autor: { CNPJ: '00574753000100' },
+  cMotivo: JustificativaCancelamento.ErroEmissao,   // '1' erro | '2' não prestado | '9' outros
+  xMotivo: 'Valor digitado incorretamente',
+});
+```
+
+Eventos deduplicam server-side por `(chave, tipoEvento)` — **determinístico por design**, para que retries caiam no dedup do SEFIN em vez de criar eventos duplicados.
+
+### 2. Lidando com cada resultado
+
+Mesma estrutura do `emitir`: três cenários distintos.
+
+```typescript
+import { ReceitaRejectionError } from 'open-nfse';
+
+try {
+  const r = await cliente.cancelar({ chaveAcesso, autor, cMotivo, xMotivo });
+
+  if (r.status === 'ok') {
+    // Cancelamento aceito pela Sefin. Persista o evento.
+    await db.insert('nfse_eventos', {
+      chave_acesso: r.evento.chaveNfse,
+      tipo_evento: '101101',
+      num_seq_evento: 1,
+      xml_evento: r.evento.xmlEvento,
+      dh_registro: r.evento.evento.infEvento.dhRegEvento,
+      origem: 'emitido',
+    });
+    return;
+  }
+
+  if (r.status === 'retry_pending') {
+    // Transiente. Já persistido no retryStore; cron cuida.
+    logger.warn('cancel transient', { pendingId: r.pending.id, err: r.error.message });
+    return;
+  }
+} catch (err) {
+  if (err instanceof ReceitaRejectionError) {
+    // Permanente. Típico: E8001 (prazo expirado), E8xxx (regra municipal),
+    // E1xxx (evento duplicado).
+    logger.error('cancel rejeitado', { codigo: err.codigo, descricao: err.descricao });
+    return;
+  }
+  throw err;
+}
+```
+
+## `substituir` — máquina de 5 estados
+
+Substituir é **emitir nova (com `<subst>` apontando para a original) + cancelar a original via 105102**. O XSD força essa ordem: `e105102` exige a `<chSubstituta>` da nova, que só existe após o emit.
+
+::: warning Janela de inconsistência
+Entre emit e cancel há ~1-3 s em que **ambas as notas estão válidas**. A lib cobre a janela com rollback automático ou persistência para retry — um dos 5 estados abaixo.
+:::
+
+### 1. Fluxo
+
+```
+emit novaDps (com subst preenchido)
+├─ step 1 falha → throw (nada a reconciliar, retry limpo)
+└─ step 1 ok → cancelar original via 105102
+   ├─ ok            → 'ok'                 ← caminho feliz
+   ├─ transient     → 'retry_pending'      ← cron retoma depois
+   └─ permanente    → rollback nova via 101101
+      ├─ ok         → 'rolled_back'        ← audit trail fragmentado, mas consistente
+      ├─ transient  → 'rollback_pending'   ← persistido no store; cron retoma
+      └─ permanente → 'rollback_failed'    ← pior caso terminal, intervenção manual
+```
+
+### 2. Chamada básica
+
+```typescript
+import { JustificativaSubstituicao, buildDps } from 'open-nfse';
+
+const novaDps = buildDps({
+  emitente: { /* mesmo do original */ },
+  serie: '1',
+  nDPS: '42',                         // obrigatório — use seu DpsCounter
+  servico: { /* corrigido */ },
+  valores: { /* corrigido */ },
+  tomador: { /* ... */ },
+  // subst é auto-preenchido pela lib com chaveOriginal
+});
+
+const r = await cliente.substituir({
+  chaveOriginal: '21113002200574753000100000000000146726037032711025',
+  novaDps,
+  autor: { CNPJ: '00574753000100' },
+  cMotivo: JustificativaSubstituicao.Outros,
+  xMotivo: 'Correção de valor',
+});
+```
+
+### 3. Lidando com cada estado
+
+```typescript
+try {
+  const r = await cliente.substituir({ chaveOriginal, novaDps, autor, cMotivo, xMotivo });
+
+  switch (r.status) {
+    case 'ok':
+      // Caminho feliz: nova emitida e original cancelada.
+      await db.tx(async (tx) => {
+        await tx.insert('nfse_autorizadas', { /* a partir de r.novaNfse */ });
+        await tx.insert('nfse_eventos', {
+          chave_acesso: r.cancelamento.chaveNfse,
+          tipo_evento: '105102',
+          xml_evento: r.cancelamento.xmlEvento,
+          /* ... */
+        });
+      });
+      break;
+
+    case 'retry_pending':
+      // Nova autorizada; cancel falhou transitoriamente, persistido no store.
+      // A original ainda está válida até o cron do replay fechar o ciclo.
+      await db.insert('nfse_autorizadas', { /* a partir de r.novaNfse */ });
+      logger.warn('substituir cancel pendente', { id: r.pending.id });
+      break;
+
+    case 'rolled_back':
+      // Cancel permanente falhou (p.ex. prazo expirado). Lib cancelou a nova
+      // via 101101 para não deixar duas notas válidas. A original permanece.
+      // Audit trail: salva ambas para ter o histórico completo.
+      await db.tx(async (tx) => {
+        await tx.insert('nfse_autorizadas', { /* r.novaNfse */ });
+        await tx.insert('nfse_eventos', { /* r.rollback, tipo 101101 */ });
+      });
+      logger.error('substituir abortada', { err: r.cancelamentoError.message });
+      alerts.send('Substituição não foi possível — revisar manualmente', { chaveOriginal });
+      break;
+
+    case 'rollback_pending':
+      // Nova válida, original válida, rollback transiente falhou.
+      // Requer atenção humana eventualmente; cron retoma o rollback.
+      logger.error('substituir inconsistente', {
+        cancel: r.cancelamentoError.message,
+        rollback: r.rollbackError.message,
+        pendente: r.pendingRollback.id,
+      });
+      alerts.send('Substituição pendente de rollback — duas notas válidas temporariamente', {
+        chaveOriginal,
+        chaveNova: r.novaNfse.chaveAcesso,
+      });
+      break;
+
+    case 'rollback_failed':
+      // Pior caso terminal: rollback falhou PERMANENTEMENTE. Nada foi
+      // persistido (RetryStore só guarda transientes) — não há replay que
+      // resolva. Nova válida + original válida → intervenção manual imediata.
+      logger.error('substituir rollback definitivamente falhou', {
+        cancel: r.cancelamentoError.message,
+        rollback: r.rollbackError.message,
+      });
+      alerts.send('Substituição requer intervenção manual — duas notas válidas e rollback rejeitado', {
+        chaveOriginal,
+        chaveNova: r.novaNfse.chaveAcesso,
+      });
+      break;
+  }
+} catch (err) {
+  // Só cai aqui se o step 1 (emit da nova) falhou. Nada foi alterado no SEFIN.
+  // Retry limpo (com novo idDps) é seguro.
+  if (err instanceof ReceitaRejectionError) {
+    logger.error('substituir emit falhou', { codigo: err.codigo });
+  }
+}
+```
+
+### Regras de decisão
+
+| Estado              | Duas notas válidas? | Ação imediata                                         |
+|---------------------|---------------------|-------------------------------------------------------|
+| `ok`                | Não                 | Persistir; done                                       |
+| `retry_pending`     | Sim (~minutos)      | Log; cron fecha                                       |
+| `rolled_back`       | Não (nova cancelada)| Persistir pair; revisar motivo — original intocada    |
+| `rollback_pending`  | Sim (indeterminado) | Alerta humano; cron tenta o rollback transiente       |
+| `rollback_failed`   | Sim (terminal)      | Intervenção manual — rollback rejeitado em definitivo, nada persistido |
+
+## Cron de replay
+
+Mesma função que cobre `emitir(params)` transientes cobre `cancelar` e `substituir` — `replayPendingEvents` distingue pelos `kind` das entries no store:
+
+```typescript
+// a cada 1-5 min, um worker só
+const items = await cliente.replayPendingEvents();
+
+for (const item of items) {
+  switch (item.status) {
+    case 'success_emission':
+      // Veio de emitir(params) transiente
+      await db.insert('nfse_autorizadas', { /* ... */ });
+      break;
+
+    case 'success':
+      // Veio de cancelar/substituir/rollback transiente
+      await db.insert('nfse_eventos', { /* ... */ });
+      break;
+
+    case 'still_pending':
+      logger.warn('ainda transient', { id: item.id });
+      break;
+
+    case 'failed_permanent':
+      // Lib removeu do store. Você decide (alerta, ticket, etc.)
+      logger.error('permanente no replay', { id: item.id, err: item.error.message });
+      alerts.send('Pending event falhou permanentemente', { id: item.id });
+      break;
+  }
+}
+```
+
+Idempotência é garantida pelo dedup server-side da Sefin:
+- **Emissões** deduplicam via `infDPS.Id` (45 chars, único por CNPJ+série+nDPS).
+- **Eventos** deduplicam via `(chave, tipoEvento)` — determinístico por NFS-e e tipo de evento.
+
+Re-POSTar o mesmo payload nunca cria duplicata: a Receita retorna o mesmo evento autorizado ou uma rejeição de duplicata reconhecível.
+
+## Interface `RetryStore`
+
+```typescript
+interface RetryStore {
+  save(entry: PendingEvent): Promise<void>;
+  list(): Promise<readonly PendingEvent[]>;
+  delete(id: string): Promise<void>;
+}
+```
+
+`PendingEvent` é discriminated union:
+
+```typescript
+type PendingEvent = PendingEmission | PendingEventoCancelamento;
+
+// kind: 'emission'                       ← emitir(params) transiente
+// kind: 'cancelamento_simples'           ← cancelar() transiente
+// kind: 'cancelamento_por_substituicao'  ← substituir() cancel transiente
+// kind: 'rollback_cancelamento'          ← substituir() rollback transiente
+```
+
+Use `isPendingEmission(e)` para narrow antes de acessar campos específicos de cada variante. `createInMemoryRetryStore()` serve para testes e demos; produção precisa persistir durável — impl Postgres completa em [Integração em serviços](./integracao#1-8-nfse-pending-events-backing-store-para-retrystore).
+
+## Regras de negócio que importam
+
+1. **Prazo é parametrizado pelo município** (rule E0050 para substituição, E0822 para cancelamento). Cada município define sua janela (24 h, 30 d, 180 d…) e a Receita retorna `E8001` ao expirar. Para checagem prévia, consulte via `consultarAliquota` / `consultarBeneficio` (guia [Parâmetros municipais](./parametros)).
+2. **Estado da NFS-e** — já cancelada, já substituída, ou com eventos bloqueantes → rejeição upfront.
+3. **Chain check em `substituir`** — se a original já foi cancelada, o emit da nova falha upfront no `subst.chSubstda`. Sem dangling state.
+4. **Dedup server-side** — SEFIN rejeita `{chave, tipoEvento}` duplicado com código específico; retry nunca cria evento fantasma.
+5. **`cMotivo=99` exige `xMotivo`** (rule E0078 do Anexo I). A lib faz o pré-check local e lança `RuleViolationError` antes do wire — evita consumir `nDPS` num emit que seria rejeitado.
+
+### Classificação de erros transientes
+
+Por default (`defaultIsTransient`), `ReceitaRejectionError` é **permanente** — 426 dos 428 códigos do Anexo I são de fato permanentes. As duas exceções são tratadas como transientes automaticamente:
+
+- **E1217** — "Serviço paralisado para manutenção" (janela de maintenance do SEFIN).
+- **E1206** — "Certificado de Transmissão — Erro de acesso a LCR" (CRL reachable).
+
+Ambos vão para o `RetryStore` e são retentados pelo cron de `replayPendingEvents`. Para sobrescrever a classificação, passe `isTransient: (err) => boolean` nas opções de cada método.
+
+---
+
+# Testando com `NfseClientFake`
+
+Source: https://github.com/fm-s/open-nfse/blob/main/docs/guide/testing.md
+
+# Testando com `NfseClientFake`
+
+A partir de v0.6, `open-nfse/testing` expõe um **dublê em memória** do `NfseClient` para você testar seu serviço sem abrir conexão com o SEFIN/ADN.
+
+```ts
+import { NfseClientFake, type NfseClientLike } from 'open-nfse/testing';
+```
+
+## Por que dois pontos de import?
+
+`open-nfse/testing` é um **subpath export** separado. Isso significa:
+
+- A lib principal (`open-nfse`) não arrasta o código do fake para produção — tree-shaking nativo.
+- O fake só é carregado em test runners.
+- As duas classes são **estruturalmente compatíveis**: `NfseClientLike = NfseClient | NfseClientFake`.
+
+## Tipando suas dependências
+
+Nos pontos onde seu serviço recebe o cliente, tipe como `NfseClientLike`:
+
+```ts
+import type { NfseClientLike } from 'open-nfse/testing';
+
+export class PedidoService {
+  constructor(private readonly nfse: NfseClientLike) {}
+
+  async criar(pedido: Pedido) {
+    return this.nfse.emitir({ ... });
+  }
+}
+
+// em prod:
+new PedidoService(new NfseClient({ ambiente, certificado }));
+
+// em teste:
+new PedidoService(new NfseClientFake());
+```
+
+## API de seed — pré-populando estado
+
+```ts
+const fake = new NfseClientFake({ ambiente: TipoAmbiente.Homologacao });
+
+// Uma NFS-e que `fetchByChave(chave)` deve retornar:
+fake.seed.nfse('21113...', mockNfseEmitResult);
+
+// Documentos que `fetchByNsu` deve retornar:
+fake.seed.dfe([
+  { nsu: 10, chaveAcesso: '...', tipoDocumento: TipoDocumento.Nfse, /* ... */ },
+  { nsu: 11, chaveAcesso: '...', /* ... */ },
+]);
+
+// Parâmetros municipais seedados:
+fake.seed.aliquota('2111300', '250101', '2026-03-01', {
+  aliquotas: {
+    '250101': [{ incidencia: 'Local', aliquota: 2.5, dataInicioVigencia: new Date('2026-01-01') }],
+  },
+});
+
+fake.seed.beneficio('2111300', 'B42', '2026-03-01', { beneficio: { ... } });
+fake.seed.convenio('2111300', { parametrosConvenio: { ... } });
+fake.seed.regimesEspeciais('2111300', '250101', '2026-03-01', { regimesEspeciais: { ... } });
+fake.seed.retencoes('2111300', '2026-03-01', { retencoes: { ... } });
+```
+
+## Simulando falhas
+
+```ts
+// Próxima emissão lança ReceitaRejectionError:
+fake.failNextEmit({
+  kind: 'rejection',
+  codigo: 'E401',
+  descricao: 'CNPJ do emitente não autorizado',
+});
+
+// Próxima emissão retorna { status: 'retry_pending' }:
+fake.failNextEmit({ kind: 'transient', message: 'simulated timeout' });
+
+// Mesmo para cancelar:
+fake.failNextCancel({ kind: 'rejection', codigo: 'E8001', descricao: 'Prazo expirado' });
+```
+
+A falha é **consumida na próxima chamada** — se você programar uma e o teste não acionar a chamada esperada, a próxima chamada futura pegaria a falha. Use `reset()` entre testes.
+
+## Introspecção — verificando o que foi feito
+
+```ts
+await service.emitirNota(pedido);
+
+expect(fake.emittedChaves).toHaveLength(1);
+expect(fake.cancelledChaves).toEqual([]);
+expect(fake.eventosRegistrados).toHaveLength(0);
+
+await service.cancelarNota(chave, 'Erro na emissão');
+expect(fake.cancelledChaves).toContain(chave);
+expect(fake.eventosRegistrados[0]?.evento.infEvento.Id).toMatch(/^EVT/);
+```
+
+Visões expostas:
+
+| Getter                | Retorna                                      |
+|-----------------------|----------------------------------------------|
+| `emittedChaves`       | `readonly string[]` — chaves emitidas/seedadas |
+| `cancelledChaves`     | `readonly string[]` — chaves canceladas        |
+| `substituidas`        | `ReadonlyMap<original, nova>`                  |
+| `eventosRegistrados`  | `readonly EventoResult[]`                      |
+
+## `reset()`
+
+Limpa todo o estado — seeds + failures + emissões registradas. Chame em `beforeEach` para isolar testes:
+
+```ts
+describe('PedidoService', () => {
+  const fake = new NfseClientFake();
+  const service = new PedidoService(fake);
+
+  beforeEach(() => fake.reset());
+
+  it('cancela nota em caso de erro de pagamento', async () => { ... });
+  it('emite nota segmentada quando há múltiplos itens', async () => { ... });
+});
+```
+
+## Exemplo — teste end-to-end
+
+```ts
+import { describe, it, expect, beforeEach } from 'vitest';
+import { NfseClientFake } from 'open-nfse/testing';
+import { PedidoService } from '../src/pedido-service.js';
+
+describe('PedidoService', () => {
+  let fake: NfseClientFake;
+  let service: PedidoService;
+
+  beforeEach(() => {
+    fake = new NfseClientFake();
+    service = new PedidoService(fake);
+  });
+
+  it('emite nota e guarda a chave no pedido', async () => {
+    const pedido = { id: 1, valor: 100, cliente: { cnpj: '...' } };
+    const resultado = await service.emitirNota(pedido);
+    expect(resultado.chaveAcesso).toMatch(/^\d{50}$/);
+    expect(fake.emittedChaves).toHaveLength(1);
+  });
+
+  it('marca pedido como rejeitado quando CNPJ é inválido', async () => {
+    fake.failNextEmit({
+      kind: 'rejection',
+      codigo: 'E401',
+      descricao: 'CNPJ não autorizado',
+    });
+    await expect(service.emitirNota({ id: 1, /* ... */ }))
+      .rejects.toMatchObject({ name: 'ReceitaRejectionError', codigo: 'E401' });
+  });
+
+  it('retorna retry_pending e salva para replay quando há timeout', async () => {
+    fake.failNextEmit({ kind: 'transient', message: 'mock timeout' });
+    const r = await fake.emitir({ /* params */ });
+    expect(r.status).toBe('retry_pending');
+  });
+});
+```
+
+## O que o fake NÃO faz
+
+- **Não valida assinatura XMLDSig** — a NFS-e sintetizada traz uma `Signature` com valores `FAKE_*`. Se seu código verifica a signature, faça mock também.
+- **Não executa o `replayPendingEvents` completo** — a função existe mas retorna `[]`. Se quiser testar replay, use um `RetryStore` de verdade + `NfseClient` com `MockAgent`.
+- **Não persiste pendentes em `failNextCancel({kind:'transient'})`** — cancelamento transiente joga `TimeoutError` direto. Emissão transiente retorna `retry_pending` com o pending objeto sintético, mas sem tocar no store real.
+
+Esses limites são deliberados — o fake é para testar **o código do consumidor**, não o fluxo de retry interno da lib.
+
+---
+
+# Validações pré-envio
+
+Source: https://github.com/fm-s/open-nfse/blob/main/docs/guide/validacoes.md
+
+# Validações pré-envio
+
+A lib valida a DPS **localmente** antes de mandar pro SEFIN. Três validações independentes, todas ligadas por default, cada uma com opt-out:
+
+| Validação   | Custo   | Tipo            | Flag para desligar          |
+|-------------|---------|-----------------|-----------------------------|
+| CPF/CNPJ DV | ~1µs    | Sync            | `skipCpfCnpjValidation`     |
+| XSD RTC     | 50-200ms* | Async (WASM)  | `skipValidation`            |
+| CEP (ViaCEP) | 50-500ms/lookup | Async (HTTP) | `skipCepValidation`    |
+
+\* A primeira chamada carrega o runtime WASM (~1MB); subsequentes são ~5-20ms.
+
+## Ordem de execução em `emitir()`
+
+```
+CPF/CNPJ (cheapest) → XSD (local) → CEP (external) → sign → POST
+```
+
+Mais barata primeiro para falhar rápido antes de gastar tempo.
+
+## CPF/CNPJ check-digit
+
+Verifica formato (11/14 dígitos sem máscara) + dígitos verificadores (algoritmo modulo-11 oficial da Receita).
+
+### Expostos para uso standalone
+
+```typescript
+import { validateCpf, validateCnpj, InvalidCpfError, InvalidCnpjError } from 'open-nfse';
+
+try {
+  validateCnpj('00574753000100');     // OK
+  validateCnpj('00000000000001');     // throws InvalidCnpjError(reason: 'check_digit')
+  validateCnpj('11111111111111');     // throws InvalidCnpjError(reason: 'known_invalid')
+  validateCnpj('abc');                 // throws InvalidCnpjError(reason: 'format')
+} catch (err) {
+  if (err instanceof InvalidCnpjError) {
+    console.log(err.cnpj, err.reason);
+  }
+}
+```
+
+### O que é validado em `emitir`
+
+`collectIdentifiersFromDps` extrai todos os identificadores CNPJ/CPF da DPS (prest, toma, interm, fornec em dedRed, IBSCBS.dest, etc.) e valida cada um. NIF e cNaoNIF são ignorados — não têm DV brasileiro.
+
+## XSD RTC v1.01
+
+`validateDpsXml()` roda o XML assinado contra o schema RTC v1.01 bundled usando libxml2 (via WASM). Pega erros estruturais que o SEFIN rejeitaria com round-trip:
+
+- Elemento obrigatório ausente (ex: `cNBS`)
+- Pattern inválido (ex: `nDPS` começando com 0, `dhEmi` com milissegundos)
+- Valor fora do enum (ex: `tribISSQN` não definido)
+- Ordem de elementos errada
+
+### Uso standalone
+
+```typescript
+import { validateDpsXml, XsdValidationError } from 'open-nfse';
+
+try {
+  await validateDpsXml(xml);
+} catch (err) {
+  if (err instanceof XsdValidationError) {
+    for (const v of err.violations) {
+      console.error(`linha ${v.line}: ${v.message}`);
+    }
+  }
+}
+
+// ou sem throw — coletar violações:
+const r = await validateDpsXml(xml, { throwOnInvalid: false });
+if (!r.valid) {
+  for (const v of r.violations) console.log(v.message, v.line);
+}
+```
+
+### WASM lazy-load
+
+A primeira chamada ao validador carrega o runtime libxml2 (~1MB). Chamadas subsequentes reusam. Em emissão em lote, o custo é amortizado instantaneamente.
+
+::: tip Bundle dos XSDs
+Os 10 XSDs da RTC v1.01 estão inlineados em `src/nfse/_rtc-schemas.generated.ts` (5800 linhas, regenerado via `scripts/generate-schemas.mjs`). Quando uma nova NT landar, rode o script e commit — sem runtime file I/O.
+:::
+
+## CEP (ViaCEP)
+
+Valida **formato** (8 dígitos, strip de pontuação) e **existência** (consulta ViaCEP).
+
+### Uso standalone
+
+```typescript
+import { createViaCepValidator, InvalidCepError } from 'open-nfse';
+
+const cepValidator = createViaCepValidator();
+
+try {
+  const info = await cepValidator.validate('01310-100');
+  console.log(info.cep);          // '01310100' (normalizado)
+  console.log(info.logradouro);   // 'Avenida Paulista'
+  console.log(info.uf);           // 'SP'
+  console.log(info.localidade);   // 'São Paulo'
+  console.log(info.ibge);         // '3550308'
+} catch (err) {
+  if (err instanceof InvalidCepError) {
+    // err.reason: 'format' | 'not_found' | 'api_unavailable'
+  }
+}
+```
+
+### Cache
+
+Por default cada `createViaCepValidator()` tem um Map em memória. Passe um cache externo para compartilhar entre chamadas (ex: reduzir ViaCEP hits em lote):
+
+```typescript
+const sharedCache = new Map();
+
+const validator1 = createViaCepValidator({ cache: sharedCache });
+const validator2 = createViaCepValidator({ cache: sharedCache });
+// validator1.validate('01310100') → cache hit em validator2
+```
+
+### Provider customizado
+
+A interface `CepValidator` é pluggable — troque ViaCEP por BrasilAPI, banco de endereços dos Correios, ou um mock em testes:
+
+```typescript
+import type { CepValidator } from 'open-nfse';
+
+const brasilApi: CepValidator = {
+  async validate(cep) {
+    const r = await fetch(`https://brasilapi.com.br/api/cep/v1/${cep}`);
+    if (r.status === 404) throw new InvalidCepError(cep, 'not_found');
+    if (!r.ok) throw new InvalidCepError(cep, 'api_unavailable');
+    const data = await r.json();
+    return { cep, logradouro: data.street, uf: data.state, /* ... */ };
+  },
+};
+
+const cliente = new NfseClient({..., cepValidator: brasilApi});
+```
+
+### CEPs coletados da DPS
+
+`collectCepsFromDps` extrai CEPs de:
+
+- `prest.end` (prestador)
+- `toma.end`, `interm.end`
+- `serv.obra.end`, `serv.atvEvento.end`
+- `IBSCBS.dest.end`, `IBSCBS.imovel.end`
+- `valores.vDedRed.documentos.docDedRed[].fornec.end`
+
+Exterior (`endExt`) é **ignorado** — não tem CEP brasileiro.
+
+## Desligando seletivamente
+
+```typescript
+await cliente.emitir({
+  ...params,
+  skipValidation: true,          // sem XSD
+  skipCepValidation: true,       // sem lookup externo
+  skipCpfCnpjValidation: true,   // sem DV algorítmico
+});
+```
+
+### Quando desligar?
+
+- **Testes** onde você já sabe que o XML é válido e quer economizar tempo.
+- **Debugging** quando quer ver o erro bruto do SEFIN em vez da falha local.
+- **Emissão em alta frequência** onde o lookup ViaCEP vira gargalo — use cache compartilhado ou skip.
+
+Em produção normal, deixe tudo ligado. O custo é negligível e os erros capturados localmente são muito mais fáceis de debugar do que uma rejeição E**** genérica da Receita.
+
+## Collectors expostos
+
+Úteis para dashboards internos ou pre-checks antes de chamar `emitir`:
+
+```typescript
+import { collectCepsFromDps, collectIdentifiersFromDps } from 'open-nfse';
+
+const ceps = collectCepsFromDps(dps);
+// [{ path: 'infDPS.prest.end.localidade.endNac.CEP', cep: '01310100' }, ...]
+
+const ids = collectIdentifiersFromDps(dps);
+// [{ path: 'infDPS.prest.CNPJ', type: 'CNPJ', value: '00574753000100' }, ...]
+```
+
+---
+
+# open-nfse
+
+Source: https://github.com/fm-s/open-nfse/blob/main/docs/index.md
+
+# open-nfse
+
+Cliente TypeScript/Node.js para o **Padrão Nacional de NFS-e** (nfse.gov.br) — a API unificada da Receita Federal, obrigatória em todo o Brasil a partir de 1º de janeiro de 2026 (LC 214/2025). Fala direto na API oficial, sem gateway intermediário.
+
+[npm](https://www.npmjs.com/package/open-nfse) · [GitHub](https://github.com/fm-s/open-nfse) · [Changelog](https://github.com/fm-s/open-nfse/blob/main/CHANGELOG.md)
+
+## Instalar
+
+```bash
+npm install open-nfse
+```
+
+Requer Node.js 20+ e certificado digital A1 (ICP-Brasil) do CNPJ emitente.
+
+## Exemplo mínimo
+
+Setup do cliente com `DpsCounter` (gera `nDPS` atomicamente) e `RetryStore` (persiste transientes). As versões in-memory cobrem testes; produção usa Postgres — [schema SQL sugerido](/guide/integracao).
+
+```typescript
+import {
+  NfseClient, Ambiente,
+  createInMemoryDpsCounter, createInMemoryRetryStore,
+} from 'open-nfse';
+
+const cliente = new NfseClient({
+  ambiente: Ambiente.ProducaoRestrita,
+  certificado: { pfx: readFileSync('./cert.pfx'), password: process.env.CERT_PASSWORD! },
+  dpsCounter: createInMemoryDpsCounter(),
+  retryStore: createInMemoryRetryStore(),
+});
+```
+
+Emissão com resultado discriminado:
+
+```typescript
+import {
+  OpcaoSimplesNacional, RegimeApuracaoSimplesNacional, RegimeEspecialTributacao,
+  ReceitaRejectionError,
+} from 'open-nfse';
+
+try {
+  const r = await cliente.emitir({
+    emitente: {
+      cnpj: '00574753000100',
+      codMunicipio: '2111300',
+      regime: {
+        opSimpNac: OpcaoSimplesNacional.MeEpp,
+        regApTribSN: RegimeApuracaoSimplesNacional.FederalEMunicipalPeloSN,
+        regEspTrib: RegimeEspecialTributacao.Nenhum,
+      },
+    },
+    serie: '1',
+    servico: { cTribNac: '010101', cNBS: '123456789', descricao: 'Consultoria' },
+    valores: { vServ: 1500.0, aliqIss: 2.5 },
+    tomador: { documento: { CNPJ: '11222333000181' }, nome: 'Acme Ltda' },
+  });
+
+  if (r.status === 'ok') {
+    console.log('chave autorizada:', r.nfse.chaveAcesso);
+  } else {
+    // r.status === 'retry_pending' — já persistido no retryStore pela lib
+    console.warn('pendente:', r.pending.id);
+  }
+} catch (err) {
+  if (err instanceof ReceitaRejectionError) {
+    console.error(`rejeitada [${err.codigo}]: ${err.descricao}`);
+  } else {
+    throw err;
+  }
+}
+```
+
+Para o ciclo completo (persistência, cron de replay, bulk com counter+retry), veja [Emitir NFS-e](/guide/emitir).
+
+## O que a lib cobre
+
+| Escopo                                   | Página                                                |
+|------------------------------------------|-------------------------------------------------------|
+| Consulta por chave e distribuição por NSU| [Consultar NFS-e](/guide/consultar)                   |
+| Emissão segura com counter + retry store | [Emitir NFS-e](/guide/emitir)                         |
+| Cancelamento e substituição (4 estados)  | [Substituir e cancelar](/guide/substituir-cancelar)   |
+| Validações XSD + CPF/CNPJ + CEP          | [Validações](/guide/validacoes)                       |
+| Parâmetros municipais com cache          | [Parâmetros municipais](/guide/parametros)            |
+| DANFSe em PDF (online + local)           | [DANFSe](/guide/danfse)                               |
+| Dublê em memória para testes             | [Testing](/guide/testing)                             |
+
+**Operação:** [Integração em serviços](/guide/integracao) (schema SQL), [Erros tipados](/guide/erros), [Ambientes e endpoints](/guide/ambientes).
+
+**Referência:** [API cheat sheet](/api-cheatsheet) · [API completa (TypeDoc)](/api/).
+
+## Status
+
+**v0.8.0 — 429-aware retry pipeline.** Ciclo fiscal inteiro coberto. Em v0.8: `TooManyRequestsError` (429) classificado como transiente, `RetryPolicy` pluggable, `notBefore` + `attempts` em `PendingEvent`, bug crítico de evento sem assinatura no replay corrigido (com rescue automático de dados v0.7.x). Foco atual é estabilização até 1.0; a API pública pode receber ajustes pontuais, sem breaking changes sem aviso em CHANGELOG. Não afiliado à Receita Federal.
+
+---
