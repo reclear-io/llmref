@@ -1,0 +1,2970 @@
+# Terway CNI Plugin
+
+Source: https://github.com/aliyuncontainerservice/terway/blob/main/README.md
+
+# Terway CNI Plugin
+
+CNI plugin for Alibaba Cloud VPC/ENI
+
+
+English | [简体中文](./README-zh_CN.md)
+
+## Introduction
+
+Terway is a self-developed CNI (Container Network Interface) plugin for ACK (Alibaba Cloud Kubernetes), built on Alibaba Cloud's Elastic Network Interface (ENI) technology. It optimizes cloud resource usage and enhances network performance. Terway supports eBPF for traffic acceleration, reducing latency, and adheres to Kubernetes Network Policy standards for container-to-container access control.
+
+In Terway, each Pod has its own network stack and IP address. Pods on the same ECS (Elastic Compute Service) instance communicate directly, while cross-ECS Pod communication transits directly through VPC ENIs, avoiding encapsulation with technologies like VxLAN for higher communication performance.
+
+## Features
+
+- **ENI Network Mode**: Allocates ENIs to Pods for optimized resource utilization and network performance.
+- **Trunking Feature**: Allows Pods to have independent ENIs for flexible security group and switch configurations.
+- **Node Pool Network Mode Configuration**: Supports configuring node pools for exclusive ENI usage.
+- **Security Policies**: Supports NetworkPolicy and traditional security groups for multi-dimensional network security control.
+- **High Performance**: Utilizes eBPF for protocol stack acceleration, ensuring low latency and high throughput.
+- **IPv6 Support**: Dual-stack support for both IPv4 and IPv6.
+- **Intelligent Computing Lingjun**：Linjun support.
+
+### Deprecated Features
+
+- **VPC Network Mode**: Direct communication to VPC resources using VPC routing.
+
+- **Exclusive ENI Mode**: Direct ENI attachment to Pods for maximum performance.（Replace with configuring the network mode through node pool dimension as a dedicated ENI.)
+
+## Version Differences
+
+ACK-provided versions are identical to the open-source version, except the Trunking feature is not available in self-hosted clusters.
+
+## Contributions
+
+We warmly welcome community contributions! Whether it's bug fixes, new features, documentation improvements, or code enhancements, your help is appreciated.
+
+[Report Issues](https://github.com/AliyunContainerService/terway/issues/new)
+[Submit Pull Request](https://github.com/AliyunContainerService/terway/compare)
+
+## Security
+
+If you discover a security vulnerability in the code, please contact [kubernetes-security@service.aliyun.com](mailto:kubernetes-security@service.aliyun.com). Refer to [SECURITY.md](SECURITY.md) for details.
+
+## Community
+
+### DingTalk
+
+Join `DingTalk` group by `DingTalkGroup` id "35924643".
+
+---
+
+# Terway Project Development Guide
+
+Source: https://github.com/aliyuncontainerservice/terway/blob/main/AGENTS.md
+
+# Terway Project Development Guide
+
+## Code Generation & CRDs
+
+- **Trigger**: When modifying Kubernetes API definitions, struct fields, or deepcopy logic.
+- **Action**:
+  - Run `make generate` to update `DeepCopy` methods.
+  - Run `make manifests` to update CustomResourceDefinitions (CRDs).
+
+## Testing Strategy
+
+### 0. Repository Test Entry Points
+
+- **Default verification**: Run `make test` on a Linux dev host for end-to-end validation.
+  - `make test` includes datapath tests and `test-quick`; do not replace it with a hand-picked `go test` package list when final verification is required.
+  - Local macOS runs are useful only for narrow feedback. Linux-only code, netlink/CNI paths, `gomonkey`, and envtest assets can behave differently on macOS.
+- **Targeted feedback**: It is fine to run focused `go test ./path -run TestName` while iterating, but finish with the project Makefile target.
+
+### 1. Interface Mocking
+
+- **Scope**: Interfaces defined within `github.com/AliyunContainerService/terway`.
+- **Tool**: Use `mockery` to generate mock implementations.
+
+### 2. Low-Level Stubbing
+
+- **Scope**: Hard-to-mock system interactions such as `os` calls, `netlink`, `grpc`, or file system operations.
+- **Tool**: Use `gomonkey` to patch functions or methods inline.
+- **Caveats**:
+  - Keep gomonkey patches tightly scoped and verify the replacement function signature matches the original method/function exactly.
+  - Avoid patching gRPC internals or constructing zero-value `grpc.ClientConn`/`grpc.Server`; prefer real in-memory servers such as `bufconn` or a temporary Unix socket.
+
+### 3. Controller & K8s Interaction
+
+- **Primary Framework**: Use `sigs.k8s.io/controller-runtime/pkg/envtest` to spin up a real API server environment.
+  - **Why**: To ensure accurate behavior validation that `client/fake` cannot provide.
+- **Discouraged**: Avoid `sigs.k8s.io/controller-runtime/pkg/client/fake` unless the logic is trivial and stateless.
+- **Constraints (Crucial)**:
+  - **Do NOT manually set** server-managed fields: `UID`, `ResourceVersion`, or `DeletionTimestamp`.
+  - To set `DeletionTimestamp`, you must perform a client `Delete` operation on the object.
+
+### 4. Test Migration From Internal Branches
+
+- **Scope filtering**: When importing tests from internal branches, exclude scenarios for code that is not public in this repository, such as HDENI-only paths.
+- **Behavior alignment**: Treat imported assertions as hypotheses. Reconcile them against the current open-source implementation before keeping them.
+- **Determinism**: Do not write table cases that depend on Go map iteration order. Use one pod/resource per focused case, or make the expected outcome independent of iteration order.
+
+## Verification & Quality Assurance
+
+- **Linting**:
+  - Strict adherence to `.golangci.yml`. Run `make lint-fix` for auto-fixes.
+  - Run `make vet` to verify build tags.
+- **Test Execution**:
+  - Run `make test` for final validation on Linux.
+  - Run `make test-quick` when datapath/kind validation is intentionally out of scope (outputs coverage to `coverage.txt`).
+
+## Dependency Management
+
+- **Trigger**: When adding/removing imports.
+- **Action**: Run `go mod tidy && go mod vendor`. CI requires vendor files to be in sync.
+
+## Pull Request Standards
+
+- **Naming**: `[terway] <Title>` or `[component] <Title>`.
+- **Checklist**: Format (`make fmt`) -> Lint (`make lint`) -> Test (`make test` or explicitly scoped `make test-quick`).
+
+---
+
+# Async ENI Task Queue Design
+
+Source: https://github.com/aliyuncontainerservice/terway/blob/main/docs/async-eni-queue.md
+
+# Async ENI Task Queue Design
+
+## Overview
+
+The Async ENI Task Queue is designed to decouple the blocking ENI attachment operations from the main Node reconciliation loop in the Terway controller. This improves the responsiveness of the controller and prevents blocking the reconciliation worker threads during slow Aliyun API calls.
+
+## Key Components
+
+### 1. ENITaskQueue (`pkg/controller/multi-ip/node/eni_task_queue.go`)
+
+The core component that manages the lifecycle of async ENI operations.
+
+- **In-Memory Queue**: Stores task state (`ENITaskRecord`) keyed by ENI ID.
+- **Async Processing**: Uses goroutines to handle individual attach tasks.
+- **Notification**: Signals the controller via a channel when a task completes.
+
+### 2. Executor (`pkg/eni/ops/executor.go`)
+
+Provides the low-level ENI operations.
+
+- **AttachAsync**: Initiates the attach operation via Aliyun API (non-blocking).
+- **CheckStatus**: Checks the current status of an ENI.
+- **Wait Logic**: Handles backoff and polling for status changes.
+
+## Workflow
+
+### 1. Submission
+
+When the controller determines a new ENI is needed:
+
+1. It creates the ENI via OpenAPI (blocking, as it's fast).
+2. It calls `SubmitAttach` to queue the attach operation.
+3. The task is added to the map with `Pending` status.
+4. A background goroutine is started for the task.
+5. The Node CR status is optimistically updated to `Attaching`.
+
+### 2. Processing (`processAttachTask`)
+
+The background goroutine performs the following steps:
+
+1. **Status Check**: Verifies the current ENI status. If already `InUse`, marks as `Completed` (handles controller restarts).
+2. **Initiate Attach**: Calls `AttachAsync` if needed.
+3. **Wait**: Sleeps for an initial delay (based on ENI type).
+4. **Poll**: Polls the API until the status becomes `InUse` or timeout.
+5. **Completion**: Updates the task status to `Completed` or `Failed` and notifies the controller.
+
+### 3. Reconciliation (`syncTaskQueueStatus`)
+
+In the main `Reconcile` loop:
+
+1. The controller calls `GetCompletedTasks`.
+2. Completed tasks are **removed** from the queue.
+3. The Node CR is updated with the result (e.g., `InUse` status, IP details).
+
+## State Machine
+
+- **Pending**: Task submitted, waiting to start.
+- **Running**: Goroutine started, operation in progress.
+- **Completed**: Operation successful.
+- **Failed**: Operation failed (API error).
+- **Timeout**: Operation timed out.
+
+## Reliability & Idempotency
+
+- **Duplicate Submission**: `SubmitAttach` ignores tasks that are already `Pending` or `Running`.
+- **Controller Restarts**: The `processAttachTask` first checks the actual ENI status. If the ENI was attached during a previous run (but status wasn't updated), it detects this and completes immediately.
+- **Reconciliation Loop**: The controller periodically reconciles and checks for completed tasks, ensuring the CR state eventually matches the actual state.
+
+---
+
+# Terway 中心化 IAPM
+
+Source: https://github.com/aliyuncontainerservice/terway/blob/main/docs/centralized-ipam.md
+
+# Terway 中心化 IAPM
+
+## 简介
+
+之前 IAPM 设计是由 terway daemonSet 运行在每个节点上自主完成的。
+有几个缺点：
+
+- 数据面权限高： 每个节点都能操作 openAPI ，风险比较高。
+- 流控管理：每个节点独立运作，不能做集群维度的流控管理。
+- IPAM 记录可见性：不好观察 IPAM 记录，分配记录都在节点的 DB 里面。
+
+## 基本流程
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant terwaycontrolplane
+    participant api
+    participant terwayd
+
+    terwaycontrolplane ->> api: create CR node
+    terwayd ->> api: watch CR node
+    terwayd ->> api: update spec.eni spec.pool
+    api -->> terwaycontrolplane: wait updated
+    terwaycontrolplane ->> api: sync node and pods
+```
+
+---
+
+# Custom CNI Chain
+
+Source: https://github.com/aliyuncontainerservice/terway/blob/main/docs/cni-chain.md
+
+# Custom CNI Chain
+
+## Overview
+
+Terway will set CNI config on the startup. The config (`/etc/cni/net.d/10-terway.conf`) looks like:
+
+```json
+{
+  "cniVersion": "0.4.0",
+  "name": "terway",
+  "type": "terway",
+  "eniip_virtual_type": "IPVlan"
+}
+```
+
+## Configuration
+
+Terway will take the cni config in this order `10-terway.conflist` then `10-terway.conf`.
+If you need to use custom CNI plugin, you need to add the new `10-terway.conflist` field.
+
+> Please note that there is no guarantee that custom plugin functionality will work.
+
+```yaml
+kind: ConfigMap
+apiVersion: v1
+metadata:
+  name: eni-config
+  namespace: kube-system
+data:
+  10-terway.conflist: |
+      {
+        "plugins": [
+          {
+            "type": "terway"
+          },
+          {
+            "type": "cilium-cni"
+          },
+          {
+            "type": "portmap",
+            "capabilities": {"portMappings": true},
+            "externalSetMarkChain":"KUBE-MARK-MASQ"
+          }
+        ]
+      }
+
+  10-terway.conf: |
+    {
+      "cniVersion": "0.4.0",
+      "name": "terway",
+      "type": "terway"
+    }
+
+
+```
+
+---
+
+# Terway Controlplane Degradation Design
+
+Source: https://github.com/aliyuncontainerservice/terway/blob/main/docs/degradation.md
+
+# Terway Controlplane Degradation Design
+
+## Overview
+
+This document describes the degradation mechanism in terway-controlplane. Degradation is a feature that allows the system to continue operating in a limited capacity when the cloud provider's OpenAPI is unavailable or experiencing issues.
+
+The degradation feature is only effective when `centralizedIPAM=true` is enabled in Terway configuration.
+
+## Degradation Levels
+
+### L0 Degradation Mode
+
+In L0 degradation mode, all OpenAPI requests are stopped. Terway will completely stop interacting with OpenAPI and only use cached ENIs and IPs for pod networking.
+
+This mode provides maximum stability when the cloud provider API is completely unavailable, but at the cost of flexibility in resource allocation.
+
+### L1 Degradation Mode
+
+In L1 degradation mode, Terway stops making OpenAPI requests that release resources, but continues to make requests that allocate resources.
+
+This mode allows the system to continue creating new pods while preventing the accidental release of resources during API instability.
+
+## Configuration
+
+To enable degradation, set the following in the terway-controlplane configuration:
+
+---
+
+# Terway插件
+
+Source: https://github.com/aliyuncontainerservice/terway/blob/main/docs/design.md
+
+# Terway插件
+
+Kubernetes有着种类丰富，数量繁多的网络插件，几乎任何场景，都能找到能用的网络插件。对于有追求的程序员来说，只是能用可不行，必须要选择最好的。很多时候，适合的才是最好的。
+
+Terway是容器服务团队推出的针对阿里云VPC网络的CNI插件，稳定、高性能，支持Kubernetes network policy、流控等高级特性。
+
+![terway](images/terway.png)
+
+Terway的结构遵从业界的CNI设计方式，首先是标准的CNI接口，支持Kubernetes。内置了Network Policy和Traffic Control。
+
+在Kubernetes场景下使用，支持Network Policies，可以实现Pod之间的访问隔离。
+
+通过在Pod上声明`annotation:` `kubernetes.io/ingress-bandwidth`和`kubernetes.io/egress-bandwidth`可以限制Pod的入网和出网带宽。
+
+## 架构设计与考虑
+
+### 设计需要考虑的问题
+
+* 不同网络方案中的网络连通性考虑，包括pod和pod，pod和service， pod和node，pod和外部网络
+* binary和daemon组件职责划分，CNI的模式是通过binary调用，但binary中又做不了所有的事情
+* 如何做到高效的IPAM和资源管理，容器的网络短暂异变，Terway网络联通性主要靠编排和配置各种底层的资源，如何高效的利用资源
+* 需要考虑资源的限制，云厂商对网络的资源都有配额限制，如何让调度感知
+* 异常处理，异常情况下如何避免垃圾资源和配置产生，上下游的调用时存在不一致的情况时如何保障资源状态
+
+### Terway组件列表与交互
+
+按照部署和调用方式划分，Terway包含[daemon](../daemon)和binary两部分(../plugin/terway)：
+
+* daemon: 供`binary`调用，分配和管理网络资源
+* binary：与`kubelet`交互及`daemon`交互，配置Pod的网络连接
+
+![deploy](images/terway_deploy_diagram.png)
+
+当一个Pod被调度到节点上时，`Kubelet`监听到`Pod`创建在自己节点上时， 会通过`runtime(docker...)`创建`sandbox`容器来`hold`住各种`namespace`，然后通过`cni`调用`terway binary`来处理网络`namespace`，
+`terway binary`调用`terway daemon`来获取网络资源，`terway daemon`调用`Aliyun Openapi`分配网络资源并返回给`terway binary`，最后`terway binary`为容器的网络`namespace`配置网络和联通网络。
+
+### 不同资源类型的通信方案
+
+Terway有多种容器网络的配置通信方式：
+
+* VPC: Pod网段不同于节点的网络的网段，通过Aliyun VPC路由表打通不同节点间的容器网络。
+* ENI: 容器的网卡是Aliyun弹性网卡，Pod的网段和宿主机的网段是一致的。
+* ENI多IP：一个Aliyun弹性网卡可以配置多个辅助VPC的IP地址，将这些辅助IP地址映射和分配到Pod中，这种Pod的网段和宿主机网段也是一致的。
+
+#### VPC
+
+集群有一个大的和宿主机不同的Overlay的网段，比如宿主机的VPC网段是`172.16.0.0/16`的，那么Pod网段需要选择和宿主机不同的网段比如`192.168.0.0/16`网段。
+`kube-controller-manager`会从`Pod`网段中为每个节点分配不同的`PodCidr`子段，每个节点上的Terway会从这个子段中为容器分配地址，
+同时 `cloud-controller-manager` 会配置转发规则将每个节点的`PodCidr`字段转发到对应的节点上。
+
+![vpc_conn](images/vpc_connection.jpg)
+
+如图所示，Pod跟宿主机通过[Linux veth设备](http://man7.org/linux/man-pages/man4/veth.4.html)联通起来, Pod中路由将`default`路由指向了Pod内的`veth`网卡，
+所以Pod内的流量都将经过Pod对端在宿主机上的`veth`，在宿主机的[`network namespace`](http://man7.org/linux/man-pages/man7/namespaces.7.html)上经过宿主机路由的转发通过宿主机的主网卡出去到VPC网络中，在VPC网络中经过自定义路由将子段转发到对应节点。
+在宿主机的`network namespace`转发时，会经过宿主机上的`iptables`和`tc`来实现负载均衡、流量控制、地址转换等。
+
+#### ENI
+
+与VPC的网络模式不同，ENI和ENI多IP的网络都是和VPC同样的网段，ENI网络就是从Aliyun的VPC网络中创建和绑定一个[弹性网卡](https://help.aliyun.com/document_detail/58496.html)到节点上，
+然后Pod利用这个弹性网卡和别的网络互通，这里需要关注的是弹性网卡的数量是有限制的，具体的根据[实例类型有不同的配额](https://help.aliyun.com/document_detail/25378.html)。
+
+![eni_conn](images/eni_connection.jpg)
+
+如图所示，Pod主网卡即是宿主机上绑定的弹性网卡挪到Pod的`network namespace`中的，Pod的`default`路由都指向了这个弹性网卡，所以Pod可以通过这个网卡直接跟VPC内的资源和公网的资源通信。
+另外为了让Pod可以访问Service时可以经过宿主机的`network namespace`中的`iptables`规则，所以另外增加了一个`veth网卡`打通Pod和宿主机的网络，并将集群的`Service`网段指向到这个`veth`网卡上。
+
+#### ENI多IP
+
+弹性网卡(ENI)支持配置多个辅助IP的功能，单个弹性网卡(ENI)根据实例规格可以分配6-20个辅助IP，ENI多IP模式就是利用了这个辅助IP分配给容器，从而大幅提高了Pod部署的规模和密度。在网络联通的方式上，Terway支持选择`Vethpair`策略路由和`ipvlan l3s`两种方案，Terway主要考虑了这些：
+
+1. 在节点上如何把弹性网卡(ENI)的辅助IP的流量都走对应的弹性网卡出去，并使用弹性网卡本身的mac地址而不被丢包
+2. 如何兼容容器服务目前广泛的`Centos 7.x`的`3.10`的版本的内核
+
+##### veth策略路由
+
+![eniip_conn](images/eniip_connection.png)
+
+如图所示，pod的网卡和VPC路由方式的网卡类似，都是一对`veth pair`来联通宿主机和pod的网络空间，但是和vpc路由方式的pod的区别在，pod的地址是来源于弹性网卡的辅助IP地址，并且节点上需要配置策略路由来保证辅助IP的流量经过它所属的弹性网卡。
+
+* 同主机上的容器通信直接通过主机上的路由到同一个主机上别的容器对应的veth上
+* 不同主机的容器通信经过VPC的网络进行转发到对应的机器上，再通过机器上的路由转发到容器中
+* 容器和其所在的宿主机之间的通信直接通过连接到宿主机`namespace`的veth pair和路由打通
+* 容器到其他主机通过VPC的网络转发到对应的机器，其他主机到容器通过VPC网络转发到对应的弹性网卡，然后通过路由转发到容器的Veth上
+* 容器到专线和共享服务也都是通过VPC的网络转发
+* 容器到公网的访问经过VSwitch配置的SNAT网关直接将源IP转换成EIP的地址到外部网络
+
+##### `ipvlan l2`
+
+![eniip_conn](images/eniip_connection_ipvlan.png)
+
+Linux在4.2以上的内核中支持了[ipvlan](https://www.kernel.org/doc/Documentation/networking/ipvlan.txt)的虚拟网络，可以实现单个网卡虚拟出来多个子网卡用不同的IP地址，而Terway便利用了这种虚拟网络类型，将弹性网卡的辅助IP绑定到IPVlan的子网卡上来打通网络，使用这种模式使ENI多IP的网络结构足够简单，性能也相对veth策略路由较好。
+
+### 资源管理和分配
+
+Terway中管理和分配给Pod的网络资源是阿里云虚拟化底层的网络资源，网络资源的创建都需要一系列的API调用，所以需要一些机制来保障资源的高效利用和快速分配，Terway资源管理设计如下：
+
+![resource manager](images/terway_resource_pool.png)
+
+#### Pod资源管理
+
+在给Pod分配网络资源时，`Terway`的资源管理中会记录Pod和资源的关联状态以及资源的租期。当有租期的Pod释放网络资源时根据租期保留其对应的网络资源，超时后才会到资源池中释放。
+通过资源管理的办法可以实现`Statefulset`的Pod在更新过程中IP地址保持不变，也可以通过垃圾回收的机制，避免`Kubelet`在`Pod`释放时未调用`CNI`导致的资源泄露。
+
+#### 资源池化
+
+Terway使用底层虚拟化底层的网络资源打通容器网络，网络资源的创建和释放需要一系列的API调用，如果在Pod创建销毁时调用API会导致Pod配置时间较长。
+Terway通过池化的方式对资源进行缓存，当小于资源的池的最小水位时自动补充资源，在大于资源池最大水位时开始释放资源，这样保障了高效的资源利用和分配的效率。
+
+#### 调度
+
+阿里云的网络资源在不同类型的机器上是有不同配额的，比如`ecs.g6.xlarge`机型只能额外绑定2个辅助网卡，如果是`Pod`独占辅助网卡只能调度两个`Pod`。
+如何让`Kubernetes`的调度感知到配额，避免调度超过节点可分配网卡数量的`Pod`，`Terway`通过[`DevicePlugin`](https://kubernetes.io/docs/concepts/extend-kubernetes/compute-storage-net/device-plugins/)的机制上报节点上支持的弹性网卡数量，Pod可以通过声明`aliyun/eni: 1`的资源需求来让调度感知到网卡的配额。
+
+### Network Policy
+
+在基于`Veth`的`VPC`和`ENI多IP的策略路由`模式中Terway的NetworkPolicy是通过集成Calico的[Felix](https://github.com/projectcalico/felix)组件来实现
+在基于`IPvlan`的`ENI多IP的IPvlan`模式中Terway的NetworkPolicy是通过集成[Cilium](https://github.com/cilium/cilium)组件来实现
+
+### Pod流量控制
+
+`Terway`会取到Pod上的`ingress`和`egress`的`annotation`配置，然后通过配置`Pod`的网卡上的`TC`的`tbf`规则来实现对速度的限制。
+
+---
+
+# Terway 节点动态配置
+
+Source: https://github.com/aliyuncontainerservice/terway/blob/main/docs/dynamic-config.md
+
+# Terway 节点动态配置
+
+Terway的配置文件是作为 `ConfigMap` 资源对象存放在 `etcd` 中(默认名称为 `eni-config` )。其内容如下：
+
+```json
+{
+  "version": "1",
+  "access_key": "ak",
+  "access_secret": "ak",
+  "security_group": "sg-xxx",
+  "service_cidr": "10.96.0.0/12",
+  "vswitches": {
+    "cn-hangzhou-g": ["vsw-xxx"]
+  },
+  "max_pool_size": 5,
+  "min_pool_size": 0
+}
+```
+
+| 名称             | 描述                          |
+| ---------------- | ----------------------------- |
+| `version`        | 版本                          |
+| `access_key`     | `AccessKey`                   |
+| `access_secret`  | `AccessSecret`                |
+| `security_group` | 安全组ID                      |
+| `service_cidr`   | 服务CIDR(使用`ipvlan`时)      |
+| `vswitches`      | 关联的虚拟交换机(ENI多IP模式) |
+| `max_pool_size`  | 资源池最大水位                |
+| `min_pool_size`  | 资源池最小水位                |
+
+关于terway的资源管理机制可见[此处](https://github.com/AliyunContainerService/terway/blob/master/docs/design.md#资源管理和分配)。
+
+该 `ConfigMap` 将挂载入 terway daemon 的Pod中，并在 daemon 启动时读取。下文中将其称为**默认配置**。
+
+除此之外，Terway 还加入通过label为单节点指定**动态配置文件**的功能。
+
+在节点标签中加入：
+
+`terway-config: <config_name>`
+
+daemon 在**启动时**会获得配置文件名，并获取**同命名空间下**的 `ConfigMap`: `<config_name>`
+
+并以其中的`eni_conf`值作为动态配置
+
+(如 `terway-config`:  `eni-config-node1` 则会获取 `eni-config-node1` 作为动态配置的 `ConfigMap`)
+
+获取到的该动态配置将会以[`MergePatch`](https://tools.ietf.org/html/rfc7396)的形式合并到默认配置上。
+
+如动态配置为：
+
+```json
+{
+  "vswitches": {
+    "cn-hangzhou-g": ["vsw-10000"]
+  },
+  "max_pool_size": 10
+}
+```
+
+默认配置如上，则最终 daemon 中读取的配置为：
+
+```json
+{
+  "version": "1",
+  "access_key": "ak",
+  "access_secret": "ak",
+  "security_group": "sg-xxx",
+  "service_cidr": "10.96.0.0/12",
+  "vswitches": {
+    "cn-hangzhou-g": ["vsw-10000"]
+  },
+  "max_pool_size": 10,
+  "min_pool_size": 0
+}
+```
+
+![image.png](images/terway-dynamic-config.png)
+
+> 注：若在现有节点上设置或更换动态配置，需要对daemon进行重启才能够应用。且daemon之前已经申请到的与配置相关的资源（如ENI等）可能仍旧会保留在daemon中。
+
+可以结合阿里云[容器服务控制台](https://cs.console.aliyun.com/)的节点池功能，批量为多个节点指定不同配置，达到对集群中不同节点的网络分划、资源水位调节、访问控制等精细化配置。
+
+## 关于合并配置
+
+terway 使用了 [`json-patch`](https://github.com/evanphx/json-patch) 库来对配置进行合并，其实现了 RFC7396 中声明的 `MergePatch` 过程。
+
+当遇到多层嵌套的 Object 结构时，也会进行部分合并。如默认配置(部分)
+
+```json
+{
+    "vswitches": {
+      "cn-hangzhou-g": ["vsw-xxx"],
+      "cn-hangzhou-i": ["vsw-yyy"]
+  }
+}
+```
+
+应用动态配置
+
+```json
+{
+    "vswitches": {
+      "cn-hangzhou-g": ["vsw-10000"]
+  }
+}
+```
+
+时，最终得到的结果为
+
+```json
+{
+    "vswitches": {
+      "cn-hangzhou-g": ["vsw-10000"],
+      "cn-hangzhou-i": ["vsw-yyy"]
+    }
+}
+```
+
+若要移除 `cn-hangzhou-i`，请设置动态配置为
+
+```json
+{
+    "vswitches": {
+      "cn-hangzhou-g": ["vsw-10000"],
+      "cn-hangzhou-i": null
+  }
+}
+```
+
+---
+
+# Terway ECS节点
+
+Source: https://github.com/aliyuncontainerservice/terway/blob/main/docs/ecs.md
+
+# Terway ECS节点
+
+## RAM
+
+确保Terway 使用的凭据，具备下面的 RAM 权限：
+
+Terway需要授权中包含以下 [`RAM 权限`](https://ram.console.aliyun.com/)
+
+```json
+{
+  "Version": "1",
+  "Statement": [
+    {
+      "Action": [
+        "ecs:CreateNetworkInterface",
+        "ecs:DescribeNetworkInterfaces",
+        "ecs:AttachNetworkInterface",
+        "ecs:DetachNetworkInterface",
+        "ecs:DeleteNetworkInterface",
+        "ecs:DescribeInstanceTypes",
+        "ecs:AssignPrivateIpAddresses",
+        "ecs:UnassignPrivateIpAddresses",
+        "ecs:AssignIpv6Addresses",
+        "ecs:UnassignIpv6Addresses"
+      ],
+      "Resource": [
+        "*"
+      ],
+      "Effect": "Allow"
+    },
+    {
+      "Action": [
+        "vpc:DescribeVSwitches"
+      ],
+      "Resource": [
+        "*"
+      ],
+      "Effect": "Allow"
+    }
+  ]
+}
+```
+
+## 节点配置
+
+| Label Key                          | Description | Example Value     |
+|------------------------------------|-------------|-------------------|
+| `alibabacloud.com/lingjun-worker`  | 灵骏节点标记。     | `true`            |
+| `topology.kubernetes.io/region`    | 地域。         | `cn-wulanchabu`   |
+| `node.kubernetes.io/instance-type` | 实例规格。       | `ecs.i2ne.xlarge` |
+| `topology.kubernetes.io/zone`      | 可用区。        | `cn-wulanchabu-c` |
+
+| Spec        | Description | Example Value          |
+|-------------|-------------|------------------------|
+| Provider ID | ECS实例 ID    | `cn-wulanchabu.i-xxxx` |
+
+## 部署 Terway
+
+```bash
+echo "
+centralizedIPAM:true
+terway:
+  securityGroupIDs:
+    - sg-1
+    - sg-2
+  vSwitchIDs:
+    cn-hangzhou-k:
+      - vsw-1
+      - vsw-2
+" | helm template --namespace kube-system terway-eniip . --values -
+```
+
+---
+
+# eip
+
+Source: https://github.com/aliyuncontainerservice/terway/blob/main/docs/eip.md
+
+# eip
+
+## Feature Description
+
+This document aims to explain to users that the EIP (Elastic IP) functionality in Terway is deprecated and no longer maintained. Users can use the EIP functionality in ACK Extend Network Controller as an alternative.
+
+Why the EIP Functionality is Deprecated
+Due to technological advancements and evolving business requirements, the Terway team has decided to optimize and upgrade the EIP functionality. In order to provide better network capabilities and enhance user experience, the Terway team has separated the EIP functionality from Terway and integrated it into [ACK Extend Network Controller](https://help.aliyun.com/zh/ack/product-overview/ack-extend-network-controller).
+
+Using the EIP Functionality in ACK Extend Network Controller
+After deprecation of the EIP functionality in Terway, users can utilize the EIP functionality in ACK Extend Network Controller. ACK Extend Network Controller is an advanced container network plugin provided by Alibaba Cloud for extending Kubernetes network capabilities. It offers the Elastic IP (EIP) functionality and seamlessly integrates with other network functionalities in Terway.
+
+## How migration works
+
+ACK Extend Network Controller usr CRD to trace the lifecycle of EIPs.
+When enable the EIP migration feature in Terway, Terway will create a `podEIP` object for each EIP in the cluster.
+So ACK Extend Network Controller can get the EIPs information from the `podEIP` object and manage the EIPs. Also Terway will no longer manage the EIPs.
+
+### pod with specific EIP id
+
+For pod specific EIP id, the EIP is provided by user. The `spec.allocationType.type` of `podEIP` cr would be `Static` .
+For pod not specific EIP id, the EIP is create by terway , and the `spec.allocationType.type` of `podEIP` cr would be `Auto` .
+
+### non-stateful workload
+
+For non-stateful workload, the `spec.allocationType.releaseStrategy` of `podEIP` cr would be `Follow` .
+
+### stateful workload
+
+For stateful workload, the `spec.allocationType.releaseStrategy` of `podEIP` cr would be `TTL` .
+
+## Migrate to ACK Extend Network Controller
+
+1. Make sure ACK Extend Network Controller is **NOT** installed in your cluster. If ACK Extend Network Controller is already installed, please uninstall it first.
+2. Upgrade Terway to the latest version.
+3. Modify the Terway configuration file to enable the EIP migration functionality in Terway.
+   - Set the value of the `enable_eip_migrate` parameter to `true` .
+   - Keep the value of the `enable_eip_pool` parameter to `"true"` .
+
+    ```yaml
+    apiVersion: v1  
+    data:
+      10-terway.conf: |
+        {
+          "type": "terway"
+        }
+      eni_conf: |
+        {
+          "version": "1",
+    
+          "enable_eip_pool": "true",
+          "enable_eip_migrate": true,
+          "vswitch_selection_policy": "ordered"
+        }
+    kind: ConfigMap
+    metadata:
+      name: eni-config
+      namespace: kube-system
+    ```
+
+4. Make sure to restart the Terway daemonset after modifying the Terway configuration file.
+5. After the Terway daemonset is restarted, Terway will automatically migrate the EIPs in your cluster to ACK Extend Network Controller. You can check the migration status in the Terway log.
+6. Check the `podEIP` CRD object in your cluster to see if the config is successfully created. The CRD object has the same name and namespace as the Pod.
+7. Start the [ACK Extend Network Controller](https://www.alibabacloud.com/help/en/ack/ack-managed-and-ack-dedicated/user-guide/associate-an-eip-with-a-pod-1) with eip function.
+8. Turn off terway eip function.
+   - Set the value of the `enable_eip_migrate` parameter to `false` or delete it.
+   - Set the value of the `enable_eip_pool` parameter to `"false"` or delete it.
+   - Restart the Terway daemonset.
+
+By following the steps mentioned above, you can successfully replace the deprecated EIP functionality in Terway with the EIP functionality in ACK Extend Network Controller. If you have any questions or need further assistance, please feel free to contact us.
+
+---
+
+# Configure Exclusive ENI Network Mode for Node Pools
+
+Source: https://github.com/aliyuncontainerservice/terway/blob/main/docs/exclusive-eni-node-pool.md
+
+# Configure Exclusive ENI Network Mode for Node Pools
+
+Exclusive ENI mode is a strategy that provides optimal network performance for Pods, particularly suitable for scenarios with strict network performance requirements. For example, when processing big data analytics, real-time stream processing, or running network-sensitive applications (such as video streaming, online gaming, or scientific computing), this network mode can provide high network throughput and extremely low network latency. In high-frequency trading scenarios, this network mode can provide multicast capabilities.
+
+## Prerequisites and Limitations
+
+### Version Requirements
+
+- **ECS instances**: Terway version v1.11.0 or higher is required
+- **Lingjun instances**: Terway version v1.14.3 or higher is required
+- To upgrade the component version, refer to [Terway upgrade documentation](https://help.aliyun.com/document_detail/97467.html)
+
+### Limitations
+
+- After enabling dual-stack on the cluster, adding nodes will be subject to ECS instance type restrictions in shared ENI mode. The ratio of primary private IP address + secondary private IPv4 addresses to IPv6 addresses must be 1:1. For information about the number of IPv4 and IPv6 addresses supported by ECS instances, refer to [ECS Instance Specifications](https://help.aliyun.com/document_detail/25378.html)
+- Lingjun instances do not support IPv6 dual-stack
+- Pods using exclusive ENI do not support eBPF network acceleration and NetworkPolicy
+- When using exclusive ENI, you must use newly created nodes. If you use existing nodes, the existing elastic network interfaces on the nodes will not be used
+- **Exclusive ENI only takes effect for newly created nodes**. After configuration, it cannot be adjusted to shared ENI, and existing shared ENI nodes cannot be modified to exclusive ENI mode
+
+## Configuration Overview
+
+Exclusive ENI is a node pool mode provided by Terway. For a detailed comparison between exclusive ENI and shared ENI, refer to [Shared ENI Mode vs Exclusive ENI Mode](https://help.aliyun.com/document_detail/25378.html).
+
+Follow the steps below to plan and create an exclusive ENI node pool. After successful creation, you can schedule Pods to the target node pool.
+
+## Step 1: Plan the Exclusive ENI Node Pool
+
+### Node Capacity Planning
+
+- In exclusive ENI mode, the maximum number of Pods per node is relatively low
+- Worker nodes must have more than 6 elastic network interfaces to join the cluster
+- For information on how to calculate the number of elastic network interfaces, refer to [ECS Instance Specifications](https://help.aliyun.com/document_detail/25378.html)
+
+### Network Configuration Planning
+
+Plan the vSwitches and security groups to be used by Pods.
+
+Terway supports multiple configuration methods with the following priority (from highest to lowest):
+
+1. [Configure Fixed IP and Independent vSwitch and Security Group for Pods](./terway-trunk.md#podnetworking-配置)
+2. [Node-level Network Configuration](./dynamic-config.md)
+3. Cluster default configuration [Custom Terway Configuration Parameters](./dynamic-config.md)
+
+> **Important**: Ensure that the vSwitches corresponding to the node availability zones are configured in the above configurations. Otherwise, Pods will fail to be created.
+> **Note**: Lingjun node pools do not support [Configure Fixed IP and Independent vSwitch and Security Group for Pods](./terway-trunk.md#podnetworking-配置).
+
+## Step 2: Create Exclusive ENI Node Pool and Verify
+
+### Create the Node Pool
+
+1. Create a new node pool following the [Create and Manage Node Pools](https://help.aliyun.com/document_detail/196931.html) guide
+2. During node pool creation, add the label `k8s.aliyun.com/exclusive-mode-eni-type: eniOnly` to the nodes
+
+   ```yaml
+   labels:
+     k8s.aliyun.com/exclusive-mode-eni-type: eniOnly
+   ```
+
+3. **Recommended**: Configure taints to prevent other Pods from being scheduled to the exclusive ENI node pool
+
+   ```yaml
+   taints:
+     - key: exclusive-eni
+       value: "true"
+       effect: NoSchedule
+   ```
+
+> **Important**: Configure the label when creating the node pool. Nodes that have already been created cannot be switched to exclusive ENI mode. If you configure incorrectly, delete the node pool and recreate it.
+
+### Verify Exclusive ENI Mode is Enabled
+
+Execute the following command to query the node's allocatable resources and check if the node has successfully enabled exclusive ENI mode:
+
+```bash
+kubectl describe node <node-name>
+```
+
+Expected output:
+
+```yaml
+Capacity:
+  aliyun/eni: 7
+  cpu: 16
+  ephemeral-storage: 123460788Ki
+  hugepages-1Gi: 0
+  hugepages-2Mi: 0
+  memory: 31555380Ki
+  pods: 213
+Allocatable:
+  aliyun/eni: 7
+  cpu: 15890m
+  ephemeral-storage: 113781462033
+  hugepages-1Gi: 0
+  hugepages-2Mi: 0
+  memory: 28587828Ki
+  pods: 213
+```
+
+The presence of `aliyun/eni` in the expected output indicates that exclusive ENI mode has been successfully enabled.
+
+## Step 3: Schedule Pods to Exclusive ENI Node Pool
+
+You can schedule Pods to the exclusive ENI node pool using NodeAffinity or the PodNetworking custom resource.
+
+### Using NodeAffinity
+
+**Limitation**: NodeAffinity does not support Pod-level configuration (using fixed IP, configuring independent vSwitch and security group).
+
+Example:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx-exclusive-eni
+spec:
+  replicas: 2
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: k8s.aliyun.com/exclusive-mode-eni-type
+                operator: In
+                values:
+                - eniOnly
+      containers:
+      - name: nginx
+        image: nginx:latest
+```
+
+### Using PodNetworking
+
+**Advantage**: PodNetworking supports configuring vSwitch and security group at the Pod level, as well as using Pod fixed IP. For specific operations, refer to [Configure Fixed IP and Independent vSwitch and Security Group for Pods](./terway-trunk.md#podnetworking-配置).
+
+You can refer to the YAML example below. Set `eniType` to `ENI` in the `eniOptions` field to schedule Pods to the exclusive ENI node pool:
+
+```yaml
+apiVersion: network.alibabacloud.com/v1beta1
+kind: PodNetworking
+metadata:
+  name: enionly
+spec:
+  eniOptions:
+    eniType: ENI
+  allocationType:
+    type: Elastic
+  selector:
+    podSelector:
+      matchLabels:
+        network: enionly
+  vSwitchOptions:
+    - vsw-xxxxx
+  securityGroupIDs:
+    - sg-xxxxx
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx-exclusive-eni
+spec:
+  replicas: 2
+  template:
+    metadata:
+      labels:
+        network: enionly
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:latest
+```
+
+## Verify Pod is Using Exclusive ENI
+
+Terway creates a PodENI resource with the same name and namespace as the Pod to record the network configuration information used.
+
+You can query it using the following method:
+
+```bash
+kubectl get podeni <pod-name> -n <namespace> -oyaml
+```
+
+Expected output:
+
+```yaml
+apiVersion: network.alibabacloud.com/v1beta1
+kind: PodENI
+metadata:
+  annotations:
+    k8s.aliyun.com/pod-uid: 05590939-fc51-47ab-a204-3dd187233bca
+  creationTimestamp: "2024-09-13T08:09:27Z"
+  finalizers:
+    - pod-eni
+  generation: 1
+  labels:
+    k8s.aliyun.com/node: cn-hangzhou.172.XX.XX.25
+  name: example-9d557694f-rcdzs
+  namespace: default
+  resourceVersion: "1131123"
+spec:
+  allocations:
+    - allocationType:
+        type: Elastic
+      eni:
+        attachmentOptions: {}
+        id: eni-xxxx
+        mac: 00:16:3e:37:xx:xx
+        securityGroupIDs:
+          - sg-xxxx
+        vSwitchID: vsw-xxxx
+        zone: cn-hangzhou-j
+      ipv4: 172.16.0.30
+      ipv4CIDR: 172.16.0.0/24
+      ipv6: 2408:4005:xxxx:xxxx:xxxx:xxxx:xxxx:9ad4
+      ipv6CIDR: 2408:4005:39c:xxxx::/64
+      zone: cn-hangzhou-j
+status:
+  eniInfos:
+    eni-xxxx:
+      id: eni-xxxx
+      status: Bind
+      type: Secondary
+      instanceID: i-xxxx
+  phase: Bind
+```
+
+In the output, check the `status.eniInfos` section. If the ENI type is `Secondary` (not `Trunk`), it indicates that the Pod is using exclusive ENI mode.
+
+## Troubleshooting
+
+### Pod Cannot Be Created
+
+1. **Check node capacity**: Ensure the node has more than 6 ENIs available
+
+   ```bash
+   kubectl describe node <node-name> | grep "aliyun/eni"
+   ```
+
+2. **Check vSwitch configuration**: Ensure the vSwitches in the node's availability zone are configured correctly
+
+   ```bash
+   kubectl get podnetworking <podnetworking-name> -oyaml
+   ```
+
+3. **Check node labels**: Verify the node has the correct label
+
+   ```bash
+   kubectl get node <node-name> --show-labels | grep exclusive-mode-eni-type
+   ```
+
+### Pod Not Scheduled to Exclusive ENI Node
+
+1. **Check NodeAffinity or PodNetworking**: Ensure the Pod's scheduling configuration matches the exclusive ENI node pool
+2. **Check node taints**: If taints are configured, ensure the Pod has corresponding tolerations
+3. **Check node resources**: Ensure the node has sufficient resources (CPU, memory, ENI)
+
+## Best Practices
+
+1. **Use dedicated node pools**: Create dedicated node pools for exclusive ENI mode to avoid mixing with shared ENI nodes
+2. **Configure taints**: Use taints to prevent non-exclusive ENI Pods from being scheduled to exclusive ENI nodes
+3. **Plan capacity**: Carefully plan the number of Pods per node based on ENI capacity
+4. **Monitor resources**: Regularly monitor ENI usage and node capacity
+5. **Network configuration**: Prefer PodNetworking for flexible network configuration at the Pod level
+
+## Related Documentation
+
+- [Terway Trunk Mode](./terway-trunk.md)
+- [Multi-Network Configuration](./multi-network.md)
+- [Dynamic Configuration](./dynamic-config.md)
+- [Shared ENI Mode vs Exclusive ENI Mode](https://help.aliyun.com/document_detail/25378.html)
+
+---
+
+# Terway 主机网络栈路由
+
+Source: https://github.com/aliyuncontainerservice/terway/blob/main/docs/host-stack-cidrs.md
+
+# Terway 主机网络栈路由
+
+## 背景
+
+- 在 Terway IPVLAN 模式中，使用 Terway 网络的 Pod 网络流量会被转发至主机网络中 IPVLAN 接口，通过其 `tc egress filter` 策略转发流量。
+- 默认情况下，`tc egress` 仅会将 `ServiceCIDR` 的流量转发至主机网络栈，交由 IPVS 等策略进行处理。如果希望将部分网段额外路由至主机网络栈，您可以参考本文进行设置。
+- 常见场景：DNS 缓存方案 `node-local-dns` 中，Local DNS 缓存作为 DaemonSet 部署在每个集群节点上，通过 Link-Local Address 暴露缓存服务。如需在 IPVLAN 模式下使用本地
+  DNS 缓存，可以将 Link-Local Address 设置到主机网络栈路由中。
+- 在 Terway ENIONLY 模式中，使用 Terway 网络的 Pod 中会默认添加 `ServiceCIDR` 路由至主机，通过设置主机网络栈，可以将指定网络同样路由至主机，配置方式同下。
+
+![host_stack_cidrs](images/host_stack_cidrs.png)
+
+## 操作流程
+
+1. 执行以下命令，打开 Terway 配置文件修改
+
+    ```bash
+    kubectl -n kube-system edit cm eni-config -o yaml
+    ```
+
+2. 可以看到默认的配置包含以下内容，如需增加主机网络栈路由，请添加 `host_stack_cidrs` 字段，并填入需要转发的网段，保存退出
+
+    ```json
+      10-terway.conf: |
+      {
+        "cniVersion": "0.4.0",
+        "name": "terway",
+        "eniip_virtual_type": "IPVlan",
+        "host_stack_cidrs": ["169.254.0.0/16"], // 此处为您希望添加的主机网络栈路由
+        "type": "terway"
+      }
+    ```
+
+3. 执行以下命令，过滤出当前 Terway 的所有 DaemonSet 容器组
+
+    ```bash
+    kubectl -n kube-system get pod | grep terway-eniip
+    terway-eniip-7d56l         2/2     Running   0          30m
+    terway-eniip-s7m2t         2/2     Running   0          30m
+    ```
+
+4. 执行以下命令，触发 Terway 容器组重建
+
+   ```bash
+    kubectl -n kube-system delete pod terway-eniip-7d56l terway-eniip-s7m2t
+   ```
+
+5. 登录任意集群节点，执行以下命令，查看 Terway 配置文件，如果包含添加的网段，则说明变更成功
+
+   ```bash
+    cat /etc/cni/net.d/*
+    {
+      "cniVersion": "0.4.0",
+      "name": "terway-chainer",
+      "plugins": [
+        {
+          "eniip_virtual_type": "IPVlan",
+          "host_stack_cidrs": [ // 此处为新增的主机网络栈路由
+            "169.254.0.0/16",
+          ],
+          "type": "terway"
+        },
+        {
+          "type": "cilium-cni"
+        }
+      ]
+    }
+    ```
+
+6. 重建任意一个使用 Terway 网络的 Pod 后，Pod 所在节点即可在容器中访问该新网段。
+
+---
+
+# Hubble 接入
+
+Source: https://github.com/aliyuncontainerservice/terway/blob/main/docs/hubble-intergration.md
+
+# Hubble 接入
+
+## 背景
+
+- 当 Terway 处于 IPVLAN + Cilium 模式中时，我们可以启用 Cilium Agent 的 Hubble 观测能力。
+- 本文档分为两部分，第一部分介绍如何打开节点上 Terway 内置 Cilium Agent 的 Hubble 观测能力，第二部分介绍如何部署 Hubble UI、Hubble Relay 进行网络流量展示 如您使用阿里云 ACK
+  集群，第二部分可以选用应用目录 `ack-terway-hubble` 组件进行部署。
+
+## 打开 Hubble 观测能力操作流程
+
+1. 执行以下命令，打开 Terway 配置文件修改
+
+    ```bash
+    kubectl -n kube-system edit cm eni-config -o yaml
+    ```
+
+2. 可以看到默认的配置包含以下内容，请参考以下注释部分配置：
+
+   ```json
+   10-terway.conf: |
+   {
+     "cniVersion": "0.4.0",
+     "name": "terway",
+     "eniip_virtual_type": "IPVlan",
+     // 新增以下配置，以打开 Hubble 网络流量分析
+     "cilium_enable_hubble": "true",
+     // 打开 Hubble 网络流量信息暴露地址，默认为 4244 端口
+     "cilium_hubble_listen_address": ":4244",
+     // Hubble Metrics 暴露的地址，默认为 9091
+     "cilium_hubble_metrics_server": ":9091",
+     // Hubble 需要采集的 Metrics，以逗号分割，以下为全量支持的 Metrics
+     // 打开 Metrics 数量多对性能有一定影响，目前不支持 dns、http 这类 L7 的能力
+     "cilium_hubble_metrics": "drop,tcp,flow,port-distribution,icmp",
+     "type": "terway"
+   }
+   ```
+
+3. 执行以下命令，过滤出当前 Terway 的所有 DaemonSet 容器组
+
+   ```bash
+   kubectl -n kube-system get pod | grep terway-eniip
+   terway-eniip-7d56l         2/2     Running   0          30m
+   terway-eniip-s7m2t         2/2     Running   0          30m
+   ```
+
+4. 执行以下命令，触发 Terway 容器组重建
+
+   ```bash
+   kubectl -n kube-system delete pod terway-eniip-7d56l terway-eniip-s7m2t
+   ```
+
+5. 登录任意集群节点，执行以下命令，查看 Terway 配置文件，如果包含刚刚添加的 `cilium_enable_hubble` 参数，则说明变更成功
+
+    ```bash
+    cat /etc/cni/net.d/*
+    ```
+
+6. 目前您已经打开 Cilium Agent 的 Hubble 观测能力暴露的配置，如您为阿里云 ACK 集群，可以在控制台应用目录中安装 `ack-terway-hubble` 完成 Hubble UI + Hubble Relay
+   的部署。
+
+## 部署 Hubble UI + Hubble Relay 操作流程
+
+1. 执行以下命令部署，需要本地安装有 `Helm v3`：
+
+   ```bash
+   # deploy hubble-relay and hubble-ui
+   git clone github.com/cilium/cilium
+   git checkout v1.8.1
+   helm install hubble-ui install/kubernetes/cilium/charts/hubble-ui --set global.hubble.ui.enabled=true --set global.hubble.enabled=true --set global.hubble.relay.enabled=true --set ingress.enabled=true --set ingress.hosts={hubble.local} --namespace kube-system
+   helm install hubble-relay install/kubernetes/cilium/charts/hubble-relay  --set global.hubble.enabled=true --set global.hubble.relay.enabled=true --set global.hubble.socketPath=/var/run/cilium/hubble.sock --set image.repository=quay.io/cilium/hubble-relay:v1.8.1 --namespace kube-system
+   ```
+
+2. 默认情况下，`hubble-relay` 上面有一个亲和性，原意是为了和 Cilium Agent 一起部署，需要删除：
+
+   ```yaml
+   # kubectl -n kube-system edit deployment hubble-relay
+   spec:
+     template:
+       spec:
+         // 删除此处 affinity
+         affinity:
+           podAffinity:
+             requiredDuringSchedulingIgnoredDuringExecution:
+               - labelSelector:
+                 matchExpressions:
+                   - key: k8s-app
+                   operator: In
+                   values:
+                   - cilium
+             topologyKey: kubernetes.io/hostname
+         // 以下不删除
+         containers:
+         ...
+   ```
+
+3. 创建以下 SVC，用于被 Prometheus 采集 Metrics：
+
+   ```yaml
+   ---
+   kind: Service
+   apiVersion: v1
+   metadata:
+     name: hubble-metrics
+     namespace: kube-system
+     annotations:
+       prometheus.io/scrape: 'true'
+       prometheus.io/port: '9091'
+     labels:
+       k8s-app: hubble
+   spec:
+     clusterIP: None
+     type: ClusterIP
+     ports:
+     - name: hubble-metrics
+       port: 9091
+       protocol: TCP
+       targetPort: 9091
+     selector:
+       app: terway-eniip
+   ```
+
+4. 访问 Hubble WEB UI 修改本地 hosts 绑定，将 `hubble.local` 指向 Ingress `hubble-ui` 的 IP 地址，访问 `http://hubble.local:80`
+
+5. 采集 Hubble Metrics 配置 Prometheus 采集 `kube-system` 下 `hubble-metrics` 即可采集到 Hubble 暴露的指标，可参考 [cilium] 进行 Dashboard 配置。
+
+[cilium]: https://docs.cilium.io/en/v1.8/operations/metrics/
+
+---
+
+# Idle IP Reclaim Policy
+
+Source: https://github.com/aliyuncontainerservice/terway/blob/main/docs/idle-ip-reclaim.md
+
+# Idle IP Reclaim Policy
+
+The idle IP reclaim policy allows Terway to automatically reclaim idle IP addresses from the IP pool after a configurable period of inactivity. This feature helps optimize resource utilization by freeing up unused IP addresses.
+
+## Configuration
+
+The idle IP reclaim policy can be configured through the `eni-config` ConfigMap or node-specific dynamic configurations. The following parameters control the reclaim behavior:
+
+| Parameter | Description | Default Value | Example |
+|-----------|-------------|---------------|---------|
+| `idle_ip_reclaim_after` | Duration an IP must be idle before becoming eligible for reclamation | - | `"30m"`, `"1h"` |
+| `idle_ip_reclaim_interval` | Time interval between reclaim checks | `"10m"` | `"15m"`, `"30m"` |
+| `idle_ip_reclaim_batch_size` | Maximum number of IPs to reclaim in a single batch | `5` | `3`, `10` |
+| `idle_ip_reclaim_jitter_factor` | Jitter factor to randomize reclaim timing (0.0-1.0) | `"0.1"` | `"0.2"`, `"0.5"` |
+
+## How It Works
+
+1. **Idle Detection**: The system monitors IP usage and tracks when IPs were last allocated or used.
+
+2. **Eligibility Check**: After the `idle_ip_reclaim_after` duration has passed since the last pool modification, IPs become eligible for reclamation.
+
+3. **Batch Reclamation**: During each reclaim check (every `idle_ip_reclaim_interval`), up to `idle_ip_reclaim_batch_size` idle IPs are reclaimed, ensuring the pool doesn't drop below `min_pool_size`.
+
+4. **Jitter Prevention**: The `jitter_factor` introduces randomness in reclaim timing to prevent thundering herd problems across multiple nodes.
+
+## Example Configuration
+
+```json
+{
+  "version": "1",
+  "max_pool_size": 10,
+  "min_pool_size": 2,
+  "idle_ip_reclaim_after": "30m",
+  "idle_ip_reclaim_interval": "10m",
+  "idle_ip_reclaim_batch_size": 3,
+  "idle_ip_reclaim_jitter_factor": "0.1"
+}
+```
+
+In this example:
+
+- IPs become eligible for reclamation 30 minutes after the last pool modification
+- Reclaim checks occur every 10 minutes (with ±10% jitter)
+- Up to 3 IPs are reclaimed per check
+- The minimum pool size of 2 is always maintained
+
+## Behavior Notes
+
+- The reclaim policy only activates when `idle_ip_reclaim_after` is configured
+- Pool modifications (new IP allocations) reset the reclaim timer
+- Reclamation respects both `max_pool_size` and `min_pool_size` boundaries
+- The feature works independently of normal pool size management
+
+---
+
+# IP Prefix 功能
+
+Source: https://github.com/aliyuncontainerservice/terway/blob/main/docs/ip-prefix.md
+
+# IP Prefix 功能
+
+## 概述
+
+IP Prefix 功能是 Terway 提供的一种基于前缀的 IPAM（IP 地址管理）模式。与传统模式分配独立 IP 地址不同，Prefix 模式在
+ENI（弹性网卡）上分配 CIDR 格式的前缀（如 `/28`），每个前缀包含一段连续的 IP 地址。
+
+### 与传统模式的区别
+
+| 特性    | 传统 IP 模式                    | IP Prefix 模式                  |
+|-------|-----------------------------|-------------------------------|
+| 分配单位  | 单个 IP 地址（如 `10.244.17.119`） | CIDR 前缀（如 `10.244.126.48/28`） |
+| IP 数量 | 每个 ENI 固定数量                 | 每个前缀包含 16 个 IP（/28）           |
+| 适用场景  | 小规模集群、IP 需求分散               | 大规模集群、IP 需求密集                 |
+| 管理模式  | Controller 管理 Pod↔IP 绑定     | Controller 仅分配前缀，Daemon 管理绑定  |
+
+### 适用场景
+
+- **大规模集群**：需要为大量 Pod 分配 IP 地址
+- **高密度部署**：每个节点运行大量 Pod
+- **快速启动**：减少 API 调用次数，提高 Pod 启动速度
+- **IPv6 双栈**：同时需要 IPv4 和 IPv6 地址的场景
+
+## 工作原理
+
+### 前缀分配机制
+
+1. **ENI 创建时分配**：创建新 ENI 时，根据 `ipv4_prefix_count` 配置分配 IPv4 前缀；双栈模式下同时自动分配 1 个 IPv6 前缀
+2. **已有 ENI 补充**：在现有 `InUse` 状态的 ENI 上补充前缀，直到达到目标数量
+3. **跨 ENI 分布**：前缀会均匀分布在多个 ENI 上，提高容错性
+
+### API 限制
+
+- **单次调用限制**：每次 API 调用最多分配 10 个前缀（`maxPrefixPerAPICall = 10`）
+- **容量计算**：每个 ENI 的最大前缀数 = `IPv4PerAdapter - 1`（预留 1 个给主 IP）
+
+### IPv6 前缀分配策略
+
+| 网络模式        | IPv4 前缀                  | IPv6 前缀                            |
+|-------------|--------------------------|------------------------------------|
+| **IPv4 单栈** | 由 `ipv4_prefix_count` 控制 | 不分配                                |
+| **IPv6 单栈** | 不分配                      | 由 `ipv6_prefix_count` 控制（取值 0 或 1） |
+| **双栈**      | 由 `ipv4_prefix_count` 控制 | **自动**：每个 ENI 恰好 1 个，无需配置          |
+
+在双栈模式下，Controller 会自动确保每个拥有 IPv4 前缀的 ENI 恰好有 1 个 IPv6 前缀。如果 ENI 已有 IPv6 前缀则跳过，不会重复分配。
+
+### 与 ECS ENI 的集成
+
+IP Prefix 功能使用阿里云 ECS 的以下 API：
+
+- `AssignPrivateIpAddresses`：分配 IPv4 前缀（`Ipv4PrefixCount` 参数）
+- `AssignIpv6Addresses`：分配 IPv6 前缀（`Ipv6PrefixCount` 参数）
+- `CreateNetworkInterface`：创建 ENI 时分配前缀
+
+## 配置方法
+
+### 前提条件
+
+1. 实例规格必须支持 Prefix 模式（非 LingJun/EFLO 节点）
+2. 为目标节点池创建独立的动态配置 ConfigMap（如 `eni-config-prefix`），并在其 `eni_conf` 中设置 `enable_ip_prefix: true`
+3. 为目标节点打上 `terway-config: <config_name>` 标签，使 Terway Daemon 加载对应的动态配置
+
+### 开启 Prefix 模式
+
+推荐通过**动态配置（Dynamic Config）**为特定节点池单独启用 Prefix 模式，而不是修改全局的 `kube-system/eni-config`
+，以避免影响集群中所有节点。
+
+#### 步骤一：创建动态配置 ConfigMap
+
+```bash
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: eni-config-prefix
+  namespace: kube-system
+data:
+  eni_conf: |
+    {
+      "enable_ip_prefix": true,
+      "ipv4_prefix_count": 5
+    }
+EOF
+```
+
+#### 步骤二：为目标节点打上标签
+
+```bash
+kubectl label node <node-name> terway-config=eni-config-prefix
+```
+
+Terway Daemon 启动时会读取节点的 `terway-config` 标签，加载对应名称的 ConfigMap，并以 MergePatch 方式合并到默认配置上。
+
+> **注意**：`enable_ip_prefix` 配置仅在 Node CR 首次创建时生效，对已有节点无效。修改动态配置后需重启 Daemon
+> 才能生效。详见下方[不可变性说明](#不可变性说明)。
+
+### ConfigMap 配置
+
+为目标节点池创建独立的动态配置 ConfigMap，在 `eni_conf` 字段中同时设置 `enable_ip_prefix` 和 `ipv4_prefix_count`：
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: eni-config-prefix
+  namespace: kube-system
+data:
+  eni_conf: |
+    {
+      "enable_ip_prefix": true,
+      "ipv4_prefix_count": 5
+    }
+```
+
+然后为目标节点打上标签，使其加载该动态配置：
+
+```bash
+kubectl label node <node-name> terway-config=eni-config-prefix
+```
+
+### 配置参数说明
+
+| 参数                  | 类型   | 默认值   | 说明                                                                                |
+|---------------------|------|-------|-----------------------------------------------------------------------------------|
+| `enable_ip_prefix`  | bool | false | 是否启用 IP Prefix 模式，仅在 Node CR 首次创建时生效                                              |
+| `ipv4_prefix_count` | int  | 0     | 节点 IPv4 前缀总数。在 IPv4 单栈和双栈模式下有效                                                    |
+| `ipv6_prefix_count` | int  | 0     | 节点 IPv6 前缀总数。**仅在 IPv6 单栈模式下有效**，取值范围 0 或 1。双栈模式下忽略此字段（IPv6 前缀由系统自动管理，每个 ENI 1 个） |
+
+### 双栈配置示例
+
+双栈模式下只需配置 `ipv4_prefix_count`，Controller 会为每个 ENI 自动分配 1 个 IPv6 前缀：
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: eni-config-prefix-dual
+  namespace: kube-system
+data:
+  eni_conf: |
+    {
+      "enable_ip_prefix": true,
+      "ipv4_prefix_count": 5
+    }
+```
+
+然后为目标节点打上标签：
+
+```bash
+kubectl label node <node-name> terway-config=eni-config-prefix-dual
+```
+
+> **注意**：双栈模式下无需配置 `ipv6_prefix_count`。系统会自动为每个拥有 IPv4 前缀的 ENI 分配恰好 1 个 IPv6 前缀。
+
+### IPv6 单栈配置示例
+
+IPv6 单栈模式下使用 `ipv6_prefix_count`（取值 0 或 1）：
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: eni-config-prefix-v6only
+  namespace: kube-system
+data:
+  eni_conf: |
+    {
+      "enable_ip_prefix": true,
+      "ipv6_prefix_count": 1
+    }
+```
+
+然后为目标节点打上标签：
+
+```bash
+kubectl label node <node-name> terway-config=eni-config-prefix-v6only
+```
+
+> **注意**：`ipv6_prefix_count` 仅在 IPv6 单栈模式下生效，取值只能为 0 或 1。
+
+## 约束与限制
+
+### 实例规格要求
+
+1. **容量限制**：每个 ENI 的最大前缀数 = `IPv4PerAdapter - 1`
+    - 例如：某规格 `IPv4PerAdapter=20`，则每个 ENI 最多 19 个前缀
+    - 19 个前缀 × 16 IP/前缀 = 304 个 IP
+
+2. **不支持 LingJun (EFLO) 节点**：Prefix 模式明确排除 EFLO 节点
+
+### 互斥性
+
+- **与独立 IP 模式互斥**：启用 Prefix 模式后，不再分配独立 IP 地址
+- **互斥逻辑**：当 `addIPv4PrefixN > 0` 时，`addIPv4N = 0`
+
+### API 调用限制
+
+- **单次调用**：最多 10 个前缀
+- **多次调用**：如需分配更多，会自动分多次 API 调用完成
+
+### 其他限制
+
+- **预热机制**：Prefix 模式跳过常规 IPAM 流程（pool 管理、预热等）
+
+## 不可变性说明
+
+`enable_ip_prefix` 配置具有不可变性约束：
+
+- **仅首次生效**：`enable_ip_prefix` 仅在 Node CR 首次创建时从动态配置 ConfigMap 读取并写入 `ENISpec`，后续对动态配置
+  ConfigMap 的修改不会影响已有节点
+- **变更被忽略**：若动态配置 ConfigMap 中的 `enable_ip_prefix` 与已有 Node CR 的 `ENISpec.EnableIPPrefix` 不一致，系统会产生
+  Warning 事件，但不会修改节点配置
+- **如需变更**：若需要对已有节点启用或禁用 Prefix 模式，必须将节点从集群中删除并重新加入，新节点加入时会读取最新的
+  动态配置 ConfigMap 配置
+
+> **注意**：修改动态配置 ConfigMap 后，仅对新加入集群的节点生效，已有节点不受影响。
+
+## 状态说明
+
+### IPPrefix 状态
+
+| 状态         | 说明          |
+|------------|-------------|
+| `Valid`    | 前缀正常可用      |
+| `Frozen`   | 前缀被冻结（暂不使用） |
+| `Invalid`  | 前缀无效        |
+| `Deleting` | 前缀正在删除中     |
+
+### 查看前缀分配情况
+
+查看 Node CR 状态：
+
+```bash
+kubectl get node <node-name> -n kube-system -o yaml
+```
+
+在 `.status.networkInterfaces` 中查看前缀分配：
+
+```yaml
+status:
+  networkInterfaces:
+    eni-xxx:
+      id: eni-xxx
+      status: InUse
+      ipv4Prefix:
+      - prefix: 10.244.126.48/28
+        status: Valid
+      - prefix: 10.244.126.64/28
+        status: Valid
+      # 双栈模式下，每个 ENI 自动分配 1 个 IPv6 前缀
+      ipv6Prefix:
+      - prefix: 2408:4005:3ab:100::/80
+        status: Valid
+```
+
+### 查看前缀统计
+
+```bash
+# 查看节点的 IP Prefix 数量
+kubectl get nodes.network.alibabacloud.com <node-name> -o jsonpath='{.spec.eni.ipPrefixCount}'
+
+# 查看所有前缀
+kubectl get nodes.network.alibabacloud.com <node-name> -o jsonpath='{.status.networkInterfaces[*].ipv4Prefix}'
+```
+
+## 最佳实践
+
+### 前缀数量规划
+
+1. **计算所需前缀数**：
+
+   ```text
+   所需前缀数 = ceil(预计 Pod 数 / 16)
+   ```
+
+   每个 /28 前缀包含 16 个 IP 地址
+
+2. **预留余量**：建议预留 20% 余量以应对 Pod 增长
+
+3. **多 ENI 分布**：前缀会自动分布在多个 ENI 上，建议每个 ENI 保留一定容量
+
+### 配置示例
+
+假设节点预计运行 200 个 Pod：
+
+```yaml
+# 计算：200 / 16 = 12.5，向上取整为 13，预留 20% 余量 ≈ 16
+ipv4_prefix_count: 16
+```
+
+### 监控和告警
+
+建议监控以下指标：
+
+1. **前缀使用率**：
+
+   ```text
+   已用前缀数 / 总前缀数
+   ```
+
+2. **ENI 容量**：
+
+   ```text
+   已分配前缀数 / (IPv4PerAdapter - 1)
+   ```
+
+3. **API 调用频率**：Prefix 分配涉及 ECS API 调用，需监控限流
+
+## 故障排查
+
+### 常见问题
+
+#### 1. 前缀未分配
+
+**现象**：节点上没有分配前缀
+
+**排查步骤**：
+
+```bash
+# 1. 检查节点是否打了 terway-config 标签
+kubectl get node <node-name> --show-labels | grep terway-config
+
+# 2. 获取节点对应的动态配置 ConfigMap 名称
+CONFIG_NAME=$(kubectl get node <node-name> -o jsonpath='{.metadata.labels.terway-config}')
+echo "动态配置 ConfigMap: ${CONFIG_NAME}"
+
+# 3. 检查动态配置 ConfigMap 中 enable_ip_prefix 是否为 true
+kubectl get cm -n kube-system ${CONFIG_NAME} -o jsonpath='{.data.eni_conf}' | python3 -m json.tool | grep enable_ip_prefix
+
+# 4. 检查动态配置 ConfigMap 中 ipv4_prefix_count 是否大于 0
+kubectl get cm -n kube-system ${CONFIG_NAME} -o jsonpath='{.data.eni_conf}' | python3 -m json.tool | grep ipv4_prefix_count
+
+# 5. 检查 Node CR 中 ENISpec 的 enableIPPrefix 字段（仅首次创建时写入）
+kubectl get nodes.network.alibabacloud.com <node-name> -o jsonpath='{.spec.eniSpec.enableIPPrefix}'
+
+# 6. 查看 Node CR 事件（若动态配置 ConfigMap 与 Node CR 不一致，会有 Warning 事件）
+kubectl describe nodes.network.alibabacloud.com <node-name> -n kube-system
+```
+
+**可能原因**：
+
+- 节点未打 `terway-config` 标签，导致 Daemon 未加载动态配置
+- 动态配置 ConfigMap 不存在或名称与标签值不匹配
+- 动态配置 ConfigMap 的 `eni_conf` 中 `enable_ip_prefix` 未设置为 `true`（注意：此配置仅对新加入节点生效）
+- `ipv4_prefix_count` 设置为 0
+- 节点是 EFLO 节点（不支持 Prefix 模式）
+- 节点在 `enable_ip_prefix: true` 写入 ConfigMap 之前已加入集群（已有节点不受 ConfigMap 变更影响）
+
+#### 2. 前缀分配不足
+
+**现象**：分配的前缀数量少于配置
+
+**可能原因**：
+
+- ENI 容量不足（`IPv4PerAdapter - 1` 限制）
+- API 调用失败（查看 controller 日志）
+
+**解决方法**：
+
+- 增加 ENI 数量（调整 `min_eni` / `max_eni`）
+- 检查阿里云配额
+
+#### 3. Pod 无法获取 IP
+
+**现象**：Pod 处于 ContainerCreating 状态，事件显示 IP 分配失败
+
+**排查步骤**：
+
+```bash
+# 查看 Pod 事件
+kubectl describe pod <pod-name>
+
+# 查看 Terway Daemon 日志
+kubectl logs -n kube-system -l app=terway --container=terway
+
+# 查看 Node CR 前缀状态
+kubectl get nodes.network.alibabacloud.com <node-name> -o yaml
+```
+
+**注意**：Controller 只确保前缀存在，Pod↔IP 绑定由 Daemon 管理。如果前缀已分配但 Pod 无法获取 IP，请检查 Daemon 日志。
+
+### 日志排查
+
+查看 controller 日志：
+
+```bash
+# 查看 Prefix 相关日志
+kubectl logs -n kube-system -l app=terway-controlplane | grep -i prefix
+```
+
+关键日志关键字：
+
+- `syncPrefixAllocation`：前缀分配同步
+- `assignIPv4Prefix`：IPv4 前缀分配
+- `assignIPv6Prefix`：IPv6 前缀分配
+
+### 恢复步骤
+
+如果 Prefix 状态异常，可以尝试：
+
+1. **重启 Terway Pod**：
+
+   ```bash
+   kubectl rollout restart deployment terway-controlplane -n kube-system
+   ```
+
+2. **对已有节点变更 Prefix 模式**：
+
+   由于 `enable_ip_prefix` 具有不可变性，若需要对已有节点启用或禁用 Prefix 模式，需重建节点：
+
+   ```bash
+   # 1. 先更新动态配置 ConfigMap 中的 enable_ip_prefix 配置
+   kubectl edit cm -n kube-system <动态配置 ConfigMap 名称>
+
+   # 2. 驱逐节点上的 Pod
+   kubectl drain <node-name> --ignore-daemonsets --delete-emptydir-data
+
+   # 3. 从集群中删除节点
+   kubectl delete node <node-name>
+
+   # 4. 在阿里云控制台将该 ECS 实例重新加入节点池，新节点加入时将读取最新动态配置 ConfigMap 配置
+   ```
+
+3. **检查阿里云控制台**：
+    - 登录阿里云控制台
+    - 查看 ENI 的前缀分配情况
+    - 确认 API 调用是否成功
+
+---
+
+# 开启 IPv6 双栈
+
+Source: https://github.com/aliyuncontainerservice/terway/blob/main/docs/ipv6.md
+
+# 开启 IPv6 双栈
+
+## 配置
+
+启用双栈模式，需要在 terway 配置中配置 `ip_stack` 为 `dual`，并重启 Terway Pods
+
+```yaml
+❯ kubectl get cm -n kube-system eni-config -oyaml
+apiVersion: v1
+data:
+  10-terway.conf: |
+    {
+      "cniVersion": "0.4.0",
+      "name": "terway",
+      "eniip_virtual_type": "IPVlan",
+      "ip_stack": "dual",   <----- 启用双栈支持
+      "type": "terway"
+    }
+  disable_network_policy: "false"
+  eni_conf: |
+    {
+      "min_pool_size": 0
+      ...
+    }
+kind: ConfigMap
+```
+
+确保 Terway 使用的 RAM 包含下面 `RAM` 权限
+
+```json
+{
+  "Version": "1",
+  "Statement": [{
+    "Action": [
+      "ecs:AssignIpv6Addresses",
+      "ecs:UnassignIpv6Addresses"
+    ],
+    "Resource": [
+      "*"
+    ],
+    "Effect": "Allow"
+  }
+}
+```
+
+---
+
+# Terway 灵骏节点
+
+Source: https://github.com/aliyuncontainerservice/terway/blob/main/docs/linjun.md
+
+# Terway 灵骏节点
+
+## 概述
+
+PAI灵骏是一种高密度计算服务，专为大规模计算场景设计。Terway CNI 能够管理灵骏节点，并支持节点上容器的网络通信。
+灵骏弹性网卡（Lingjun Elastic Network Interface，简称 LENI）是灵骏 GPU 实例接入专有网络 VPC 的虚拟网络接口。它连接灵骏节点与
+VPC，实现与 VPC 内其他云资源的高效互联互通。
+与 ECS 弹性网卡类似，LENI 也支持辅助 IP 配置。
+
+## RAM
+
+Terway需要授权中包含以下 [`RAM 权限`](https://ram.console.aliyun.com/)
+
+```json
+{
+  "Version": "1",
+  "Statement": [
+    {
+      "Action": [
+        "eflo:CreateElasticNetworkInterface",
+        "eflo:DeleteElasticNetworkInterface",
+        "eflo:AssignLeniPrivateIpAddress",
+        "eflo:UnassignLeniPrivateIpAddress",
+        "eflo:GetElasticNetworkInterface",
+        "eflo:ListLeniPrivateIpAddresses",
+        "eflo:ListElasticNetworkInterfaces",
+        "eflo:GetNodeInfoForPod"
+      ],
+      "Resource": [
+        "*"
+      ],
+      "Effect": "Allow"
+    },
+    {
+      "Action": [
+        "vpc:DescribeVSwitches"
+      ],
+      "Resource": [
+        "*"
+      ],
+      "Effect": "Allow"
+    }
+  ]
+}
+```
+
+## 节点配置
+
+| Label Key                          | Description | Example Value     |
+|------------------------------------|-------------|-------------------|
+| `alibabacloud.com/lingjun-worker`  | 灵骏节点标记。     | `true`            |
+| `topology.kubernetes.io/region`    | 地域。         | `cn-wulanchabu`   |
+| `node.kubernetes.io/instance-type` | 实例规格。       | `ecs.i2ne.xlarge` |
+| `topology.kubernetes.io/zone`      | 可用区。        | `cn-wulanchabu-c` |
+
+| Spec        | Description | Example Value     |
+|-------------|-------------|-------------------|
+| Provider ID | 灵骏实例 ID     | `e01-ow037ccv4ux` |
+
+- 确保节点上arp 设置正确
+
+```text
+sysctl -w net.ipv4.conf.all.arp_announce = 0
+sysctl -w net.ipv4.conf.all.arp_ignore = 0
+```
+
+## 部署 Terway
+
+```bash
+echo "
+centralizedIPAM:true
+featureGates=\"EFLO=true\"
+terway:
+  securityGroupIDs:
+    - sg-1
+    - sg-2
+  vSwitchIDs:
+    cn-hangzhou-k:
+      - vsw-1
+      - vsw-2
+" | helm template --namespace kube-system terway-eniip . --values -
+```
+
+---
+
+# Pod 多网卡配置 (Multi-Network Configuration for Pods)
+
+Source: https://github.com/aliyuncontainerservice/terway/blob/main/docs/multi-network.md
+
+# Pod 多网卡配置 (Multi-Network Configuration for Pods)
+
+Pod 可以配置多个弹性网卡（ENI），本文描述了如何为 Pod 配置多个网卡的操作。
+
+## 使用限制 (Limitations)
+
++ ECS 支持自定义路由配置（defaultRoute 和 routes 参数）
++ ACS 不支持自定义路由配置（defaultRoute 和 routes 参数）
++ 在ACK 上，你可以通过 eniType 的设置来控制 Pod 使用 Trunk 还是使用独占 ENI
+
+## 配置方式概述 (Configuration Overview)
+
+**PodNetworking 资源说明：**
+
++ `PodNetworking` 是一个集群级别的自定义资源，用于描述一个网络平面的配置，包含交换机（vSwitch）、安全组（SecurityGroup）等网络配置
++ Pod 可以引用 1-n 个网络平面配置
++ 在 Pod 中，只能有一个网络平面设置为 default 路由，其他网络平面可以配置明细路由
++ **注意**：目前 ACS 不支持路由配置功能
+
+**配置关系：**
+
++ Pod 与 PodNetworking 呈现多对多的引用关系
++ 只有在创建 Pod 时，PodNetworking 配置才会被应用
++ 修改 PodNetworking 不会影响已创建的 Pod
+
+### 配置示例
+
+创建 PodNetworking 的示例如下：
+
+```yaml
+apiVersion: network.alibabacloud.com/v1beta1
+kind: PodNetworking
+metadata:
+  name: example
+spec:
+  allocationType:
+    type: Fixed # Pod IP分配的策略，可以取值为 Elastic 或 Fixed
+    releaseStrategy: TTL # 只有将 type 配置为 Fixed 时，releaseStrategy 参数才有效
+    releaseAfter: "1h" # 在 releaseStrategy 为 TTL 模式下，releaseAfter 参数才有效
+  selector: { } # 在多网卡场景下不可填写
+  securityGroupIDs:
+  - sg-bpxxxx
+  vSwitchOptions:
+  - vsw-bpxxxx
+```
+
+### 参数说明
+
+| 参数                                        | 子参数                    | 说明                                                                                                                                                                                                                                                                                         |
+|:------------------------------------------|:-----------------------|:-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| **allocationType**<br/>（Pod IP 分配策略）      | type                   | 取值范围：<br/>• `Elastic`：弹性 IP 策略。Pod 删除后，IP 资源被释放<br/>• `Fixed`：固定 IP 策略。启用后，该 PodNetworking 只对有状态（StatefulSet）的 Pod 生效。关于 StatefulSet，请参见 [Kubernetes有状态服务-StatefulSet使用最佳实践](https://developer.aliyun.com/article/629007)<br/><br/>**说明**：如果您使用了固定 IP 策略，Pod 重建后的可用区将被添加约束，来确保和第一次调度的可用区匹配 |
+|                                           | releaseStrategy        | IP 释放策略，只有将 `type` 配置为 `Fixed` 时，该参数才有效。参数取值范围如下：<br/>• `TTL`：延迟释放 IP 策略。当 Pod 被删除一段时间后，才会释放 IP，最小值为 5 分钟<br/>• `Never`：不释放 IP 策略。当您无需使用 IP 时，需要自行删除 PodENI 资源                                                                                                                             |
+|                                           | releaseAfter           | 延迟回收时间。仅在 `releaseStrategy` 为 `TTL` 模式下生效，支持时间格式为 Go time type，例如 `2h45m`、`5m0s`。关于 Go time type，请参见 [Go time type](https://pkg.go.dev/time#ParseDuration)                                                                                                                                 |
+| **selector**<br/>（标签选择器，用于选择应用该网络配置的 Pod） | -                      | **在多网络平面场景中，不可配置此字段**。多网卡通过 Pod 注解 `k8s.aliyun.com/pod-networks-request` 进行配置                                                                                                                                                                                                              |
+| **vSwitchOptions**                        | -                      | 用于配置 Pod 使用的 vSwitch，多个 vSwitchID 之间为**或**的关系。Pod 仅能使用一个 vSwitch，Terway 将选择一个符合条件的 vSwitch<br/>• 您的 Pod 部署的可用区将被添加约束，来确保这些可用区保持和您配置的 vSwitchOptions 列表中的可用区一致<br/>• 请确保 vSwitchOptions 中的 vSwitch 所在可用区与您指定调度的节点可用区一致，并且拥有足够的剩余 IP 资源，否则 Pod 将无法创建                                         |
+| **vSwitchSelectOptions**<br/>（交换机选择策略）    | vSwitchSelectionPolicy | 取值范围：<br/>• `ordered`：默认值，按填写的交换机顺序选择<br/>• `most`：优先使用剩余 IP 多的交换机<br/>• `random`：随机选择交换机                                                                                                                                                                                                  |
+| **securityGroupIDs**                      | -                      | 可配置多个安全组 ID，配置多个安全组时将同时生效，安全组数量小于等于 10 个                                                                                                                                                                                                                                                   |
+| **eniOptions**<br/>（弹性网卡类型配置）             | eniType                | 在多网络平面场景中，ACK 可以配置此字段，取值范围 `Default`, `ENI`, `Trunk` ACS 只可以填写 `Default`。 多个网络平面配置必须一致，才可以被pod 使用。                                                                                                                                                                                         |
+
+### 验证 PodNetworking 状态
+
+创建 PodNetworking 后，请确保 PodNetworking 状态变为 `status: Ready`：
+
+```yaml
+apiVersion: network.alibabacloud.com/v1beta1
+kind: PodNetworking
+metadata:
+  generation: 1
+  name: default
+  resourceVersion: "5744"
+  uid: 65903fc5-9bd0-4e3e-bfe2-c9f1081dd680
+spec:
+  allocationType:
+    type: Elastic
+  eniOptions:
+    eniType: Default
+  securityGroupIDs:
+  - sg-bp15u1lb14uqfp5ytexk
+  vSwitchOptions:
+  - vsw-a
+  - vsw-b
+  - vsw-c
+  vSwitchSelectOptions:
+    vSwitchSelectionPolicy: ordered
+status:
+  status: Ready  # 确保状态为 Ready
+  updateAt: "2025-03-24T06:10:00Z"
+  vSwitches:
+  - id: vsw-a
+    zone: cn-hangzhou-g
+  - id: vsw-b
+    zone: cn-hangzhou-i
+  - id: vsw-c
+    zone: cn-hangzhou-h
+```
+
+## 步骤三：为 Pod 关联网络平面 (Step 3: Associate Network Planes to Pod)
+
+通过在 Pod 的 annotation 中添加 `k8s.aliyun.com/pod-networks-request` 注解来配置多网卡：
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: multi-network-pod
+  annotations:
+    k8s.aliyun.com/pod-networks-request: |
+      [
+        {"interfaceName":"eth0","network":"default","defaultRoute": true},
+        {"interfaceName":"eth1","network":"secondary"}
+      ]
+spec:
+  containers:
+  - name: nginx
+    image: nginx:latest
+```
+
+### 注解参数说明
+
+| 参数                | 说明                                                                                                                           |
+|-------------------|------------------------------------------------------------------------------------------------------------------------------|
+| **interfaceName** | 类型：string<br/>接口名称，必须唯一<br/>**必填**                                                                                           |
+| **network**       | 类型：string<br/>PodNetworking 资源的名称<br/>**必填**                                                                                 |
+| **defaultRoute**  | 类型：bool<br/>是否设置为默认路由，默认 eth0 为 default<br/>可选<br/><br/>**注意**：当前 ACS 环境下暂不支持此参数                                             |
+| **routes**        | 类型：Route 数组<br/>额外的明细路由配置<br/>可选<br/><br/>**注意**：当前 ACS 环境下暂不支持此参数<br/><br/>Route 结构：<br/>`type Route struct { Dst string }` |
+
+### 完整配置示例
+
+以下是一个完整的多网卡 Pod 配置示例：
+
+```yaml
+# 1. 创建主网络平面
+---
+apiVersion: network.alibabacloud.com/v1beta1
+kind: PodNetworking
+metadata:
+  name: primary-network
+spec:
+  allocationType:
+    type: Elastic
+  securityGroupIDs:
+  - sg-primary-xxxx
+  vSwitchOptions:
+  - vsw-primary-a
+  - vsw-primary-b
+
+# 2. 创建辅助网络平面
+---
+apiVersion: network.alibabacloud.com/v1beta1
+kind: PodNetworking
+metadata:
+  name: secondary-network
+spec:
+  allocationType:
+    type: Elastic
+  securityGroupIDs:
+  - sg-secondary-xxxx
+  vSwitchOptions:
+  - vsw-secondary-a
+  - vsw-secondary-b
+
+# 3. 创建多网卡 Pod
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: multi-network-app
+  annotations:
+    k8s.aliyun.com/pod-networks-request: |
+      [
+        {"interfaceName":"eth0","network":"primary-network","defaultRoute": true},
+        {"interfaceName":"eth1","network":"secondary-network"}
+      ]
+spec:
+  containers:
+  - name: app
+    image: nginx:latest
+    ports:
+    - containerPort: 80
+```
+
+## 注意事项 (Important Notes)
+
+1. **ENI 类型限制**：多网卡功能目前仅支持 Trunk ENI或者独占 ENI 。不支持灵骏节点。
+2. **可用区约束**：使用多网卡时，Pod 调度会受到 vSwitch 所在可用区的约束
+3. **IP 地址分配**：每个网络接口都会从对应的 vSwitch 中分配一个 IP 地址
+4. **路由配置**：当前 ACS 环境暂不支持自定义路由配置（defaultRoute 和 routes 参数）
+5. **资源清理**：删除 Pod 后，对应的网络资源会根据 allocationType 配置进行回收
+6. **安全组数量**：每个 PodNetworking 最多可配置 10 个安全组
+
+---
+
+# QoS
+
+Source: https://github.com/aliyuncontainerservice/terway/blob/main/docs/qos.md
+
+# QoS
+
+Traffic control mainly have two aspect
+
+- Traffic Shaping
+- Traffic Priority
+
+| Terway Mode                     | Egress Shaping | Ingress Shaping | Egress priority |
+|---------------------------------|----------------|-----------------|-----------------|
+| vpc mode                        | ☑️             | ☑️              | -               |
+| shared eni (eniip)              | ☑️             | ☑️              | ☑️              |
+| shared eni (eniip)+ IPvlan eBPF | ☑️             | -               | ☑️              |
+| exclusive eni                   | -              | -               | -               |
+| trunking                        | -              | -               | -               |
+| shared eni (eniip)+ datapath v2 | ☑️             | ☑️              | -               |
+
+## shaping
+
+| Annotation                             | Mean             |
+|----------------------------------------|------------------|
+| `kubernetes.io/ingress-bandwidth: 10M` | ingress banwidth |
+| `kubernetes.io/egress-bandwidth: 10M`  | egress banwidth  |
+
+### config shaping
+
+to enable shaping, follow config need to add in `eni-config`
+
+```yaml
+# kubectl edit cm -n kube-system eni-config
+apiVersion: v1
+data:
+  10-terway.conf: |
+    {
+      "cniVersion": "0.4.0",
+      "name": "terway",
+      "capabilities": {"bandwidth": true}, # add 
+      "type": "terway"
+    }
+```
+
+## priority
+
+We have three annotations available for pod, to control different priority.
+
+| Annotation                                       | Mean                          | bands |
+|--------------------------------------------------|-------------------------------|-------|
+| `k8s.aliyun.com/network-priority: "guaranteed"`  | for latency sensitive service | 0     |
+| `k8s.aliyun.com/network-priority: "burstable"`   | normal traffic                | 1     |
+| `k8s.aliyun.com/network-priority: "best-effort"` | for lowest priority           | 2     |
+
+When priority is set, a `priority qdisc` is set to the `eni` related to pod.  
+Pod egress traffic will classify into different bands based on the config.  
+For more info about how priority works , please refer to [tc-prio](https://man7.org/linux/man-pages/man8/tc-prio.8.html)
+.
+
+> note: default qdisc will be replaced
+
+### config priority
+
+to enable priority, follow config need to add in `eni-config`
+
+```yaml
+# kubectl edit cm -n kube-system eni-config
+apiVersion: v1
+data:
+  10-terway.conf: |
+    {
+      "cniVersion": "0.4.0",
+      "name": "terway",
+      "enable_network_priority": true, # add
+      "type": "terway"
+    }
+```
+
+---
+
+# Symmetric Routing Configuration
+
+Source: https://github.com/aliyuncontainerservice/terway/blob/main/docs/symmetric_routing_config.md
+
+# Symmetric Routing Configuration
+
+## Overview
+
+Terway supports symmetric routing configuration through the `symmetric_routing_config` field in the CNI configuration.
+This allows users to customize the mark, mask, table ID, rule priority, and comment values used for symmetric routing.
+
+## Configuration
+
+The `symmetric_routing_config` is an optional field in the terway CNI configuration. If not provided, default values
+will be used.
+When using `dataPathv2`, SNAT to node IP is required for proper functionality.
+
+### Default Values
+
+- `interface`: "eth0"
+- `mark`: 0x10 (16)
+- `mask`: 0x10 (16)
+- `table_id`: 100
+- `rule_priority`: 600
+- `comment`: "terway-symmetric"
+- `backend`: "iptables"
+
+### Configuration Structure
+
+```json
+{
+  "symmetric_routing_config": {
+    "interface": "eth0",
+    "mark": 32,
+    "mask": 32,
+    "table_id": 100,
+    "rule_priority": 600,
+    "comment": "custom-terway-symmetric",
+    "backend": "nftables"
+  }
+}
+```
+
+### Field Descriptions
+
+- `interface`: The interface name used for symmetric routing (string)
+- `mark`: The fwmark value used for symmetric routing (integer)
+- `mask`: The fwmark mask value used for symmetric routing (integer)
+- `table_id`: The routing table ID used for symmetric routing (integer)
+- `rule_priority`: The priority of the ip rule (integer)
+- `comment`: The comment for iptables rules (string)
+- `backend`: The firewall backend used for symmetric routing rules (string, "iptables" or "nftables", default "iptables")
+
+## Example Configuration
+
+### Basic Configuration
+
+```json
+{
+  "cniVersion": "0.4.0",
+  "name": "terway",
+  "type": "terway",
+  "symmetric_routing": true,
+  "symmetric_routing_config": {
+    "mark": 32,
+    "mask": 32,
+    "table_id": 100,
+    "rule_priority": 600,
+    "comment": "terway-symmetric"
+  }
+}
+```
+
+## Usage Notes
+
+1. The `symmetric_routing` field must be set to `true` for the configuration to take effect.
+2. All fields in `symmetric_routing_config` are optional.
+3. Only positive integer values are accepted for numeric fields.
+4. The configuration applies to both IPv4 and IPv6 when dual-stack is enabled.
+5. Changes to the configuration require restarting the terway daemon to take effect.
+
+## Validation
+
+The configuration is validated when the terway daemon starts:
+
+- Numeric fields must be positive integers
+- String fields must not be empty if provided
+- Invalid configurations will cause the daemon to fail to start
+
+## Troubleshooting
+
+If symmetric routing is not working as expected:
+
+1. Check that `symmetric_routing` is set to `true`
+2. Verify the configuration values are valid
+3. Check the terway daemon logs for any configuration errors
+4. Ensure the mark/mask values don't conflict with other network policies
+
+---
+
+# Terway CLI 使用文档
+
+Source: https://github.com/aliyuncontainerservice/terway/blob/main/docs/terway-cli.md
+
+# Terway CLI 使用文档
+
+## 介绍
+
+为了增强`terway`组件的可观测性，便于在出现问题时能够快速定位问题，在terway的pod中打包了二进制调试工具`terway-cli`，可以在运行时通过`gRPC`向`terway daemon`拉取关键信息。
+
+## 设计
+
+在terway daemon中增加了tracing组件，daemon中的关键组件(`network_service，pool, factory`等)注册到tracing组件中，并且通过接口来提供关键信息或是执行命令。同时，tracing组件提供了对外的`gRPC`接口来与`terway-cli`通信。
+
+![terway_tracing](images/terway_tracing.png)
+
+为了保证之后的可扩展性和兼容性，tracing中的组件按照`(type, resource_name)`的形式注册。
+
+## 命令
+
+目前，在`terway-cli`中提供了5个可用命令
+
+- **`list [type]`**- 列出目前已注册的所有资源的类型，如果指定了类型，则列出该类型的所有资源
+
+- **`show <type> [resource_name]`**- 获得某一资源的配置和追踪信息。如果没有指定资源名称，则默认选择该类型下的第一个资源。资源的具体信息解释请见文档底部。
+
+- **`mapping`** - 获得Pod -- Pool -- Factory(Aliyun API)的资源对应关系。
+
+  当使用mapping时，结果可能会出现以下几种情况
+
+  - 正常(白色) - 资源映射关系正常，并有Pod正在使用该资源
+  - 空闲(蓝色) - 资源映射关系正常，没有Pod正在使用该资源
+  - 错误(红色) - 资源映射关系出错 (Pool和Factory的资源无法一一对应)
+
+  当出现错误时，`terway-cli`会以 error exists in mapping 错误结束程序，并返回error code为1。
+
+  ![terway_cli_mapping](images/terway_cli_mapping.png)
+
+- **`execute <type> <resource_name> <command> args...`**  - 在某一资源上执行定义的命令
+
+  目前在所有资源上存在mapping命令，以查看当前层的资源映射清单。在`eniip factory`上存在audit指令，进行本地多IP工厂资源与阿里云API资源的对账功能。
+
+  因为可以直接使用mapping命令代替这两者的功能，所以不推荐直接使用。
+  
+- **`metadata`** - 通过`metadata`获得资源信息
+
+  使用该指令，可以查询`ECS metadata API`返回的网络资源，以树的形式呈现。该命令用于检视`metadata`内资源是否与本地资源相对应。
+
+   ![terway_cli_metadata](images/terway_cli_metadata.png)
+
+## 资源配置与追踪信息
+
+目前已经注册的信息有
+
+- `network_service`
+  - `name` - 名称
+  - `daemon_mode` - `daemon`的运行模式(`ENIMultiIP、ENIOnly、VPC`)
+  - `config_file_path` - 配置文件路径
+  - `kubeconfig` - `k8s`的配置路径
+  - `master` - `k8s`的master地址，如果与`kubeconfig`同时为空，则自动获取
+  - `pending_pods_count` - 等待申请的Pod数量
+  - `pods`: 各个Pod的资源分配情况
+- `resource_pool`
+  - `name` - 名称
+  - `max_idle` - 最多保有空闲资源数(最高水位)
+  - `min_idle` - 最少保有空闲资源数(最低水位)
+  - `idle` - 当前空闲的资源
+  - `inuse` - 当前正在使用的资源
+- `factory(eniip)`
+  - `name` - 名称
+  - `eni_max_ip` - 每个ENI能够拥有的最大IP数
+  - `primary_ip` - 主IP
+  - `eni_count` - 目前拥有的ENI数量
+  - `secondary_ip_count` - 目前拥有的辅助IP数量
+  - `eni`
+    - `pending` - 等待申请的IP数量
+    - `secondary_ips` - 目前该ENI上的辅助IP
+    - `ip_alloc_inhibit_expire_at` - 禁用IP申请过期时间
+- `factory(eni)`
+  - `name` - 名称
+  - `vswitches` - 拥有的虚拟交换机数量
+  - `vswitch_selection_policy` - 交换机选择策略
+  - `cache_expire_at` - 交换机列表缓存过期时间
+  - `vswitch`
+    - `ip_count` - 可分配的IP数
+
+---
+
+# Terway trunk 模式
+
+Source: https://github.com/aliyuncontainerservice/terway/blob/main/docs/terway-trunk.md
+
+# Terway trunk 模式
+
+terway trunk 模式使用ECS 弹性网卡（ENI）构建，相比之前 ENI 多IP 模式，提供更加灵活的配置能力
+trunk 模式和 ENI 多 IP 模式互不影响，trunk 不占用ENI 多 IP 的配额
+
+trunk 模式提供下面功能
+
+- 固定IP
+- Pod 配置独立 vSwitch、安全组
+- 可为一组 Pod或 namespace 进行配置
+
+## design
+
+## 支持情况
+
+terway trunk 功能依赖 ECS 的 ENI 与 ENI 的 trunk 能力
+目前在 `g6`、`g7` 系列部分机型上提供
+
+[机型可以参考](https://help.aliyun.com/document_detail/25378.html)
+
+## usage
+
+在 eni trunking 模式中，用户通过自定义资源方式描述容器网络配置、Pod 映射关系
+terway-controlplane 会观测用户定义的资源来决定 Pod 使用的网络模式
+
+使用前需要在 `kube-system/eni-config` 里面配置启用 trunk 模式
+
+```yaml
+❯ kubectl get cm -n kube-system eni-config -oyaml
+apiVersion: v1
+data:
+  10-terway.conf: |
+    {
+      "cniVersion": "0.4.0",
+      "name": "terway",
+      "eniip_virtual_type": "IPVlan",
+      "type": "terway"
+    }
+  disable_network_policy: "false"
+  eni_conf: |
+    {
+      "min_pool_size": 0,
+      "enable_eni_trunking": true,   <----- 启用 Trunk
+      ...
+    }
+kind: ConfigMap
+```
+
+> 当前 trunk 模式只能在 Terway 多IP 模式下启用
+>
+> 修改 config-map 后请重启 Terway pod 生效配置
+
+terway-controlplane 需要通过  openAPI 去操作网络资源，请确保授权中包含以下 [`RAM 权限`](https://ram.console.aliyun.com/)
+
+```json
+{
+  "Version": "1",
+  "Statement": [{
+    "Action": [
+      "ecs:CreateNetworkInterface",
+      "ecs:DescribeNetworkInterfaces",
+      "ecs:AttachNetworkInterface",
+      "ecs:DetachNetworkInterface",
+      "ecs:DeleteNetworkInterface"
+    ],
+    "Resource": [
+      "*"
+    ],
+    "Effect": "Allow"
+  },
+    {
+      "Action": [
+        "vpc:DescribeVSwitches"
+      ],
+      "Resource": [
+        "*"
+      ],
+      "Effect": "Allow"
+    }
+  ]
+}
+```
+
+### podNetworking 配置
+
+`podNetworking` 是 trunk 模式下引入的自定义资源，用来描述一个网络平面的配置信息。 一个网络平面可以配置独立的 vSwitch、安全组等信息。集群内可以配置多个网络平面信息。
+`podNetworking` 通过标签选择器来匹配 Pod，被匹配的 Pod 将使用 trunking 模式
+
+配置总览
+
+```yaml
+apiVersion: network.alibabacloud.com/v1beta1
+kind: PodNetworking
+metadata:
+  name: your-networking
+spec:
+  allocationType:
+    type: Elastic/Fixed
+    releaseStrategy: TTL
+    releaseAfter: "5m0s"
+  selector:
+    podSelector:
+      matchLabels:
+        foo: bar
+    namespaceSelector:
+      matchLabels:
+        foo: bar
+  vSwitchOptions:
+    - vsw-aaa
+  securityGroupIDs:
+    - sg-aaa
+```
+
+- allocationType: 描述 Pod IP 分配的策略
+  - type
+    - Elastic: 弹性IP 策略。Pod 删除后 IP 资源释放。
+    - Fixed: 固定IP 策略。如果配置为固定IP，这个 PodNetworking 仅对有状态pod 生效。
+  - releaseStrategy: IP回收策略，在`type` 配置为 `Fixed` 情况有效。
+    - TTL: 延迟回收模式，当Pod 被删除一段时间后，释放 IP，最小值为 5m
+  - releaseAfter: 延迟回收时间。仅在`releaseStrategy` 为 `TTl` 模式下生效
+
+- selector: 用于配置标签选择器，同时配置 podSelector、namespaceSelector 时，将全部生效
+  - podSelector: 用来匹配 pod 的 labels
+  - namespaceSelector: 用来匹配 namespace 的 labels
+- vSwitchOptions: 用于配置 Pod 使用的 vSwitch。多个vSwitchID 之间为或关系。Pod 仅能使用一个 vSwitch ，terway 将根据配置顺序、vSwitch region 选择一个 vSwitch
+- securityGroupIDs: 可配置多个安全组 ID，配置多个安全组时将同时生效。安全组数量小于等于 5个
+
+> 请确保 Pod 可以被唯一的 PodNetworking 配置匹配，避免歧义
+>
+> 我们强烈建议用户主动配置 vSwitchOptions、securityGroupIDs 字段，如果不配置，则使用 kube-system/eni-config 中的默认值
+
+创建PodNetworking 后，controller 会对 PodNetworking 进行同步，当同步完成 PodNetworking 中  Status 会标记状态 `Ready`
+
+```yaml
+❯ kubectl get podnetworkings.network.alibabacloud.com  stateless -oyaml
+apiVersion: network.alibabacloud.com/v1beta1
+kind: PodNetworking
+...
+status:
+  status: Ready   <---- status
+  updateAt: "2021-07-19T10:45:31Z"
+  vSwitches:
+    - id: vsw-bp1s5grzef87ikb5zz1px
+      zone: cn-hangzhou-i
+    - id: vsw-bp1sx0zhxd6bw6vpt0hbl
+      zone: cn-hangzhou-i
+```
+
+### podENI 配置介绍
+
+`podENI` 是 trunk 模式下引入的自定义资源，用于 Terway 记录每个Pod 使用的网络信息
+每个 trunk 模式的 Pod 将有一个同名的资源
+
+> **该配置由Terway 维护，请勿修改**
+
+```yaml
+❯ kubectl get podenis.network.alibabacloud.com -n default
+apiVersion: network.alibabacloud.com/v1beta1
+kind: PodENI
+...
+spec:
+  allocation:
+    eni:
+      id: eni-bp16h6wuzpa9w2vdm5dn     <--- pod 使用的eni id
+      mac: 00:16:3e:0d:7b:c2
+      zone: cn-hangzhou-i
+    ipType:
+      releaseAfter: 0s
+      type: Elastic                    <--- podIP 分配策略
+    ipv4: 192.168.51.99
+status:
+  instanceID: i-bp1dkga3et5atja91ixt   <--- ecs 实例 ID
+  podLastSeen: "2021-07-19T11:23:55Z"
+  status: Bind
+  trunkENIID: eni-bp16h6wuzpa9utho0t2o
+```
+
+### 非固定IP示例
+
+下面定义名为 stateless 的配置
+该配置意味着 default namespace 下，包含 `kind: front`、`app: nginx` 标签的 pod 会使用 trunk 模式
+
+```yaml
+apiVersion: network.alibabacloud.com/v1beta1
+kind: PodNetworking
+metadata:
+  name: stateless
+spec:
+  allocationType:
+    type: Elastic
+  selector:
+    podSelector:
+      matchLabels:
+        kind: front
+        app: nginx
+  vSwitchOptions:
+    - vsw-bp1s5grzef87ikb5zz1px
+    - vsw-bp1sx0zhxd6bw6vpt0hbl
+  securityGroupIDs:
+    - sg-bp172wuqj4y3f98x7ptm
+```
+
+创建 Pod
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx-front
+  labels:
+    app: nginx
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      kind: front
+      app: nginx
+  template:
+    metadata:
+      labels:
+        kind: front
+        app: nginx
+    spec:
+      containers:
+        - name: nginx
+          image: nginx
+```
+
+### 固定IP示例
+
+eni Trunking 模式支持固定 IP 模式，该模式只适用于有状态应用（StatefulSet）
+
+下面的 PodNetworking 声明了将使用固定IP模式，当 Pod 被删除 5分钟后 PodIP 资源将被回收
+
+```yaml
+apiVersion: network.alibabacloud.com/v1beta1
+kind: PodNetworking
+metadata:
+  name: fixed-ip
+spec:
+  allocationType:
+    type: Fixed              <--- podIP 模式
+    releaseStrategy: TTL
+    releaseAfter: "5m0s"     <--- pod 删除后回收策略，golang 时间类型
+  selector:
+    podSelector:
+      matchLabels:
+        kind: backend
+        app: sts-pod
+...
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: "sts-fixed-ip"
+spec:
+  serviceName: "sts-fixed-ip"
+  selector:
+    matchLabels:
+      kind: backend
+      app: sts-pod
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        kind: backend
+        app: sts-pod
+    spec:
+      containers:
+        - name: nginx
+          image: nginx
+```
+
+创建后可以在 CRD 资源里面看到固定IP 分配信息
+
+```yaml
+❯ kubectl get podenis.network.alibabacloud.com  sts-fixed-ip-0 -oyaml
+apiVersion: network.alibabacloud.com/v1beta1
+kind: PodENI
+metadata:
+  generation: 1
+  name: sts-fixed-ip-0
+  namespace: default
+spec:
+  allocation:
+    eni:
+      id: eni-bp161irhf5hrdxdzzodq
+      mac: 00:16:3e:10:34:65
+      zone: cn-hangzhou-i
+    ipType:
+      releaseAfter: 5m0s
+      releaseStrategy: TTL
+      type: Fixed
+    ipv4: 192.168.63.206
+status:
+  instanceID: i-bp18kejuoajwm8jsb0er
+  podLastSeen: "2021-07-12T08:21:16Z"
+  status: Bind
+  trunkENIID: eni-bp1b1plkgpoi8lxj1hcj
+```
+
+当 Pod 删除后，PodENI 记录会保留,且状态变为 Unbind
+
+```yaml
+❯ kubectl get podenis.network.alibabacloud.com  sts-fixed-ip-0 -oyaml
+apiVersion: network.alibabacloud.com/v1beta1
+kind: PodENI
+metadata:
+  name: sts-fixed-ip-0
+  namespace: default
+spec:
+  allocation:
+    eni:
+      id: eni-bp161irhf5hrdxdzzodq
+      mac: 00:16:3e:10:34:65
+      zone: cn-hangzhou-i
+    ipType:
+      releaseAfter: 5m0s
+      releaseStrategy: TTL
+      type: Fixed
+    ipv4: 192.168.63.206
+status:
+  instanceID: i-bp18kejuoajwm8jsb0er
+  podLastSeen: "2021-07-12T08:21:16Z"
+  status: Unbind
+  trunkENIID: eni-bp1b1plkgpoi8lxj1hcj
+```
+
+第二次创建 sts pod 时，webhook 会为 pod 添加可用区的约束
+
+```yaml
+❯ kubectl get pod sts-fixed-ip-0 -oyaml
+apiVersion: v1
+kind: Pod
+metadata:
+  annotations:
+    k8s.aliyun.com/pod-eni: "true"
+  labels:
+    app: sts-pod
+    controller-revision-hash: sts-fixed-ip-56bf5859d6
+    kind: backend
+    statefulset.kubernetes.io/pod-name: sts-fixed-ip-0
+  name: sts-fixed-ip-0
+  namespace: default
+spec:
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+        - matchExpressions:
+          - key: topology.kubernetes.io/zone
+            operator: In
+            values:
+            - cn-hangzhou-i
+```
+
+pod迁移到其他节点
+
+```yaml
+❯ kubectl get podenis.network.alibabacloud.com sts-fixed-ip-0 -oyaml
+apiVersion: network.alibabacloud.com/v1beta1
+kind: PodENI
+metadata:
+  name: sts-fixed-ip-0
+  namespace: default
+spec:
+  allocation:
+    eni:
+      id: eni-bp161irhf5hrdxdzzodq
+      mac: 00:16:3e:10:34:65
+      zone: cn-hangzhou-i
+    ipType:
+      releaseAfter: 5m0s
+      releaseStrategy: TTL
+      type: Fixed
+    ipv4: 192.168.63.206
+status:
+  instanceID: i-bp18kejuoajwm8jsb0es
+  podLastSeen: "2021-07-12T08:21:16Z"
+  status: Bind
+  trunkENIID: eni-bp11zk87y8gq0piexey4
+```
+
+---
+
+# Terway + Cilium整合文档
+
+Source: https://github.com/aliyuncontainerservice/terway/blob/main/docs/terway-with-cilium.md
+
+# Terway + Cilium整合文档
+
+## 考虑
+
+- 我们基本只使用 `Cilium` 的路由和网络策略功能，将 `Cilium` 的全部组件一起运行比较多余
+- `IPVLan` 和 `eBPF` 都对内核版本有要求，应该做一些判断
+- Terway的不同网络模式( `Veth/IPVlan/IPVlan+Cilium` )是否能够在同一集群中共存，并且保证连通性
+- Plugin Chaining 的最小 `CNI` 版本为 `3.0` ，如果版本不满足条件，是否有兼容措施
+- 不同网络模式之间的切换是否简单
+- 对 `Terway` 部署的改动尽量小，并且使用同一个镜像便于分发
+
+## 设计
+
+在`IPVlan`模式，基于`Calico`的网络策略失效，并且`Cilium`具有网络策略的相关功能。
+
+可以将 `Cilium` 放入 `policy` 容器，通过启动脚本来判断应该启动 `Calico` 或是 `Cilium` ；同时，`Cilium` 的运行还需要安装`BPF` ，生成对应的 `conflist`  文件等步骤，可以在初始化容器中完成这些工作。
+
+![image-20200717113416705](images/terway_with_cilium.png)
+
+除此之外，为了保证低内核版本下的兼容性(创建网络时不会出现错误)，在 `Terway CNI` 中还需要加入额外的判断，在不满足IPVlan要求的情况下回退到策略路由模式，并以 `Pod Event` 的形式上报。
+
+## 使用流程
+
+- 安装支持 `Cilium` 的 `Terway` 版本(修改并应用仓库目录下的 `charts/terway` )
+
+```shell
+helm package charts/terway -d charts
+
+helm install terway charts/terway --namespace kube-system --set enableIPvlan=true
+```
+
+- 重启节点以应用配置
+
+## 验证计划
+
+- `Veth` 模式连通性正常，`network_policy` 开关正常
+- 切换到 `IPVlan` 之后连通性正常，`network_policy` 开关正常
+- 切换回 `Veth` 模式连通性正常
+- 在低内核版本下(`CentOS 7`)触发配置回退
+
+## 问题
+
+- 需要重启节点
+- 由于 `Cilium` 需要的库较多，更换 `ubuntu` 镜像打包后体积由180MB到了500+MB
+- 丢弃了 `Cilium` 的较多组件(`Operator`、`Envoy Proxy`、基于 `ConfigMap` 的配置)，稳定性需要进一步测试
+
+## 之后的工作
+
+- 针对ENI独占模式的 `Cilium` 整合
+- `Cilium` 的大部分组件在当前场景下不需要，能否单独将 `routing` 和 `network policy`部分抽出
+- `Cilium` 的参数能否透出给客户进行修改
+- 在大规模集群上需要做进一步的性能测试
+- Override kernel版本检查
+
+---
+
+# IP Warm-Up Configuration
+
+Source: https://github.com/aliyuncontainerservice/terway/blob/main/docs/warm-up.md
+
+# IP Warm-Up Configuration
+
+The IP warm-up feature allows Terway to pre-allocate a specified number of IP addresses when a node starts up. This helps reduce pod startup latency by having IPs ready in the pool before pods are scheduled.
+
+## Configuration
+
+The warm-up size can be configured through the `eni-config` ConfigMap:
+
+| Parameter | Description | Default Value | Example |
+|-----------|-------------|---------------|---------|
+| `ip_warm_up_size` | Number of IPs to pre-allocate during node warm-up | `0` (disabled) | `10`, `20` |
+
+## How It Works
+
+1. **Initialization**: When a node starts and `ip_warm_up_size` is configured (> 0), the controller initializes the warm-up state:
+   - `WarmUpTarget`: Set to the configured `ip_warm_up_size`
+   - `WarmUpAllocatedCount`: Tracks the number of IPs allocated via OpenAPI during warm-up
+   - `WarmUpCompleted`: Set to `false` initially
+
+2. **Allocation**: During reconciliation, if warm-up is not completed, the controller calculates additional IP demand to reach the warm-up target and allocates IPs accordingly.
+
+3. **Completion**: Warm-up is marked as completed when `WarmUpAllocatedCount >= WarmUpTarget`. Once completed, the warm-up process will not run again for that node.
+
+## Relationship with Pool Size
+
+**Important**: The `ip_warm_up_size` is independent of `min_pool_size` and `max_pool_size`. It can be set to a value larger or smaller than the pool size limits.
+
+However, setting `ip_warm_up_size` larger than `max_pool_size` is **not recommended** because:
+
+- The warm-up process will allocate IPs up to `ip_warm_up_size`
+- After warm-up completes, the pool management and idle IP reclaim policy will release excess IPs to maintain the pool within `min_pool_size` and `max_pool_size` boundaries
+- This results in unnecessary IP allocation and deallocation, wasting resources and API calls
+
+### Recommended Configuration
+
+```json
+{
+  "version": "1",
+  "max_pool_size": 20,
+  "min_pool_size": 5,
+  "ip_warm_up_size": 15
+}
+```
+
+In this example:
+
+- On node startup, 15 IPs will be pre-allocated (warm-up)
+- The pool will maintain between 5-20 IPs during normal operation
+- Since `ip_warm_up_size` (15) is within the pool size range (5-20), all pre-allocated IPs will be retained
+
+### Not Recommended Configuration
+
+```json
+{
+  "version": "1",
+  "max_pool_size": 10,
+  "min_pool_size": 2,
+  "ip_warm_up_size": 20
+}
+```
+
+In this example:
+
+- On node startup, 20 IPs will be pre-allocated (warm-up)
+- After warm-up completes, 10 IPs will be released because `max_pool_size` is only 10
+- This causes unnecessary IP churn and API calls
+
+## Status Fields
+
+The warm-up progress can be monitored through the Node CR status:
+
+| Field | Description |
+|-------|-------------|
+| `warmUpTarget` | The target number of IPs to allocate during warm-up |
+| `warmUpAllocatedCount` | Current count of IPs allocated via OpenAPI during warm-up |
+| `warmUpCompleted` | Whether warm-up has been completed |
+
+Example status:
+
+```yaml
+status:
+  warmUpTarget: 10
+  warmUpAllocatedCount: 10
+  warmUpCompleted: true
+```
+
+## Use Cases
+
+1. **Batch Job Scheduling**: When scheduling many pods simultaneously on a new node, pre-allocated IPs reduce waiting time.
+
+2. **Auto-scaling**: New nodes in auto-scaling groups can have IPs ready before workloads are scheduled.
+
+3. **Low-latency Requirements**: Applications requiring fast pod startup benefit from having IPs pre-allocated.
+
+## Notes
+
+- Warm-up only runs once per node lifecycle (when the node first joins the cluster)
+- If a node already has warm-up status initialized, changing `ip_warm_up_size` will not affect the ongoing warm-up
+- Warm-up progress is tracked independently of actual IP usage, ensuring consistent behavior even if IPs are allocated/deallocated during warm-up
+
+---
+
+# Terway 网络插件
+
+Source: https://github.com/aliyuncontainerservice/terway/blob/main/README-zh_CN.md
+
+# Terway 网络插件  
+
+CNI plugin for alibaba cloud VPC/ENI
+
+
+[English](./README.md) | 简体中文
+
+## 简介
+
+Terway网络插件是ACK自研的容器网络接口（CNI）插件，基于阿里云的弹性网卡（ENI）构建网络，可以充分利用云上资源。Terway支持eBPF对网络流量进行加速，降低延迟，支持基于Kubernetes标准的网络策略（Network Policy）来定义容器间的访问策略。
+
+在Terway网络插件中，每个Pod都拥有自己的网络栈和IP地址。同一台ECS内的Pod之间通信，直接通过机器内部的转发，跨ECS的Pod通信、报文通过VPC的弹性网卡直接转发。由于不需要使用VxLAN等的隧道技术封装报文，因此Terway模式网络具有较高的通信性能。
+
+## 特性
+
+- ENI网络模式：分配 Elastic Network Interfaces (ENIs) 给Pod，优化资源利用率和网络性能。
+- Trunking功能：允许Pod配置独立的ENI，支持灵活安全组、交换机配置。
+- 节点池维度网络模式配置：支持节点池配置为独占ENI。
+- 安全策略：支持NetworkPolicy和传统的安全组，提供多维度的网络安全控制。
+- 高性能：使用eBPF加速协议栈，确保低延迟和高吞吐量。
+- IPv6: 支持IPv4/IPv6双栈。
+- 灵骏: 支持智能计算灵骏。
+
+### 以下功能已经废弃
+
+- VPC网络模式：利用VPC路由，实现容器与VPC内其他资源的直接通信。
+- 独占ENI模式：将ENI直通进Pod，最大化网络性能。（替换为通过节点池维度网络模式配置为独占ENI）
+
+## 版本差异
+
+ACK 提供的版本和开源一致。仅Trunking功能无法在自建集群使用。
+
+## 贡献
+
+我们非常欢迎社区的贡献！无论是修复bug、新增功能、改进文档，或者仅仅是对现有代码的改进，你的帮助都将被我们珍视。
+
+[报告问题](https://github.com/AliyunContainerService/terway/issues/new)
+[提交Pull Request](https://github.com/AliyunContainerService/terway/compare)
+
+## 安全
+
+如果您发现了代码中的安全漏洞，请联系[kubernetes-security@service.aliyun.com](mailto:kubernetes-security@service.aliyun.com)。详见 [SECURITY.md](SECURITY.md)
+
+## 社区
+
+### 钉钉群
+
+通过钉钉群号 "35924643" 加入`钉钉`群组。
+
+---
+
+# Security Policy
+
+Source: https://github.com/aliyuncontainerservice/terway/blob/main/SECURITY.md
+
+# Security Policy
+
+## Supported Versions
+
+| Version | Supported          |
+| ------- | ------------------ |
+| >= v1.6.0  | :white_check_mark: |
+| < 1.6.0    | :x:                |
+
+## Reporting a Vulnerability
+
+DO NOT CREATE AN ISSUE to report a security problem. Instead, please send an email to [kubernetes-security@service.aliyun.com](mailto:kubernetes-security@service.aliyun.com)
+
+## Vulnerability Management Plans
+
+### Critical Updates And Security Notices
+
+We learn about critical software updates and security threats from these sources
+
+1. GitHub Security Alerts
+2. [Dependabot](https://dependabot.com/) Dependency Updates
+
+---
