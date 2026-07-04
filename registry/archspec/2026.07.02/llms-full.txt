@@ -1,0 +1,2098 @@
+# archspec
+
+Source: https://github.com/krus210/archspec/blob/main/README.md
+
+# archspec
+
+> Spec-driven architecture validation for microservices.
+
+## What it does
+
+archspec captures a microservice's architecture as a versioned, machine-readable
+contract (`SERVICE_MAP.yaml`), generates Mermaid diagrams and `ARCHITECTURE.md`
+deterministically from it, and validates code changes against it on two layers:
+
+- **Deterministic gate** in pre-commit (schema, cycles, breaking changes, exceptions)
+- **AI deep dive** via `/archspec:validate` (idempotency, race conditions, eventual consistency)
+
+```
+                    ┌─────────────────────────┐
+                    │  docs/SERVICE_MAP.yaml  │  ← single source of truth
+                    └────────────┬────────────┘
+                                 │
+        ┌────────────────────────┼────────────────────────┐
+        ▼                        ▼                        ▼
+  /archspec:sync          pre-commit hook         /archspec:validate
+  (Mermaid + ARCH.md)     (DET-001..015)          (AI-001..010)
+```
+
+## Why
+
+| Pain | archspec answer |
+|---|---|
+| `ARCHITECTURE.md` rots — written by hand, updated by goodwill | Generated from YAML; CI fails on drift |
+| C4 diagrams in Lucidchart aren't version-controlled | Mermaid in repo, deterministic |
+| Invariants like "endpoint must be idempotent" live in tribal knowledge | Encoded in `SERVICE_MAP.yaml`; AI rules check the code |
+| Reviewers can't mechanically check contracts | Pre-commit + `/archspec:validate` reports |
+| New contributors need weeks to understand the bounded context | Read one YAML, get diagrams + invariants |
+
+## 5-minute install
+
+### Option A — Claude Code plugin (recommended)
+
+```bash
+/plugin marketplace add krus210/archspec
+/plugin install archspec@archspec
+```
+
+After installation, run `/reload-plugins` (or restart Claude Code) so commands and skills become available.
+
+### Option B — standalone skills
+
+```bash
+git clone https://github.com/krus210/archspec
+ln -s "$PWD/archspec/skills/architecture-sync"        ~/.claude/skills/
+ln -s "$PWD/archspec/skills/architecture-investigate" ~/.claude/skills/
+```
+
+### Bootstrap a service
+
+```bash
+cd path/to/your-service
+/archspec:init
+```
+
+This creates `docs/SERVICE_MAP.yaml`, generates initial diagrams + `ARCHITECTURE.md`,
+installs the pre-commit hook, and appends the archspec block to `CLAUDE.md`.
+
+## What you get
+
+archspec is intentionally small: each command/skill has a concrete artifact at the
+end, and those artifacts stay in the repo.
+
+| Flow | Output |
+|---|---|
+| `/archspec:init` / `architecture-sync` bootstrap | `docs/SERVICE_MAP.yaml`, `docs/diagrams/{context,container,sequence}.mmd`, generated `docs/ARCHITECTURE.md`, `.servicemap/schema.json`, `docs/adr/`, installed git hooks, and the archspec block in `CLAUDE.md` |
+| `/archspec:sync` / `architecture-sync` | Regenerated Mermaid diagrams and the managed region of `docs/ARCHITECTURE.md` |
+| `/archspec:investigate` / `architecture-investigate` | Read-only contract summary, clarification questions, an optional cross-check against a reference/golden spec, a chat-only sequence diagram for the proposed change, a YAML diff to apply before coding — including an `edge_cases[]` risk register that turns every finding into a DET-003-enforced test path — plus a persisted `docs/plans/*.archplan.md` artifact reviewed by an independent plan-review gate, and a definition-of-done + validation loop to run after implementation |
+| `/archspec:implement` / `architecture-implement` | Contract edits applied + re-synced docs, a coding plan with an archplan↔task conformance table, the implemented change, five conformance passes (wiring, event emission, end-to-end field threading, dedup atomicity, requirement evidence), green `/archspec:validate` + `/archspec:check-architecture`, and an independent diff review |
+| `/archspec:validate` | Markdown report grouped by `BLOCK` / `WARN` / `INFO` / `SUPPRESSED`, with file references and fix hints |
+| `/archspec:check-architecture` | Monorepo-wide architecture audit across all `SERVICE_MAP.yaml` files |
+
+The generated diagrams are plain Mermaid, so a fresh `/archspec:init` produces
+reviewable text artifacts rather than screenshots. Example output from a
+`task-service` init is checked in under
+[`examples/task-service-init-output/docs/diagrams`](examples/task-service-init-output/docs/diagrams).
+
+Context diagram:
+
+```mermaid
+flowchart LR
+  subgraph this["task-service"]
+    svc[task-service]
+  end
+  upstream_api-gateway[api-gateway] --> svc
+  svc -.-> storage_task-store[("in-memory: task-store")]
+  svc ==>|publish| topic_task-created>task.created]
+```
+
+Container diagram:
+
+```mermaid
+flowchart LR
+  subgraph svc_box["task-service"]
+    svc[task-service]
+  end
+  up_api-gateway[api-gateway] -->|CreateTask, GetTask, ListTasks| svc
+  svc -.-> store_task-store[("in-memory: task-store")]
+  svc ==>|publish v1| pub_task-created>task.created]
+```
+
+Sequence diagram:
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant client as Client
+  participant svc as task-service
+  participant task-store as in-memory:task-store
+  participant events as message-bus
+  client->>svc: gRPC CreateTask
+  Note over svc: read X-Idempotency-Key
+  svc->>task-store: write
+  svc->>events: publish task.created (v1)
+  svc-->>client: response
+  client->>svc: gRPC GetTask
+  svc->>task-store: read
+  svc-->>client: response
+  client->>svc: gRPC ListTasks
+  svc->>task-store: read
+  svc-->>client: response
+```
+
+## What `/archspec:init` does
+
+For Go services, `init` runs a read-only scanner over your source files and pre-fills `docs/SERVICE_MAP.yaml` with what it finds:
+
+- HTTP endpoints from `net/http`, `chi`, `gin`, `echo` route registration
+- gRPC endpoints from `pb.RegisterXxxServer` calls
+- Downstream gRPC dependencies from `grpc.NewClient` / `grpc.Dial`, with the target service name resolved from address constants where possible
+- Storage clients: postgres (`pgx`, `pgxpool`), redis (`go-redis`), mongodb (`mongo-driver`), generic SQL (`sqlx`/`database/sql`), and in-memory repository factories
+- Messaging topics from Kafka (`segmentio/kafka-go` writer/reader, `IBM/sarama` producer/consumer-group) and NATS (`nats-io/nats.go` core `Publish`/`Subscribe`/`QueueSubscribe` and JetStream `Publish`), with subjects resolved through Go const tables in the same file
+
+For each finding, archspec asks you to confirm it and to supply the fields the scanner cannot extract from code: SLA, idempotency policy, timeouts, retries, fallback strategy, and contract paths. Skipped findings do not enter the YAML.
+
+If the service is not Go, or the scanner finds nothing, `init` falls back to a fully manual questionnaire. **Messaging stacks the scanner does not know yet (RabbitMQ, GCP Pub/Sub, in-house queues) do not cause failures** — events just come back empty and the questionnaire asks you to list them manually. Adding a new backend to the scanner is a small contribution: extend `_MESSAGING_BACKENDS` in `skills/architecture-sync/scripts/scan_go.py` with one publish/subscribe pattern pair plus a fixture.
+
+## Commands
+
+| Command | Purpose |
+|---|---|
+| `/archspec:init` | Bootstrap a new service |
+| `/archspec:sync` | Regenerate Mermaid + ARCHITECTURE.md from `SERVICE_MAP.yaml` |
+| `/archspec:validate` | Run the AI rules and produce a markdown report |
+| `/archspec:investigate` | Pre-feature workflow: read contract, propose YAML changes inline, persist a reviewed `.archplan.md` |
+| `/archspec:implement` | Implement an `.archplan.md`: contracts → coding plan → TDD → conformance passes → validate |
+| `/archspec:check-architecture` | Monorepo-wide audit across all `SERVICE_MAP.yaml` files |
+
+See `commands/*.md` for full details.
+
+## Skills (autopilot)
+
+| Skill | Triggers when | Produces |
+|---|---|---|
+| `architecture-sync` | After Edit on `SERVICE_MAP.yaml`; phrases like "regenerate diagram", "service map drift" | Validated `SERVICE_MAP.yaml`, refreshed Mermaid diagrams, refreshed `ARCHITECTURE.md`, staged generated artifacts |
+| `architecture-investigate` | Phrases like "let's add X", "investigate Y", "understand how Z works" | Read-only architecture slice, clarification gate, optional reference-spec cross-check, change-only sequence diagram, proposed YAML diff with an `edge_cases[]` risk register, self-review loop, persisted `.archplan.md` + independent plan-review gate, definition-of-done + validation checklist |
+| `architecture-implement` | An `.archplan.md` exists and the user says "implement the plan", "build it" | Applied contract edits, coding plan with conformance table, TDD implementation, five conformance passes, green validate/check-architecture, independent diff review |
+
+## What gets validated
+
+<details>
+<summary>Click to expand the rule list</summary>
+
+**Deterministic (DET-*)** — pre-commit, < 1s, zero false positives:
+
+- DET-001 schema validation · DET-002 dependency cycles · DET-003 reference paths
+- DET-004 diagram drift · DET-005 hand-edited diagrams · DET-006 idempotency breaks
+- DET-007 removed edge_cases / scenarios · DET-008 missing changelog
+- DET-009 consistency model change · DET-010..015 exception discipline
+
+**AI (AI-*)** — `/archspec:validate`, contextual:
+
+- AI-001 idempotency · AI-002 outbox bypass · AI-003 optimistic locking
+- AI-004 façade-only violation · AI-005..006 coverage · AI-007 swallowed errors
+- AI-008 redundant calls · AI-009 undeclared events · AI-010 undeclared endpoint
+
+</details>
+
+Full catalog: [`docs/VALIDATION_RULES.md`](docs/VALIDATION_RULES.md).
+
+## Extending to your language
+
+Day one ships `linters/go/`. Adding `linters/python/` or `linters/node/` means dropping a
+folder and following [`docs/EXTENDING.md`](docs/EXTENDING.md). Activation is automatic via
+`service.language` in `SERVICE_MAP.yaml`.
+
+## Determinism guarantees
+
+Generators sort inputs by stable key, use a pure `slugify()` for IDs (no hashing), and read
+no clocks, randomness, environment, or filesystem state beyond the input YAML and templates.
+LF line endings, UTF-8 no BOM, fixed trailing newline. The benchmark suite enforces this:
+20 runs of every input must produce one SHA-256 per output file.
+
+## Benchmarks
+
+```bash
+./benchmarks/run.sh
+```
+
+Three suites: determinism, schema, violations (F1 ≥ 0.95 threshold). Behavioral evaluation
+requiring `ANTHROPIC_API_KEY` is deferred to a later milestone.
+
+## How it compares
+
+| | archspec | hand-written `ARCHITECTURE.md` | Structurizr / C4 modeling |
+|---|---|---|---|
+| Source of truth | YAML in repo | Markdown, drifts | DSL in separate tool |
+| CI gate | yes | no | partial |
+| Generated diagrams | yes (Mermaid) | no | yes |
+| AI-level invariant checks | yes | no | no |
+| Cost | free, local | free, manual | commercial |
+
+## Contributing
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md). Linters for new languages are very welcome.
+
+## License
+
+MIT. See [`LICENSE`](LICENSE).
+
+---
+
+# Contributing
+
+Source: https://github.com/krus210/archspec/blob/main/CONTRIBUTING.md
+
+# Contributing
+
+Contributions are welcome, especially linters for new languages under
+`linters/<lang>/`.
+
+## One-time setup
+
+The project uses a local virtualenv at `.venv/` so commands work the same
+on every machine regardless of system `python` / `pip`:
+
+```bash
+make bootstrap     # python3 -m venv .venv + pip install -r requirements-dev.txt
+```
+
+Requires `python3 >= 3.11` and `go >= 1.23` on PATH.
+
+## Before opening a PR
+
+Run the local checks:
+
+```bash
+.venv/bin/ruff check .
+make test                  # pytest + go test
+make benchmarks            # ./benchmarks/run.sh
+```
+
+If the change edits `SERVICE_MAP.yaml`, regenerate derived docs before
+committing (the launcher picks `.venv/bin/python` automatically and falls
+back to system `python3`):
+
+```bash
+bin/archspec-python skills/architecture-sync/scripts/sync.py docs/SERVICE_MAP.yaml docs
+```
+
+## Releasing a new version
+
+archspec follows [SemVer](https://semver.org). To cut a release, the version
+string must be bumped in **four** files in lock-step — Claude Code's installer
+reads `marketplace.json` for catalog discovery, `plugin.json` for the install
+manifest, and the plugin tests assert on both. Forgetting any one of them
+either breaks `pytest` or makes `/plugin update` no-op silently.
+
+1. **Bump the version** in all four files:
+   - `.claude-plugin/plugin.json` → `"version"`
+   - `.claude-plugin/marketplace.json` → `plugins[0].version`
+   - `pyproject.toml` → `[project] version`
+   - `tests/test_plugin_manifest.py` → the `data["version"] == "..."` assertion
+
+2. **Add a CHANGELOG entry** under a new `## [X.Y.Z] - YYYY-MM-DD` heading
+   summarising what changed. Do not skip this — `/archspec:validate` does not
+   rely on the changelog, but downstream users do.
+
+3. **Run the full local check** to make sure nothing else drifted:
+
+   ```bash
+   .venv/bin/ruff check .
+   .venv/bin/python -m pytest -q
+   ```
+
+4. **Open a PR**, merge with squash, then **tag and release**:
+
+   ```bash
+   git checkout main && git pull --ff-only
+   git tag -a vX.Y.Z -m "vX.Y.Z — short description"
+   git push origin vX.Y.Z
+   gh release create vX.Y.Z --title "vX.Y.Z — title" --notes "..."
+   ```
+
+5. **Note on `marketplace.json` `source`**: it is set to the relative path
+   `"./"` (marketplace and plugin live in the same repo). Do *not* change it
+   to the github-object form `{"source": "github", "repo": ...}` — Claude Code's
+   installer hits a code path with that form where it updates
+   `installed_plugins.json` with the new version but skips the actual file
+   fetch, leaving users with an empty install path. See CHANGELOG v0.4.3 for
+   the full story.
+
+## Adding a language linter
+
+Add a new directory under `linters/<lang>/`, document its activation in a
+`README.md`, and emit findings using the JSON contract described in
+`docs/EXTENDING.md`.
+
+---
+
+# Exceptions
+
+Source: https://github.com/krus210/archspec/blob/main/docs/EXCEPTIONS.md
+
+# Exceptions
+
+Some violations are intentional. archspec supports two suppression
+channels, both auditable, both subject to the discipline rules
+`DET-010`..`DET-015` (see [`VALIDATION_RULES.md`](./VALIDATION_RULES.md)).
+
+| Channel | Where | When to use |
+| --- | --- | --- |
+| Declarative | `SERVICE_MAP.yaml exceptions[]` | Long-lived, scoped to an endpoint or aggregate, requires an ADR. |
+| Inline pragma | `// archspec:ignore <ID> -- <reason>` in code | One-off, scoped to a single statement or function. |
+
+Both channels must justify themselves: a `reason`, an approver, and (for
+declarative entries) a link to an ADR. Unjustified suppressions are
+treated as bugs by the deterministic layer.
+
+## 1. Declarative exceptions (preferred)
+
+The `exceptions[]` array in `SERVICE_MAP.yaml` is the canonical place
+for suppressions. The schema enforces structure
+(`SERVICE_MAP_SPEC.md`); the deterministic checks enforce content
+(`DET-010`..`DET-014`).
+
+```yaml
+exceptions:
+  - rule: AI-001
+    scope:
+      endpoint: "GET /admin/health"
+    reason: "internal admin endpoint, no client retries possible"
+    approved_by: "@alice"
+    adr: "docs/adr/0042-skip-idempotency-on-admin.md"
+    expires: "2026-12-31"
+  - rule: AI-002
+    scope:
+      function: "internal/migrations/backfill.go::runBackfill"
+    reason: "migration job, single-use, runs once during cutover"
+    approved_by: "@bob"
+    adr: "docs/adr/0043-backfill-outbox-bypass.md"
+    expires: "2026-06-30"
+```
+
+### Required fields
+
+- `rule` — must match `^(DET|AI)-\d{3}$` and reference a documented
+  rule. Suppressing an undefined rule is a `DET-001` schema error.
+- `scope` — free-form object describing what the suppression applies
+  to. Common shapes: `{endpoint: "..."}`, `{function: "..."}`,
+  `{aggregate: "..."}`, `{path: "internal/legacy/**"}`. The schema
+  does not enforce keys; use what makes the scope unambiguous to the
+  reviewer.
+- `reason` — non-empty string. `DET-010` blocks empty or stub values.
+- `approved_by` — non-empty string. By convention `@handle`, but any
+  identifier works.
+- `adr` — non-empty string pointing to a real file. `DET-011` blocks
+  if the file does not exist in the repository.
+
+### Optional fields
+
+- `expires` — `YYYY-MM-DD` date. Past dates produce `DET-012` warnings
+  on every commit. Reasons matching `migration`, `temporary`, or
+  `legacy` without an `expires` produce `DET-014` warnings.
+
+### Why declarative is preferred
+
+- Lives next to the architecture contract; reviewers see the
+  exception when reviewing the service.
+- The ADR link forces a written rationale that survives the original
+  commit message.
+- Scope is structured, so a future tool can audit "all `AI-001`
+  suppressions across the org" mechanically.
+- Auto-expires through `DET-012`, prompting periodic review.
+
+## 2. Inline pragmas
+
+For one-off suppressions where the surrounding context is necessary,
+use an inline pragma directly in the source file:
+
+```go
+// archspec:ignore AI-002 -- migration script, single-use
+repo.Save(ctx, item)
+publisher.Publish(ctx, event)
+```
+
+Block-scoped variant suppresses multiple rules over a function or
+region:
+
+```go
+// archspec:ignore-block AI-001 AI-007 -- legacy adapter, removal scheduled Q3
+func legacyHandler(ctx context.Context, r *http.Request) error {
+    // ... pre-existing code ...
+}
+```
+
+Pragma format (enforced by `DET-015`):
+
+```
+// archspec:ignore <ID> [<ID>...] -- <reason>
+// archspec:ignore-block <ID> [<ID>...] -- <reason>
+```
+
+Rules:
+
+- The `--` delimiter is mandatory. A pragma without `-- <reason>` is a
+  `DET-015` block.
+- The reason must be a single line. If it does not fit, move to the
+  declarative channel.
+- The pragma matches the comment style of the surrounding language:
+  `//` for Go/JS/TS/Java/Kotlin/Rust, `#` for Python. The check looks
+  for the literal `archspec:ignore` substring; the comment marker is
+  language-defined.
+- Block scope (`archspec:ignore-block`) applies until the closing brace
+  of the enclosing function or block. Linters interpret this per
+  language; the Go reference linter scopes by AST function.
+
+### Languages currently scanned by `DET-015`
+
+`.go`, `.py`, `.js`, `.ts`, `.java`, `.kt`, `.rs`. Source files in
+other languages are not scanned for pragmas; use declarative
+exceptions for those services.
+
+## 3. Discipline rules summary
+
+`DET-010`..`DET-015` exist to keep the suppression mechanism trustworthy.
+Full text in [`VALIDATION_RULES.md`](./VALIDATION_RULES.md); the table
+below is a quick reference.
+
+| Rule | Severity | What it enforces |
+| --- | --- | --- |
+| `DET-010` | BLOCK | Every `exceptions[]` entry has `reason` and `approved_by`. |
+| `DET-011` | BLOCK | Every `exceptions[]` entry has an `adr` link to an existing file. |
+| `DET-012` | WARN | `exceptions[].expires` in the past surfaces a warning. |
+| `DET-013` | INFO | Any change to `exceptions[]` is highlighted on the PR run summary. |
+| `DET-014` | WARN | Reason mentions `migration\|temporary\|legacy` but no `expires` is set. |
+| `DET-015` | BLOCK | Inline pragma without `-- <reason>` fails the commit. |
+
+These run on every commit; an exception that violates them is a defect
+in the suppression itself, not in the code.
+
+## 4. Worked examples
+
+### 4.1 Declarative — admin endpoint without idempotency
+
+A health endpoint accessed only by Kubernetes liveness probes does not
+benefit from idempotency. Add the exception:
+
+```yaml
+api:
+  endpoints:
+    - name: GetAdminHealth
+      protocol: HTTP
+      idempotency:
+        required: false
+      contract: "openapi/admin.yaml#/paths/~1admin~1health/get"
+      sla: { p99_latency: "50ms", availability: "99.99%" }
+
+exceptions:
+  - rule: AI-001
+    scope:
+      endpoint: "GET /admin/health"
+    reason: "internal admin endpoint, no client retries possible"
+    approved_by: "@alice"
+    adr: "docs/adr/0042-skip-idempotency-on-admin.md"
+    expires: "2026-12-31"
+```
+
+The ADR (`docs/adr/0042-skip-idempotency-on-admin.md`) records the
+context: who relies on the endpoint, why retries are not a concern, when
+to revisit the decision.
+
+### 4.2 Inline — backfill script bypasses the outbox
+
+A one-time migration job needs to publish events without going through
+the outbox table. Inline pragma is appropriate because the suppression
+is single-use and the function will be deleted after the migration:
+
+```go
+// archspec:ignore-block AI-002 -- backfill: events emitted post-write
+// during the cutover from direct-publish to outbox.
+func runBackfillFor(ctx context.Context, ids []string) error {
+    for _, id := range ids {
+        item, err := repo.Load(ctx, id)
+        if err != nil {
+            return err
+        }
+        if err := repo.Save(ctx, item); err != nil {
+            return err
+        }
+        if err := publisher.Publish(ctx, item.toEvent()); err != nil {
+            return err
+        }
+    }
+    return nil
+}
+```
+
+When the migration ships, delete the function. The pragma goes with it.
+
+### 4.3 Inline — single-statement allowance
+
+For a single statement (not a whole function), use the line-scoped
+form:
+
+```go
+key := r.Header.Get("X-Idempotency-Key")
+if key == "" {
+    // archspec:ignore AI-001 -- legacy clients without the header are
+    // allowed to retry; we hash the body instead.
+    key = hashBody(r.Body)
+}
+```
+
+## 5. Inline → declarative migration policy
+
+Inline pragmas are for one-off cases. Once a file accumulates
+**more than two** pragmas of the same rule, the suppression has become
+a pattern and belongs in `SERVICE_MAP.yaml exceptions[]` so reviewers
+can see it in one place.
+
+The threshold is intentional: one or two pragmas in a file are easy to
+spot during review; a dozen scattered through a 400-line file are not.
+
+### Trigger
+
+`> 2` pragmas of the same rule in a single file. Detected by reading
+`internal/<file>.go` and grepping for `archspec:ignore` — there is no
+automated enforcement on day one, so apply the policy during PR review.
+
+### Migration recipe
+
+1. Identify the rule and the smallest scope that covers all the
+   pragmas (a directory, a package, a service component).
+2. Write or amend the ADR.
+3. Add a single declarative exception with that scope.
+4. Remove the inline pragmas in the same commit.
+
+### Before
+
+`internal/legacy/handler.go` (5 pragmas, all `AI-002`):
+
+```go
+package legacy
+
+func ProcessOrderV1(ctx context.Context, o Order) error {
+    // archspec:ignore AI-002 -- legacy v1 path, removed when v2 is GA
+    repo.Save(ctx, o)
+    publisher.Publish(ctx, OrderProcessedV1{ID: o.ID})
+    return nil
+}
+
+func ProcessRefundV1(ctx context.Context, r Refund) error {
+    // archspec:ignore AI-002 -- legacy v1 path, removed when v2 is GA
+    repo.Save(ctx, r)
+    publisher.Publish(ctx, RefundProcessedV1{ID: r.ID})
+    return nil
+}
+
+func CancelOrderV1(ctx context.Context, id string) error {
+    o, err := repo.Load(ctx, id)
+    if err != nil {
+        return err
+    }
+    o.Status = "cancelled"
+    // archspec:ignore AI-002 -- legacy v1 path, removed when v2 is GA
+    repo.Save(ctx, o)
+    publisher.Publish(ctx, OrderCancelledV1{ID: id})
+    return nil
+}
+
+func RetryShipmentV1(ctx context.Context, id string) error {
+    s, err := repo.Load(ctx, id)
+    if err != nil {
+        return err
+    }
+    // archspec:ignore AI-002 -- legacy v1 path, removed when v2 is GA
+    repo.Save(ctx, s)
+    publisher.Publish(ctx, ShipmentRetriedV1{ID: id})
+    return nil
+}
+
+func ArchiveOrderV1(ctx context.Context, id string) error {
+    // archspec:ignore AI-002 -- legacy v1 path, removed when v2 is GA
+    repo.Save(ctx, Order{ID: id, Archived: true})
+    publisher.Publish(ctx, OrderArchivedV1{ID: id})
+    return nil
+}
+```
+
+`SERVICE_MAP.yaml` (no exceptions yet):
+
+```yaml
+exceptions: []
+```
+
+### After
+
+`internal/legacy/handler.go` (no pragmas — all five removed):
+
+```go
+package legacy
+
+func ProcessOrderV1(ctx context.Context, o Order) error {
+    repo.Save(ctx, o)
+    publisher.Publish(ctx, OrderProcessedV1{ID: o.ID})
+    return nil
+}
+
+func ProcessRefundV1(ctx context.Context, r Refund) error {
+    repo.Save(ctx, r)
+    publisher.Publish(ctx, RefundProcessedV1{ID: r.ID})
+    return nil
+}
+
+func CancelOrderV1(ctx context.Context, id string) error {
+    o, err := repo.Load(ctx, id)
+    if err != nil {
+        return err
+    }
+    o.Status = "cancelled"
+    repo.Save(ctx, o)
+    publisher.Publish(ctx, OrderCancelledV1{ID: id})
+    return nil
+}
+
+func RetryShipmentV1(ctx context.Context, id string) error {
+    s, err := repo.Load(ctx, id)
+    if err != nil {
+        return err
+    }
+    repo.Save(ctx, s)
+    publisher.Publish(ctx, ShipmentRetriedV1{ID: id})
+    return nil
+}
+
+func ArchiveOrderV1(ctx context.Context, id string) error {
+    repo.Save(ctx, Order{ID: id, Archived: true})
+    publisher.Publish(ctx, OrderArchivedV1{ID: id})
+    return nil
+}
+```
+
+`SERVICE_MAP.yaml` (one declarative exception covers the whole
+package):
+
+```yaml
+exceptions:
+  - rule: AI-002
+    scope:
+      path: "internal/legacy/**"
+    reason: "legacy v1 publish path; will be removed when v2 GA ships"
+    approved_by: "@alice"
+    adr: "docs/adr/0051-legacy-v1-publish-path.md"
+    expires: "2026-09-30"
+```
+
+The diff: minus five inline comments scattered through one file, plus
+one structured entry next to the rest of the contract. Reviewers see
+the suppression once. The ADR records the v2 GA timeline. `DET-012`
+will warn on every commit after `2026-09-30`, prompting either removal
+or an extension.
+
+## See also
+
+- [`VALIDATION_RULES.md`](./VALIDATION_RULES.md) — full text of every
+  rule, including which ones support inline pragmas.
+- [`SERVICE_MAP_SPEC.md`](./SERVICE_MAP_SPEC.md) — schema for the
+  `exceptions[]` array.
+- [`EXTENDING.md`](./EXTENDING.md) — how new linters declare which
+  channels they honor.
+
+---
+
+# Extending archspec
+
+Source: https://github.com/krus210/archspec/blob/main/docs/EXTENDING.md
+
+# Extending archspec
+
+archspec ships with a Go linter on day one. The architecture is designed
+so that adding a linter for another language (Python, Node, Java, Rust,
+Kotlin, ...) does not require any change to the core schema, hooks, or
+templates.
+
+This document covers:
+
+1. Where new linters live and how they activate.
+2. The JSON contract every linter must produce.
+3. The `<lang>_extensions` block that lets a linter read
+   language-specific configuration without a schema PR.
+4. A complete worked example: contributing `linters/python/` with one
+   `AI-001` (idempotency) check.
+
+## 1. Folder layout
+
+```
+linters/
+├── go/                       (ships day one)
+│   ├── README.md
+│   ├── main.go
+│   ├── handler_idempotency.go
+│   ├── outbox_pattern.go
+│   ├── optimistic_locking.go
+│   └── testdata/
+└── <your-language>/          (add yours here)
+    ├── README.md
+    ├── ...                   (any language and build system)
+    └── testdata/
+```
+
+There are no naming requirements beyond the directory name itself,
+because activation is data-driven (see next section). Use whatever
+language tooling you prefer. The Go linter is a Go binary invoked via
+`go run`; a Python linter would be a script invoked via `python3 -m`;
+Node would be `node`. The only contract is the JSON output (section 3).
+
+## 2. Activation
+
+A linter activates when `service.language` in the target service's
+`SERVICE_MAP.yaml` matches the directory name.
+
+```yaml
+service:
+  language: python      # → /archspec:validate runs linters/python/
+```
+
+The validate skill iterates over `linters/<lang>/` for whichever
+language the YAML declares, then aggregates findings into a single
+report. There is no central registry to update; dropping a directory in
+the right place is enough.
+
+A service may declare any string for `service.language`. If the
+matching directory does not exist, `/archspec:validate` reports
+"language `<lang>` has no linter installed" but does not fail. The
+deterministic layer (`DET-001..015`) still runs because it is
+language-agnostic.
+
+## 3. The JSON Finding contract
+
+Every linter writes a JSON array of `Finding` objects to stdout. This
+schema is taken verbatim from the design spec §4.5:
+
+```json
+{
+  "rule": "AI-001",
+  "severity": "BLOCK",
+  "file": "internal/handler/listing_create.go",
+  "line": 42,
+  "contract_ref": "SERVICE_MAP.yaml:78",
+  "message": "...",
+  "suggested_fix": "..."
+}
+```
+
+Field semantics:
+
+| Field | Type | Required | Notes |
+| --- | --- | --- | --- |
+| `rule` | string | yes | Stable id (`AI-001` etc.); reserve new ids in [`VALIDATION_RULES.md`](./VALIDATION_RULES.md) before shipping. |
+| `severity` | string | yes | One of `BLOCK`, `WARN`, `INFO`. |
+| `file` | string | yes when applicable | Repo-relative path. Empty string is allowed for whole-service findings (e.g. "no handler matches endpoint"). |
+| `line` | integer | yes when applicable | 1-based. Use `0` when the finding is file- or service-level. |
+| `contract_ref` | string | yes | Cross-reference to the YAML section that motivated the rule. Format: `SERVICE_MAP.yaml — <pointer>`. |
+| `message` | string | yes | One-line description of the violation. |
+| `suggested_fix` | string | optional | If present, surfaced as the fix hint in the validate report. |
+
+Output rules:
+
+- Always emit a JSON array, never `null`. An empty array means "no
+  findings".
+- Use UTF-8, LF line endings, no BOM.
+- Do not pretty-print with timestamps, colors, or other entropy. The
+  benchmarks in `benchmarks/violations/` will compare your output
+  byte-for-byte against `expected.json`.
+- Sort by `(file, line, rule)` so two runs against the same input
+  produce the same output. The Go reference linter relies on AST
+  traversal order, which is already sorted.
+
+Exit codes:
+
+- `0` — no findings emitted.
+- `1` — at least one finding emitted (any severity).
+- `2` — usage error (bad flags, missing input).
+
+Other exit codes are reserved.
+
+## 4. The `<lang>_extensions` block
+
+Language-specific configuration that does not belong in the
+language-agnostic schema lives in a top-level `<prefix>_extensions`
+object. The schema permits any object whose key matches `*_extensions$`
+(see `skills/architecture-sync/schema/servicemap.schema.json`,
+`patternProperties`).
+
+By convention, the prefix matches `service.language`:
+
+```yaml
+service:
+  language: python
+
+python_extensions:
+  framework: fastapi
+  idempotency_decorator: "@idempotent"
+  outbox_helper: "events.OutboxPublisher"
+```
+
+The Go linter's reference shape:
+
+```yaml
+go_extensions:
+  optimistic_locking_field: "row_version"
+  outbox_table: "outbox_events"
+```
+
+Linters are responsible for declaring their own defaults. The schema
+does not validate the contents of an `*_extensions` block (it is
+`additionalProperties: true`), so document expected keys in your
+linter's `README.md`. Users with conflicting keys across multiple
+linters can use distinct prefixes (e.g.
+`python_idempotency_extensions`).
+
+## 5. Worked example: `linters/python/handler_idempotency.py`
+
+This walkthrough adds a single rule (`AI-001`) for Python services
+using FastAPI. It mirrors the Go reference implementation in
+`linters/go/handler_idempotency.go`.
+
+### 5.1 Scaffolding
+
+```
+linters/python/
+├── README.md
+├── archspec_python_linter/
+│   ├── __init__.py
+│   ├── __main__.py
+│   ├── finding.py
+│   ├── servicemap.py
+│   └── handler_idempotency.py
+├── pyproject.toml
+└── testdata/
+    └── handler_idempotency/
+        ├── ok/
+        │   ├── SERVICE_MAP.yaml
+        │   └── app.py
+        └── bad/
+            ├── SERVICE_MAP.yaml
+            └── app.py
+```
+
+### 5.2 `finding.py`
+
+```python
+from __future__ import annotations
+
+import json
+from dataclasses import asdict, dataclass
+
+@dataclass(frozen=True)
+class Finding:
+    rule: str
+    severity: str
+    file: str
+    line: int
+    contract_ref: str
+    message: str
+    suggested_fix: str = ""
+
+def encode_findings(findings: list[Finding]) -> str:
+    """Sort, then emit a JSON array. Never None, no trailing newline."""
+    findings = sorted(findings, key=lambda f: (f.file, f.line, f.rule))
+    return json.dumps([asdict(f) for f in findings], ensure_ascii=False)
+```
+
+### 5.3 `servicemap.py`
+
+```python
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import yaml
+
+@dataclass
+class Idempotency:
+    required: bool = False
+    key_source: str = ""
+    storage: str = ""
+
+@dataclass
+class Endpoint:
+    name: str = ""
+    protocol: str = ""
+    idempotency: Idempotency = field(default_factory=Idempotency)
+
+@dataclass
+class ServiceMap:
+    path: str
+    language: str
+    endpoints: list[Endpoint]
+    extensions: dict
+
+def load(path: str | Path) -> ServiceMap:
+    raw = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+    endpoints = []
+    for ep in (raw.get("api") or {}).get("endpoints", []) or []:
+        idem = ep.get("idempotency") or {}
+        endpoints.append(Endpoint(
+            name=ep.get("name", ""),
+            protocol=ep.get("protocol", ""),
+            idempotency=Idempotency(
+                required=bool(idem.get("required")),
+                key_source=idem.get("key_source", ""),
+                storage=idem.get("storage", ""),
+            ),
+        ))
+    return ServiceMap(
+        path=str(path),
+        language=(raw.get("service") or {}).get("language", ""),
+        endpoints=endpoints,
+        extensions=raw.get("python_extensions") or {},
+    )
+```
+
+### 5.4 `handler_idempotency.py` (the rule)
+
+The check uses `ast.NodeVisitor` to find every function whose name
+matches a declared endpoint, then walks its body for
+`request.headers.get("<header>")` calls.
+
+```python
+from __future__ import annotations
+
+import ast
+from pathlib import Path
+
+from .finding import Finding
+from .servicemap import Endpoint, ServiceMap
+
+_HEADER_PREFIX = "header:"
+
+def _header_name(key_source: str) -> str:
+    """`header: X-Idempotency-Key` -> `x-idempotency-key`."""
+    if not key_source.lower().startswith(_HEADER_PREFIX):
+        return ""
+    return key_source.split(":", 1)[1].strip().lower()
+
+class _HandlerScanner(ast.NodeVisitor):
+    def __init__(self, header: str) -> None:
+        self.header = header
+        self.reads_header = False
+
+    def visit_Call(self, node: ast.Call) -> None:  # noqa: N802
+        # request.headers.get("X-Idempotency-Key") or
+        # request.headers["X-Idempotency-Key"]
+        if (
+            isinstance(node.func, ast.Attribute)
+            and node.func.attr == "get"
+            and isinstance(node.func.value, ast.Attribute)
+            and node.func.value.attr == "headers"
+            and len(node.args) >= 1
+            and isinstance(node.args[0], ast.Constant)
+            and isinstance(node.args[0].value, str)
+            and node.args[0].value.lower() == self.header
+        ):
+            self.reads_header = True
+        self.generic_visit(node)
+
+def _walk_python_files(root: Path) -> list[Path]:
+    return sorted(p for p in root.rglob("*.py") if "/.venv/" not in str(p))
+
+def run(sm: ServiceMap, code_root: Path) -> list[Finding]:
+    required: list[Endpoint] = [e for e in sm.endpoints if e.idempotency.required]
+    if not required:
+        return []
+
+    handlers: dict[str, tuple[Path, int]] = {}
+    bodies: dict[str, ast.FunctionDef] = {}
+    for path in _walk_python_files(code_root):
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                handlers.setdefault(node.name, (path, node.lineno))
+                bodies.setdefault(node.name, node)
+
+    findings: list[Finding] = []
+    for ep in required:
+        header = _header_name(ep.idempotency.key_source)
+        body = bodies.get(ep.name)
+        if body is None:
+            findings.append(Finding(
+                rule="AI-001", severity="BLOCK",
+                file="", line=0,
+                contract_ref=f"{sm.path} — endpoint {ep.name}",
+                message=(
+                    "endpoint declared idempotency.required=true "
+                    "but no matching handler function found"
+                ),
+                suggested_fix=(
+                    f"name the handler function exactly `{ep.name}` "
+                    "or add a registration mapping"
+                ),
+            ))
+            continue
+        scanner = _HandlerScanner(header)
+        scanner.visit(body)
+        if header and not scanner.reads_header:
+            path, lineno = handlers[ep.name]
+            findings.append(Finding(
+                rule="AI-001", severity="BLOCK",
+                file=str(path.relative_to(code_root)),
+                line=lineno,
+                contract_ref=f"{sm.path} — endpoint {ep.name}",
+                message=f"handler does not read declared idempotency key {header}",
+                suggested_fix=(
+                    f'key = request.headers.get("{header}")'
+                ),
+            ))
+    return findings
+```
+
+### 5.5 `__main__.py` (CLI)
+
+```python
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+from .finding import encode_findings
+from .handler_idempotency import run as run_handler_idempotency
+from .servicemap import load
+
+_SUBCOMMANDS = {"handler-idempotency": run_handler_idempotency}
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="archspec-python-linter")
+    parser.add_argument("subcommand", choices=sorted(_SUBCOMMANDS))
+    parser.add_argument("--service-map", default="docs/SERVICE_MAP.yaml")
+    parser.add_argument("--code", default=".")
+    args = parser.parse_args(argv)
+
+    sm = load(args.service_map)
+    findings = _SUBCOMMANDS[args.subcommand](sm, Path(args.code))
+    sys.stdout.write(encode_findings(findings))
+    return 1 if findings else 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+```
+
+### 5.6 Fixture: `testdata/handler_idempotency/bad/`
+
+`SERVICE_MAP.yaml`:
+
+```yaml
+metadata:
+  schema_version: "1.0"
+  source_of_truth: local
+  drift_check_in_ci: true
+  last_reviewed: "2026-04-25"
+service:
+  name: orders
+  team: payments
+  language: python
+  repo: github.com/example/orders
+  domain: orders
+  ownership: { primary: "@alice", oncall: "@oncall" }
+  responsibilities: ["accept order requests"]
+  invariants: ["idempotent create"]
+api:
+  version: 1
+  endpoints:
+    - name: create_order
+      protocol: HTTP
+      idempotency:
+        required: true
+        key_source: "header: X-Idempotency-Key"
+        storage: redis
+      contract: "openapi/orders.yaml#/paths/~1orders/post"
+      sla: { p99_latency: "200ms", availability: "99.9%" }
+  changelog: []
+dependencies:
+  upstream: []
+  downstream: { sync: [], async: [] }
+  storage: []
+events: { published: [], consumed: [] }
+consistency:
+  model: eventual
+  bounded_aggregate: order
+  write_path: { pattern: outbox }
+  read_path: { consistency: eventual }
+  cross_service_invariants: []
+concurrency: { aggregates: [], hot_keys: [], shared_state: [] }
+```
+
+`app.py` (handler does not read the header, so the rule must fire):
+
+```python
+from fastapi import FastAPI, Request
+
+app = FastAPI()
+
+@app.post("/orders")
+async def create_order(request: Request):
+    payload = await request.json()
+    return {"id": payload.get("id")}
+```
+
+Expected output (`expected.json`):
+
+```json
+[
+  {
+    "rule": "AI-001",
+    "severity": "BLOCK",
+    "file": "app.py",
+    "line": 6,
+    "contract_ref": "testdata/handler_idempotency/bad/SERVICE_MAP.yaml — endpoint create_order",
+    "message": "handler does not read declared idempotency key x-idempotency-key",
+    "suggested_fix": "key = request.headers.get(\"x-idempotency-key\")"
+  }
+]
+```
+
+Mirror the layout for the `ok/` case (handler that calls
+`request.headers.get("X-Idempotency-Key")` returns an empty array).
+
+### 5.7 Wire into the validate skill
+
+Once the linter passes its own tests, register the language directory
+by creating `linters/python/README.md`. The validate skill discovers
+linters by directory name; no other registration is needed.
+
+In a follow-up PR, add a benchmark fixture under
+`benchmarks/violations/fixtures/<NN>_python_handler_idempotency/` so
+the F1 metric covers the new rule.
+
+## See also
+
+- [`SERVICE_MAP_SPEC.md`](./SERVICE_MAP_SPEC.md) — every key your
+  linter is allowed to read.
+- [`VALIDATION_RULES.md`](./VALIDATION_RULES.md) — reserve new `AI-*`
+  ids here before shipping.
+- [`EXCEPTIONS.md`](./EXCEPTIONS.md) — how users will suppress your
+  rules.
+- `linters/go/` — reference implementation; mirror its directory
+  layout if your language has no strong convention.
+
+---
+
+# SERVICE_MAP.yaml — schema reference
+
+Source: https://github.com/krus210/archspec/blob/main/docs/SERVICE_MAP_SPEC.md
+
+# SERVICE_MAP.yaml — schema reference
+
+`SERVICE_MAP.yaml` is the single source of truth for a microservice's
+architecture contract. It is read by every archspec workflow:
+`/archspec:sync` (diagram + `ARCHITECTURE.md` generation), the pre-commit
+hook (`DET-001..015`), `/archspec:validate` (`AI-001..010`), and
+`/archspec:investigate` (read-side feature workflow).
+
+This document is the user-facing reference. The authoritative schema lives
+at `skills/architecture-sync/schema/servicemap.schema.json` (JSON Schema
+Draft-07).
+
+## Top-level shape
+
+```yaml
+metadata:       { ... }   # required
+service:        { ... }   # required
+api:            { ... }   # required
+dependencies:   { ... }   # required
+events:         { ... }   # required
+consistency:    { ... }   # required
+concurrency:    { ... }   # required
+
+edge_cases:     [ ... ]   # optional
+scenarios:      [ ... ]   # optional
+failure_modes:  [ ... ]   # optional
+architecture_rules: { ... }   # optional
+exceptions:     [ ... ]   # optional
+
+go_extensions:      { ... }   # optional, language-scoped
+python_extensions:  { ... }   # optional, language-scoped
+node_extensions:    { ... }   # optional, language-scoped
+```
+
+The seven required core sections are validated with
+`additionalProperties: false`; any unknown key inside them is a `DET-001`
+error. Anything matching the pattern `*_extensions` is open
+(`additionalProperties: true`) so language plug-ins under `linters/<lang>/`
+can extend the contract without a schema PR.
+
+## Quick reference
+
+Every property in the schema, top to bottom. `R` = required, `O` = optional.
+
+| Path | Type | R/O | Notes |
+| --- | --- | --- | --- |
+| `metadata` | object | R | Provenance and review cadence. |
+| `metadata.schema_version` | string `^\d+\.\d+$` | R | Bump on schema breaks; see `metadata.schema_version` migration policy. |
+| `metadata.source_of_truth` | enum `local`, `external` | R | `external` if generated from another system. |
+| `metadata.drift_check_in_ci` | boolean | R | Toggles the pre-push drift gate. |
+| `metadata.last_reviewed` | string `YYYY-MM-DD` | R | Date of last human review; surfaced by `/archspec:investigate`. |
+| `service` | object | R | Identity and ownership. |
+| `service.name` | string (min length 1) | R | Stable slug; used for diagram node ids. |
+| `service.team` | string (min length 1) | R | Free-form team handle. |
+| `service.language` | string (min length 1) | R | Activates `linters/<language>/` (`go`, `python`, `node`, ...). |
+| `service.repo` | string (min length 1) | R | Repository URL or path. |
+| `service.domain` | string (min length 1) | R | Bounded context label. |
+| `service.ownership` | object | R | Two-field record. |
+| `service.ownership.primary` | string | R | Primary maintainer (`@handle` or email). |
+| `service.ownership.oncall` | string | R | Oncall rotation handle. |
+| `service.responsibilities` | array of string | R | What the service owns; bullet list. |
+| `service.invariants` | array of string | R | Properties that must always hold. |
+| `api` | object | R | Public surface. |
+| `api.version` | integer (min 1) | R | Major API version. |
+| `api.endpoints` | array of [endpoint](#endpoint) | R | Empty array allowed. |
+| `api.changelog` | array | R | Append-only; required by `DET-008` on api edits. |
+| `dependencies` | object | R | Outgoing relationships. |
+| `dependencies.upstream` | array | R | Services that call us. |
+| `dependencies.downstream` | object | R | Services we call. |
+| `dependencies.downstream.sync` | array of object | R | Synchronous calls. |
+| `dependencies.downstream.sync[].service` | string | R | Target service name. |
+| `dependencies.downstream.sync[].timeout` | string | R | Duration (e.g. `300ms`). |
+| `dependencies.downstream.sync[].retries` | integer (min 0) | R | Retry budget. |
+| `dependencies.downstream.sync[].fallback` | string | R | What replaces the call on failure. |
+| `dependencies.downstream.sync[].on_failure` | string | R | Policy: `degrade`, `fail`, etc. |
+| `dependencies.downstream.async` | array of object | R | Asynchronous calls. |
+| `dependencies.downstream.async[].topic` | string | R | Broker topic name. |
+| `dependencies.downstream.async[].contract` | string | R | Path to schema doc. |
+| `dependencies.downstream.async[].qos` | string | R | `at-least-once`, `exactly-once`, etc. |
+| `dependencies.storage` | array of object | R | Owned datastores. |
+| `dependencies.storage[].type` | string | R | `postgres`, `redis`, ... |
+| `dependencies.storage[].name` | string | R | Logical name. |
+| `dependencies.storage[].owned_by` | string | R | Service that owns the schema. |
+| `events` | object | R | Pub/sub surface. |
+| `events.published` | array of object | R | Topics this service emits. |
+| `events.published[].topic` | string | R | Topic name. |
+| `events.published[].contract` | string | R | Path to schema doc. |
+| `events.published[].version` | integer | R | Contract version. |
+| `events.consumed` | array of object | R | Topics this service consumes. |
+| `events.consumed[].topic` | string | R | Topic name. |
+| `events.consumed[].contract` | string | R | Path to schema doc. |
+| `events.consumed[].expected_version` | integer | R | Minimum supported producer version. |
+| `consistency` | object | R | Write/read semantics. |
+| `consistency.model` | enum `eventual`, `strong` | R | Service-wide default. |
+| `consistency.bounded_aggregate` | string | R | Aggregate root name. |
+| `consistency.write_path` | object | R | How writes propagate. |
+| `consistency.write_path.pattern` | enum `outbox`, `direct`, `saga` | R | Drives `AI-002` (outbox vs direct publish). |
+| `consistency.read_path` | object | R | Read guarantees. |
+| `consistency.read_path.consistency` | enum `read-your-writes`, `eventual` | R | What clients must expect. |
+| `consistency.cross_service_invariants` | array of string | R | Cross-boundary constraints. |
+| `concurrency` | object | R | Conflict semantics. |
+| `concurrency.aggregates` | array of object | R | Per-aggregate write strategy. |
+| `concurrency.aggregates[].name` | string | R | Aggregate label. |
+| `concurrency.aggregates[].write_strategy` | enum `optimistic`, `pessimistic` | R | Drives `AI-003` (locking checks). |
+| `concurrency.hot_keys` | array of string | R | Known hot partitions. |
+| `concurrency.shared_state` | array of string | R | Caches, locks, queues shared between instances. |
+| `edge_cases` | array of object | O | Documented edge cases. |
+| `edge_cases[].id` | string `^EC-\d+$` | R | Stable identifier. |
+| `edge_cases[].description` | string | R | What edge case this is. |
+| `edge_cases[].test` | string | R | Path to the covering test. |
+| `scenarios` | array of object | O | End-to-end scenarios. |
+| `scenarios[].id` | string `^S-\d+$` | R | Stable identifier. |
+| `scenarios[].description` | string | R | One-line summary. |
+| `scenarios[].test` | string | R | Path to the e2e test. |
+| `scenarios[].monitor` | string | O | Synthetic monitor name. |
+| `failure_modes` | array of object | O | Known failure modes. |
+| `failure_modes[].when` | string | R | Trigger condition. |
+| `failure_modes[].user_sees` | string | R | Observable behavior. |
+| `failure_modes[].detection` | string | R | How an operator notices. |
+| `architecture_rules` | object | O | Free-form policy block (e.g. `facade_only`, `forbidden_imports`, `required_layers`). |
+| `exceptions` | array of object | O | Suppressions; see [`EXCEPTIONS.md`](./EXCEPTIONS.md). |
+| `exceptions[].rule` | string `^(DET\|AI)-\d{3}$` | R | Rule being suppressed. |
+| `exceptions[].scope` | object | R | What the suppression applies to (free-form keys). |
+| `exceptions[].reason` | string (min length 1) | R | Why; enforced by `DET-010`. |
+| `exceptions[].approved_by` | string (min length 1) | R | Approver handle; enforced by `DET-010`. |
+| `exceptions[].adr` | string (min length 1) | R | ADR path; enforced by `DET-011`. |
+| `exceptions[].expires` | string `YYYY-MM-DD` | O | If absent and `reason` matches `migration\|temporary\|legacy`, `DET-014` warns. |
+| `<lang>_extensions` | object | O | Open container; values are language-specific. |
+| `go_extensions.optimistic_locking_field` | string | O | Column name used by `AI-003` (default `row_version`). |
+| `go_extensions.outbox_table` | string | O | Table name surfaced in `AI-002` fix hints. |
+
+### endpoint
+
+| Path | Type | R/O | Notes |
+| --- | --- | --- | --- |
+| `name` | string | R | Must match the handler function (used by `AI-001`). |
+| `protocol` | enum `HTTP`, `gRPC` | R | Transport. |
+| `idempotency` | [idempotency](#idempotency) | R | Always present, even when `required: false`. |
+| `contract` | string | R | OpenAPI/Proto path; checked by `DET-003`. |
+| `sla` | object | R | Two-field record. |
+| `sla.p99_latency` | string | R | E.g. `200ms`. |
+| `sla.availability` | string | R | E.g. `99.95%`. |
+
+### idempotency
+
+| Path | Type | R/O | Notes |
+| --- | --- | --- | --- |
+| `required` | boolean | R | When `true`, `key_source` and `storage` are required (conditional rule). |
+| `key_source` | string | C | Required when `required: true`. Use `header: X-Header-Name` form. |
+| `key_ttl` | string | O | Duration (e.g. `24h`). |
+| `storage` | string | C | Required when `required: true`. E.g. `redis: idemp:{key}`. |
+| `on_duplicate` | string | O | Policy text (e.g. `return cached response`). |
+
+`C` = conditionally required by the JSON Schema `if`/`then` clause.
+
+## Required core sections
+
+### `metadata`
+
+Provenance for the file itself. `last_reviewed` is the only field that is
+allowed to read the wall clock during validation (via `DET-012`). Everything
+else is static.
+
+```yaml
+metadata:
+  schema_version: "1.0"
+  source_of_truth: local
+  drift_check_in_ci: true
+  last_reviewed: "2026-04-25"
+```
+
+### `service`
+
+Identity, ownership, and the two narrative fields (`responsibilities`,
+`invariants`) that drive the generated `ARCHITECTURE.md`. `service.language`
+is load-bearing: it selects the linter directory under `linters/`. See
+[`EXTENDING.md`](./EXTENDING.md).
+
+### `api`
+
+A versioned list of endpoints plus an append-only `changelog`. `DET-008`
+blocks any structural change to `api` that does not bump `changelog`.
+
+### `dependencies`
+
+Outgoing relationships in three buckets: `upstream` (for documentation),
+`downstream.sync` (timeout/retry/fallback policy required), `downstream.async`
+(topic/contract/qos). `storage` lists owned datastores.
+
+### `events`
+
+Pub/sub surface. Every published topic must declare a contract path and a
+version. Every consumed topic must declare an `expected_version` so a
+producer bump is detectable.
+
+### `consistency`
+
+The semantic backbone. `consistency.write_path.pattern` activates the
+outbox AI rule (`AI-002`); `consistency.read_path.consistency` documents
+what clients must expect; `cross_service_invariants` is free-form prose
+asserted by `/archspec:validate`.
+
+### `concurrency`
+
+Aggregate-level write strategy. `optimistic` activates `AI-003`
+(version-column predicate on `UPDATE`). `hot_keys` and `shared_state` are
+narrative only on day one but reserved for future rules.
+
+## Optional sections
+
+### `edge_cases` and `scenarios`
+
+Both are arrays of `{id, description, test}` records. The `id` patterns
+(`^EC-\d+$`, `^S-\d+$`) are required so that removed entries can be
+detected by `DET-007` (a removal without an ADR is a block). `scenarios`
+may carry an extra `monitor` string for synthetic observability.
+
+### `failure_modes`
+
+Operator-facing documentation. No automation reads it on day one, but
+the generator includes it in `ARCHITECTURE.md`.
+
+### `architecture_rules`
+
+Free-form policy block. The schema declares it as `type: object` with no
+inner constraints so teams can experiment. The reserved sub-keys
+(`facade_only`, `forbidden_imports`, `required_layers`) are read by
+`AI-004` once it is implemented.
+
+### `exceptions`
+
+The declarative suppression channel. Each entry must reference a real
+rule (`DET-*` or `AI-*`), include `reason`, `approved_by`, and a path to
+an `adr` file (enforced by `DET-010`/`DET-011`). See
+[`EXCEPTIONS.md`](./EXCEPTIONS.md) for the full lifecycle.
+
+### `<lang>_extensions`
+
+Pattern key matching `*_extensions$`. Values are arbitrary objects. By
+convention the prefix is the same string as `service.language` (`go`,
+`python`, `node`, ...). Used by per-language linters; documented in
+[`EXTENDING.md`](./EXTENDING.md).
+
+## JSON Schema rules
+
+- **Draft**: JSON Schema Draft-07 (`$schema:
+  http://json-schema.org/draft-07/schema#`).
+- **Closed core**: every required top-level section uses
+  `additionalProperties: false`. Unknown keys inside `metadata`,
+  `service`, `api`, `dependencies`, `events`, `consistency`, or
+  `concurrency` are `DET-001` errors.
+- **Open extensions**: `patternProperties: { "_extensions$": { type: object } }`
+  permits arbitrary `<lang>_extensions` blocks at the top level.
+- **Conditional idempotency**: when `endpoint.idempotency.required: true`,
+  the schema requires both `key_source` and `storage` via an `if`/`then`
+  clause.
+- **Pattern identifiers**: `metadata.schema_version` must match
+  `^\d+\.\d+$`; dates use `^\d{4}-\d{2}-\d{2}$`; `edge_cases[].id` matches
+  `^EC-\d+$`; `scenarios[].id` matches `^S-\d+$`; `exceptions[].rule`
+  matches `^(DET|AI)-\d{3}$`.
+- **Cross-file conditional**: every `exceptions[].rule` must reference a
+  rule documented in [`VALIDATION_RULES.md`](./VALIDATION_RULES.md).
+  Rule-id existence is enforced by the schema regex; rule semantics
+  remain documentation.
+
+## Minimal example
+
+Smallest file that passes `DET-001` (lifted from
+`benchmarks/determinism/inputs/01_minimal.yaml`):
+
+```yaml
+metadata:
+  schema_version: "1.0"
+  source_of_truth: local
+  drift_check_in_ci: true
+  last_reviewed: "2026-04-25"
+service:
+  name: minimal-service
+  team: platform
+  language: go
+  repo: github.com/example/minimal-service
+  domain: example
+  ownership:
+    primary: "@alice"
+    oncall: "@oncall"
+  responsibilities:
+    - "expose REST API"
+  invariants:
+    - "all writes go through the outbox"
+api:
+  version: 1
+  endpoints: []
+  changelog: []
+dependencies:
+  upstream: []
+  downstream:
+    sync: []
+    async: []
+  storage: []
+events:
+  published: []
+  consumed: []
+consistency:
+  model: eventual
+  bounded_aggregate: example
+  write_path:
+    pattern: outbox
+  read_path:
+    consistency: eventual
+  cross_service_invariants: []
+concurrency:
+  aggregates: []
+  hot_keys: []
+  shared_state: []
+```
+
+## Full example
+
+Realistic file exercising every optional section (lifted from
+`benchmarks/determinism/inputs/02_full.yaml`):
+
+```yaml
+metadata:
+  schema_version: "1.0"
+  source_of_truth: local
+  drift_check_in_ci: true
+  last_reviewed: "2026-04-25"
+service:
+  name: listings-service
+  team: marketplace
+  language: go
+  repo: github.com/example/listings-service
+  domain: listings
+  ownership:
+    primary: "@alice"
+    oncall: "@listings-oncall"
+  responsibilities:
+    - "expose REST API for listings"
+    - "publish ListingCreated events"
+  invariants:
+    - "all writes go through the outbox"
+    - "listing IDs are monotonic"
+api:
+  version: 2
+  endpoints:
+    - name: CreateListing
+      protocol: HTTP
+      idempotency:
+        required: true
+        key_source: header:Idempotency-Key
+        key_ttl: "24h"
+        storage: redis
+        on_duplicate: return_original
+      contract: openapi/listings.yaml#/paths/~1listings/post
+      sla:
+        p99_latency: "200ms"
+        availability: "99.9%"
+    - name: GetListing
+      protocol: HTTP
+      idempotency:
+        required: false
+      contract: openapi/listings.yaml#/paths/~1listings~1{id}/get
+      sla:
+        p99_latency: "100ms"
+        availability: "99.95%"
+  changelog: []
+dependencies:
+  upstream:
+    - api-gateway
+  downstream:
+    sync:
+      - service: pricing-service
+        timeout: "300ms"
+        retries: 2
+        fallback: "cache"
+        on_failure: "degrade"
+    async:
+      - topic: "listings.created"
+        contract: "schemas/listing_created.json"
+        qos: at-least-once
+  storage:
+    - type: postgres
+      name: listings_db
+      owned_by: listings-service
+    - type: redis
+      name: idempotency_cache
+      owned_by: listings-service
+events:
+  published:
+    - topic: "listings.created"
+      contract: "schemas/listing_created.json"
+      version: 1
+  consumed:
+    - topic: "users.deleted"
+      contract: "schemas/user_deleted.json"
+      expected_version: 1
+consistency:
+  model: eventual
+  bounded_aggregate: listing
+  write_path:
+    pattern: outbox
+  read_path:
+    consistency: read-your-writes
+  cross_service_invariants:
+    - "a listing always has a valid owner_id"
+concurrency:
+  aggregates:
+    - name: listing
+      write_strategy: optimistic
+  hot_keys:
+    - "listing:popular"
+  shared_state:
+    - "idempotency_cache"
+edge_cases:
+  - id: EC-001
+    description: "duplicate listing creation"
+    test: "internal/handler/listing_test.go::TestEC001"
+scenarios:
+  - id: S-001
+    description: "happy path create listing"
+    test: "tests/e2e/scenario_001_test.go"
+    monitor: "synthetic-ms-listings-create"
+failure_modes:
+  - when: "kafka unavailable"
+    user_sees: "create succeeds, indexer eventually catches up"
+    detection: "lag metric > 30s"
+exceptions:
+  - rule: AI-001
+    scope:
+      endpoint: "GET /admin/health"
+    reason: "internal admin endpoint, no client retries"
+    approved_by: "@alice"
+    adr: "docs/adr/0042-skip-idempotency-on-admin.md"
+    expires: "2026-12-31"
+```
+
+## See also
+
+- [`VALIDATION_RULES.md`](./VALIDATION_RULES.md) — every `DET-*` and `AI-*`
+  rule that reads this file.
+- [`EXCEPTIONS.md`](./EXCEPTIONS.md) — declarative and inline suppression.
+- [`EXTENDING.md`](./EXTENDING.md) — adding a new language linter and
+  `<lang>_extensions` block.
+- `skills/architecture-sync/schema/servicemap.schema.json` — authoritative
+  JSON Schema (the source of this reference).
+
+---
+
+# Validation rules
+
+Source: https://github.com/krus210/archspec/blob/main/docs/VALIDATION_RULES.md
+
+# Validation rules
+
+Two layers, one catalog. Every rule has a stable id, a single owning
+implementation, and a fixed severity.
+
+| Layer | IDs | Where it runs | Latency budget |
+| --- | --- | --- | --- |
+| Deterministic | `DET-001`..`DET-015` | `hooks/pre-commit/run_all_checks.py` and `hooks/pre-push/` | < 1s, zero false positives |
+| AI / static | `AI-001`..`AI-010` | `/archspec:validate` via `linters/<lang>/` | seconds, contextual |
+
+Severity vocabulary:
+
+- `BLOCK` — fails the commit (or `/archspec:validate` exit code).
+- `WARN` — non-blocking warning surfaced in the report.
+- `AUTO-FIX` — the hook can repair the issue automatically and re-stage.
+- `INFO` — informational, used to draw reviewer attention.
+
+Every rule supports two suppression channels — declarative entries in
+`SERVICE_MAP.yaml` `exceptions[]` and inline `// archspec:ignore <ID> --
+<reason>` pragmas. See [`EXCEPTIONS.md`](./EXCEPTIONS.md) for the policy.
+
+## Deterministic layer (`DET-*`)
+
+### DET-001 · Schema validation · BLOCK
+
+Validates the staged `SERVICE_MAP.yaml` against
+`skills/architecture-sync/schema/servicemap.schema.json` (JSON Schema
+Draft-07). Implemented in `hooks/pre-commit/checks/check_schema.py`.
+Every error reports the failing JSON pointer and the schema message.
+
+The most common failures are: missing required keys (e.g. `metadata`,
+`service.ownership.primary`), wrong type (e.g. an integer where a string
+is expected), unknown property inside a closed core section
+(`additionalProperties: false`), or pattern mismatches such as
+`metadata.last_reviewed: 2026-4-25` (must be `YYYY-MM-DD`).
+
+To fix, follow the JSON pointer in the error to the offending field.
+Cross-reference [`SERVICE_MAP_SPEC.md`](./SERVICE_MAP_SPEC.md). Suppression
+is intentionally not supported for `DET-001`: a malformed file cannot be
+suppressed because no other rule can read it. Do not add it to
+`exceptions[]`.
+
+### DET-002 · Cycle and self-loop in sync dependencies · BLOCK
+
+Implemented in `hooks/pre-commit/checks/check_cycles.py`. Walks
+`dependencies.downstream.sync[]` for the staged file and reports two
+shapes of error: the service depending on itself
+(`service.name == sync[].service`) and the same downstream listed twice.
+
+Common failure: copy-pasting a downstream entry while iterating on
+timeouts and forgetting to rename the second copy. Less common but
+critical: a refactor that splits a service in half and accidentally
+references the original name.
+
+Fix: remove the duplicate entry or correct the typo. Cross-service cycle
+detection across multiple `SERVICE_MAP.yaml` files lives in the pre-push
+hook (`hooks/pre-push/check_drift.py`), not here. To suppress (e.g. an
+intentional self-call through a public API), add an `exceptions[]` entry
+with `rule: DET-002`, an ADR, and an approver — though in practice you
+should rename the entry instead.
+
+### DET-003 · Test and contract path existence · BLOCK
+
+Implemented in `hooks/pre-commit/checks/check_references.py`. Every
+`api.endpoints[].contract` path, every `edge_cases[].test` path, and
+every `scenarios[].test` path is resolved against the repo root and the
+service root (the YAML's grandparent directory) so that fixtures nested
+under `examples/<svc>/docs/SERVICE_MAP.yaml` remain portable.
+
+Common failures: the file was deleted, renamed, or moved without
+updating the YAML; the path uses the wrong separator
+(`internal\\handler\\foo_test.go` on Windows); the `test:` field still
+references the `::TestName` suffix but the underlying file was moved.
+
+Fix: update the path or restore the file. Suppress with an
+`exceptions[]` entry only when the contract is intentionally external
+(e.g. an OpenAPI doc hosted in a sibling repo) — and even then, prefer
+to vendor a copy. Inline `// archspec:ignore DET-003 -- <reason>` is not
+supported; this is a YAML-level rule.
+
+### DET-004 · Diagrams out of sync · AUTO-FIX
+
+Implemented in `hooks/pre-commit/checks/check_diagrams.py`. When
+`SERVICE_MAP.yaml` is staged, the hook re-runs the deterministic
+generator (`skills/architecture-sync/scripts/sync.py`) into a temp
+directory and compares the bytes against `docs/diagrams/*.mmd` and
+`docs/ARCHITECTURE.md`. Any difference is flagged.
+
+Common cause: editing `SERVICE_MAP.yaml` without running
+`/archspec:sync`. Because the generator is fully deterministic
+(alphabetical sort, pure `slugify`, no datetime/random/uuid, LF line
+endings), any drift is reproducible.
+
+Fix: run `/archspec:sync` and stage the regenerated files. The rule is
+classified `AUTO-FIX` because the hook prints the exact command needed
+and the generator is idempotent. Suppression is not supported and not
+useful — diagrams that disagree with the contract have no value.
+
+### DET-005 · Diagram edited without YAML · BLOCK
+
+Same file, opposite direction. If a `*.mmd` diagram (`context.mmd`,
+`container.mmd`, `sequence.mmd`) is staged but `SERVICE_MAP.yaml` is
+not, the hook blocks the commit with the message "manual edit of
+generated diagram".
+
+The generated artifacts are write-only outputs of `/archspec:sync`.
+Hand-editing them produces drift on the next sync run, when the
+generator overwrites the manual changes. Most often this happens when a
+contributor opens a `.mmd` file in their editor to tweak a label.
+
+Fix: edit `SERVICE_MAP.yaml` and rerun `/archspec:sync`. Suppression is
+not supported. If the generator output is genuinely insufficient, the
+fix is to extend the templates under
+`skills/architecture-sync/templates/`, not to bypass `DET-005`.
+
+### DET-006 · Idempotency downgrade without ADR · BLOCK
+
+Implemented in `hooks/pre-commit/checks/check_breaking_changes.py`.
+Compares the staged YAML against `HEAD`. When an existing endpoint
+flips `idempotency.required: true → false`, the hook requires a staged
+file under `docs/adr/*.md` in the same commit.
+
+This is one of the most consequential breaking changes a service can
+make: clients that previously relied on automatic deduplication may
+issue duplicate writes. The rule forces an ADR so the decision is
+recorded and reviewable.
+
+Fix: write `docs/adr/NNNN-relax-idempotency-on-<endpoint>.md`, stage
+both files, and re-commit. Suppression via `exceptions[]` requires the
+same ADR — there is no shortcut. Inline pragmas are not honored: this
+is a YAML-level rule.
+
+### DET-007 · Removed edge case or scenario without ADR · BLOCK
+
+Same check file as `DET-006`. Compares the set of
+`edge_cases[].id` and `scenarios[].id` between `HEAD` and the staged
+file. Any removal that lacks a staged ADR is blocked.
+
+Edge cases and scenarios are the contract's safety net. Removing
+`EC-014` ("creation under partial network failure") without a written
+rationale is exactly the kind of silent regression archspec exists to
+prevent. Renaming an id (e.g. EC-014 → EC-200) counts as a removal +
+addition; both must be justified.
+
+Fix: write `docs/adr/NNNN-retire-EC014.md` explaining the rationale,
+stage it alongside the YAML edit. Use `exceptions[]` only in
+exceptional cases (e.g. a one-time data correction); ADR is still
+required. No inline pragma support.
+
+### DET-008 · API change without changelog entry · BLOCK
+
+Same check file. Diffs the `api` block (excluding `changelog`) between
+`HEAD` and the staged YAML. Any structural change without at least one
+new entry in `api.changelog` is blocked.
+
+Common failures: adding an endpoint and forgetting the changelog entry;
+tightening a SLA without recording why; changing an `idempotency`
+configuration. The rule treats `api.changelog` as append-only — a
+missing or shorter list after the diff is also a failure.
+
+Fix: append a free-form entry (string, object, anything) to
+`api.changelog` describing the change. Suppression via `exceptions[]`
+is allowed for trivial reformatting (whitespace), but the recommended
+fix is always to append a `{date, change}` record.
+
+### DET-009 · Consistency model change · WARN
+
+Same check file. When `consistency.model` changes between `eventual`
+and `strong`, the hook emits a warning. It does not block; flipping the
+model has wide-reaching effects (read-your-writes guarantees, replica
+configuration, contract negotiations with consumers) and warrants an
+ADR but not a hard stop.
+
+Common cause: experimenting with a stronger guarantee during a refactor
+and committing the change before drafting the ADR. The warning is the
+nudge to slow down.
+
+Fix: write an ADR covering the new semantic. Suppression is rarely
+appropriate — leave the warning visible until the ADR exists.
+
+### DET-010 · Exceptions discipline · BLOCK
+
+Implemented in `hooks/pre-commit/checks/check_exceptions.py`. Every
+entry in `SERVICE_MAP.yaml exceptions[]` must have a non-empty `reason`
+and `approved_by`. Both are required by the schema as well; this rule
+catches the case where the schema accepts the field (string, length ≥ 1)
+but the content is meaningless.
+
+Common failure: stub entries left over from a refactor (`reason: TODO`,
+`approved_by: TBD`). The check accepts any non-empty string; humans
+review the actual content during PR review.
+
+Fix: fill in real values. Suppression is not supported — `DET-010`
+exists precisely to prevent suppressions from rotting.
+
+### DET-011 · Exception ADR link · BLOCK
+
+Same check file. Every `exceptions[].adr` field must point to an
+existing file in the repository. Missing field, empty string, or path
+that does not resolve all produce blocks.
+
+Common failures: ADR file was renamed or moved; ADR was committed in a
+different branch and was not merged before the exception PR; the path
+uses a leading slash (`/docs/adr/...`) instead of a repo-relative one.
+
+Fix: create the ADR or correct the path. The pre-commit hook resolves
+paths relative to the repository root, not the YAML file's directory.
+
+### DET-012 · Expired exceptions · WARN
+
+Same check file. Every `exceptions[].expires` date is compared to the
+current ISO date. Past dates produce a warning, not a block, so an
+expired exception does not freeze CI — but it is visible on every
+commit until cleaned up.
+
+This is the one place archspec is allowed to read the wall clock.
+Tests inject `today=` explicitly. The intent is to make stale
+suppressions noisy enough to drive removal.
+
+Fix: either remove the entry (preferred) or extend `expires` with a
+new ADR. Suppression is intentionally not supported — `DET-012` is
+itself a warning, and warnings must remain visible.
+
+### DET-013 · Exception change visibility · INFO
+
+Implemented as a summary line in `run_all_checks.py`. When the
+`exceptions[]` block changes between `HEAD` and the staged YAML, the
+hook surfaces an `INFO` notice on the run summary.
+
+This is documentation, not enforcement. The goal is to make it harder
+for an exception change to slip into a large PR diff unnoticed by
+reviewers.
+
+There is nothing to fix and nothing to suppress. To reduce noise, batch
+exception changes into dedicated PRs labeled `archspec/exception`.
+
+### DET-014 · Temporary exception without expires · WARN
+
+Same check file as `DET-010`. Scans every `exceptions[].reason` for the
+words `migration`, `temporary`, or `legacy` (case-insensitive). If the
+reason matches and the entry has no `expires` date, the hook warns.
+
+The pattern catches the most common rationale for a "should be
+short-lived" suppression. Treating it as `WARN` (not `BLOCK`) is a
+deliberate trade-off — sometimes a legacy adapter genuinely has no
+removal date — but the warning serves as a prompt to add one.
+
+Fix: add an `expires: YYYY-MM-DD` field. Suppression is not supported
+and not appropriate.
+
+### DET-015 · Pragma format discipline · BLOCK
+
+Implemented in `hooks/pre-commit/checks/check_pragmas.py`. Scans every
+staged source file (`.go`, `.py`, `.js`, `.ts`, `.java`, `.kt`, `.rs`)
+for `archspec:ignore` and `archspec:ignore-block` pragmas. Every pragma
+must include a `--` reason comment; otherwise the commit is blocked.
+
+Common failure: copy-pasting a pragma from a snippet and forgetting the
+trailing reason (`// archspec:ignore AI-002` instead of
+`// archspec:ignore AI-002 -- migration script, single-use`). The rule
+treats the missing reason as a hard error because unreasoned
+suppressions are the failure mode that makes the entire suppression
+mechanism untrustworthy.
+
+Fix: append `-- <reason>` to the pragma. Suppression is not supported
+(the rule itself is what makes other suppressions auditable). If you
+cannot articulate the reason in a single line, the suppression should
+move to `SERVICE_MAP.yaml exceptions[]` where the full ADR + approver
+context lives.
+
+## AI layer (`AI-*`)
+
+### AI-001 · Idempotency declared but not implemented · BLOCK
+
+Implemented in `linters/go/handler_idempotency.go`. For every endpoint
+where `idempotency.required: true`, the linter looks up the matching
+Go handler function (matched by `Endpoint.Name`), then walks its body
+for `r.Header.Get("<KeySource>")` calls. Two failure shapes are
+reported: no matching handler at all, and a handler that does not read
+the declared header.
+
+Common failures: the handler was renamed but the YAML still references
+the old name; the header constant lives in a sibling package and the
+linter cannot see the literal string; the handler reads the header but
+does not pass it to the dedup store.
+
+Fix: name the handler exactly `Endpoint.Name` and read the header
+explicitly. To suppress on a documented exception (e.g. an internal
+admin endpoint with no client-side retries), add an `exceptions[]`
+entry scoped to the endpoint. Inline `// archspec:ignore AI-001 --
+<reason>` is supported when the suppression applies to a single
+function.
+
+### AI-002 · Outbox pattern violation · BLOCK
+
+Implemented in `linters/go/outbox_pattern.go`. When
+`consistency.write_path.pattern: outbox`, the linter walks every
+function body and flags the sequence `<repo>.Save(...)` followed by
+`<publisher>.Publish(...)`. The expected pattern is `Save(...)` plus
+an outbox-table append in the same transaction.
+
+Common failures: inherited "save then publish" code from before the
+service adopted the outbox pattern; a refactor that introduced the
+outbox table for one entity but missed another; a helper that calls
+`Publish` indirectly through a wrapper the linter does not match.
+
+Fix: append the event to `go_extensions.outbox_table` (default surfaced
+in the suggested-fix string) inside the same database transaction that
+performed the save. Suppress one-off migration scripts with
+`// archspec:ignore AI-002 -- migration: backfill outbox`. Persistent
+exceptions belong in `exceptions[]` with an ADR.
+
+### AI-003 · Optimistic locking missing version predicate · BLOCK
+
+Implemented in `linters/go/optimistic_locking.go`. When at least one
+`concurrency.aggregates[].write_strategy: optimistic` is declared, the
+linter scans every Go string literal for SQL `UPDATE` statements and
+asserts that the configured version column (default `row_version`,
+overridden by `go_extensions.optimistic_locking_field`) appears at
+least twice — once in `SET` and once in `WHERE`.
+
+Common failures: hand-written SQL that omits `AND row_version = ?`; an
+ORM-generated query that uses a column name (`version`) different from
+the declared field; an UPDATE without a `WHERE` clause at all (the
+linter skips this because it is a separate bug).
+
+Fix: append `AND <field> = ?` to the WHERE clause and bump the column
+in `SET`. Suppress one-off admin scripts with an inline pragma; durable
+exceptions (e.g. an aggregate that intentionally uses application-level
+serialization) belong in `exceptions[]`.
+
+### AI-004 · Architecture rules — facade only · BLOCK
+
+Specified in the design but **not yet implemented in `linters/go/`**.
+Once shipped, the rule will read
+`architecture_rules.facade_only.[serviceX]` and report any code that
+imports `serviceX/internal/...` directly instead of going through the
+declared facade.
+
+Until the implementation lands, declaring the rule has documentation
+value only. The pre-commit and `/archspec:validate` runs will neither
+report nor block on it. Track the implementation status in
+`linters/go/README.md`.
+
+To prepare for the rule, declare the facade in `architecture_rules` now
+and review imports manually. When the linter ships, the existing
+declaration will activate it without a YAML change.
+
+### AI-005 · Edge case coverage · WARN
+
+Specified in the design but **not yet implemented in `linters/go/`**.
+The intended behavior: for every `edge_cases[]` entry, locate the test
+referenced by `test:` and assert that it actually exercises the case.
+Severity is `WARN` because heuristic test inspection is inherently
+fuzzy.
+
+Today only `DET-003` checks that the test file exists. `AI-005` will
+extend the check to function-level matching (e.g. `TestEC001` exists
+inside the file) and ideally to behavior-level matching (the test
+mentions the documented condition).
+
+Until shipped, treat `edge_cases[]` as a peer-review checklist. Add the
+test reference and rely on PR review until the linter takes over.
+
+### AI-006 · Scenario coverage · WARN
+
+Specified in the design but **not yet implemented in `linters/go/`**.
+Mirrors `AI-005` for the `scenarios[]` array. The intended behavior:
+locate the e2e test (and, when present, the synthetic monitor) and
+assert that both are alive.
+
+Today the only check is `DET-003` (file existence). The future linter
+will additionally probe the monitor name through a stub registry and
+validate the test signature.
+
+Until shipped, treat scenario coverage as a release-checklist item.
+
+### AI-007 · Swallowed downstream errors · WARN
+
+Implemented in `linters/go/swallowed_errors.go`. When at least one
+`dependencies.downstream.sync[]` entry declares an `on_failure` policy, the
+linter flags a method call whose return is discarded via a blank `_` — both the
+fully-discarded form (`_ = recv.Method(...)`) and the common partial form
+(`resp, _ := recv.Method(...)`, error position blanked).
+
+Severity is `WARN`, not `BLOCK`: the matcher is AST-only and cannot prove the
+receiver is one of the declared downstream clients (vs a local logger/metrics
+helper), so it advises rather than blocks. Receiver-type resolution that would
+justify `BLOCK` is a planned extension.
+
+Common failures: a fire-and-forget call that should propagate or degrade; a
+refactor that dropped the `if err != nil` after a downstream call.
+
+Fix: capture the error and handle it per the declared `on_failure`
+(`propagate`, `fail-open`, `fail-closed`, `degrade-gracefully`). Suppress a
+genuinely fire-and-forget call with an inline `// archspec:ignore AI-007 --
+<reason>` pragma, or an `exceptions[]` entry for a durable case.
+
+### AI-008 · Redundant call detection · WARN
+
+Implemented in `linters/go/redundant_call.go`. Flags a singular method
+called inside a `for`/`range` loop when a batch sibling
+(`<Method>Batch`, `<Method>sBatch`, `<Method>esBatch`) appears anywhere in the
+scanned code — e.g. `GetDistance` looped per worker while `GetDistancesBatch`
+is available. Each iteration is a round-trip the batch call collapses.
+
+This is a pure code-pattern heuristic: it does **not** consult
+`dependencies.downstream`, so it cannot prove the looped call is a downstream
+RPC (it may be any batch-capable operation) — another reason it stays `WARN`.
+
+Severity is `WARN` (raised from the originally-reserved `INFO`): the matcher is
+conservative — it fires only when a concrete batch sibling exists in the code —
+so the signal is reliable enough to surface in the report, while staying
+non-blocking because batching is a performance choice, not a correctness one.
+
+Fix: collect the inputs in the loop and call the batch method once afterwards.
+Suppress with an inline `// archspec:ignore AI-008 -- <reason>` pragma when the
+per-item call is intentional (e.g. early-exit on the first match).
+
+### AI-009 · Undeclared event · WARN
+
+Implemented in `linters/go/undeclared_event.go` (v1 scope: **NATS topics**).
+Detects `Publish`, `Subscribe`, and `QueueSubscribe` calls whose first argument
+resolves to a concrete string — a literal or a package-level string `const`
+(so `natsSubjectTaskFailed = "task.failed"` resolves) — and that is shaped like
+a NATS subject. A published topic absent from `events.published[].topic`, or a
+subscribed topic absent from `events.consumed[].topic`, is flagged.
+
+Severity is `WARN`, not `BLOCK`: the matcher keys on the method name
+(`Publish`/`Subscribe`/`QueueSubscribe`) and the subject shape but is AST-only
+and does not verify the receiver is an actual NATS client, so a non-NATS
+publisher with a topic-shaped argument is not hard-blocked. A subject built at
+runtime or a non-subject-shaped string is skipped rather than guessed.
+
+Planned extension (not in v1): service-level detection (gRPC `New<Svc>Client`
+vs `dependencies.downstream`), database dependencies, and Kafka topic
+resolution (the topic hides in a writer-config struct field).
+
+Fix: declare the topic in `events.published` / `events.consumed`, or stop
+emitting/consuming it. Suppress a deliberate reply-subject with an inline
+`// archspec:ignore AI-009 -- <reason>` pragma.
+
+### AI-010 · Undeclared endpoint · BLOCK
+
+Specified in the design but **not yet implemented in `linters/go/`**.
+Intended behavior: detect new HTTP/gRPC handlers registered in code
+that are missing from `api.endpoints[]`.
+
+Today the easiest way to catch undeclared endpoints is to grep for the
+service's router setup and reconcile against `api.endpoints` during
+review. When the linter ships it will run during `/archspec:validate`.
+
+When implementing, keep the matcher conservative — false positives on
+this rule erode trust quickly.
+
+## See also
+
+- [`SERVICE_MAP_SPEC.md`](./SERVICE_MAP_SPEC.md) — every key these rules
+  read.
+- [`EXCEPTIONS.md`](./EXCEPTIONS.md) — declarative and inline
+  suppression for any rule that supports it.
+- [`EXTENDING.md`](./EXTENDING.md) — adding new linters under
+  `linters/<lang>/` and reserving new `AI-*` ids.
+- `linters/go/README.md` — currently shipped subcommands.
+- `hooks/pre-commit/checks/` — `DET-*` implementations.
+
+---
