@@ -1,0 +1,2052 @@
+# README.md
+
+Source: https://github.com/getkyo/kyo/blob/main/README.md
+
+<img src="https://raw.githubusercontent.com/getkyo/kyo/main/kyo.png" width="200" alt="Kyo">
+
+
+Kyo is a Scala 3 toolkit for building applications. Its starting point is what it makes impossible: an error path left unhandled does not compile. An effect used without being declared in the signature is rejected at the call site. A resource cannot outlive its scope, even when something fails partway through. Concurrent work started together cannot leak its children. A durable workflow's progress survives a crash and resumes from the last completed step. One source tree compiles to JVM, JavaScript, Scala Native, and WebAssembly.
+
+The mechanism behind those guarantees is algebraic effects with modular handlers, exposed through a compact infix type `A < S` ("A pending S"): `A` is the value the computation produces, and `S` is the open, type-level *set* of effects it needs. A function returning `A < (Sync & Abort[E] & Env[Config] & Emit[Log])` names its four effects in its return type. Handlers remove effects from the set one at a time, the call site decides where each one runs, and the compiler refuses to execute anything until the set is empty. Composition stays ordinary Scala: `map`, `flatMap`, and for-comprehensions over plain values. The theory traces back to Plotkin and Pretnar and to languages like Koka and Eff.
+
+For a deeper context, see [Suspension: the magic behind composability](https://www.youtube.com/watch?v=y3KiuFczOFE) (Lambda Days 2025), or jump to [Modules](#modules) for the ecosystem map.
+
+> Coming from ZIO or Cats Effect? Jump straight to [the migration table](#coming-from-zio-or-cats-effect).
+
+## Getting Started
+
+Add the modules you want to `build.sbt`. Most application code starts with `kyo-core` (see the [Modules](#modules) tables below for what each module provides). Add more modules as needed.
+
+```sbt doctest:expect=skipped
+libraryDependencies ++= Seq(
+    "io.getkyo" %% "kyo-core" % "<version>",
+    "io.getkyo" %% "kyo-http" % "<version>"    // optional: HTTP client/server
+)
+```
+
+Use `%%` for JVM and Scala Native, `%%%` for the Scala.js and WebAssembly backends. See the [Modules](#modules) tables below for platform support per module. Replace `<version>` with: ![Version](https://img.shields.io/maven-central/v/io.getkyo/kyo-core_3)
+
+A minimal application extends `KyoApp`, the entrypoint trait that discharges the effect row your `main` body produces:
+
+```scala doctest:expect=skipped
+import kyo.*
+
+object Hello extends KyoApp:
+    run {
+        Console.printLine("Hello from Kyo")
+    }
+end Hello
+```
+
+A first read-through of [`kyo-core/README.md`](kyo-core/README.md) covers `Sync`, `Async`, `Scope`, `Fiber`, `KyoApp`, and the standard concurrent primitives. The natural follow-up for an application developer is [`kyo-http`](kyo-http/README.md). From there, drop into the module map below as your application grows.
+
+### Prerequisites
+
+Kyo uses advanced features from the latest Scala 3 versions that IntelliJ IDEA may not fully support. For a smoother development experience, we recommend using a [Metals-based](https://scalameta.org/metals/) IDE with the SBT BSP server, which offers better stability. Refer to the Metals [guide](https://scalameta.org/metals/docs/build-tools/sbt/#sbt-build-server) to switch from Bloop to SBT BSP.
+
+These Scala compiler flags are required when working with Kyo. They catch common mistakes (silently discarded effects, untyped equality) that the API surface relies on you not making:
+
+1. `-Wvalue-discard`: Warns when non-Unit expression results are unused.
+2. `-Wnonunit-statement`: Warns when non-Unit expressions are used in statement position.
+3. `-Wconf:msg=(unused.*value|discarded.*value|pure.*statement):error`: Elevates the warnings from the previous flags to compilation errors.
+4. `-language:strictEquality`: Enforces type-safe equality comparisons by requiring explicit evidence that types can be safely compared.
+
+Add these to your `build.sbt`:
+
+```scala doctest:expect=skipped
+scalacOptions ++= Seq(
+    "-Wvalue-discard",
+    "-Wnonunit-statement",
+    "-Wconf:msg=(unused.*value|discarded.*value|pure.*statement):error",
+    "-language:strictEquality"
+)
+```
+
+## Introduction
+
+This section is how the guarantees work: the pending type, how to import Kyo, how to compose effects, the shape every effect follows, how handler ordering shows up in the result type, and the recommended writing style. It is the working vocabulary for every module README, and each subsection links into the relevant per-module deep dive.
+
+### The pending type
+
+The pending type is the one piece of vocabulary you need before reading the rest of the docs. Kyo wraps every effectful computation in an opaque type `A < S` ("`A` pending `S`"), where `A` is the value the computation will produce and `S` is the *set* of effects it depends on. `S` is a Scala 3 intersection type built from individual effect markers like `Sync`, `Async`, `Abort[E]`, `Env[R]`, `Var[V]`, `Emit[V]`, `Scope`, and any custom effect you define. An effect is *added* to the row by mentioning it in the type; an effect is *removed* by applying its handler.
+
+A plain value lifts into the empty row (`A < Any`) automatically via an implicit conversion, so a bare `42` is already a valid `Int < S` for any `S`. There is no need for a `pure` / `Kyo.lift` call: any non-computation expression in a position that wants a computation is lifted on the spot.
+
+```scala doctest:scope=inherited
+import kyo.*
+
+// implicit conversion: the bare 42 lifts into the empty effect row
+val a: Int < Any = 42
+
+// an Abort effect joins the row (map extracts the Int before the conditional)
+val b: Int < Abort[String] =
+    a.map(v => if v > 0 then v else Abort.fail("not positive"))
+
+// adding Sync wraps b in a side-effectful step: the row now carries both
+val c: Int < (Abort[String] & Sync) =
+    Sync.defer(b)
+```
+
+Handlers discharge one effect at a time, returning a value whose row no longer mentions that effect:
+
+```scala doctest:scope=inherited
+// Abort.run handles Abort[String], leaving < Sync
+val d: Result[String, Int] < Sync = Abort.run(c)
+```
+
+`.eval` is the "give me the value" call for computations without side effects (no pending `Sync`). The compiler will refuse it until every effect in the row has been handled. A `< (Sync & Abort[E])` value cannot escape into plain Scala without `Sync` and `Abort` being explicitly handled first; the unhandled-effect set is part of the value's type. This is the single property that makes the rest of Kyo work: every signature spells out exactly which effects it consumes, and the call site decides where each one gets interpreted.
+
+The expected way to discharge `Sync` is through an entrypoint that owns the side-effecting boundary: `kyo.KyoApp` for applications (see [`kyo-core`](kyo-core/README.md)), `kyo.test.Test` for tests (the project's own cross-platform test framework, see [`kyo-test`](kyo-test/README.md)). An escape hatch for scripts and REPL exploration exists (`Sync.Unsafe.evalOrThrow`, gated by an explicit `AllowUnsafe` witness), but it bypasses the runtime guarantees the effect system provides; see [`kyo-core`](kyo-core/README.md) for when and how to use it.
+
+### Imports: all you need is `import kyo.*`
+
+One import covers everything. `import kyo.*` brings in the pending type, the value types (`Maybe`, `Result`, `Chunk`, `Span`), the effects (`Sync`, `Async`, `Abort`, `Env`, `Var`, `Scope`, `Emit`), and the runtime primitives (`Fiber`, `Channel`, `Promise`, `AtomicRef`). Adding a module to the classpath adds its types to that same import: no per-module import to remember. Two subpackages exist for specialized use, `kyo.kernel.*` (defining new effects) and `kyo.compat.*` (the runtime-portable library-author surface, see [`kyo-compat`](kyo-compat/README.md)), and any module asking for an import beyond `kyo.*` says so in its README.
+
+### Composing computations: `map`, `flatMap`, and `for`
+
+`A < S` is a monad. You build larger computations out of smaller ones with `map` and `flatMap`, the same way you would with `Option`, `Future`, `IO`, or `ZIO`:
+
+```scala
+val parsed: Int < Sync =
+    Sync.defer("42").map(_.toInt)
+
+val chained: String < Sync =
+    Sync.defer("42").flatMap { s =>
+        Sync.defer(s.toInt).map(_ + 1).map(_.toString)
+    }
+```
+
+In Kyo, `map` and `flatMap` are the same method. Both have this signature:
+
+```scala doctest:expect=skipped
+extension [A, S](v: A < S)
+    def map[B, S2](f: A => B < S2): B < (S & S2)
+    def flatMap[B, S2](f: A => B < S2): B < (S & S2)
+```
+
+The function argument is always `A => B < S2`. A plain function `A => B` passes too because of **automatic lifting**: any value of type `A` lifts to `A < S` through a zero-cost type-level conversion (no runtime wrapping, no allocation), so `A => B` is already a valid `A => B < Any`. There is no `pure`, `succeed`, or `point` to call, ever: wherever a computation is expected, a plain value works.
+
+```scala
+def describe(n: Int < Sync): String < Sync =
+    n.map(v => if v > 0 then "positive" else "non-positive")
+
+// A plain value lifts on the spot: no wrapping call, no allocation
+val fromValue: String < Sync = describe(42)
+
+// An effectful computation passes unchanged
+val fromEffect: String < Sync = describe(Sync.defer(42))
+
+// map takes pure and effectful functions alike: a pure function's result
+// lifts, an effectful function's row merges into the result type
+val pureStep: Int < Sync      = Sync.defer(20).map(_ + 1)
+val effectfulStep: Int < Sync = pureStep.map(v => Sync.defer(v * 2))
+```
+
+This is what keeps Kyo code free of wrapping ceremony. For-comprehensions mix pure and effectful steps without marking which is which, the bind never needs a separate `pure` operation the way classical monad encodings do, and a function that accepts `A < S` accepts a constant from a test as easily as a database call from production.
+
+> **Note:** Automatic lifting is the type-level dual of JS-Promise-style flattening, and it is what makes the encoding sound. `Promise.then` accepts either `A => B` or `A => Promise<B>` and at runtime *flattens* a returned `Promise<Promise<A>>` down to `Promise<A>` by running the inner promise dynamically. That flatten loses the ability to represent a real `Promise<Promise<A>>`, breaks the monad laws, and forces every consumer to reason about an implicit runtime collapse. Kyo's automatic lifting does the opposite: there is no runtime collapse, `B < S2 < S3` is a real distinct type. Use `Kyo.lift` when you explicitly want to nest a computation (`Kyo.lift(inner: B < S2): (B < S2) < S3`); use `.flatten` to collapse one. The one bind operator stays both honest and law-abiding.
+
+The idiomatic use in Kyo is composing computations with `map`. The `flatMap` method is offered for compatibility with for-comprehensions given the compiler's requirements:
+
+```scala
+val program: String < Sync =
+    for
+        a <- Sync.defer("40")
+        b <- Sync.defer(a.toInt + 2)
+    yield b.toString
+```
+
+This is the same programs-as-values style you might know from cats-effect, ZIO, fs2, or scalaz. The difference is the row: instead of one `IO[A]` per computation, each `A < S` carries the open *set* of effects it uses, and handlers shrink that set toward `Any` until `.eval` can run.
+
+### Composing many computations: sequential vs parallel
+
+Once you have a collection of `A < S` values, two companions cover collection-style operations:
+
+- **`Kyo.*` for sequential execution** (defined in kyo-prelude, works over any effect row). `Kyo.collectAll(xs)` turns a `Seq[A < S]` into a `Seq[A] < S`; `Kyo.foreach(xs)(f)` maps an effectful function over a collection; `Kyo.fill(n)(v)` runs the same effect `n` times; `Kyo.zip(a, b, c)` combines several effects into a tuple. None of these require `Sync` or `Async`.
+- **`Async.*` for parallel execution** (defined in kyo-core, requires `Async` in the row). `Async.foreach(xs, concurrency = 8)(f)` fans out with a bounded pool; `Async.gather(...)` collects results from concurrent computations; `Async.zip(a, b)` runs two in parallel.
+
+Mental model: reach for `Kyo.*` when sequential processing is sufficient, `Async.*` when concurrent execution would help. The Kyo companion lives in kyo-prelude alongside the core effects, not on `Sync` or `Async` themselves, because it works for any effect row.
+
+### The shape of an effect
+
+Every Kyo effect has the same three-phase shape: it is *introduced* into the row, *used* inside a computation, and *discharged* by its handler. Once you have read one effect, you have read all of them. The companion-object methods follow a small naming convention that mirrors those three phases:
+
+- `init*` constructs an instance of the effect's container type (`Fiber.init`, `Promise.init`, `Channel.init`, `Hub.init`).
+- `get*` lifts an existing value into the effect's row (`Abort.get(Right(42))` produces an `Int < Abort[Nothing]`, `Env.get[Config]` reads the environment value, `Var.get[V]` reads the current state).
+- `run*` discharges the effect, returning a computation whose row no longer mentions it (`Abort.run`, `Env.run(config)`, `Var.run(init)`, `Sync.Unsafe.evalOrThrow`).
+
+> **Note:** A common misconception is that Kyo tracks every side effect a computation performs, a separate effect for console access, another for clock reads, and so on. It does the opposite. The pending set is kept deliberately small and canonical: `S` names coarse effects (can this perform side effects, can it fail, can it park), not individual operations. Printing to the console, for instance, is just `Sync`, with no `Console` effect in the row (`Console` is an ordinary API whose methods return `Unit < Sync`). Keeping the set small is what makes rows readable and effects compose, instead of turning every signature into a ledger of operations.
+
+Defining a brand-new effect is therefore an advanced, rarely-needed step. The three-phase shape applies to your own effects too (`ArrowEffect` / `ContextEffect`, see [`kyo-kernel`](kyo-kernel/README.md)), but most of what looks like it needs a new effect is better served by an opaque type with extension methods layered over the existing effects. Reach for a genuinely new effect only when no existing one captures the control-flow shape you need.
+
+```scala doctest:scope=inherited
+val program: Int < (Abort[String] & Env[Int]) =
+    for
+        v <- Abort.get(Right(42)) // introduce a value into Abort[String]'s row
+        e <- Env.get[Int]         // read the Env[Int] context value
+    yield v + e // use both; Kyo tracks the row in the type
+
+// run* discharges one effect at a time, narrowing the row
+val handled: Result[String, Int] < Any =
+    Env.run(10)(Abort.run(program))
+
+val result: Result[String, Int] = handled.eval
+```
+
+When more than one handler is needed, the `.handle` method chains them left-to-right without nesting parentheses. It takes any number of functions and applies them in order, so a handler pipeline reads top-down the way the row shrinks:
+
+```scala doctest:scope=inherited
+val viaHandle: Result[String, Int] =
+    program.handle(Abort.run(_), Env.run(10)).eval
+
+// equivalent to the nested form above
+val viaNesting: Result[String, Int] =
+    Env.run(10)(Abort.run(program)).eval
+
+// .handle also accepts ordinary transformations and `.eval` itself
+val unwrapped: Int =
+    program.handle(Abort.run(_), Env.run(10), _.map(_.getOrElse(0)), _.eval)
+```
+
+### Effect ordering
+
+Swapping the order in which two handlers run changes the result type of the computation, not just its runtime semantics. The inner handler's residual type is the outer handler's input, so the resulting shape is composed bottom-up. The type checker catches mismatches at the call site.
+
+A short illustration with `Var[Int]` and `Abort[String]`. `Var.runTuple(init)(v)` pairs the final state with the result; `Abort.run(v)` lifts a possible failure into a `Result`. Running them in opposite orders produces different return types:
+
+```scala doctest:scope=inherited
+val counted: Int < (Abort[String] & Var[Int]) =
+    for
+        _ <- Var.update[Int](_ + 1)
+        n <- Var.get[Int]
+        _ <- if n < 5 then ().asInstanceOf[Unit < Any] else Abort.fail("limit reached")
+    yield n
+
+// Var.runTuple inside, Abort.run outside.
+// The Var folds its state into a tuple. If Abort fires, the whole computation aborts
+// before the tuple is built. Result: Result[String, (Int, Int)].
+val varInner: Result[String, (Int, Int)] =
+    counted.handle(Var.runTuple(0), Abort.run(_)).eval
+
+// Abort.run inside, Var.runTuple outside.
+// Abort.run wraps the Int in a Result while Var is still in the row, so when
+// Var.runTuple runs it pairs its state with that Result. State survives the abort.
+// Result: (Int, Result[String, Int]).
+val varOuter: (Int, Result[String, Int]) =
+    counted.handle(Abort.run(_), Var.runTuple(0)).eval
+```
+
+The state visibility differs: `varOuter` lets you read the final counter even when the computation aborted, because `Var.runTuple` saw the `Result` instead of being short-circuited; `varInner` discards any state that did not survive into the produced tuple. The same pattern shows up for `Choice` with `Abort` (a `Seq[Result[E, A]]` versus a `Result[E, Seq[A]]`), for `Emit` with `Abort` (emitted values up to the failure point are kept or lost), and for any pair of effects where one observes the other. See [`kyo-prelude`](kyo-prelude/README.md) and [`kyo-kernel`](kyo-kernel/README.md) for the per-effect discussion.
+
+### Idiomatic style: monadic by default
+
+Kyo is programs-as-values: every `A < S` is a pure description that handlers interpret. The recommended way to write Kyo code is the monadic style introduced above: `map` and Scala 3's for-comprehensions over `A < S` values, with handler chains (`comp.handle(Abort.run, Env.run(config))`) discharging effects runs the program. The rest of the documentation, the worked examples, and the library code itself are written in this form because monadic composition needs no macro, no compiler-plugin syntax, and no rewrite rules: it is just the pure-monad style.
+
+If you prefer direct-style code, [kyo-direct](kyo-direct/README.md) ships a `direct { ... }` macro that lets you write `val x = effect1.now; val y = effect2.now; x + y` and compiles it to the same `map` chain. Direct style is an alternative, not the default. Reach for it when a function's suspension graph is dense enough that nested `map` calls or a long for-comprehension would obscure the logic; stay with the monadic style everywhere else. Either way, the underlying values are still pure monadic computation: `direct { ... }` is sugar, not a different runtime.
+
+## Platforms
+
+One source tree, one Scala 3 LTS compiler, four published targets:
+
+| Platform     | Runtime              | Coordinate |
+| ------------ | -------------------- | ---------- |
+| JVM          | JDK 21+              | `%%`       |
+| Scala.js     | Node.js, browsers    | `%%%`      |
+| Scala Native | Native binary (LLVM) | `%%`       |
+| WebAssembly  | Node.js 24+          | `%%%`      |
+
+Scala.js and the WebAssembly backend share a single-threaded, event-loop concurrency model; on the JVM, Kyo runs its multi-threaded work-stealing scheduler.
+
+WebAssembly uses the experimental Scala.js WebAssembly backend (WasmGC). It runs on Node.js 24+, where V8's Turboshaft Wasm pipeline is the default; Kyo passes `--experimental-wasm-exnref` for the exception-handling opcodes the backend emits. Because the backend shares Scala.js's source and model, WASM coverage matches Scala.js with one exception: the cats-effect bridges `kyo-cats` and `kyo-compat-ce` are not built for WASM, because cats-effect does not yet support the backend ([cats-effect#4608](https://github.com/typelevel/cats-effect/issues/4608)).
+
+## Modules
+
+Every module ships its own README. Open the linked README for the full surface, features, callouts, and worked examples. The tables below name each module's identity in one sentence so you can pick the right one fast. Each identity cell names types and operations defined inside that module; expect unfamiliar names on first scan and treat the linked README as the source for what each one does. Platform columns mean published artifacts: ✅ marks the platforms each module is published for.
+
+### Core
+
+What every Kyo program uses. `kyo-core` and `kyo-prelude` carry the effects you touch most, `kyo-data` the value types they return. `kyo-kernel` defines `A < S` itself and is where effect authors look. `kyo-scheduler` is the engine fibers run on, also usable as a standalone jar (see [the drop-in scheduler](#drop-in-scheduler-for-zio-cats-effect-pekko-finagle)). `kyo-data` also works standalone: `Maybe`, `Result`, and `Chunk` without the effect system.
+
+| Module                                       | JVM | JS  | Native | WASM | Identity                                                                                                   |
+| -------------------------------------------- | --- | --- | ------ | ---- | ---------------------------------------------------------------------------------------------------------- |
+| [kyo-core](kyo-core/README.md)               | ✅  | ✅  | ✅     | ✅   | I/O and concurrency: `Sync`, `Async`, `Scope`, `Fiber`, `Channel`, `Hub`, `Queue`, `Clock`, `Log`, `Path`  |
+| [kyo-prelude](kyo-prelude/README.md)         | ✅  | ✅  | ✅     | ✅   | Strictly-pure effect layer: `Abort`, `Env`, `Var`, `Memo`, `Choice`, `Emit`, `Poll`, `Stream`, `Layer`     |
+| [kyo-data](kyo-data/README.md)               | ✅  | ✅  | ✅     | ✅   | Low-allocation data types: `Maybe`, `Result`, `Chunk`, `Span`, `Duration`, `Instant`, `Schedule`, `TypeMap`|
+| [kyo-kernel](kyo-kernel/README.md)           | ✅  | ✅  | ✅     | ✅   | Algebraic-effects substrate; defines `A < S`, `ArrowEffect`, `ContextEffect`, multi-shot continuations     |
+| [kyo-scheduler](kyo-scheduler/README.md)     | ✅  | ✅  | ✅     | ✅   | Adaptive work-stealing pool with automatic blocking detection and admission control                        |
+
+### Applications
+
+The vertical an application developer assembles: HTTP services and clients, derived codecs, runtime config and feature flags, durable workflows, web UIs, and a GraphQL surface.
+
+| Module                                       | JVM | JS  | Native | WASM | Identity                                                                                                   |
+| -------------------------------------------- | --- | --- | ------ | ---- | ---------------------------------------------------------------------------------------------------------- |
+| [kyo-http](kyo-http/README.md)               | ✅  | ✅  | ✅     | ✅   | HTTP/1.1 client and server with shared API across JVM/JS/Native/WASM, bidirectional OpenAPI                |
+| [kyo-schema](kyo-schema/README.md)           | ✅  | ✅  | ✅     | ✅   | One `derives Schema` powers JSON, Protobuf, validation, lenses, diffs, builders, and structural conversion |
+| [kyo-config](kyo-config/README.md)           | ✅  | ✅  | ✅     | ✅   | Type-safe config + feature flags with a percentage-rollout DSL, optional kyo-http admin and live sync      |
+| [kyo-flow](kyo-flow/README.md)               | ✅  | ✅  | ✅     | ✅   | Durable workflow engine (Temporal/Cadence/ZIO-Flow space); value-replay execution, auto-generated REST     |
+| [kyo-ui](kyo-ui/README.md)                   | ✅  | ✅  | ✅     | ✅   | Web UIs as pure values: Scala.js DOM app, server HTML-over-SSE or SSR stream with first-class reactivity   |
+| [kyo-ai](kyo-ai/README.md)                   | ✅  | ✅  | ✅     | ✅   | Typed LLM programs: prompts, tools, thoughts, agents, streaming, provider backends                         |
+| [kyo-caliban](kyo-caliban/README.md)         | ✅  |     |        |      | Caliban GraphQL mounted on kyo-http: typed Kyo effects in resolvers, WebSocket subscriptions               |
+
+### Writing style
+
+Alternative dialects to write Kyo code more fluently. Pick `kyo-direct` for straight-line code with `.now` suspension points; pick `kyo-combinators` for ZIO-style fluent operators and the `forAbort[E1]` failure-narrowing DSL.
+
+| Module                                         | JVM | JS  | Native | WASM | Identity                                                                                                  |
+| ---------------------------------------------- | --- | --- | ------ | ---- | --------------------------------------------------------------------------------------------------------- |
+| [kyo-direct](kyo-direct/README.md)             | ✅  | ✅  | ✅     | ✅   | Direct-style: `direct { val x = effect.now; ... }` desugars to the equivalent `flatMap` chain             |
+| [kyo-combinators](kyo-combinators/README.md)   | ✅  | ✅  | ✅     | ✅   | Sanctioned home for symbolic operators (`*>`, `<*>`, `&>`) and the `forAbort[E1]` narrowing DSL           |
+
+### Testing
+
+The project's own reusable cross-platform test framework, plus a bridge for running `zio-test` suites with Kyo bodies.
+
+| Module                                       | JVM | JS  | Native | WASM | Identity                                                                                                  |
+| -------------------------------------------- | --- | --- | ------ | ---- | --------------------------------------------------------------------------------------------------------- |
+| [kyo-test](kyo-test/README.md)               | ✅  | ✅  | ✅     | ✅   | Cross-platform test framework for kyo-based codebases                                                     |
+| [kyo-zio-test](kyo-zio-test/README.md)       | ✅  | ✅  | ✅     | ✅   | Write `zio-test` `Spec`s whose bodies are Kyo computations (`KyoSpecDefault`, `KyoSpecAbstract`)          |
+
+### Concurrency
+
+Higher-level concurrency built on `kyo-core`'s fiber runtime. Reach for `kyo-actor` for typed message passing; `kyo-stm` for multi-cell atomicity; `kyo-offheap` for typed arrays outside the JVM heap.
+
+| Module                                         | JVM | JS  | Native | WASM | Identity                                                                                                  |
+| ---------------------------------------------- | --- | --- | ------ | ---- | --------------------------------------------------------------------------------------------------------- |
+| [kyo-actor](kyo-actor/README.md)               | ✅  | ✅  | ✅     | ✅   | Typed actors over `Channel` and `Fiber`: `Subject[A]`, `ask`, supervision by composition                  |
+| [kyo-stm](kyo-stm/README.md)                   | ✅  | ✅  | ✅     | ✅   | STM with `TRef` / `TMap` / `TChunk` / `TTable`, including compile-checked `TTable.Indexed` queries        |
+| [kyo-offheap](kyo-offheap/README.md)           | ✅  |     | ✅     |      | Arena-scoped typed primitive arrays via JEP 442 (JVM 22+) and `calloc`/`free` (Native)                    |
+
+### Specialized tools
+
+Domain-shaped modules: parsing, durable workflows, container management, low-latency messaging, browser automation, web UIs, Slack bots, native C bindings, and TASTy reflection.
+
+| Module                                  | JVM | JS  | Native | WASM | Identity                                                                                                   |
+| --------------------------------------- | --- | --- | ------ | ---- | ---------------------------------------------------------------------------------------------------------- |
+| [kyo-parse](kyo-parse/README.md)        | ✅  | ✅  | ✅     | ✅   | Parser combinators in the effect row; supports dual-input-type parsers (e.g. `Parse[Char] & Parse[Int]`)   |
+| [kyo-pod](kyo-pod/README.md)            | ✅  | ✅  | ✅     | ✅   | Docker and Podman client cross-compiled to JVM/JS/Native/WASM, streaming logs/stats, scope-managed cleanup |
+| [kyo-slack](kyo-slack/README.md)        | ✅  | ✅  | ✅     | ✅   | Slack Socket Mode bot client: structural acking, Web API, typed Block Kit + `dsl`, lossless reconnect      |
+| [kyo-browser](kyo-browser/README.md)    | ✅  | ✅  | ✅     | ✅   | Browser automation over Chrome DevTools Protocol; settlement-aware actions, `readableContent` as Markdown  |
+| [kyo-jsonrpc](kyo-jsonrpc/README.md)    | ✅  | ✅  | ✅     | ✅   | JSON-RPC 2.0 peers over pluggable transports with typed routes, calls, notifications, progress, and cancel |
+| [kyo-mcp](kyo-mcp/README.md)            | ✅  | ✅  | ✅     | ✅   | Model Context Protocol client and server built on kyo-jsonrpc with typed tools, prompts, and resources     |
+| [kyo-lsp](kyo-lsp/README.md)            | ✅  | ✅  | ✅     | ✅   | Language Server Protocol 3.17 servers and clients with typed handlers, documents, progress, and cancel     |
+| [kyo-compiler](kyo-compiler/README.md)  | ✅  |     |        |      | Scala 3 presentation compiler pool for diagnostics, completions, hover, signatures, and symbols            |
+| [kyo-aeron](kyo-aeron/README.md)        | ✅  |     |        |      | Typed pub/sub on Aeron: shared-memory IPC, UDP unicast, UDP multicast through one `Topic` API              |
+| [kyo-ffi](kyo-ffi/README.md)            | ✅  | ✅  | ✅     |      | Bind a C library once with typed Scala signatures; safe calls from JVM (Panama), JS (koffi), and Native    |
+| [kyo-tasty](kyo-tasty/README.md)        | ✅  | ✅  | ✅     | ✅   | Cross-platform TASTy reflection over a pure sealed model; Scala 3 reflection without a live JVM             |
+
+### Observability
+
+In-process metrics and tracing registry, OTLP exporter that activates from `OTEL_EXPORTER_OTLP_ENDPOINT`, and two bridges from `kyo.Log` to the JDK or SLF4J logging APIs.
+
+| Module                                                   | JVM | JS  | Native | WASM | Identity                                                                                                  |
+| -------------------------------------------------------- | --- | --- | ------ | ---- | --------------------------------------------------------------------------------------------------------- |
+| [kyo-stats-registry](kyo-stats-registry/README.md)       | ✅  | ✅  | ✅     | ✅   | Process-global registry; counters / gauges / counter-gauges / histograms; `TraceExporter` SPI             |
+| [kyo-stats-otlp](kyo-stats-otlp/README.md)               | ✅  | ✅  | ✅     | ✅   | Zero-code OTLP/HTTP+JSON exporter; W3C `traceparent` propagation auto-installed on kyo-http               |
+| [kyo-logging-jpl](kyo-logging-jpl/README.md)             | ✅  |     |        |      | Bridge `kyo.Log` to `java.lang.System.Logger` (JEP 264, JDK 9+); zero third-party deps                    |
+| [kyo-logging-slf4j](kyo-logging-slf4j/README.md)         | ✅  |     |        |      | Bridge `kyo.Log` to any SLF4J binding the host application already configures (Logback, Log4j 2, etc.)    |
+
+### Interop
+
+Whatever you keep from your current stack, there is a bridge. Bidirectional bridges to neighbouring effect systems, plus `kyo-compat` for writing a library once and shipping it to six runtimes.
+
+| Module                                                   | JVM | JS  | Native | WASM | Identity                                                                                                  |
+| -------------------------------------------------------- | --- | --- | ------ | ---- | --------------------------------------------------------------------------------------------------------- |
+| [kyo-compat](kyo-compat/README.md)                       | ✅  | ✅* | ✅*    | ✅*  | Library-author API: write once against `kyo.compat.*`, ship to ZIO, CE, Kyo, Future, Twitter Future, Ox   |
+| [kyo-reactive-streams](kyo-reactive-streams/README.md)   | ✅  | ✅  | ✅     | ✅   | Bidirectional bridge between Kyo `Stream` and `Publisher`/`Subscriber`; verified against the TCK          |
+| [kyo-zio](kyo-zio/README.md)                             | ✅  | ✅  | ✅     | ✅   | Three-object bridge: `ZIOs` (effects), `ZStreams` (streams), `ZLayers` (layers)                           |
+| [kyo-cats](kyo-cats/README.md)                           | ✅  | ✅  |        |      | Two-method bridge between Kyo and `cats.effect.IO`, with bidirectional cancellation                       |
+
+*kyo-compat platform support depends on the runtime binding (-kyo / -future / -zio: JVM+JS+Native+WASM; -ce: JVM+JS; -ox / -twitter-future: JVM).
+
+### Dev tools
+
+CLI-parser bridge, README example validation, runnable end-to-end programs, and the cross-runtime benchmark suite.
+
+| Module                                       | JVM | JS  | Native | WASM | Identity                                                                                                  |
+| -------------------------------------------- | --- | --- | ------ | ---- | --------------------------------------------------------------------------------------------------------- |
+| [kyo-case-app](kyo-case-app/README.md)       | ✅  | ✅  | ✅     | ✅   | Bridge case-app annotation-driven CLI parsing into a Kyo `run { options => ... }` entrypoint              |
+| [kyo-doctest](kyo-doctest/README.md)         | ✅  |     |        |      | Validates Markdown code blocks against the Scala 3 compiler; sbt plugin runs them on `sbt doctest`        |
+| [kyo-examples](kyo-examples)                 | ✅  |     |        |      | Two runnable programs: a ledger HTTP service and an N-queens solver (run with `sbt`)                      |
+| [kyo-bench](kyo-bench)                       | ✅  |     |        |      | JMH suite with side-by-side Kyo / Cats Effect / ZIO implementations for each scenario                     |
+
+### Scheduler interop
+
+Replace the host runtime's executors with Kyo's adaptive work-stealing scheduler. One pool covers compute and blocking work, with admission control and CPU-based blocking detection; no application code change beyond a one-line swap.
+
+| Module                                                       | JVM | JS  | Native | WASM | Identity                                                                                                  |
+| ------------------------------------------------------------ | --- | --- | ------ | ---- | --------------------------------------------------------------------------------------------------------- |
+| [kyo-scheduler-cats](kyo-scheduler-cats/README.md)           | ✅  |     |        |      | Drop-in `IORuntime` replacement: `extends KyoSchedulerIOApp` or `import KyoSchedulerIORuntime.global`     |
+| [kyo-scheduler-zio](kyo-scheduler-zio/README.md)             | ✅  |     | ✅     |      | ZIO: `extends KyoSchedulerZIOAppDefault` or `KyoSchedulerZIORuntime.default` standalone                   |
+| [kyo-scheduler-pekko](kyo-scheduler-pekko/README.md)         | ✅  |     |        |      | Pekko: one HOCON line replaces any dispatcher's executor                                                  |
+| [kyo-scheduler-finagle](kyo-scheduler-finagle/README.md)     | ✅  |     |        |      | Twitter Finagle: activated by `-Dcom.twitter.finagle.exp.scheduler=kyo` (Scala 2.13 only)                 |
+
+## Coming from ZIO or Cats Effect
+
+Two things stay exactly as you know them. First, `A < S` is a monad: the same programs-as-values style you write today, composed with `map`, `flatMap`, and for-comprehensions, referentially transparent, no macros and no capture-based tricks involved. Second, direct-style syntax is not the programming model: it ships as a separate, optional module ([`kyo-direct`](kyo-direct/README.md)), and the core is plain monadic composition.
+
+What changes is the effect channel. Kyo's pending set generalizes what these libraries fix in advance: where `ZIO[R, E, A]` carries two type-level channels and `cats.effect.IO[A]` carries one concrete effect type, `S` is an open set, so each requirement (`Env[R1]`, `Abort[E]`, `Sync`, `Async`) is a separate member assembled per call. Effects are not threaded through an `R` environment, hidden inside a typeclass dictionary, or stacked through monad transformers; handlers are supplied in any order at the call site.
+
+| You currently use                                            | Kyo translation                                                                                                                                                                                |
+| ------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ZIO[R, E, A]`                                               | `A < S` where `S` carries each requirement (`Env[R1]`, `Abort[E]`, `Sync`, `Async`, ...) as a separate effect member                                                                           |
+| `cats.effect.IO[A]`                                          | `A < (Sync & Async & Abort[Throwable])`, plus any extra effects                                                                                                                                |
+| `scala.concurrent.Future[A]`                                 | `A < (Async & Abort[Throwable])`, referentially transparent, one auto-sized scheduler in place of ad-hoc `ExecutionContext`s                                                                   |
+| ZIO `ZLayer`                                                 | Kyo `Layer` (see [kyo-prelude](kyo-prelude/README.md))                                                                                                                                         |
+| ZIO `ZStream` / fs2 `Stream` / Akka Streams                  | Kyo `Stream` (pull-based, chunked, fused), see [kyo-prelude](kyo-prelude/README.md)                                                                                                            |
+| ZIO Test                                                     | [`kyo-test`](kyo-test/README.md), the project's own cross-platform test framework; or [`kyo-zio-test`](kyo-zio-test/README.md) to keep writing `zio-test` `Spec`s with Kyo bodies                                                                                                                           |
+| zio-schema / circe / jsoniter                                | [`kyo-schema`](kyo-schema/README.md)                                                                                                                                                           |
+| `Resource[IO, A]` / `ZIO.scoped`                             | `Scope` effect with `Scope.acquireRelease`, see [kyo-core](kyo-core/README.md)                                                                                                                 |
+| `Ref[IO, A]` / `zio.Ref`                                     | `AtomicRef`, `AtomicInt`, `AtomicLong`, `AtomicBoolean`                                                                                                                                        |
+| `Deferred[IO, A]` / `zio.Promise`                            | `Promise`                                                                                                                                                                                      |
+| `cats.effect.std.Queue` / `zio.Queue`                        | `Queue` with `Access` policy (MPMC / MPSC / SPMC / SPSC)                                                                                                                                       |
+| tagless final / `Sync[F]` typeclasses (library authors)      | [`kyo-compat`](kyo-compat/README.md): write once, ship to ZIO + Cats Effect + Kyo + Future + Twitter Future + Ox via inline lowering, no typeclass dispatch                                    |
+| http4s / tapir / Play / sttp                                 | [`kyo-http`](kyo-http/README.md)                                                                                                                                                               |
+
+Three migration paths cover most adopters:
+
+- **Adopt Kyo end-to-end**: start at [Core](#core) and [Applications](#applications), then pick the other module groups you need.
+- **Add Kyo inside an existing ZIO or Cats Effect app**: use [`kyo-zio`](kyo-zio/README.md) or [`kyo-cats`](kyo-cats/README.md) for bidirectional effect interop; optionally swap the runtime scheduler with [`kyo-scheduler-zio`](kyo-scheduler-zio/README.md) or [`kyo-scheduler-cats`](kyo-scheduler-cats/README.md).
+- **Write a runtime-portable library**: use [`kyo-compat`](kyo-compat/README.md) to target ZIO, Cats Effect, Kyo, `scala.concurrent.Future`, Twitter Future, and Ox from one source tree.
+
+ZIO migrants looking for fluent extension methods (`.race`, `.timeout`, `.retry`, `.provide`, etc.) over Kyo effects should also see [`kyo-combinators`](kyo-combinators/README.md), which is also where Cats Effect migrants find the cats-syntax-style operators (`*>`, `<*`, `>>`) and the `forAbort[E1]` failure-narrowing DSL. Migrants whose fs2 / ZStream code crosses into Kyo can route through the bidirectional `Stream` bridge in [`kyo-reactive-streams`](kyo-reactive-streams/README.md).
+
+## Drop-in scheduler for ZIO, Cats Effect, Pekko, Finagle
+
+`kyo-scheduler` is the auto-sized work-stealing pool that Kyo fibers run on. Three things set it apart from a plain thread pool:
+
+- **Work-stealing.** Idle workers pull tasks from busier workers' queues, keeping every core fed.
+- **Admission control.** The pool measures its own latency under load and rejects new submissions when it cannot meet a target, rather than queuing them indefinitely.
+- **CPU-based blocking detection.** It watches per-worker CPU time and reacts when a task stops making progress on-CPU, so blocking work needs no `blocking { }` annotation at the call site.
+
+It ships as an independent jar that runs on any Scala 2 or Scala 3 codebase, with or without the rest of Kyo. Dropping it into an existing ZIO, Cats Effect, Pekko, or Finagle service is a one-config swap: the host code keeps its native effect APIs, and the scheduler underneath adds the three additions above.
+
+See [`kyo-scheduler`](kyo-scheduler/README.md) for the standalone API, and one of the adapter READMEs for runtime-specific wiring:
+
+- Cats Effect: [`kyo-scheduler-cats`](kyo-scheduler-cats/README.md)
+- ZIO: [`kyo-scheduler-zio`](kyo-scheduler-zio/README.md)
+- Pekko: [`kyo-scheduler-pekko`](kyo-scheduler-pekko/README.md)
+- Finagle: [`kyo-scheduler-finagle`](kyo-scheduler-finagle/README.md) (Scala 2.13 only)
+
+## Talks
+
+| Title                                                                                                                | Speaker(s)                 | Host                   | Date           | Resources                                                                                                |
+| -------------------------------------------------------------------------------------------------------------------- | -------------------------- | ---------------------- | -------------- | -------------------------------------------------------------------------------------------------------- |
+| [Beyond `flatMap`: Is Kyo the Future of Scala Effects?](https://youtu.be/SOHbEo7UH28)                                | Jonathan Winandy           | Scalar                 | March, 2026    |                                                                                                          |
+| [Suspension: the magic behind composability (or "The Kyo Monad")](https://www.youtube.com/watch?v=y3KiuFczOFE)       | Flavio Brasil              | Lambda Days            | June, 2025     | [Slides](https://speakerdeck.com/fwbrasil/suspension-the-magic-behind-composability-or-the-kyo-monad)    |
+| [An Algebra of Thoughts: When Kyo effects meet LLMs](https://www.youtube.com/watch?v=KIjtXM5dlgY)                    | Flavio Brasil              | Func Prog Sweden       | May, 2025      | [Slides](https://www.canva.com/design/DAGoBBQ3oJw/vFGuHA0z_ZFtZgbJQbQHXw/view)                           |
+| [Redefining Stream Composition with Algebraic Effects](https://www.youtube.com/watch?v=WcYKTyQwEA0)                  | Adam Hearn                 | LambdaConf             | May, 2025      |                                                                                                          |
+| [Kyo: A New Approach to Functional Effects in Scala](https://www.youtube.com/watch?v=uA2_TWP5WF4)                    | Flavio Brasil & Adam Hearn | Scala for Fun & Profit | February, 2025 |                                                                                                          |
+| [The Actor Model Beyond Akka With Kyo](https://www.youtube.com/watch?v=VU31k3lQ8yU)                                  | Damian Reeves              | Functional Scala       | December, 2024 |                                                                                                          |
+| [Building Robust Applications with Kyo: A Hands on Introduction](https://www.youtube.com/watch?v=QW8mAJr0Wso)        | Adam Hearn                 | ScalaIO                | November, 2024 | [Workshop + Slides](https://github.com/hearnadam/kyo-workshop)                                           |
+| [Comparing Approaches to Structured Concurrency](https://www.youtube.com/watch?v=g6dyLhAublQ)                        | James Ward & Adam Hearn    | LambdaConf             | May, 2024      | [Slides](https://jamesward.github.io/easyracer/lambdaconf_2024.html)                                     |
+| [Algebraic Effects from Scratch](https://www.youtube.com/watch?v=qPvPdRbTF-E)                                        | Kit Langton                | Func Prog Sweden       | April, 2024    |                                                                                                          |
+| [Releasing Kyo: When Performance Meets Elegance In Scala](https://www.youtube.com/watch?v=FXkYKQRC9LI)               | Flavio Brasil              | Functional Scala       | December, 2023 | [Slides](https://speakerdeck.com/fwbrasil/kyo-functional-scala-2023)                                     |
+
+A podcast interview that doubles as a one-hour live-coded tour:
+
+<a href="http://www.youtube.com/watch?v=uA2_TWP5WF4" title="Kyo: A New Approach to Functional Effects in Scala">
+    <img src="https://img.youtube.com/vi/uA2_TWP5WF4/maxresdefault.jpg" alt="Kyo: A New Approach to Functional Effects in Scala" width="500" height="300">
+</a>
+
+## Contributing
+
+- [CONTRIBUTING.md](CONTRIBUTING.md) covers the contribution workflow, the API-design conventions, and the per-module README structure.
+- [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) covers community norms.
+- [AGENTS.md](AGENTS.md) is the entry point for agent-driven contributions.
+- [Discord](https://discord.gg/KxxkBbW8bq) is the fastest way to ask a question.
+
+This project exists because of a specific belief about what software is for and who gets to build it. [Read the manifesto](MANIFESTO.md).
+
+## Acknowledgements
+
+Kyo's development was originally inspired by the paper ["Do Be Do Be Do"](https://arxiv.org/pdf/1611.09259.pdf) and its implementation in the [Unison](https://www.unison-lang.org/learn/language-reference/abilities-and-ability-handlers/) programming language. Kyo's effect semantics are close to Unison's abilities, expressed through monadic composition (`A < S`) rather than Unison's direct-style syntax. The runtimes differ sharply: Unison captures and resumes effects with delimited continuations that copy runtime stack segments, while Kyo represents the same continuations as pure, immutable value composition. That encoding, suspending concrete values tied to specific effects, is what makes Kyo efficient and stack-safe on the JVM without VM-level continuation support.
+
+Kyo also draws on [ZIO](https://zio.dev/). Its core algebraic-effect mechanism generalizes ZIO's [effect rotation](https://degoes.net/articles/rotating-effects): where ZIO fixes two type-level channels (`R` and `E`), Kyo opens the same idea to an arbitrary set of effects. Several primitives map directly onto their ZIO counterparts, `Env` and `Abort` onto its environment and error channels, `Scope` and `Hub` onto their namesakes, which keeps the two libraries easy to compose in one program and lowers the barrier for ZIO developers adopting Kyo.
+
+Kyo's asynchronous primitives take several aspects from [Twitter's util](https://github.com/twitter/util) and [Finagle](https://github.com/twitter/finagle), including features like async root compression, to provide stack safety, and support for cancellations (interruptions in Kyo).
+
+Lastly, the name "Kyo" comes from a Buddhist term for "Sutra," a compiled teaching. The character's older sense is the *warp* threads of a loom, the lengthwise threads everything else is woven across, a fitting image for a library built on composition.
+
+## License
+
+See the [LICENSE.txt](LICENSE.txt) file for details.
+
+---
+
+# Agent Guide
+
+Source: https://github.com/getkyo/kyo/blob/main/AGENTS.md
+
+# Agent Guide
+
+This file helps AI coding agents work effectively on the Kyo codebase. Read [CONTRIBUTING.md](CONTRIBUTING.md) first: it is the comprehensive reference for all conventions, patterns, and design decisions.
+
+## Operating Premise (read before anything else)
+
+**Only complete and correct solutions are acceptable.**
+
+This is non-negotiable. It applies to every change at every scope ; a one-line fix, a refactor across a module, a campaign that touches three modules. The framework is the same:
+
+1. **Identify the correct fix.** Diagnose root cause. The correct fix is the one a reviewer with full context would call right. It is not the cheapest fix; it is not the fix that fits a time budget; it is not the smaller-scope alternative offered as a "pragmatic choice."
+
+2. **Scope the correct fix honestly.** Read every layer it touches. If a type-system change at one factory cascades into another module's engine, that is part of the scope. Do not estimate the visible surface; estimate the actual surface. If the actual surface is larger than first thought, say so.
+
+3. **Execute the correct fix.** Across every layer, end to end. Tests pass. Docs reflect the new shape. No dead branches. No "we will polish this later."
+
+4. **Never propose alternatives that trade correctness for scope.** If you find a smaller fix that achieves a similar user-visible outcome via a less-rigorous path, that is information for the conversation. It is NOT an option for you to silently take. Surface it; let the user pick. Default to the correct one.
+
+5. **Never normalize incomplete results.** If a refactor is half-done because the remaining layers are large, the work is half-done. Do not commit it. Do not declare it shipped. Do not write a celebratory summary listing what was done while omitting what was skipped.
+
+6. **A change that breaks tests, breaks compile, or breaks documentation is not a change. It is a partial change.** Roll forward to completion or revert and reset.
+
+7. **When in doubt, ask.** Asking for the correct scope is cheaper than shipping the wrong one.
+
+The phrase **"shall I take the smaller fix?"** is structurally an offer to be incomplete. Do not offer it. If only the larger fix is correct, do the larger fix. If a smaller fix IS the correct fix, it would not have surfaced as "smaller" ; it would have surfaced as the natural answer.
+
+The phrase **"this is good enough for now"** has no place in a kyo change. Either it is correct and done, or it is not done.
+
+### The "pending issue" / "known issue" stop-pattern is banned
+
+If a campaign goal is "X works end-to-end" and validation surfaces multiple bugs, fixing 4 of 5 and writing the 5th up as a "known issue requiring deeper investigation" does NOT meet the goal. The campaign is half-done. The 5th bug IS the work.
+
+Forbidden phrasings, structurally — when you catch yourself drafting one, treat it as a flag that you are about to commit the anti-pattern:
+
+- "Known issue: …" / "Documented as a known limitation."
+- "This requires sustained X-internals investigation beyond a validation session."
+- "Fix path: either … or … . That work is substantially larger than this session."
+- "We've surfaced enough; let's pause and assess."
+- "Documenting in FINDINGS for follow-up."
+- "Out of scope for this session."
+
+Re-scope instead: the unfixed bug is the next concrete task. Pick the fix path, execute it. Validation isn't done when the diagnostic writeup is comprehensive; it is done when the demonstrable end-state is true (host connects, tool calls succeed, response shape matches the spec, …).
+
+The only legitimate stops within an in-flight campaign are:
+
+1. The user explicitly says stop / pivot / park.
+2. The next step requires a destructive or scope-affecting action that policy requires confirmation for (push, force-reset, schema-breaking change with downstream impact).
+3. A genuine block: 3 attempts have failed AND each failure mode was novel AND there is no information you could gather independently to make a 4th attempt better.
+
+"This is hard," "this touches a layer I haven't worked in yet," and "this needs deeper investigation" are not blocks. They are work.
+
+## Core Rules
+
+### Working Mindset
+
+How to work on Kyo, not just what the code looks like. CONTRIBUTING.md carries the full conventions; these are the principles behind them.
+
+- **Think in values, not actions (FP).** A Kyo computation is a value you compose, not an action you run. The effect row (`< Sync`, `< Async`, `< Abort[E]`) is part of the contract: never widen or hide it to shorten a signature. Default to immutability (`val`, `Span` over `Array`). Use mutable state only when it is genuinely necessary (a hot-path read buffer, a local accumulator); when you do, give it the smallest possible scope and keep it well isolated, never a shared `var` reaching across methods or fibers. For state that must cross fibers, use `Atomic*`. Keep side effects inside effects and pure positions pure. Make functions total: model absence and failure with `Maybe`, `Result`, and `Abort`, never `null`, exceptions-as-control-flow, or partial functions.
+- **Never reward-hack.** A failing test or red CI that exposes a real bug is the deliverable, not an obstacle. Never revert a fix, weaken an assertion, catch-and-suppress an error, or relabel a failure "flaky", "pre-existing", or "out of scope" to get green. Fix the root cause. The "Fix the Code, Not the Test" rule below is the test-specific case.
+- **Complete and correct, no scope cuts.** Finish the whole task. Do not silently drop, defer, or "simplify" a requirement; if something genuinely cannot be done, flag it rather than quietly skipping it. Never infer priorities or reorder work by assumed importance: order only by technical dependency, and ask when the order is unclear. Treat these words in your own reasoning as red flags: "for now", "out of scope", "edge case", "probably not needed".
+- **No AI-generation tells in any output.** No em-dashes or en-dashes, no marketing adjectives ("blazing", "powerful", "seamless"), no filler openers. This holds everywhere: code comments, scaladoc, READMEs, commit messages. Use commas, colons, parentheses, or separate sentences instead of dashes.
+- **All platforms, shared tests.** Source and tests target JVM, JS, and Native. Cross-platform tests live in `shared/src/test` and must pass on all three; never move a test into a `jvm/` (or `js/`, `native/`) folder to dodge platform-specific infra cost. Genuine platform-specific behavior is the only reason to split.
+- **Safe by default.** Prefer the safe API tier. Reach for `AllowUnsafe` or the unsafe tier only at justified bridging boundaries, and mark each site with a `// Unsafe:` comment explaining why. See CONTRIBUTING.md "Unsafe Boundary" for the tiers.
+
+### Leave No Issue Behind
+
+When you find a problem, it is yours to resolve, whether or not you caused it. A failing test, a compiler warning, a broken link, a flaky result, a latent bug noticed in passing: own it.
+
+- **"Pre-existing", "unrelated", "not my change", "flaky", and "out of scope" are not dismissals.** During any campaign (a CI-greening pass, a refactor, an audit, a test run), every red signal gets owned. A failure you did not introduce is still a failure you found, and walking past it ships it to the next person.
+- **Compaction may have erased the context that proves an issue is yours.** When a long task is summarized to fit the context window, you can lose the memory that you introduced a failure, deleted the symbol it depends on, or already accepted ownership of it. So a gut feeling that something is "pre-existing", "not mine", "already broken", or "out of scope" is untrustworthy: it is far more often just missing context than a real fact. Never use those labels to walk past an issue. Treat every issue you observe as yours to fix. If you genuinely believe an issue predates your work, the bar is evidence (a clean reproduction on the base commit or `origin/main`), never memory or assumption.
+- **Route what genuinely crosses a boundary; never drop it.** If an issue belongs to another module or concern and truly cannot be fixed in place, surface it explicitly: call it out in your summary, leave a tracked note, or hand it off. Silently skipping it is the exact failure mode this rule exists to prevent.
+- **No deferral to a phase that never comes.** Fix issues in the current step or the immediately-next one. "Handle it later" and "cleanup phase" reliably resolve to "never"; deferred issues compound.
+- **Do not use priority as an excuse.** Never decide a discovered issue is low-priority and therefore skippable. Address what you surface; escalate to the user only when a fix is genuinely value-underdetermined.
+
+### Fix the Code, Not the Test
+
+When a test fails or code doesn't compile, **diagnose the root cause before changing anything**:
+
+1. **Determine if it's a code bug or a test bug.** Read both the implementation and the test. Understand what the test is verifying and why.
+2. **Don't assume which side is wrong.** Read the implementation and the test. Understand the intended behavior, then determine where the bug is. Changing whichever side is easier is not diagnosing.
+3. **Only change a test when the test itself is incorrect**: wrong assertion, outdated expectation, flawed setup. Document why the test was wrong.
+4. **Never weaken a test to make it pass.** Removing assertions, loosening checks, or catching exceptions to suppress failures hides bugs.
+
+### Reproduce Before You Fix
+
+For any bug, regression, or "this shouldn't happen" report, write a failing test that reproduces it *before* touching the implementation.
+
+1. **Reproduce first.** Add a test that fails because of the bug, and confirm it fails for the *right reason*: the actual symptom (wrong value, leaked resource, hang, panic), not a typo or setup error. A test that fails for the wrong reason does not capture the bug.
+2. **Then fix.** Change the implementation until that test passes, without weakening the test you just wrote.
+3. **Keep it as a regression guard.** The reproducing test stays in the suite permanently, named and placed with the surface it covers (see [Test Patterns](CONTRIBUTING.md#test-patterns-by-level)), never deleted once green.
+4. **A fix with no reproducing test is incomplete.** If the bug was reachable once, an untested fix lets it return silently. The test is both the proof the fix works and the alarm if it regresses.
+5. **Reproduce concurrency and timing bugs too.** Races, interrupts, and deadlocks are the hardest and most important to pin down. Drive them with deterministic `Async` constructs (latches via `Channel`/`Fiber`, `Clock` control) rather than sleeps; if a bug is only probabilistic, loop the scenario enough to make the failure reliable before fixing.
+
+### Write Meaningful Tests
+
+- **Every test must assert something specific.** A test that just runs code without checking results proves nothing. `assert(result == expected)`, not `assert(true)` or no assert at all.
+- **Assert on concrete values, not just types or non-emptiness.** `assert(result == List(1, 2, 3))`, not `assert(result.nonEmpty)` or `assert(result.isInstanceOf[List[_]])`.
+- **Test behavior, not implementation.** Verify what the code does from the caller's perspective, not how it does it internally.
+- **Cover edge cases.** Empty inputs, error paths, boundary conditions, concurrent scenarios, not just the happy path.
+
+### Write Clean, Simple, and Safe Code
+
+- **Never block a thread.** No `Thread.sleep`, `synchronized`, `Future.await`, `CountDownLatch.await`, or any blocking primitive. Use `Async`-based suspension (`Channel.put`, `Fiber.get`, `Clock.sleep`).
+- **Minimize allocations.** Use opaque types over wrapper classes. Provide pure variants (`mapPure`, `filterPure`) for hot paths. Fast-path degenerate cases (empty, single-element) before entering general logic. Prefer `@tailrec` loops over recursive allocations.
+- **Keep it simple.** Don't over-engineer. No unnecessary abstractions, no speculative generality. Three similar lines are better than a premature abstraction.
+
+The goal is always improvement. Making things compile and pass is not the goal: correct, well-designed code is.
+
+## Build & Test
+
+Building automatically formats the code: no need to run formatting separately. Re-read any files you've edited after building, since formatting may have changed them.
+
+```sh
+# Set JVM options (required for stable builds)
+export JAVA_OPTS="-Xms3G -Xmx4G -Xss10M -XX:MaxMetaspaceSize=512M -XX:ReservedCodeCacheSize=128M -Dfile.encoding=UTF-8"
+export JVM_OPTS="$JAVA_OPTS"
+
+# Test a specific module (JVM)
+sbt 'kyo-coreJVM/test'
+
+# Test a specific test class
+sbt 'kyo-coreJVM/testOnly kyo.ChannelTest'
+```
+
+## Project Structure
+
+Layered stack, each module depends only on the modules above it:
+
+| Layer | Modules | Purpose |
+|-------|---------|---------|
+| Foundation | `kyo-data`, `kyo-kernel` | Data types, effect system kernel |
+| Effects | `kyo-prelude`, `kyo-core`, `kyo-combinators` | Effect definitions and combinators |
+| Integrations | `kyo-caliban`, `kyo-cats`, `kyo-zio`, ... | Library integrations |
+| Applications | `kyo-http`, `kyo-stm`, `kyo-actor`, ... | Higher-level modules |
+
+Source layout within each module:
+```
+kyo-<module>/
+  shared/src/main/scala/kyo/       # Cross-platform source
+  shared/src/test/scala/kyo/       # Cross-platform tests
+  jvm/src/main/scala/kyo/          # JVM-specific source
+  js/src/main/scala/kyo/           # JS-specific source
+  native/src/main/scala/kyo/       # Native-specific source
+```
+
+### Test File Naming (no orphan test classes)
+
+Every test file MUST share a name prefix with a source file. The goal is 1:1: `Foo.scala` is tested by `FooTest.scala`. When one source genuinely needs more than one test file, split by aspect keeping the source as the prefix: `FooParsingTest.scala`, `FooEncodingTest.scala`. Default to the 1:1 file and add tests there; only create an aspect file when the 1:1 file would grow unwieldy.
+
+- **Never commit a test class with no corresponding source.** `ReactiveLoopExperimentTest.scala` with no `ReactiveLoop.scala` is an orphan and is not allowed in a finished change. Before adding a test, find the source it covers and use that prefix.
+- **Scratch / experiment / reproduction test files are dev artifacts.** It is fine to create an ad-hoc test (with any name) while reproducing a bug or probing a hypothesis, but it MUST be removed before the change is done: fold the validated assertions into the matching `*Test.scala` for the source under test, then delete the scratch file. A finished change leaves no orphan or experiment test behind.
+
+## Writing Module READMEs
+
+To create or rewrite a module's README, invoke the `/readme <module-path>` skill (defined at `.claude/skills/readme/SKILL.md`). The skill carries the conventions and runs the full source-analysis, draft, critique, and doctest-verification pipeline. `sbt <module>/doctest` validates every fenced Scala block.
+
+## Pre-Change Checklist
+
+- [ ] Read the file first: understand existing patterns before editing
+- [ ] Read CONTRIBUTING.md for the relevant section
+
+## Pre-Submission Checklist
+
+- [ ] Tests pass: `sbt '<module>/test'` for affected modules
+- [ ] Naming follows conventions: action verbs, no symbolic operators in core (see [Naming](CONTRIBUTING.md#naming))
+- [ ] Public APIs have explicit return types
+- [ ] Public types have scaladoc (8-35 lines)
+- [ ] `using` clauses correctly ordered: `Tag` before `Frame` (inline), `Frame` before evidence (non-inline), `AllowUnsafe` last
+- [ ] `inline` used correctly: effect suspension paths yes, handling paths no. Use to avoid function dispatch. (see [Inline Guidelines](CONTRIBUTING.md#inline-guidelines))
+- [ ] Tests use the module's `Test` base class, not ScalaTest directly
+- [ ] No `protected`, no `@uncheckedVariance`: use `private[kyo]` for cross-package visibility
+- [ ] Kyo types used: `Maybe` not `Option`, `Result` not `Either`, `Chunk` not `List` (see [Types](CONTRIBUTING.md#types))
+
+## Common Gotchas
+
+1. **`kyo.System` shadows `java.lang.System`**: use fully qualified `java.lang.System` when needed
+2. **Effect handlers are not inline**: `Abort.run`, `Var.run` are regular methods; only suspend/create methods are inline
+3. **`Frame` required on every effectful method**, but not on pure data accessors like `capacity` or `size`
+4. **Overloads delegate to canonical**: never duplicate logic across method variants
+5. **`Scope`-managed resources are the default**: use `init`/`initWith` unless there's a specific reason for `initUnscoped`
+6. **Unsafe tier mirrors safe tier**: every safe operation has an `Unsafe` equivalent; bridge via `Sync.Unsafe.defer`
+
+---
+
+# CLAUDE.md
+
+Source: https://github.com/getkyo/kyo/blob/main/CLAUDE.md
+
+AGENTS.md
+
+---
+
+# How to Make Contributions
+
+Source: https://github.com/getkyo/kyo/blob/main/CONTRIBUTING.md
+
+# How to Make Contributions
+
+Thank you for considering contributing to this project! We welcome all contributions, whether it's bug reports, feature requests, documentation improvements, or code contributions.
+
+## Table of Contents
+
+- [Contributing](#contributing)
+  - [Getting Started](#getting-started)
+  - [Configuring Java Options](#configuring-java-options)
+  - [How to Build Locally](#how-to-build-locally)
+  - [Adding a New API](#adding-a-new-api)
+  - [LLM Use Guide](#llm-use-guide)
+- [Core Principles](#core-principles)
+- [API Design](#api-design)
+  - [Naming](#naming)
+  - [Types](#types)
+  - [Failure Tracking](#failure-tracking)
+  - [Method Signatures](#method-signatures)
+- [Code Conventions](#code-conventions)
+  - [Pending Type (A < S)](#pending-type-a--s)
+  - [Scala Conventions](#scala-conventions)
+  - [Documentation](#documentation)
+    - [Type-Level Scaladoc](#type-level-scaladoc)
+    - [Method-Level Scaladoc](#method-level-scaladoc)
+    - [Markdown Formatting](#markdown-formatting)
+    - [Inline Comments](#inline-comments)
+  - [File Organization](#file-organization)
+- [Module READMEs](#module-readmes)
+  - [Structure](#structure)
+  - [Writing Style](#writing-style)
+  - [Avoid](#avoid)
+  - [Runnable Modules](#runnable-modules)
+  - [Self-Review Checklist](#self-review-checklist)
+- [Optimization](#optimization)
+  - [Performance](#performance)
+  - [Zero-Cost Type Design](#zero-cost-type-design)
+  - [Inline Guidelines](#inline-guidelines)
+- [Testing](#testing)
+  - [Framework](#framework)
+  - [Base Trait Hierarchy](#base-trait-hierarchy)
+  - [Test Patterns by Level](#test-patterns-by-level)
+  - [Platform-Conditional Tests](#platform-conditional-tests)
+  - [Compile-Time Tests](#compile-time-tests)
+  - [Concurrent Test Helpers](#concurrent-test-helpers)
+- [Unsafe Boundary](#unsafe-boundary)
+  - [The Two-Tier API Pattern](#the-two-tier-api-pattern)
+  - [Unsafe API Conventions](#unsafe-api-conventions)
+  - [AllowUnsafe Tiers](#allowunsafe-tiers)
+  - [AllowUnsafe for Zero-Allocation Side Effects](#allowunsafe-for-zero-allocation-side-effects)
+  - [Closeable Resource Pattern](#closeable-resource-pattern)
+  - [Close Method Convention](#close-method-convention)
+  - [Local-Backed Service Pattern](#local-backed-service-pattern)
+  - [KyoException Convention](#kyoexception-convention)
+- [Effect Implementation Reference](#effect-implementation-reference)
+  - [Anatomy of an Effect](#anatomy-of-an-effect)
+  - [Delegation Pattern for Higher-Level Types](#delegation-pattern-for-higher-level-types)
+  - [Isolate Protocol for Fiber-Crossing Operations](#isolate-protocol-for-fiber-crossing-operations)
+
+## Contributing
+
+### Getting Started
+
+#### Prerequisites
+
+Before you begin, make sure you have the following installed:
+
+- **Java 21 (or later)**
+- **Scala**
+- **Node** (Node 24+ to run the experimental WASM target: it defaults to V8's Turboshaft Wasm pipeline)
+- **sbt** (Scala Build Tool)
+- **Git**
+
+#### Setting Up Your Environment
+
+1. **Fork the Repository**
+   - Navigate to the **kyo** repository and click the **Fork** button.
+
+2. **Clone Your Fork**
+   ```sh
+   git clone https://github.com/your-username/kyo.git
+   cd your-repo
+   ```
+
+3. **Set Up Upstream Remote**
+   ```sh
+   git remote add upstream https://github.com/getkyo/kyo.git
+   ```
+
+### Configuring Java Options
+
+Java options (`JAVA_OPTS` and `JVM_OPTS`) define how much memory and resources the JVM should use when running the project. Setting these options correctly ensures stable performance and prevents out-of-memory errors.
+
+To configure Java options, run the following commands in your terminal:
+```sh
+export JAVA_OPTS="-Xms3G -Xmx4G -Xss10M -XX:MaxMetaspaceSize=512M -XX:ReservedCodeCacheSize=128M -Dfile.encoding=UTF-8"
+export JVM_OPTS="-Xms3G -Xmx4G -Xss10M -XX:MaxMetaspaceSize=512M -XX:ReservedCodeCacheSize=128M -Dfile.encoding=UTF-8"
+```
+
+#### Explanation of Parameters:
+
+- `-Xms2G`: Sets the initial heap size to 3GB.
+- `-Xmx3G`: Sets the maximum heap size to 4GB.
+- `-Xss10M`: Sets the stack size to 10MB.
+- `-XX:MaxMetaspaceSize=512M`: Limits the maximum metaspace size to 512MB.
+- `-XX:ReservedCodeCacheSize=128M`: Reserves 128MB for compiled code caching.
+- `-Dfile.encoding=UTF-8`: Ensures file encoding is set to UTF-8.
+
+#### Adjusting These Values
+
+If you experience memory issues or your system has more resources, you can increase these values. For example, if you have 16GB RAM, you might set:
+```sh
+export JAVA_OPTS="-Xms4G -Xmx8G -Xss10M -XX:MaxMetaspaceSize=1G -XX:ReservedCodeCacheSize=256M -Dfile.encoding=UTF-8"
+export JVM_OPTS="-Xms4G -Xmx8G -Xss10M -XX:MaxMetaspaceSize=1G -XX:ReservedCodeCacheSize=256M -Dfile.encoding=UTF-8"
+```
+
+You can also add these lines to your `.bashrc` or `.zshrc` file for persistent settings.
+
+### How to Build Locally
+
+Run the following commands to build and test the project locally:
+```sh
+sbt '+kyoJVM/test' # Runs JVM tests
+sbt '+kyoJS/test'  # Runs JS tests
+sbt '+kyoNative/Test/compile' # Compiles Native code
+```
+
+Check formatting before submitting:
+```sh
+sbt "scalafmtCheckAll"
+```
+
+### Adding a New API
+
+If you want to contribute a new method or type, feel free to:
+
+- Open an issue
+- Discuss on Discord: [https://discord.gg/afch62vKaW](https://discord.gg/afch62vKaW)
+- Share design examples:
+    - Use cases
+    - Equivalent in `ZIO` or `Cats Effect`
+    - Other motivating patterns
+
+#### Where to Add Your API
+
+| Subproject        | Use For                                                   |
+| ----------------- | --------------------------------------------------------- |
+| `kyo-data`        | Data structures (`Chunk`, `Maybe`, `Result`, etc.)        |
+| `kyo-prelude`     | Effect types without `Sync` (`Abort`, `Env`, `Var`, etc.) |
+| `kyo-core`        | Methods requiring `Sync`                                  |
+| `kyo-combinators` | Extensions or composition helpers                         |
+
+Add corresponding tests in the same subproject.
+
+**Example:**\
+A new `Stream.fromSomething` method:
+
+- If it uses `Sync`: place it in `kyo-core/shared/src/main/scala/kyo/StreamCoreExtensions.scala`
+- If it doesn't: place it in `kyo-prelude/shared/src/main/scala/kyo/Stream.scala`
+
+### LLM Use Guide
+We encourage contributors to leverage Large Language Models (LLMs) responsibly:
+- Do **not** submit low-effort, AI-generated code without review.
+- If you use AI assistance, ensure that the submission is well-tested and meets our standards.
+- Automated PRs without human oversight may be closed.
+
+---
+
+## Core Principles
+
+These are the axioms. Everything else in this guide derives from them.
+
+1. **Source files are documentation.** Every `.scala` file is meant to be read top-to-bottom. Method ordering, scaladocs, section separators, and the flow from public API down to internals all serve readability. A contributor opening a file for the first time should understand the type's purpose and usage patterns just by reading the file — before touching any external docs. Treat the ordering and structure of a file as carefully as you treat the implementation.
+
+2. **Most-used first.** Within each section, prioritize what users reach for most. Factory methods before configuration, `run` before `runWith`, simple overloads before complex ones. Discoverability beats alphabetical order.
+
+3. **Action verbs, not theory.** `foreach` not `traverse`. Accessible naming lowers the barrier to entry and keeps the API approachable for developers who don't have category theory backgrounds.
+
+4. **Performance is a first-class feature.** Avoid allocations, avoid unnecessary suspensions, use `inline` and opaque types where appropriate. Zero-cost abstractions aren't optional — they're the reason Kyo can be both safe and fast.
+
+5. **Composition over inheritance.** Delegate, don't extend. No `protected`, no deep hierarchies. Build complex behavior by combining simple pieces.
+
+6. **Type safety first, escape hatches as last resort.** Write type-safe code by default. `asInstanceOf` and `@unchecked` are acceptable only when they're strictly necessary inside opaque type boundaries or kernel internals where the type system can't express a known invariant — never as a convenience shortcut. Never use `@uncheckedVariance`. `Frame`, `Tag`, and `AllowUnsafe` guard the public surface where users interact.
+
+7. **Symmetry across related types.** Paired or complementary types should share the same structural patterns (factory methods, config, lifecycle) and naming conventions. Keep names consistent — if one type uses `close`, the paired type should too. When users learn one side, the other should feel familiar.
+
+8. **Explain the surprising, skip the obvious.** A comment on a race condition is essential. A comment on `get` returning a value is noise.
+
+---
+
+## API Design
+
+### Naming
+| Don't write                | Write instead                          | Why                                     |
+| -------------------------- | -------------------------------------- | --------------------------------------- |
+| `traverse`                 | `foreach`                              | Describes the action, not the structure |
+| `sequence`                 | `collectAll`                           | Says what it does                       |
+| `pure` / `succeed`         | `Kyo.lift` or rely on implicit lifting | No ceremony for the common case         |
+| `void` / `as(())`          | `.unit`                                | Direct                                  |
+| `*>` / `>>`                | `.andThen`                             | Readable without memorizing operators   |
+| `replicateM`               | `fill`                                 | Plain English                           |
+| `filterA`                  | `filter`                               | Same name as stdlib                     |
+| `foldM`                    | `foldLeft`                             | Same name as stdlib                     |
+| `bracket`                  | `acquireRelease`                       | Says what it does                       |
+| `provide` / `provideLayer` | `Env.run` / `Env.runLayer`             | Consistent `run` pattern                |
+
+**No symbolic operators** in `kyo-data`, `kyo-prelude`, or `kyo-core`. Use named methods (`.andThen`, `.unit`, `.map`). Symbolic operators like `*>`, `<*>`, `<&>` live exclusively in `kyo-combinators` for users who prefer that style.
+
+Effect operations follow consistent naming:
+- **`run`** eliminates an effect: `Abort.run`, `Var.run`, `Emit.run`, `Choice.run`, `Env.run`. Common handler variants beyond `run`:
+  - `runWith(v)(continue)` — canonical handler with continuation
+  - `runTuple` — returns `(State, A)` tuple
+  - `runDiscard` — discards emitted/intermediate values
+  - `runFirst` — handles only the first occurrence
+  - `runPartial` / `runPartialOrThrow` — handles a subset of a union error type
+  Non-`run` eliminators have specific semantics beyond elimination:
+  - `recover` / `recoverError` — recovers from errors with a fallback value
+  - `catching` — catches exceptions and converts to effect errors
+  - `fold` / `foldError` — maps all result cases (success/failure) to a single return type
+- **`get`** extracts a value from a container type, lifting the error case into the effect. `Abort.get(either)` extracts the `Right` value, lifting `Left` into `Abort`. `Abort.get(maybe)` extracts `Present`, lifting `Absent` into `Abort`. For context effects, `get` demands the current value: `Env.get[R]: R < Env[R]`, `Var.get[V]: V < Var[V]`.
+- **`use`** applies a function to the gotten value: `Env.use[R](f: R => A < S)`, `Var.use[V](f: V => A < S)`.
+- **`init`** / **`initWith`** / **`use`** / **`initUnscoped`** / **`initUnscopedWith`** — resource factory variants with increasing lifecycle control:
+  - `init` — creates a `Scope`-managed resource (default choice)
+  - `initWith(f)` — creates a `Scope`-managed resource and applies `f` to it
+  - `use(f)` — bracket semantics without `Scope` in the effect set
+  - `initUnscoped` — no cleanup guarantees, caller manages lifecycle
+  - `initUnscopedWith(f)` — no cleanup + applies `f`
+
+  See "Resource Factory Convention" in the Unsafe Boundary section for the full delegation chain.
+- **`fooPure`** suffix for pure (non-effectful) variants: `mapPure`, `filterPure`, `collectPure`, `contramapPure`. The pure version avoids suspension overhead. Used consistently across `Stream`, `Pipe`, and `Sink`.
+- **`fooDiscard`** drops the return value: `offer` returns `Boolean`, `offerDiscard` returns `Unit`. Same for `complete`/`completeDiscard`, `interrupt`/`interruptDiscard`, etc.
+- **Sync-try vs async-wait** — sync-try operations use names that imply attempt (`offer`, `poll`) and return a success indicator (`Boolean`, `Maybe`). Async-wait operations use names that imply completion (`put`, `take`) and suspend until done. The async version tries the sync version first and only suspends on failure.
+- **`noop`** / **`Noop`** for degenerate cases (formally, the identity implementation): `Latch(0)` returns a pre-completed noop, `Meter.Noop` is a no-op meter that passes through without rate-limiting. This is both an optimization (avoids allocating real state when nothing will happen) and a naming convention for when you need an identity/pass-through implementation of a type.
+
+### Types
+
+When a Kyo primitive exists for a concept, use it instead of the stdlib equivalent.
+
+**kyo-data** — foundational value types:
+
+| Kyo primitive  | Replaces                                                   | Notes                                                                                                                                                                                            |
+| -------------- | ---------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `Maybe[A]`     | `Option[A]`                                                | `Option` only as conversion input (e.g., `Abort.get(opt: Option[A])`). When stdlib methods return `Option` (e.g., `collectFirst`), convert to `Maybe` as soon as possible via `Maybe.fromOption` |
+| `Result[E, A]` | `Either`, `Try`                                            | Three-way: `Success`/`Failure`/`Panic` — never raw `Either` or `Try` in effect signatures                                                                                                        |
+| `Chunk[A]`     | `Seq`, `List`, `Vector`                                    | Use internally; accept generic collections in public APIs (see below)                                                                                                                            |
+| `Duration`     | `java.time.Duration`, `scala.concurrent.duration.Duration` | Opaque `Long`-based, zero-allocation                                                                                                                                                             |
+| `Instant`      | `java.time.Instant`                                        | Kyo's own wrapper with consistent API                                                                                                                                                            |
+| `Span[A]`      | `IArray[A]`, `ArraySeq[A]`                                 | Immutable array wrapper, avoids boxing, O(1) indexing                                                                                                                                            |
+| `Schedule`     | Custom retry/timing logic                                  | Composable scheduling policies                                                                                                                                                                   |
+| `TypeMap[A]`   | Heterogeneous maps                                         | Type-safe map keyed by type                                                                                                                                                                      |
+
+**kyo-prelude** — effects:
+
+| Kyo primitive | Purpose              | Notes                                                               |
+| ------------- | -------------------- | ------------------------------------------------------------------- |
+| `Abort[E]`    | Short-circuit errors | Typed error channel; use `Abort.fail`, `Abort.recover`, `Abort.run` |
+| `Env[R]`      | Dependency injection | Context effect; use `Env.get`, `Env.run`                            |
+| `Var[V]`      | Mutable state        | Effect-tracked state; use `Var.get`, `Var.set`, `Var.run`           |
+| `Emit[V]`     | Value emission       | Push-based output; use `Emit.value`, `Emit.run`                     |
+| `Poll[V]`     | Value polling        | Pull-based input; use `Poll.one`, `Poll.run`                        |
+| `Choice`      | Nondeterminism       | Multiple values; use `Choice.eval`, `Choice.run`                    |
+| `Check`       | Assertion checking   | Lightweight validation; use `Check.apply`, `Check.run`              |
+| `Batch`       | Automatic batching   | Groups operations for batch execution                               |
+| `Memo`        | Memoization          | Caches results; opaque alias for `Var[Memo.Cache]`                  |
+
+**kyo-prelude** — streaming and composition:
+
+| Kyo primitive   | Purpose                  | Notes                                                             |
+| --------------- | ------------------------ | ----------------------------------------------------------------- |
+| `Stream[V, S]`  | Lazy effectful sequences | Chunked push/pull hybrid; prefer over manual `Emit` for sequences |
+| `Pipe[A, B, S]` | Stream transformation    | Composable `Stream[A] => Stream[B]`                               |
+| `Sink[V, A, S]` | Stream consumption       | Composable `Stream[V] => A`                                       |
+| `Layer[Out, S]` | Dependency injection     | Composable; use `Layer.init` for compile-time wiring              |
+
+**kyo-core** — effects:
+
+| Kyo primitive | Purpose                | Notes                                                                  |
+| ------------- | ---------------------- | ---------------------------------------------------------------------- |
+| `Sync`        | Effect suspension      | Marks side-effecting code; use `Sync.defer { ... }`                    |
+| `Async`       | Concurrency            | Main effect for concurrent programming; prefer over direct `Fiber` use |
+| `Scope`       | Resource management    | `acquireRelease`, `ensure`; structured cleanup via `Scope.run`         |
+| `Clock`       | Time operations        | `now`, `sleep`, `deadline`; `withTimeControl` for testing              |
+| `Log`         | Logging                | `trace`, `debug`, `info`, `warn`, `error` with level control           |
+| `Console`     | Console I/O            | `readLine`, `print`, `printLine`, `printErr`                           |
+| `Random`      | Random generation      | Seeded or context-bound; use for testability                           |
+| `System`      | Environment/properties | Type-safe access with custom `Parser`s                                 |
+| `Retry`       | Retry with policy      | Takes a `Schedule` from kyo-data                                       |
+
+**kyo-core** — concurrency primitives:
+
+| Kyo primitive                                              | Purpose                  | Notes                                                                               |
+| ---------------------------------------------------------- | ------------------------ | ----------------------------------------------------------------------------------- |
+| `Fiber[A]`                                                 | Async computation handle | Low-level; prefer `Async` API in application code                                   |
+| `Channel[A]`                                               | Async message passing    | Bounded, backpressured; use over raw queues for async communication                 |
+| `Queue[A]`                                                 | Concurrent collection    | Synchronous ops, bounded/unbounded; use `Channel` when async backpressure is needed |
+| `Hub[A]`                                                   | Broadcast messaging      | Fan-out to multiple listeners; built on `Channel` + `Fiber`                         |
+| `Signal[A]`                                                | Reactive value           | Current + change notification; use for observable state                             |
+| `AtomicInt`, `AtomicLong`, `AtomicBoolean`, `AtomicRef[A]` | Atomic operations        | Thread-safe single-value containers                                                 |
+| `LongAdder`                                                | High-contention counter  | Use over `AtomicLong` for write-heavy workloads                                     |
+| `Meter`                                                    | Concurrency control      | Semaphore, mutex, rate limiter — composable via `pipeline`                          |
+| `Latch`                                                    | One-shot barrier         | Use for coordination points                                                         |
+| `Barrier`                                                  | Reusable barrier         | Use for phased coordination                                                         |
+
+**kyo-core** — error types:
+
+| Kyo primitive | Purpose             | Notes                                                            |
+| ------------- | ------------------- | ---------------------------------------------------------------- |
+| `Closed`      | Resource closed     | Standard error for closeable resources; carries creation `Frame` |
+| `Timeout`     | Operation timed out | Used by `Async.timeout` and related APIs                         |
+| `Interrupted` | Fiber interrupted   | Used for cancellation; extends `Panic` semantics                 |
+| `Rejected`    | Admission rejected  | Load shedding signal from `Admission`                            |
+
+Accept generic collections in public APIs, use `Chunk` internally:
+```scala
+def foreach[CC[+X] <: Iterable[X] & IterableOps[X, CC, CC[X]], A, B, S](
+    source: CC[A]
+)(f: Safepoint ?=> A => B < S)(using Frame, Safepoint): CC[B] < S =
+    Kyo.foreach(Chunk.from(source))(f).map(source.iterableFactory.from(_))
+```
+
+### Failure Tracking
+
+A typed `Abort[E]` row is a precise contract: it names exactly which failures an operation can produce, so a caller handles one and the compiler narrows the row to prove what remains. A blanket error-base on a row, or a raw non-module exception leaking onto it, discards that; the row degrades to "something might fail" and the leaf hierarchy becomes decorative.
+
+**Each public operation's row names its precise failure set.** Declare the narrowest type that covers exactly what the operation produces; do not smear a module-wide error base onto a row when the operation raises a small subset of it.
+
+**One sealed module-exception hierarchy, a sealed trait per operation, leaves that mix in.** This is how kyo-jsonrpc's `JsonRpcError` and kyo-http's `HttpException` are organized:
+
+```scala
+sealed abstract class FooException(code: Int, message: String, ...)(using Frame) extends KyoException(message, ...)
+
+sealed trait FooCallFailure extends FooException   // one trait per operation; this is the row type
+sealed trait FooReadFailure extends FooException
+
+case class FooUnknownException(name: String)(using Frame)
+    extends FooException(...) with FooCallFailure                      // leaf in one operation
+case class FooConnectionClosedException()(using Frame)
+    extends FooException(...) with FooCallFailure with FooReadFailure  // shared leaf, several operations
+```
+
+A trait can extend the parameter-carrying base because the concrete leaf supplies the constructor arguments, so a leaf mixes in every operation-trait it belongs to. The operation's row is then the operation-trait (`def call(...): A < Abort[FooCallFailure]`): one lean type in the signature that is *exactly* that operation's sealed failure set, matched exhaustively.
+
+**No raw non-module exception on a public row.** A kyo `Closed` / `Timeout`, a wire-protocol error, or a raw `Throwable` reaching a public row is untyped tracking-loss: it carries no module-level message and cannot be matched as part of the model. Map it to a typed leaf at the boundary (the `Abort.recover` site); a closed transport becomes a typed `*ConnectionClosedException` leaf, a remote wire error becomes a typed remote-error leaf.
+
+**Handler-body rows carry the user's error, not a framework blanket.** When a module accepts a user-supplied handler, the body's row is `Abort[E | <control signal>]` where `E` is the user's declared or inferred error; never a fixed module-exception blanket. A body that raises no module failure has an empty `E`; one that calls a framework accessor infers that accessor's leaves into `E`.
+
+**Every leaf carries its own message, built from typed fields.** The leaf's fields are typed (`name: String`, `uri: Uri`, `requested: Version`) and its `message` is constructed from them in the case-class body; no free-form `detail: String` parameter stands in for structure. See [KyoException Convention](#kyoexception-convention) for the base-class mechanics.
+
+**Construction-time validation panics; it does not appear on a tracked `Abort` row.** A bad configuration (an empty required set, a non-positive timeout, a handler claiming a framework-reserved code) is a construction-time programmer error, so `require` throws rather than threading an `Abort[ConfigError]` through every `init` signature, exactly as the sibling `JsonRpcHandler.Config.require` does. Prefer a typed leaf for the thrown payload (`McpConfigurationError`) over a raw `IllegalArgumentException` so the message stays structured, but that leaf carries no operation-trait and never reaches a row. Impossible states and misuse (an accessor used outside its dynamic extent, a partition invariant) are likewise bugs, not tracked failures: they panic and stay off every row.
+
+### Method Signatures
+
+
+#### `(using Frame)` as Type Parameter Separator
+
+Scala 3 doesn't support `def foo[A][B, C]`. The workaround is to use `(using Frame)` between type parameter clauses. The first clause holds the type parameter the user specifies explicitly; the second holds types inferred from value arguments:
+
+```scala
+//                      user specifies E     inferred from args
+//                      vvvvvvvvvvvvvvvv     vvvvvvvvvvvvvvvvvvvv
+inline def get[E](using inline frame: Frame)[A](either: Either[E, A]): A < Abort[E]
+
+inline def runWith[E](using Frame)[A, S, ER, B, S2](
+    v: => A < (Abort[E | ER] & S)
+)(continue: Result[E, A] => B < S2)(...): B < (S & reduce.SReduced & S2)
+
+def apply[E: ConcreteTag](using Frame)[A, S](
+    v: => A < (Abort[E] & S)
+): A < (Async & Abort[E] & S)
+```
+
+Pattern: `[UserSpecified](using Frame)[InferredFromArgs]`
+
+#### `using` Clause Ordering
+
+Inline methods — `Tag` before `Frame`:
+```scala
+inline def get[V](using inline tag: Tag[Var[V]], inline frame: Frame): V < Var[V]
+```
+
+Non-inline methods — `Frame` before type-level evidence:
+```scala
+def run[E](...)(using frame: Frame, ct: ConcreteTag[E], reduce: Reducible[Abort[ER]]): ...
+```
+
+`AllowUnsafe` always last:
+```scala
+def init(parallelism: Int)(using frame: Frame, allow: AllowUnsafe): ...
+```
+
+#### Frame and Tag
+
+- **`Frame`** on every method that suspends or handles effects. Never on pure data accessors (`capacity`, `size`). Always `inline` on inline methods for zero-cost source location capture.
+- **`Tag`** when runtime effect dispatch is needed — parametric effects like `Var[V]`, `Emit[V]`, `Env[R]` require tags because the handler must identify which effect to match at runtime.
+
+#### `@targetName` for Extension Methods
+
+Use `@targetName` to disambiguate extension methods on opaque types that erase to the same JVM signature as methods on the underlying type.
+
+#### Overload Organization
+
+Simple variants delegate to the canonical implementation — never duplicate logic:
+
+```scala
+// Canonical — does the actual work
+private[kyo] inline def runWith[V, A, S, B, S2](state: V)(v: A < (Var[V] & S))(
+    inline f: (V, A) => B < S2
+): B < (S & S2) = ArrowEffect.handleLoop(...)
+
+// Variants — project the result differently
+def run[V, A, S](state: V)(v: A < (Var[V] & S)): A < S =
+    runWith(state)(v)((_, result) => result)
+
+def runTuple[V, A, S](state: V)(v: A < (Var[V] & S)): (V, A) < S =
+    runWith(state)(v)((state, result) => (state, result))
+```
+
+For overloads by arity: variadic delegates to `Seq`, `Seq` delegates to `Seq`+config:
+```scala
+def race(first, rest*) = race(first +: rest)
+def gather(iterable) = gather(iterable.size)(iterable)
+```
+
+Ordered by increasing arity/complexity within each group.
+
+---
+
+## Code Conventions
+
+### Pending Type (`A < S`)
+
+`A < S` represents a computation that produces an `A` with pending effects `S`. Kyo automatically lifts plain values into computations — any `A` can be used where `A < S` is expected, with no wrapping needed. Use `Kyo.lift` only when the compiler struggles with type inference.
+
+- Avoid nested computations (`(A < S1) < S2`) — they require `.flatten` and make code harder to follow. Use `.map` chains or for-comprehensions to keep computations flat. `Kyo.lift` exists to wrap a value as a nested computation when unavoidable, but needing it usually signals the code should be restructured.
+- Use `.map`, not `.flatMap` — identical on pending types; `flatMap` exists for for-comprehensions only
+- Use `.andThen(next)` to sequence, not `.map(_ => next)`
+- Use `.unit` to discard a result to `Unit < S`
+- Prefer `.map` chains over for-comprehensions — use for-comprehensions when readability benefits (many dependent steps)
+- Use `.handle(Abort.run, Env.run(x))` for left-to-right handler pipelines instead of nested calls
+- Prefer `Abort.recover` over `Abort.run` + `Result` pattern matching
+
+### Scala Conventions
+
+- **Prefer functional style** — no mutable `var`s, no `while` loops, no `throw`/`catch` for control flow. Use `val`, recursion (with `@tailrec`), `Loop`, and `Abort` for errors. Mutable state is acceptable only in performance-critical internals (atomics, bit-packing) where it's encapsulated behind a pure interface.
+- Use `discard(expr)` to suppress unused value warnings, not `val _ = expr`
+- Provide `CanEqual` for all comparable types — use `derives CanEqual` on case classes and enums. Skip types with non-comparable fields like functions.
+- Minimize explicit type parameters at call sites — APIs should infer well from value arguments. If a user must write `Abort.fail[String]("error")` instead of `Abort.fail("error")`, that's a design smell. Use the `(using Frame)` type parameter separator pattern (see [Method Signatures](#method-signatures)) when user-specified types are unavoidable
+- Explicit return types on public API only — let the compiler infer elsewhere:
+  ```scala
+  def offer(v: A)(using Frame): Boolean < (Sync & Abort[Closed])   // public — explicit
+  private def helper(v: A) = ...                                    // private — inferred
+  val result = someCall()                                           // val — inferred
+  val chunk = Chunk.from(values)                                    // not Chunk.from[A](values)
+  ```
+- No `protected` — use `private[kyo]` or `private[kernel]`
+- All public APIs in the `kyo` package — internal code uses `kyo.internal`
+- Avoid `asInstanceOf` and `@unchecked` — acceptable only inside opaque type boundaries or kernel internals. Never use `@uncheckedVariance`
+- Imports: specific over wildcard, internal wildcards OK, grouped by origin
+- Keep `S` open if appropriate: use `A < (S & SomeEffect)` instead of `A < SomeEffect`
+- Prefer call-by-name (`body: => A < S`) for methods that capture a side-effecting body. This is a safety net in case the user forgets to suspend side effects — without call-by-name, `Abort.catching(connection.read())` would execute `read()` eagerly before `catching` can intercept the exception
+- Mark methods `final` in abstract classes/traits when not intended for override
+- Run `sbt "scalafmtCheckAll"` before submitting
+
+### Documentation
+
+#### Type-Level Scaladoc
+
+Every main public type needs a scaladoc (8-35 lines) covering:
+
+- Opening sentence — what the type *is*, brief and definitional
+- Conceptual "why" — 1-3 paragraphs on mental model and design rationale
+- Feature/capability bullets — key operations and behaviors
+- Gotcha callouts — `WARNING:`, `IMPORTANT:`, or `Note:` for surprising behavior
+- `@tparam` tags for all type parameters
+- `@see` references — 3-6 links per type, grouped by topic (creation, handling, related types)
+- No code examples unless demonstrating composition patterns or system property syntax (rare)
+
+WARNING/IMPORTANT/Note decision:
+- **`WARNING:`** — risk of data loss, memory exhaustion, or incorrect behavior if misused
+- **`IMPORTANT:`** — subtle semantic distinction that affects correctness
+- **`Note:`** — behavioral clarification or platform difference
+
+#### Method-Level Scaladoc
+
+- Brief description (1-3 lines)
+- `@param` / `@return` only when name and type aren't enough
+- Skip for truly trivially obvious methods (`capacity: Int`, `size: Int`)
+
+#### Markdown Formatting
+
+Scaladoc parses comments as CommonMark markdown (the Scala 3 default). Scala 2 wiki syntax (`=Heading=`, `'''bold'''`, `''italic''`, `[[url text]]`) renders as literal text and must not be used.
+
+Heading levels map to CSS classes that determine visual size:
+
+| Source       | HTML | Size |
+|--------------|------|------|
+| `#` / `##`   | h1 / h2 | very large (page-level) |
+| `###`        | h3 | large |
+| `####`       | h4 | moderate — **use for in-class sub-sections** |
+| `#####` / `######` | h5 / h6 | small |
+
+Use `####` for sub-sections inside a class/object/trait docstring. `#` and `##` compete visually with the type's own title. For light visual grouping where no anchor or sidebar entry is wanted, use `**bold**` inline labels instead of a heading.
+
+Code blocks: prefer markdown fenced blocks with a language tag for syntax highlighting:
+
+````
+```scala
+val x: Int < Async = 42
+```
+````
+
+Scala 2 `{{{ }}}` blocks render correctly (backward-compat) but get no syntax highlight; prefer fenced form for new code. **Indented (4-space) code blocks do not work** — they render as plain paragraphs.
+
+Links:
+
+- External URLs: `[text](https://…)` markdown form. Never `[[https://… text]]` (Scala 2 wiki).
+- Internal type / member references: `[[kyo.Foo]]` or `[[Foo]]` (wiki-style member-link, kept for backward-compat and preferred for cross-references).
+- `[[Foo custom label]]` for a renamed link target.
+
+Emphasis: `**bold**` and `*italic*`. Never `'''bold'''` / `''italic''`.
+
+Other supported markdown: GFM tables (`| col |`), block quotes (`>`), horizontal rules (`---` / `***`), ordered/unordered lists with nesting, strikethrough (`~~`), inline HTML (`<em>`, `<sub>`, etc.).
+
+Scaladoc tags (`@param`, `@tparam`, `@return`, `@throws`, `@note`, `@see`, `@example`, `@since`) render in a structured "Attributes" section below the description. For `@throws`, always use a resolvable type name (e.g. `@throws java.lang.IllegalArgumentException`) — bare type-parameter names like `@throws E` emit unresolvable-link warnings.
+
+**scalafmt interaction (critical)**: the repo `.scalafmt.conf` sets `docstrings.wrap = keep` so scalafmt preserves docstring line structure. Even with that setting, markdown still requires blank `* ` lines between blocks — heading + paragraph, paragraph + list, paragraph + code block all need a blank separator line. Otherwise markdown joins them into a single paragraph.
+
+Example of correct structure:
+
+````
+/** Single-sentence summary on the line right after the slash-star-star.
+  *
+  * Longer paragraph describing the type. Spans as many sentences as needed.
+  *
+  * #### Sub-section heading
+  *
+  * Paragraph that follows the heading. The blank `*` lines above and below
+  * the heading are mandatory.
+  *
+  *   - List items go here
+  *   - With a blank line above and below the list
+  *
+  * ```scala
+  * val example = …
+  * ```
+  *
+  * @tparam A summary
+  * @param input summary
+  */
+````
+
+#### Inline Comments
+
+Methods typically have short comments to aid understanding when they're more complex. Comments appear in these situations:
+
+1. **Method-level clarity** — a brief comment on what a non-trivial method does, especially when the name alone isn't enough
+2. **Phase markers in multi-step methods** — brief labels marking logical sections within a method body (`// extract path params`, `// combine inputs`, `// map errors`). Help readers scan without reading every line. One line per phase, not a paragraph. Comments must add understanding — don't restate what the function name already says (`// process completed transfers` before `processCompletedTransfers()` is noise).
+3. **Navigational comments in large methods (30+ lines)** — longer methods benefit from slightly more comments even when individual lines are self-evident, because readers lose context over many lines. These act as signposts helping someone skim the method's structure without reading every line.
+4. **Race conditions / concurrency hazards** — explain the interleaving
+5. **Bit-packing / encoding schemes** — diagram the layout
+6. **Known limitations / TODOs** — describe what's missing and why
+7. **Non-obvious algorithmic choices** — explain *why*, not *what*
+
+Quality bar: every comment should pass the test "would removing this make the code harder to understand?" If the answer is no, consider deleting it.
+
+### File Organization
+
+A source file should read like a guided tour of the type. A contributor opening it for the first time learns — in order — what the type is, how to create it, how to use it, and only then how it works internally. Scaladocs set the context, method ordering tells the story, and section separators mark the chapters.
+
+#### File Template
+
+```scala
+package kyo                           // or kyo.internal
+
+import kyo.specific.imports
+import scala.annotation.tailrec
+
+/** Type-level scaladoc.
+  *
+  * Conceptual explanation.
+  *
+  * @tparam A description
+  * @see [[kyo.Related]]
+  */
+sealed trait MyEffect[A] extends ArrowEffect[...] // or opaque type, final class
+
+object MyEffect:
+
+    // --- Public API (frequency-of-use order) ---
+
+    // Suspend/create methods
+    inline def create[A](...)(using ...): A < MyEffect[A] = ...
+
+    // Query/access methods
+    inline def get[A](...)(using ...): A < MyEffect[A] = ...
+    inline def use[A](...)(using ...): B < (MyEffect[A] & S) = ...
+
+    // Handler methods
+    def run[A](...)(using ...): Result < S = runWith(...)(identity)
+    private[kyo] def runWith[A](...)(f: ...)(using ...): B < S = ...
+
+    // Factory methods (for resource types)
+    def init[A](...)(using Frame): MyType[A] < (Sync & Scope) = ...
+    def initWith[A](...)(f: ...)(using Frame): B < (Sync & Scope & S) = ...
+    def initUnscoped[A](...)(using Frame): MyType[A] < Sync = ...
+
+    // --- Nested Types ---
+
+    object Unsafe:
+        ...
+
+    // --- Internal ---
+
+    private[kyo] def internal(...) = ...
+
+end MyEffect
+```
+
+#### Readability Ordering
+
+The file template above reflects a deliberate top-to-bottom reading order:
+
+1. **Type definition + scaladoc** — the reader learns what the type is and why it exists
+2. **Public API** — organized into groups by usage pattern, most-used first within each group:
+   1. Suspend/create methods
+   2. Query/access methods
+   3. Handler methods
+   4. Factory methods (for resource types)
+3. **Nested types** — `Unsafe`, `Config`, auxiliary case classes, public type aliases
+4. **Internal methods** — implementation details, `private[kyo]` helpers, internal-only givens
+
+Within each group, simple overloads come before complex ones. The canonical implementation sits next to its variants so the reader sees the delegation at a glance. Scaladocs on each method flow naturally from one to the next — each building on context established by the previous.
+
+This ordering matters because it determines how quickly a contributor can orient themselves. A well-ordered file answers "what does this do?" and "how do I use it?" without scrolling.
+
+#### Visibility Tiers
+
+| Modifier       | Scope         | Use for                                |
+| -------------- | ------------- | -------------------------------------- |
+| *(none)*       | Public        | User-facing API                        |
+| `private[kyo]` | Cross-package | Internal utilities used across modules |
+| `private`      | Class-local   | Mutable state, helpers                 |
+
+#### Section Separators
+
+Use `// ---...` separators with section names in all files:
+
+```scala
+// --- Generic ---
+
+def foreach[...] = ...
+def filter[...] = ...
+
+// --- List ---
+
+def foreach[A, B, S](source: List[A])(...) = ...
+```
+
+Group by semantic category (reads → writes → updates → handlers), then by arity within each group.
+
+#### `export` for Nested Type Promotion
+
+When a nested type is heavily used, promote it to package level with `export`:
+
+```scala
+// In Fiber.scala — after the companion object
+export Fiber.Promise   // makes kyo.Promise available without Fiber. prefix
+```
+
+Use sparingly — only for types that users reference frequently enough that qualification would be noisy.
+
+---
+
+## Module READMEs
+
+Every module ships a `README.md` aimed at a developer evaluating or first using it. It positions the module, shows how to install and use it, and introduces features in an order a reader can stop at any time with a coherent picture. It is not a reference manual (scaladoc covers the full API) and not a tutorial (`kyo-examples` covers end-to-end programs).
+
+To add or revise a module README, use the [`/readme` skill](.claude/skills/readme/SKILL.md). The skill is the authoritative source for both structure and writing style: it orchestrates source analysis, drafting, multi-axis critique, and doctest verification, and it carries the conventions every Kyo README follows (opening hook, capability summary, topical ordering, code-example rules, gotcha markers, and so on). `kyo-http/README.md` and `kyo-schema/README.md` are the working models the skill draws from.
+
+`sbt <module>/doctest` validates that every fenced Scala block in the README compiles against the module's classpath. CI runs `sbt doctest` over the full project.
+
+---
+
+## Optimization
+
+### Performance
+
+- Prefer `final class` for concrete types and `abstract class` over `trait` for base types — JVM interface dispatch is more expensive than class dispatch. Use `trait` only when defining a pure interface (like effect types extending `ArrowEffect`/`ContextEffect`)
+- Mark classes `final` unless `sealed` or `abstract`
+- Provide pure-function variants (`mapPure`, `filterPure`) when a hot transformation doesn't need suspension
+- Fast-path before slow-path — always check for degenerate cases (empty, single-element, already-resolved) before entering the general/expensive path:
+  ```scala
+  if source.isEmpty then Chunk.empty              // empty: return immediately
+  else if source.sizeIs == 1 then
+      f(source.head).map(Chunk(_))                // single: avoid Loop setup
+  else Loop.indexed(...)                           // general case
+  ```
+- Use opaque types — never wrap when you can alias. See [Zero-Cost Type Design](#zero-cost-type-design)
+- Use `inline` strategically — inline creation paths, not handling paths. See [Inline Guidelines](#inline-guidelines)
+- Prefer `@tailrec` loops — allocate continuations only when effects force suspension
+- **Never block a thread** — use `Async`-based suspension (`Channel.put`, `Fiber.get`, `Clock.sleep`) instead of blocking primitives (`Thread.sleep`, `CountDownLatch.await`, `synchronized`, `Future.await`). 
+- Prefer lock-free algorithms (CAS + `@tailrec`) over blocking synchronization
+- Bit-pack atomically-updated composite state to avoid wrapper allocations. Always include a layout comment:
+  ```scala
+  // Bit allocation:
+  // Bits 0-15 (16 bits): depth (0-65535)
+  // Bit 16 (1 bit): hasInterceptor flag
+  // Bits 17-63 (47 bits): threadId
+  ```
+- Avoid the erased tag pattern — existing usages are tech debt from when `Tag` had limitations with variant effects. `Tag` no longer has this limitation, so do not introduce new instances:
+  ```scala
+  // tech debt — do not copy
+  private inline def erasedTag[E]: Tag[Abort[E]] = Tag[Abort[Any]].asInstanceOf[Tag[Abort[E]]]
+  ```
+
+### Zero-Cost Type Design
+
+Kyo achieves zero-cost abstractions through opaque types. When designing a new type, choose the strategy that eliminates allocation on the hot path.
+
+**Union discriminability:** When using union types, ensure all components are fully discriminable at runtime. Overlapping erasures will cause incorrect dispatch.
+
+| Strategy               | Example                                      | Wraps                        | When to use                                                   |
+| ---------------------- | -------------------------------------------- | ---------------------------- | ------------------------------------------------------------- |
+| Opaque over primitive  | `Duration = Long`                            | Raw primitive                | Numeric quantities (time, size, count)                        |
+| Opaque over JVM type   | `Instant = JInstant`                         | Existing class               | Wrapping a well-tested JVM type with a safer/simpler API      |
+| Opaque over union      | `Maybe[A] = Absent \| Present[A]`            | Union of subtypes            | Discriminated types where the success path avoids boxing      |
+| Opaque over array      | `Span[A] = Array[? <: A]`                    | Mutable array                | Immutable view of array data without copying                  |
+| Opaque over Unsafe     | `Channel[A] = Channel.Unsafe[A]`             | Unsafe implementation        | Concurrent types with safe/unsafe tiers (see Unsafe Boundary) |
+| Effect alias           | `Async <: (Sync & Async.Join)`               | Subtype bounds               | Composing effects via subtype relationships                   |
+| Subtype-bounded opaque | `Queue.Unbounded[A] <: Queue[A] = Queue[A]`  | Parent opaque                | Expressing subtype relationships between opaque types         |
+
+**Structuring an opaque type:**
+- Define the opaque type and its companion in the same file
+- Expose the safe API via **extension methods** in the companion — not methods on a class
+- Factory methods in the companion validate input: `Maybe(null)` returns `Absent`, `Duration.fromNanos` clamps negatives
+- Internal code accesses the underlying value via pattern matching on union members or direct use within the opaque boundary
+- Avoid exposing the underlying representation; if escape hatches are needed, use `private[kyo]`
+
+**Given instances for new types** — provide as applicable:
+- `CanEqual` — required if the type supports `==`/`!=` (strict equality is enabled project-wide)
+- `Render` — for human-readable display
+- `Ordering` — if the type is naturally sortable
+- `Tag` — automatically derived; only customize if the type has special encoding
+
+**Sealed trait vs opaque type:**
+- Use **opaque type** when you want zero-cost wrapping of an existing representation
+- Use **sealed abstract class** or **enum** when you need pattern matching on cases or case class features (structural equality, copy). Reserve sealed traits for effect type hierarchies
+- Both can coexist: `Result` is an opaque union whose members (`Success`, `Failure`, `Panic`) are sealed subtypes
+
+### Inline Guidelines
+
+`inline` is powerful but creates code bloat when overused. The codebase follows a deliberate strategy: **inline the creation path (where effects are born), not the handling path (where effects are processed), and inline function parameters to avoid closure allocation**.
+
+**IMPORTANT: Inline as little as possible.** When a method needs `inline`, mark only the function/by-name parameters as `inline` and keep the method body small. This eliminates closure allocation while minimizing code bloat at each call site. Two patterns:
+
+1. **Trivial body** — the method body is a one-liner, so inlining the whole thing is fine:
+   ```scala
+   // Maybe.map — body is a simple branch, no bloat risk
+   inline def map[B](inline f: A => B): Maybe[B] =
+       if isEmpty then Absent else f(get)
+   ```
+
+2. **Non-trivial body** — define a local non-inline `def` for the real logic. The `inline` method eliminates the lambda allocation for `f`, but the loop/recursion compiles as a regular method that doesn't duplicate at every call site:
+   ```scala
+   // Pending.map — inline entry point, non-inline loop
+   inline def map[B, S2](inline f: Safepoint ?=> A => B < S2)(...): B < (S & S2) =
+       @nowarn("msg=anonymous") def mapLoop(v: A < S)(using Safepoint): B < (S & S2) =
+           v match
+               case kyo: KyoSuspend[...] => ...  // recursive loop logic
+               case v => f(v.unsafeGet)
+       mapLoop(v)
+   ```
+
+When in doubt, don't inline. The cost of unnecessary inlining (code bloat, slower compilation) is higher than the cost of a method call on a non-hot path.
+
+**DO inline:**
+
+| Category                                 | Examples                                                    | Why                                                                                          |
+| ---------------------------------------- | ----------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| Effect suspend/create calls              | `Abort.fail`, `Var.set`, `Emit.value`, `Choice.evalSeq`     | Direct calls to `ArrowEffect.suspend`/`suspendWith` — must be zero-cost                      |
+| Kernel framework entry points            | `ArrowEffect.handle`, `ArrowEffect.suspend`                 | Backbone of the effect system; enables compile-time specialization                           |
+| `private[kyo]` hot-path helpers          | `Var.runWith`, internal handler implementations             | Optimizes internal glue without affecting public API size                                    |
+| Methods with function/by-name parameters | `Maybe.map`, `Maybe.flatMap`, `Var.use`, `Result.fold`      | Eliminates `Function1` allocation — the lambda body is substituted directly at the call site |
+
+**DO NOT inline:**
+
+| Category                                | Examples                                                   | Why                                                                                                  |
+| --------------------------------------- | ---------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| Public effect handlers/runners          | `Abort.run`, `Var.run`, `Emit.runFold`, `Choice.run`       | These call back into the kernel; inlining would duplicate complex handler logic at every call site   |
+| Methods that take only value parameters | `Maybe.get`, `Maybe.zip`, `Maybe.contains`, `Maybe.toList` | No function/by-name parameters means no closure to eliminate, so inlining adds bloat without benefit |
+
+**The pattern in practice** — look at any effect like `Abort`:
+- `Abort.fail`, `Abort.panic`, `Abort.get`, `Abort.when` → **inline** (creation)
+- `Abort.run`, `Abort.runWith`, `Abort.recover`, `Abort.fold` → **not inline** (handling)
+
+Similarly for data types like `Maybe`:
+- `Maybe.map`, `Maybe.flatMap`, `Maybe.filter`, `Maybe.getOrElse` → **inline** (simple branches)
+- `Maybe.get`, `Maybe.zip`, `Maybe.contains`, `Maybe.flatten` → **not inline** (complex logic)
+
+**`@nowarn` for inlined lambdas** — when inlining a function parameter causes the compiler to warn about new anonymous classes, use `@nowarn("msg=anonymous")`.
+
+---
+
+## Testing
+
+### Framework
+
+Test suites extend `kyo.test.Test[Any]` (or a module-derived base that extends it). The type parameter is an additive extra effect row; `Any` is the common case (baseline `Async & Abort[Any] & Scope` only). There are no per-module `Test.scala` shim files. Test files are named `FooTest.scala` and mirror the main source structure.
+
+```scala
+class ChannelTest extends kyo.test.Test[Any]:
+    "put and take" in {
+        for
+            channel <- Channel.init[Int](2)
+            _       <- channel.put(1)
+            v       <- channel.take
+        yield assert(v == 1)
+    }
+```
+
+Modules that share a common fixture define a thin abstract base:
+
+```scala
+// e.g. kyo-parse
+abstract class ParseTestBase extends kyo.test.Test[Any]
+
+class ParserTest extends ParseTestBase:
+    "parse empty" in {
+        assert(parse("") == Result.unit)
+    }
+```
+
+### Test Patterns by Level
+
+**Pure / synchronous**: no effects, leaf body is `Unit`:
+```scala
+"value equality" in {
+    assert(Maybe(42) == Maybe(42))
+}
+```
+
+**Effectful**: the leaf body is `Unit < (Async & Abort[Any] & Scope)`; Kyo effects compose directly with no `run` wrapper:
+```scala
+"put and take" in {
+    for
+        channel <- Channel.init[Int](2)
+        _       <- channel.put(1)
+        v       <- channel.take
+    yield assert(v == 1)
+}
+```
+
+Groups are registered with `-` (always a group; body runs at registration time to collect nested leaves):
+
+```scala
+"channel" - {
+    "bounded" - {
+        "put and take" in { ... }
+    }
+}
+```
+
+### Assertion Model
+
+`assert(cond)` is a power-assert macro: on failure it prints a diagram of subexpression values. Every leaf must evaluate at least one assertion; a leaf that completes without any assertion is failed by default (the `failOnNoAssertion` check). To explicitly mark a leaf as asserting no runtime value, write `succeed` (or `succeed("why")`) in the body.
+
+To disable the check for a whole suite:
+
+```scala
+override def config = super.config.failOnNoAssertion(false)
+```
+
+### Compile-Time Tests
+
+Verify that code compiles or fails to compile:
+
+```scala
+"valid code compiles" in {
+    typeCheck("Env.get[Int]")
+}
+
+"invalid code fails with expected message" in {
+    typeCheckFailure("Layer.init[String]()")("Missing Input: scala.Predef.String")
+}
+```
+
+The string passed to `typeCheckFailure` is a substring match against the compiler error.
+
+### Concurrent Test Helpers
+
+`assertEventually(cond)` retries `cond` every 10ms until it yields `true`, bounded by the per-test timeout. Use it for eventually-consistent concurrent state instead of sleeps:
+
+```scala
+"counter reaches 1" in {
+    for
+        counter <- AtomicInt.init(0)
+        _       <- Async.run(counter.incrementAndGet.unit)
+        _       <- assertEventually(counter.get.map(_ > 0))
+    yield ()
+}
+```
+
+### Debugging Hangs and Timeouts
+
+When a leaf stalls past the heartbeat interval or hits its timeout, the runner captures a full thread dump and every registered diagnostic snapshot alongside the failure. This makes a rare hang or deadlock root-causable from a single occurrence, rather than needing a second, instrumented reproduction.
+
+Runtime components publish their live internal state through the process-global registry `kyo.internal.Diagnostics`. Register a named dumper (typically at construction) and close the registration when the component shuts down so it does not accumulate across a long-lived process:
+
+```scala
+private val diag =
+    Diagnostics.register("ConnectionPool@" + java.lang.System.identityHashCode(this)) { () =>
+        s"active=${active.size} idle=[${idleKeys.mkString(" ")}]"
+    }
+// on shutdown:
+diag.close()
+```
+
+A dumper runs on the reporter's thread, concurrently with the component it inspects, so it must read state best-effort (a stale or partial snapshot is acceptable) and must never block. An I/O driver, for example, can register its pending-operation tables and poll/reap liveness counters this way.
+
+### Exception and Failure Assertions
+
+`intercept[E](body)` asserts that `body` throws an exception of type `E` and returns the caught exception:
+
+```scala
+"throws on invalid input" in {
+    val ex = intercept[IllegalArgumentException] {
+        parseStrict("")
+    }
+    assert(ex.getMessage.contains("empty"))
+}
+```
+
+### Skipping and Preconditions
+
+`assume(cond, msg)` cancels (not fails) the test when a precondition is not met. `cancel(msg)` cancels unconditionally. Use these for platform-specific prerequisites rather than guarding with `if`:
+
+```scala
+"requires multiple cores" in {
+    assume(Runtime.getRuntime.availableProcessors > 1, "requires multi-core")
+    // ...
+}
+```
+
+### Platform-Conditional Tests
+
+Platform gates restrict a leaf or group to one or more platforms. On a disabled platform the body is compile-excluded (absent, not skipped):
+
+```scala
+"jvm only" .jvm in { ... }
+"not native" .notNative in { ... }
+"jvm or js" .notNative in { ... }
+```
+
+### Decorators
+
+Decorators chain on a leaf name before `in`:
+
+```scala
+"flaky network call" .flaky in { ... }          // retry up to 3x, tags "flaky"
+"slow integration" .timeout(120.seconds) in { ... }
+"known broken" .pendingUntilFixed("issue #42") in { ... }
+"retry on failure" .retry(3) in { ... }
+```
+
+### Per-Suite Configuration
+
+Override `config` to control parallelism, timeout, and other run settings:
+
+```scala
+// Run all leaves in this suite sequentially
+override def config = super.config.sequential
+
+// Change the default per-leaf timeout
+override def timeout = 30.seconds
+```
+
+Override `aroundLeaf` to wrap every leaf with shared setup or teardown:
+
+```scala
+override def aroundLeaf[A](body: A < (Async & Abort[Any] & Scope))(using Frame) =
+    HttpClient.withConfig(_.timeout(60.seconds))(body)
+```
+
+---
+
+## Unsafe Boundary
+
+### The Two-Tier API Pattern
+
+Every concurrent type (`Channel`, `Queue`, `Hub`, `Fiber`, `Meter`, `Latch`, `Signal`, etc.) exposes two parallel APIs: a **safe** tier that tracks effects in the type system, and an **Unsafe** tier for integrations, libraries, and performance-sensitive code that bypasses effect tracking.
+
+Users can always navigate between the two tiers:
+- **`.unsafe`** on any safe instance returns the `Unsafe` counterpart
+- **`.safe`** on any `Unsafe` instance returns the safe counterpart
+
+The two tiers mirror each other — every operation available on the safe API has an `Unsafe` equivalent, and vice versa. The safe tier wraps operations in effects (`Sync`, `Abort[Closed]`, `Async`), while the `Unsafe` tier returns raw values and `Result`s, guarded by `(using AllowUnsafe)`.
+
+**Structure**: For a type `T`, expect to find:
+- `T` — the safe type with effectful methods (takes `using Frame`)
+- `T.Unsafe` — the form depends on the type: `sealed abstract class` when multiple implementations are needed (e.g., open/closed states), or `opaque type` for zero-cost wrapping of a single Java/platform type (e.g., `AtomicInt.Unsafe = AtomicInteger`). Operations take `(using AllowUnsafe)` instead of `(using Frame)`
+- `T.Unsafe.init(...)` — factory in the `Unsafe` companion (takes `using AllowUnsafe`; add `Frame` only if the factory uses it, e.g., to capture creation context for `Closed`). Unsafe methods should return raw values or `Result`s, not effectful computations (`A < S`). `Frame` in unsafe code is primarily for capturing creation context, not for effect suspension
+- `T.init(...)` / `T.use(...)` / `T.initUnscoped(...)` — safe factories that delegate to `Unsafe.init` with lifecycle management (see "Factory methods" in Naming above)
+
+**Safe→Unsafe bridge**: Safe methods enter the unsafe tier via `Sync.Unsafe.defer { ... }`, which provides `AllowUnsafe` implicitly. Inside, they call the `Unsafe` method and wrap `Result[Closed, A]` in `Abort.get` to convert to `Abort[Closed]` effect.
+
+**Subtypes preserve the pattern**: `Queue.Unbounded` has `Queue.Unbounded.Unsafe` that extends `Queue.Unsafe`. The subtype relationship holds on both tiers.
+
+### Unsafe API Conventions
+
+- **WARNING scaladoc** on every `Unsafe` class and `object Unsafe` — always the same text: "Low-level API meant for integrations, libraries, and performance-sensitive code. See AllowUnsafe for more details." Skip detailed method-level scaladocs for `Unsafe` APIs — the WARNING class-level scaladoc is sufficient. Add method-level docs only when the behavior is non-obvious or differs from the safe counterpart.
+- **`(using AllowUnsafe)`** on every method that performs side effects without suspension. Pure accessors like `capacity` don't need it.
+- **`extends Serializable`** on `sealed abstract class Unsafe` for closeable types
+- **Closeable operations return `Result[Closed, A]`** — never throw on closed state
+- **Factory methods** in `object Unsafe` take `(using AllowUnsafe)`. Add `Frame` only when the factory actually uses it (e.g., to capture the creation context for `Closed` errors)
+
+### AllowUnsafe Tiers
+
+**All side effects must be suspended.** No side-effecting code should execute outside of Kyo's effect system without either an `AllowUnsafe` proof or a suspension boundary like `Sync.Unsafe`. This is a hard rule — unsuspended side effects break referential transparency.
+
+In order of preference:
+
+1. **Propagate the proof** — caller explicitly opts in (preferred for performance — no suspension overhead):
+   ```scala
+   def init[A](capacity: Int)(using AllowUnsafe): Queue.Unsafe[A]
+   ```
+
+2. **Suspend in Sync** — wraps the unsafe operation in an effect:
+   ```scala
+   def offer(v: A)(using Frame): Boolean < (Sync & Abort[Closed]) =
+       Sync.Unsafe.defer(Abort.get(self.offer(v)))
+   ```
+
+3. **Import danger** — external runtime callbacks (Netty listeners, platform interop), application boundaries (KyoApp, tests), and initialization of globally shared module-level values that need unsafe operations at class loading time (e.g., `Clock.live`, `Async.defaultConcurrency`):
+   ```scala
+   import AllowUnsafe.embrace.danger
+   ```
+
+**Scope `AllowUnsafe` as narrowly as possible.** Never place `(using AllowUnsafe)` on a constructor or class-level import where it leaks to all methods — this masks accidental unsafe operations that the compiler would otherwise catch. Instead, take it only on the specific methods that need it, or scope the import to the smallest block possible:
+```scala
+// Wrong — leaks AllowUnsafe to every method in the class
+class MyConnection(...)(using AllowUnsafe):
+    private val flag = AtomicBoolean.Unsafe.init()
+    def send(...) = ... // compiler won't catch unsafe ops here
+
+// Right — scoped to the specific initialization
+class MyConnection(..., closed: AtomicBoolean):
+    def isAlive(using AllowUnsafe): Boolean = !closed.unsafe.get()
+    def send(...) = ... // compiler catches accidental unsafe ops
+```
+
+**Prefer the safe type, access `.unsafe` when needed.** When a type has safe/unsafe tiers, hold the safe version and use `.unsafe` only in methods that already have `AllowUnsafe` in scope. This ensures the compiler enforces safety by default:
+```scala
+// Preferred — hold safe type, access .unsafe in AllowUnsafe methods
+class MyConnection(closed: AtomicBoolean):
+    def isAlive(using AllowUnsafe): Boolean = !closed.unsafe.get()
+    def close(using Frame): Unit < Async = closed.set(true).andThen(...)
+
+// Avoid — holding Unsafe type bypasses safety checks everywhere
+class MyConnection(closed: AtomicBoolean.Unsafe):
+    def isAlive(using AllowUnsafe): Boolean = !closed.get()
+```
+
+
+### AllowUnsafe for Zero-Allocation Side Effects
+
+`AllowUnsafe` is a compiler-enforced proof that the side effect has already been suspended at an outer scope. Methods can perform side effects directly without allocating a `Sync.Unsafe` suspension, while the proof guarantees the call chain is rooted in a properly suspended context.
+
+This is the mechanism behind the safe→unsafe bridge. The safe tier suspends via `Sync.Unsafe`, which provides `AllowUnsafe` implicitly, then calls the `Unsafe` method that performs the side effect directly:
+
+```scala
+// Safe tier — suspends once, then delegates
+def set(v: Boolean)(using Frame): Unit < Sync = Sync.Unsafe.defer(unsafe.set(v))
+
+// Unsafe tier — performs the side effect directly, no allocation
+// The AllowUnsafe proof guarantees an outer scope has already suspended
+extension (self: Unsafe)
+    inline def set(v: Boolean)(using AllowUnsafe): Unit = self.set(v)
+```
+
+The same pattern applies to internal APIs. When a method takes `(using AllowUnsafe)`, it's declaring: "I perform side effects, but I trust my caller to have suspended." This allows multiple unsafe operations to compose without each one wrapping in its own `Sync.Unsafe`:
+
+```scala
+// One suspension covers multiple unsafe operations — no per-operation allocation
+def release(conn: Connection)(using AllowUnsafe, Frame): Unit =
+    if conn.isAlive then          // unsafe: reads atomic flag
+        idleChannels.offer(conn)  // unsafe: mutates concurrent queue
+    else
+        conn.closeAbruptly()      // unsafe: closes connection
+```
+
+Without `AllowUnsafe`, each of these would need its own `Sync.Unsafe` wrapper, allocating a closure each time. The `AllowUnsafe` proof eliminates this overhead by hoisting the suspension to the outermost boundary.
+
+### Closeable Resource Pattern
+
+All closeable resources follow:
+
+```scala
+// Closed carries creation context for diagnostics
+class Closed(resource: String, createdAt: Frame, details: String = "")(using Frame)
+
+// Unsafe level returns Result[Closed, A]
+def offer(v: A)(using AllowUnsafe): Result[Closed, Boolean]
+
+// Safe level converts to Abort[Closed]
+def offer(v: A)(using Frame): Boolean < (Sync & Abort[Closed]) =
+    Sync.Unsafe.defer(Abort.get(self.offer(v)))
+```
+
+Resource factory convention — all variants delegate down to `Unsafe.init`:
+
+| Method                | Lifecycle                   | Effect Set         | Delegates to                          |
+| --------------------- | --------------------------- | ------------------ | ------------------------------------- |
+| `init`                | `Scope`-managed cleanup     | `Sync & Scope`     | `initWith(identity)`                  |
+| `initWith(f)`         | `Scope`-managed + callback  | `Sync & Scope & S` | `Unsafe.init` + `Scope.ensure(close)` |
+| `use(f)`              | Bracket (no `Scope` needed) | `Sync & S`         | `Unsafe.init` + `Sync.ensure(close)`  |
+| `initUnscoped`        | No cleanup guarantees       | `Sync`             | `initUnscopedWith(identity)`          |
+| `initUnscopedWith(f)` | No cleanup + callback       | `Sync & S`         | Bare `Unsafe.init`                    |
+
+The delegation chain (using `Channel` as canonical example):
+```scala
+// init delegates to initWith with identity — Scope-managed lifecycle
+def init[A](capacity: Int, access: Access)(using Frame): Channel[A] < (Sync & Scope) =
+    initWith[A](capacity, access)(identity)
+
+// initWith: create resource, register Scope cleanup, apply callback
+inline def initWith[A](capacity: Int, access: Access)[B, S](
+    inline f: Channel[A] => B < S
+)(using inline frame: Frame): B < (S & Sync & Scope) =
+    Sync.Unsafe.defer:
+        val channel = Unsafe.init[A](capacity, access)
+        Scope.ensure(Channel.close(channel)).andThen:
+            f(channel)
+
+// use: bracket semantics via Sync.ensure — no Scope in the effect set
+inline def use[A](capacity: Int, access: Access)[B, S](
+    inline f: Channel[A] => B < S
+)(using inline frame: Frame): B < (S & Sync) =
+    Sync.Unsafe.defer:
+        val channel = Unsafe.init[A](capacity, access)
+        Sync.ensure(Channel.close(channel)):
+            f(channel)
+
+// initUnscoped delegates to initUnscopedWith with identity — no cleanup
+def initUnscoped[A](capacity: Int, access: Access)(using Frame): Channel[A] < Sync =
+    initUnscopedWith[A](capacity, access)(identity)
+
+// initUnscopedWith: bare Unsafe.init, no cleanup registered
+inline def initUnscopedWith[A](capacity: Int, access: Access)[B, S](
+    inline f: Channel[A] => B < S
+)(using inline frame: Frame): B < (S & Sync) =
+    Sync.Unsafe.defer(f(Unsafe.init[A](capacity, access)))
+```
+
+Choose `init` (Scope-managed) by default. Use `use` when you want bracket semantics without `Scope` in the effect set. Use `initUnscoped` only when the caller manages lifecycle manually.
+
+### Close Method Convention
+
+Types that offer a `close` method must provide three variants. The parameterized version is the canonical implementation; the others delegate to it:
+
+```scala
+// Canonical — takes an explicit grace period
+def close(gracePeriod: Duration)(using Frame): Unit < Async
+
+// Default — delegates with a default grace period
+def close(using Frame): Unit < Async = close(30.seconds)
+
+// Immediate — delegates with zero grace period
+def closeNow(using Frame): Unit < Async = close(Duration.Zero)
+```
+
+This gives callers control without forcing them to pick a timeout for the common case. `closeNow` makes the intent explicit — no ambiguity about whether a bare `close` waits or not.
+
+For producer/consumer resources (Channel, Queue), also provide `closeAwaitEmpty` — closes the resource but waits until remaining elements are consumed before completing.
+
+### Local-Backed Service Pattern
+
+Types like `Clock`, `Log`, `Random`, `Console`, `System`, and `HttpClient` follow a common pattern: a `Local` holds a default instance, and the companion exposes `get`/`use`/`let` to interact with it. Convenience methods on the companion delegate through the local so callers never need the instance directly.
+
+```scala
+final case class Clock(unsafe: Clock.Unsafe):
+    // Instance methods operate on `this`
+    def now(using Frame): Instant < Sync = ...
+
+object Clock:
+    private val local = Local.init(live)
+
+    // Access the local instance
+    def get(using Frame): Clock < Any = local.get
+    def use[A, S](f: Clock => A < S)(using Frame): A < S = local.use(f)
+
+    // Swap the instance for a scope
+    def let[A, S](c: Clock)(f: => A < S)(using Frame): A < S = local.let(c)(f)
+
+    // Convenience — delegates through the local
+    def now(using Frame): Instant < Sync = ...
+    def sleep(duration: Duration)(using Frame): Unit < Async = ...
+```
+
+Key points:
+- The `Local` is private; external code uses only `get`/`use`/`let`
+- Companion convenience methods delegate to the local instance so most callers never call `get` or `use` explicitly
+- `let` enables testing by substituting a mock/controlled instance
+- The live default means the service works out of the box with no setup
+
+### KyoException Convention
+
+All custom exceptions extend `KyoException`, which provides:
+- `NoStackTrace` for performance (stack traces are expensive and rarely useful for expected errors)
+- `Frame`-based context that captures the creation site
+- Environment-aware formatting (rich ANSI in dev, minimal in prod)
+
+```scala
+class Closed(resource: String, createdAt: Frame, details: String = "")(using Frame)
+    extends KyoException(s"$resource created at ${createdAt.position.show} is closed.", details)
+```
+
+Follow this pattern for all new exception types:
+- Extend `KyoException`, not `Exception` or `RuntimeException` — `KyoException` already includes `NoStackTrace`, so you don't need to add it yourself
+- Take `(using Frame)` to capture context
+- Use `String` for messages
+- Keep the message concise — the `Frame` provides the location context
+
+---
+
+## Effect Implementation Reference
+
+NOTE: This section is a reference for the uncommon task of implementing a new effect. For everyday coding, the sections above are sufficient.
+
+### Anatomy of an Effect
+
+1. **Type definition** — sealed trait extending one of two base classes:
+   - **`ArrowEffect[I, O]`** — for function-like effects that transform inputs to outputs. Operations are encoded as an ADT and dispatched in a handler loop. Used by `Abort`, `Var`, `Emit`, `Choice`, `Poll`.
+   - **`ContextEffect[A]`** — for value-providing effects (dependency injection). No ADT or handler loop needed — just `ContextEffect.handle(tag, value)(computation)`. Values are inherited across async boundaries by default; mark with `ContextEffect.Noninheritable` to prevent this. Used by `Env`, `Local`.
+
+   ```scala
+   sealed trait Var[V] extends ArrowEffect[Const[Op[V]], Const[V]]   // ArrowEffect
+   sealed trait Env[+R] extends ContextEffect[R]                     // ContextEffect
+   ```
+
+2. **Operations as data** — encode operations as an ADT, not as methods:
+   ```scala
+   private type Op[V] = Get.type | V | Update[V]
+   private object Get
+   private type Update[V] = V => V
+   ```
+
+3. **Suspend** — translate domain operations into kernel inputs:
+   ```scala
+   inline def get[V](...): V < Var[V] = use[V](identity)
+   inline def use[V](...)(inline f: V => A < S)(...) =
+       ArrowEffect.suspendWith[V](tag, Get: Op[V])(f)
+   inline def set[V](inline value: V)(...) =
+       ArrowEffect.suspend[Unit](tag, value: Op[V])
+   ```
+
+4. **Handle** — choose the right kernel handler for the effect:
+
+   | Handler                                 | When to use                                                       |
+   | --------------------------------------- | ----------------------------------------------------------------- |
+   | `ArrowEffect.handle`                    | Simple one-shot handling, no looping or state                     |
+   | `ArrowEffect.handleFirst`               | Handle only the first occurrence, get a continuation for the rest |
+   | `ArrowEffect.handleLoop` (no state)     | Loop through all occurrences without accumulating state           |
+   | `ArrowEffect.handleLoop` (with state)   | Loop with state threaded through each occurrence                  |
+   | `ArrowEffect.handleLoop` (state + done) | Same, plus a final transformation when computation completes      |
+
+   Example with stateful `handleLoop`:
+   ```scala
+   ArrowEffect.handleLoop(tag, initialState, computation)(
+       [C] => (input, state, cont) =>
+           input match
+               case _: Get.type  => Loop.continue(state, cont(state))
+               case input: Update[V] =>
+                   val nst = input(state)
+                   Loop.continue(nst, cont(nst))
+               case input: V     => Loop.continue(input, cont(state)),
+       done = (state, result) => ...
+   )
+   ```
+
+   Use `Effect.catching` to intercept exceptions inside effect implementations and convert them to effect errors.
+
+5. **`Reducible.Eliminable` given** if the effect can be fully eliminated:
+   ```scala
+   given eliminateAbort: Reducible.Eliminable[Abort[Nothing]] with {}
+   ```
+
+6. **`Reducible` in handler signatures** — when an effect has union types (e.g., `Abort[E | ER]`), handlers use `Reducible` to allow partial handling. The handler eliminates `E` and reduces the remaining `ER` via `reduce.SReduced`:
+   ```scala
+   def run[E](using Frame)[A, S, ER](
+       v: => A < (Abort[E | ER] & S)
+   )(using
+       ct: ConcreteTag[E],
+       reduce: Reducible[Abort[ER]]
+   ): Result[E, A] < (S & reduce.SReduced)
+   ```
+   This lets callers handle one layer of a union error type while preserving the rest in the effect stack.
+
+7. **Variants delegate to canonical** — never duplicate handler logic:
+   ```scala
+   def run[V, A, S](state: V)(v: A < (Var[V] & S)): A < S =
+       runWith(state)(v)((_, result) => result)
+   def runTuple[V, A, S](state: V)(v: A < (Var[V] & S)): (V, A) < S =
+       runWith(state)(v)((state, result) => (state, result))
+   ```
+
+### Delegation Pattern for Higher-Level Types
+
+Higher-level types delegate to lower-level ones — they don't reimplement:
+
+| Higher           | Delegates to        | Adds                                 |
+| ---------------- | ------------------- | ------------------------------------ |
+| `Channel`        | `Queue`             | Fiber-aware put/take with suspension |
+| `Hub`            | `Channel` + `Fiber` | Fan-out distribution fiber           |
+| `Async`          | `Fiber`             | Structured concurrency, isolation    |
+| `Stream`         | `Emit[Chunk[V]]`    | Chunked processing, transformations  |
+| `Meter.pipeline` | `Seq[Meter]`        | Composed admission control           |
+
+Build new types by composing existing ones. Create anonymous instances when composition logic varies:
+```scala
+def pipeline[S](meters: Seq[Meter < (Sync & S)]): Meter < (Sync & S) =
+    Kyo.collectAll(meters).map { seq =>
+        new Meter:
+            def run[A, S](v: => A < S)(using Frame) = ...
+    }
+```
+
+### Isolate Protocol for Fiber-Crossing Operations
+
+Methods that fork computations carrying arbitrary effect state (`A < (Abort[E] & Async & S)`) into new fibers must use the three-step `Isolate` protocol to safely move effectful state across fiber boundaries. When the forked computation has a concrete type with no extra effects (e.g., `Int < Async`), no Isolate is needed because there is no effect state to transfer across the fiber boundary.
+
+```scala
+def race[E, A, S](
+    using isolate: Isolate[S, Abort[E] & Async, S]   // Isolate comes first in using clause
+)(iterable: Seq[A < (Abort[E] & Async & S)])(using Frame): A < (Abort[E] & Async & S) =
+    isolate.capture { state =>                         // 1. capture current state
+        Fiber.internal.race(
+            iterable.map(isolate.isolate(state, _))    // 2. attach state to each forked computation
+        ).map(fiber => isolate.restore(fiber.get))     // 3. restore state from the winner
+    }
+```
+
+Note the `using` parameter ordering: `Isolate` precedes `Frame` because it participates in type inference.
+
+Effects that carry state across fibers provide standard isolate strategies in an `object isolate` namespace in their companion:
+- **`update`** — the forked fiber gets the current state; on completion, the outer state is replaced with the forked fiber's final state
+- **`merge(f)`** — combines the outer and inner states using a merge function `f`
+- **`discard`** — the forked fiber gets the current state but its final state is thrown away
+
+Example: `Var.isolate.update`, `Var.isolate.merge((a, b) => a + b)`, `Var.isolate.discard`.
+
+---
+
+# After Scarcity
+
+Source: https://github.com/getkyo/kyo/blob/main/MANIFESTO.md
+
+# After Scarcity
+
+Software is about to become nearly free to write. The question is who gets the benefit.
+
+For decades, software has been expensive to make, so most of it has come from organizations large enough to afford the cost. That expense kept software scarce and mostly closed. We rent many of our tools rather than own them, we run on systems we cannot inspect, and we depend on software whose direction is set by someone else. This is the world scarcity built.
+
+That scarcity is ending. The cost of writing software is falling toward zero, and what software is for will change with it.
+
+There are two ways this can go.
+
+In one, the cost collapse accrues to a small number of platforms. They produce more software faster, while everyone else keeps renting it. The next era of computing gets built on what they own, and the advantage concentrates further rather than spreading out. The imbalance we already have grows.
+
+In the other, the cost collapse accrues to the people who could not produce software before. Anyone who can describe a tool can build one. Software becomes less something we buy and more something we make, for ourselves, for each other, for whoever needs it. The field stops moving at the speed of product roadmaps and starts moving at the speed of human curiosity.
+
+These paths produce different worlds. The first is the path of least resistance.
+
+We are building toward the second path because it should exist. It requires software that actually works, that respects the people who use it, and that anyone can build and evolve.
+
+Scarcity built the world we have. We're building the one that comes next.
+
+---
