@@ -1,24 +1,29 @@
 ---
 name: llmref
 description: >-
-  Fetch accurate, VERSION-PINNED documentation for a library, framework, SDK,
+  Fetch accurate, VERSION-CORRECT documentation for a library, framework, SDK,
   API, or CLI tool from the LLM Reference registry (llmref, api.llmref.org)
-  instead of relying on training data. Use whenever the user asks about a
-  library's API, configuration, setup, migration, version differences, or
-  library-specific debugging — even well-known ones (React, Next.js, Prisma,
-  Tailwind, Drizzle, Hono, Svelte, Zod, Bun, Vite). Especially use when the
-  task targets a specific version, or when correctness for the exact version
-  in the project matters. Triggers: "docs for X", "how do I do X in <library>",
-  "X version <n>", "is this the right API for <library>@<version>", "look up
-  <library> docs", "llmref".
+  instead of relying on training data. Reach for it whenever a task touches a
+  library's API, configuration, setup, migration, behavior, or debugging — even
+  well-known ones (React, Next.js, Prisma, Tailwind, Drizzle, Hono, Svelte, Zod,
+  Bun, Vite), and even when only the library is named, not a version. The goal is
+  to read the RIGHT version's docs: pin to the version the project actually uses
+  so you don't spend context on — or get misled by — docs for a version it
+  doesn't. Use it both when a specific version is requested and, proactively, to
+  make any library answer version-correct. Triggers: "docs for X", "how do I do X
+  in <library>", "X version <n>", "is this the right API for <library>@<version>",
+  "look up <library> docs", "llmref", or any time version-correct docs would
+  prevent a version-mismatch mistake.
 ---
 
 # LLM Reference (llmref)
 
 LLM Reference is a **versioned, reproducible** documentation registry. Unlike a
 live "latest" doc index, every snapshot is pinned to an exact upstream version
-and is byte-for-byte stable. Reach for it when the *version* matters — read the exact snapshot a project
-depends on rather than an amalgam of whatever is current. Versions are semver for
+and is byte-for-byte stable. Reach for it to read the *right version's* docs — the exact snapshot the project
+depends on — rather than an amalgam of whatever your training data absorbed. That
+matters even when nobody named a version: pulling the wrong version's docs wastes
+context and produces version-mismatch bugs. Versions are semver for
 package-sourced docs (e.g. `drizzle-orm@0.45.2`) and crawl dates for site-crawled
 projects (e.g. Next.js at `2026.07.02`).
 
@@ -26,10 +31,15 @@ Base URL: `https://api.llmref.org/v1` — **no account or API key required.**
 
 ## When to use
 
-- The user asks how to do something in a specific library/framework/SDK/CLI.
-- The task pins a version (from `package.json`, a lockfile, or the user saying so).
+- Any task that touches a library/framework/SDK/CLI's API, config, setup, or
+  behavior — **even when only the library is named, not a version.** Resolve the
+  version the project actually uses first, so you read the right docs.
+- To avoid spending context on, or being misled by, docs for the wrong version —
+  pin to the exact version rather than an amalgam of whatever is current.
+- The task pins a version (from `package.json`, a lockfile, or the user), or
+  version-correctness matters for the answer.
 - You're unsure your training data reflects the version in use.
-- The user wants to search a library's docs semantically for a passage.
+- You want to search a library's docs semantically for a passage.
 
 **Don't** use it for general programming concepts, refactoring, or business-logic
 debugging — only for library-specific facts.
