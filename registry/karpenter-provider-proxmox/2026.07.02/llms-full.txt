@@ -1,0 +1,1770 @@
+# Karpenter Provider for Proxmox
+
+Source: https://github.com/sergelogvinov/karpenter-provider-proxmox/blob/main/README.md
+
+# Karpenter Provider for Proxmox
+
+## Overview
+
+__Motivation__: Most of the time, my bare-metal servers have more capacity than I actually need.
+However, there are two situations where I require additional capacity:
+
+1. During maintenance – I need to migrate workloads from one server to another. In this case, I temporarily rent a virtual machine from a cloud provider (hybrid Kubernetes setup) and release it after maintenance is complete.
+2. When demand grows quickly – if a service suddenly becomes more popular, I add cloud VMs for rapid scale-up. Later, I replace them with a larger bare-metal server, which often costs the same or even less than renting VMs.
+
+When I rent a bare-metal server, I maximize its utilization by running as many VMs as the hardware allows, distributing them according to the NUMA architecture. This setup works very well. However, sometimes Kubernetes spreads pods across different VMs, which can reduce network performance. Of course, we can use pod affinity to prevent this, but it requires additional management and fine-tuning.
+
+This brings me to an idea: implementing a node autoscaler that can automatically create VMs on my Proxmox Cluster(s) as needed. This would eliminate the need to manually run terraform to add/delete nodes, which is not the fastest process.
+
+Also, having free resources can provide more advantages than we might initially expect:
+* `Power efficiency` – Idle CPU cores can be switched to power-saving mode, reducing overall energy usage and lowering system temperature.
+* `Better CPU frequency boosting` – With unused capacity, the system has additional power headroom to boost active core frequencies when needed.
+* `Automated VM recreation` – Using Karpenter framework, VMs can be automatically recreated if they become unhealthy or require upgrades (drift management).
+* `CPU pinning` – VMs can automatically have pinned vCPUs to specific host cores, improving cache locality and reducing latency.
+* `NUMA node affinity` – VMs can be scheduled on the same NUMA node to improve performance by minimizing cross-node communication. Achieving this with Kubernetes requires identical resource requests and limits for pods, which is not always possible.
+
+## In Scope
+
+* [x] Dynamic VM creation and termination
+* [x] Cloud-init metadata delivery via CD-ROM
+* [x] Cloud-init Go-template metadata support (dynamic metadata based on instance type and node location)
+* [x] Firewall security group support
+* [x] Kubelet short-lived join tokens
+* [x] Kubelet configuration tuning
+* [x] Predefined VM template selection
+* [x] Prepare VM templates via CRD
+* [x] Simple IPAM (IP Address Management) for VM network interfaceses
+* [x] VM optimization: Placement across zones
+* [x] VM optimization: Network performance
+* [x] VM optimization: CPU pinning, see [limitations](docs/noderesource.md)
+* [x] VM optimization: NUMA node affinity, see [limitations](docs/noderesource.md)
+* [x] VM and Node optimization: by additional debian service [proxmox scheduler](docs/scheduler.md)
+* [ ] Dynamic VM sizing (instance types) based on the best fit in the Proxmox Node(s)
+* [ ] Spot instances support
+
+## Requirements
+
+- Kubernetes 1.30+
+- Proxmox VE 8+
+- Proxmox CCM plugin (optional, but recommended for better integration)
+
+## Installation
+
+Create a configuration file with credentials for your Proxmox cluster.
+Apply the configuration as a secret to the `kube-system` namespace.
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: karpenter-provider-proxmox
+  namespace: kube-system
+stringData:
+  config.yaml: |
+    clusters:
+      - url: https://cluster-api-1.exmple.com:8006/api2/json
+        token_id: "kubernetes@pve!karpenter"
+        token_secret: "secret"
+        region: Region-1
+```
+
+Deploy the Karpenter Proxmox Helm chart.
+
+```shell
+helm upgrade -i -n kube-system karpenter-proxmox oci://ghcr.io/sergelogvinov/charts/karpenter-proxmox
+```
+
+For more details, see [Installation instruction](docs/install.md).
+
+## Configuration
+
+### Karpenter Proxmox Node Class configuration:
+
+```yaml
+apiVersion: karpenter.proxmox.sinextra.dev/v1alpha1
+kind: ProxmoxNodeClass
+metadata:
+  name: default
+spec:
+  # Tags to apply to the VM on Proxmox Dashboard (optional)
+  tags:
+    - k8s
+    - karpenter
+
+  # The Proxmox virtual machine template reference (required)
+  instanceTemplateRef:
+    # CRD resource kind: ProxmoxTemplate or ProxmoxUnmanagedTemplate
+    kind: ProxmoxTemplate
+    # The name of the resource
+    name: default
+
+  metadataOptions:
+    # How delivery the metadata to the VM, options: none or cdrom (required)
+    type: none|cdrom
+    # templatesRef is used if the type is `cdrom`, that contains cloud-init metadata templates
+    templatesRef:
+      name: ubuntu-k8s
+      namespace: kube-system
+
+  # Firewall Security Groups to apply to the VM (optional)
+  securityGroups:
+    - name: kubernetes
+      interface: net0
+```
+
+For more details, see:
+- [Karpenter Proxmox NodeClass](docs/nodeclass.md).
+- [Proxmox Virtual Machine template configuration](docs/nodetemplateclass.md)
+
+### Karpenter Node Pool configuration:
+
+```yaml
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: default
+spec:
+  limits:
+    cpu: "64"
+    memory: 512Gi
+
+  template:
+    spec:
+      nodeClassRef:
+        group: karpenter.proxmox.sinextra.dev
+        kind: ProxmoxNodeClass
+        name: default
+      requirements:
+        - key: "kubernetes.io/arch"
+          operator: In
+          values: ["amd64"]
+```
+
+The requirements labels (key) can be:
+
+- `kubernetes.io/arch`: The CPU architecture of the node, e.g. [`amd64`, `arm64`].
+- `kubernetes.io/os`: The operating system of the node, e.g. [`linux`, `windows`].
+- `topology.kubernetes.io/zone`: The zone where the node is located, e.g. [`us-west-1a`, `us-east-1b`].
+- `topology.kubernetes.io/region`: The region where the node is located, e.g. [`us-west-1`, `us-east-1`].
+- `node.kubernetes.io/instance-type`: The instance type of the node, e.g. [`t1.2VCPU-6GB`, `m1.2VCPU-16GB`].
+
+Karpenter specific labels:
+
+- `karpenter.sh/capacity-type`: The capacity type of the node [`on-demand`, `spot`, `reserved`].
+- `karpenter.sh/nodepool`: The node pool to which the node belongs.
+- `karpenter.proxmox.sinextra.dev/instance-family`: The instance family of the node [`t1`,`s1`, `m1`]
+- `karpenter.proxmox.sinextra.dev/proxmoxnodeclass`: The Proxmox Node Class name of the node.
+
+For more details, see:
+- [Karpenter Instance Types](docs/instancetypes.md) for information about instance types.
+- [Karpenter Node Pool](https://karpenter.sh/docs/concepts/nodepools/) for information about node pools spec.
+
+## Contributing
+
+Contributions are welcomed and appreciated!
+See [Contributing](CONTRIBUTING.md) for our guidelines.
+
+If this project is useful to you, please consider starring the [repository](https://github.com/sergelogvinov/karpenter-provider-proxmox).
+
+## Privacy Policy
+
+This project does not collect or send any metrics or telemetry data.
+You can build the images yourself and store them in your private registry, see the [Makefile](Makefile) for details.
+
+To provide feedback or report an issue, please use the [GitHub Issues](https://github.com/sergelogvinov/karpenter-provider-proxmox/issues).
+
+## Community, discussion and support
+
+If you have any questions or want to get the latest project news, you can connect with us in the following ways:
+- __Using and Deploying Karpenter?__ Reach out in the [#karpenter](https://kubernetes.slack.com/archives/C02SFFZSA2K) channel in the [Kubernetes slack](https://slack.k8s.io/) to ask questions about configuring or troubleshooting Karpenter.
+
+## Code of Conduct
+
+This [Code of Conduct](CODE_OF_CONDUCT.md) is adapted from the Contributor Covenant, version 1.4.
+
+## References
+
+- [Karpenter](https://karpenter.sh/)
+- [Proxmox VE](https://www.proxmox.com/en/proxmox-ve)
+- [Proxmox CCM](https://github.com/sergelogvinov/proxmox-cloud-controller-manager)
+
+## License
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+[http://www.apache.org/licenses/LICENSE-2.0](http://www.apache.org/licenses/LICENSE-2.0)
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+---
+
+`Proxmox®` is a registered trademark of [Proxmox Server Solutions GmbH](https://www.proxmox.com/en/about/company).
+
+---
+
+# Adopters
+
+Source: https://github.com/sergelogvinov/karpenter-provider-proxmox/blob/main/ADOPTERS.md
+
+# Adopters
+
+This is a list of organizations or projects that have adopted the Proxmox CSI driver.
+
+## Adopters (listed alphabetically)
+
+### Template
+
+* **[Project/User name](Project URL)**
+  Description & Use cases
+
+---
+
+# Contributing
+
+Source: https://github.com/sergelogvinov/karpenter-provider-proxmox/blob/main/CONTRIBUTING.md
+
+# Contributing
+
+## Pull Requests
+
+All PRs require a single commit.
+
+Having one commit in a Pull Request is very important for several reasons:
+* A single commit per PR keeps the git history clean and readable.
+  It helps reviewers and future developers understand the change as one atomic unit of work, instead of sifting through many intermediate or redundant commits.
+* One commit is easier to cherry-pick into another branch or to track in changelogs.
+* Squashing into one meaningful commit ensures the final PR only contains what matters.
+
+## Developer Certificate of Origin
+
+All commits require a [DCO](https://developercertificate.org/) sign-off.
+This is done by committing with the `--signoff` flag.
+
+## Development
+
+The build process for this project is designed to run entirely in containers.
+To get started, run `make help` and follow the instructions.
+
+## Conformance
+
+To verify conformance status, run `make conformance`.
+This runs a series of tests on the working tree and is required to pass before a contribution is accepted.
+
+---
+
+# Provider configuration file
+
+Source: https://github.com/sergelogvinov/karpenter-provider-proxmox/blob/main/docs/config.md
+
+# Provider configuration file
+
+This file configures the Proxmox Karpenter Provider and defines how it connects to Proxmox VE cluster.
+
+```yaml
+clusters:
+  # List of Proxmox clusters
+  - url: https://cluster-api-1.exmple.com:8006/api2/json
+
+    # Skip the certificate verification, if needed
+    insecure: false
+
+    # Proxmox api credentials
+    ## Username and password (not recommended, use api tokens instead)
+    username: "root@pam"
+    password: "password"
+    ## Proxmox api token (recommended)
+    token_id: "kubernetes@pve!karpenter"
+    token_secret: "secret"
+    ## Proxmox api token via files, it can be used both with token_id and token_secret
+    ## token_id and token_secret have priority over files
+    token_id_file: "/path/to/token_id_file"
+    token_secret_file: "/path/to/token_secret_file"
+
+    # Region name, which is cluster name and `topology.kubernetes.io/region` label
+    region: Region-1
+
+  # Add more clusters if needed
+  - url: https://cluster-api-2.exmple.com:8006/api2/json
+    insecure: false
+    token_id: "kubernetes@pve!karpenter"
+    token_secret: "secret"
+    region: Region-2
+```
+
+## Cluster credentials
+
+You can define multiple clusters in the `clusters` section.
+
+* `url` - The URL of the Proxmox cluster API.
+* `insecure` - Set to `true` to skip TLS certificate verification.
+* `username` - The Proxmox username (not recommended, use API tokens instead).
+* `password` - The Proxmox password (not recommended, use API tokens instead).
+* `token_id` - The Proxmox API token ID.
+* `token_id_file` - The path to a file containing the Proxmox API token ID.
+* `token_secret` - The Proxmox API token.
+* `token_secret_file` - The path to a file containing the Proxmox API token secret.
+* `region` - The name of the region, which is also used as `topology.kubernetes.io/region` label.
+
+---
+
+# Template function list
+
+Source: https://github.com/sergelogvinov/karpenter-provider-proxmox/blob/main/docs/functions.md
+
+# Template function list
+
+The Cloud-Init provider supports several template functions that can be used to customize the generated Cloud-Init configuration files.
+
+### Logic functions
+
+* `default` - the function to return the default value if the given value is empty.
+
+  ```yaml
+  {{ default "world" "" }} -> world
+  ```
+
+  ```yaml
+  {{ default "world" "hello" }} -> hello
+  ```
+* `coalesce` - the function to return the first non-empty value from the list of values.
+
+  ```yaml
+  {{ coalesce "" "" "hello" "world" }} -> hello
+  ```
+
+* `ternary` - the function to return one of the two values based on the condition.
+
+  ```yaml
+  {{ ternary "yes" "no" true }} -> yes
+  ```
+
+  ```yaml
+  {{ ternary "yes" "no" false }} -> no
+  ```
+
+* `toJson` - the function to convert the value to a JSON string.
+
+* `toPrettyJson` - the function to convert the value to a pretty-printed JSON string.
+
+* `toYaml` - the function to convert the value to a YAML string.
+
+* `toPrettyYaml` - the function to convert the value to a pretty-printed YAML string.
+
+### String modification functions
+
+* `indent` - the function to indent each line of the string with the specified number of spaces.
+
+  ```yaml
+  {{ indent 4 "hello\nworld" }} -> "    hello\n    world"
+  ```
+
+* `nindent` - the function to indent each line of the string with the specified number of spaces, including a newline at the beginning.
+
+  ```yaml
+  {{ nindent 4 "hello\nworld" }} -> "\n    hello\n    world"
+  ```
+
+* `quote` - the function to wrap the string in double quotes.
+
+  ```yaml
+  {{ quote "hello" }} -> "hello"
+  ```
+
+* `upper` - the function to convert the string to uppercase.
+
+  ```yaml
+  {{ upper "hello" }} -> HELLO
+  ```
+
+* `lower` - the function to convert the string to lowercase.
+
+  ```yaml
+  {{ lower "HELLO" }} -> hello
+  ```
+
+* `trim` - the function to remove leading and trailing whitespace from the string.
+
+  ```yaml
+  {{ trim "  hello  " }} -> hello
+  ```
+
+* `trimSuffix` - the function to remove the suffix from the string.
+
+  ```yaml
+  {{ trimSuffix "hello" "lo" }} -> hel
+  ```
+
+* `trimPrefix` - the function to remove the prefix from the string.
+
+  ```yaml
+  {{ trimPrefix "hello" "he" }} -> llo
+  ```
+
+* `split` - the function to split the string by the given separator and return a slice of strings.
+
+  ```yaml
+  {{ split "a,b,c" "," }} -> [a b c]
+  ```
+
+* `join` - the function to join a slice of strings with the given separator.
+
+  ```yaml
+  {{ join (list "a" "b" "c") "," }} -> a,b,c
+  ```
+
+* `replace` - the function to replace all occurrences of the old string with the new string.
+
+  ```yaml
+  {{ replace "hello" "l" "L" }} -> heLLo
+  ```
+
+* `regexFind` - return the first (left most) match of the regular expression in the input string.
+
+  ```yaml
+  {{ regexFind "[a-zA-Z][1-9]" "abcd1234" }} -> d1
+  ```
+
+* `regexFindString` - the function to find the match of the regular expression pattern in the string and return the submatch at the specified index.
+
+  ```yaml
+  {{ regexFindString "^type-([a-z0-9]+)-(.*)$" "type-metal1-asz" 1 }} -> metal1
+  ```
+
+* `regexReplaceAll` - the function to replace all occurrences of the regular expression in the input string with the replacement string.
+
+  ```yaml
+  {{ regexReplaceAll "a(x*)b" "-ab-axxb-" "${1}W" }} -> -W-xxW-
+  ```
+
+### String slice functions
+
+* `get` - the function to get the value from the string slice by index.
+
+  ```yaml
+  {{ get (dict "a" 1 "b" 2) "a" }} -> 1
+  ```
+
+* `getValue` - the function to get the value from the map by key.
+
+  ```yaml
+  {{ getValue "ds=nocloud;i=1234" "i" }} -> 1234
+  ```
+
+### Conditional functions
+
+* `empty` - the function to return true if the string is empty.
+
+  ```yaml
+  {{ empty "" }} -> true
+  ```
+
+* `contains` - the function to return true if the string contains the substring.
+
+  ```yaml
+  {{ contains "hello" "lo" }} -> true
+  ```
+
+* `hasPrefix` - the function to return true if the string has the specified prefix.
+
+  ```yaml
+  {{ hasPrefix "hello" "he" }} -> true
+  ```
+
+* `hasSuffix` - the function to return true if the string has the specified suffix.
+
+  ```yaml
+  {{ hasSuffix "hello" "lo" }} -> true
+  ```
+
+* `hasKey` - the function to return true if the map has the specified key.
+
+  ```yaml
+  {{ hasKey (dict "a" 1 "b" 2) "a" }} -> true
+  ```
+
+* `hasTag` - the function to return true if the string slice contains the specified tag.
+
+  ```yaml
+  {{ hasTag (list "tag1" "tag2") "tag2" }} -> true
+  ```
+
+### Encoding functions
+
+* `b64enc` - the function to return the base64-encoded string.
+
+  ```yaml
+  {{ b64enc "hello" }} -> aGVsbG8=
+  ```
+* `b64dec` - the function to return the base64-decoded string.
+
+  ```yaml
+  {{ b64dec "aGVsbG8=" }} -> hello
+  ```
+
+### Network functions
+
+* `cidrhost` - the function to return the IP address of the host in the CIDR notation.
+
+  ```yaml
+  {{ cidrhost "192.168.1.5/24" }} -> 192.168.1.5
+  ```
+
+  ```yaml
+  {{ cidrhost "192.168.1.5/24" 15 }} -> 192.168.1.15
+  ```
+
+* `cidrslaac` - the function to return the SLAAC address for the given CIDR and MAC address.
+
+  ```yaml
+  {{ "2001:db8::/64" | cidrslaac "00:1A:2B:3C:4D:5E" }} -> 2001:db8:1:0:21a:2bff:fe3c:4d5e/64
+  ```
+
+  ```yaml
+  {{ "2001:db8:1:2:3::/80" | cidrslaac "00:1A:2B:3C:4D:5E" }} -> 2001:db8:1:2:3:2bff:fe3c:4d5e/80
+  ```
+
+## References
+
+For more details on the functions, see the [source code](/pkg/providers/instance/cloudinit/functions.go).
+
+Those functions was inspired by Helm [Template Functions and Pipelines](https://helm.sh/docs/chart_template_guide/functions_and_pipelines/).
+
+---
+
+# Install Proxmox Karpenter Provider
+
+Source: https://github.com/sergelogvinov/karpenter-provider-proxmox/blob/main/docs/install.md
+
+# Install Proxmox Karpenter Provider
+
+## Proxmox configuration
+
+Proxmox Karpenter Provider requires the correct privileges in order to create the VMs.
+
+Create `Karpenter` role in Proxmox:
+
+```shell
+pveum role add Karpenter -privs "Datastore.Allocate Datastore.AllocateSpace Datastore.AllocateTemplate Datastore.Audit Mapping.Audit Mapping.Use Sys.Audit Sys.AccessNetwork SDN.Audit SDN.Use VM.Audit VM.Allocate VM.Clone VM.Config.CDROM VM.Config.CPU VM.Config.Memory VM.Config.Disk VM.Config.Network VM.Config.HWType VM.Config.Cloudinit VM.Config.Options VM.PowerMgmt"
+```
+
+If you want to update VM pool membership in ProxmoxNodeClass resource, add also the following privileges to the role:
+
+```shell
+pveum role modify Karpenter --append --privs "Pool.Audit Pool.Allocate"
+```
+
+Next create a user `kubernetes@pve` for the Karpenter plugin and grant it the above role
+
+```shell
+pveum user add kubernetes@pve
+pveum aclmod / -user kubernetes@pve -role Karpenter
+pveum user token add kubernetes@pve karpenter -privsep 0 --comment "Kubernetes Karpenter"
+```
+
+Or more restricted way, which allows to use the token with special privileges only for the plugin:
+
+```shell
+pveum user add kubernetes@pve
+pveum aclmod / -user kubernetes@pve -role Karpenter
+pveum user token add kubernetes@pve karpenter -privsep 1 --comment "Kubernetes Karpenter"
+pveum aclmod / --token 'kubernetes@pve!karpenter' -role Karpenter
+```
+
+## Install Karpenter Provider
+
+All examples below assume that plugin controller runs on control-plane. Change the `nodeSelector` to match your environment if needed.
+
+```yaml
+nodeSelector:
+  node-role.kubernetes.io/control-plane: ""
+tolerations:
+  - key: node-role.kubernetes.io/control-plane
+    effect: NoSchedule
+```
+
+### Install by using kubectl
+
+Create a Proxmox cloud config to connect to your cluster with the Proxmox user you just created.
+More information about the configuration can be found in [plugin configuration file](config.md).
+
+```yaml
+# config.yaml
+clusters:
+  # List of Proxmox clusters
+  - url: https://cluster-api-1.exmple.com:8006/api2/json
+    # Skip the certificate verification, if needed
+    insecure: false
+    # Proxmox api token
+    token_id: "kubernetes@pve!karpenter"
+    token_secret: "secret"
+    # Region name, which is cluster name
+    region: Region-1
+```
+
+Upload the configuration to the Kubernetes as a secret
+
+```shell
+kubectl -n kube-system create secret generic karpenter-provider-proxmox --from-file=config.yaml
+```
+
+Install latest release version
+
+```shell
+kubectl apply -f https://raw.githubusercontent.com/sergelogvinov/karpenter-provider-proxmox/main/docs/deploy/karpenter-provider-proxmox.yml
+```
+
+Or install latest stable version (edge)
+
+```shell
+kubectl apply -f https://raw.githubusercontent.com/sergelogvinov/karpenter-provider-proxmox/main/docs/deploy/karpenter-provider-proxmox-edge.yml
+```
+
+### Install by using Helm
+
+Create the helm values file, for more information see [values.yaml](/charts/karpenter-provider-proxmox/values.yaml)
+
+```yaml
+# karpenter-proxmox.yaml
+config:
+  clusters:
+    - url: https://cluster-api-1.exmple.com:8006/api2/json
+      insecure: false
+      token_id: "kubernetes@pve!karpenter"
+      token_secret: "secret"
+      region: Region-1
+```
+
+Deploy the Proxmox Karpenter Provider using Helm:
+
+```shell
+helm upgrade -i -n kube-system -f karpenter-proxmox.yaml karpenter-provider-proxmox oci://ghcr.io/sergelogvinov/charts/karpenter-provider-proxmox
+```
+
+---
+
+# Karpenter instance types
+
+Source: https://github.com/sergelogvinov/karpenter-provider-proxmox/blob/main/docs/instancetypes.md
+
+# Karpenter instance types
+
+Karpenter uses instance types to make intelligent decisions about where to allocate new nodes.
+Each instance type defines a specific combination of CPU, memory, and other resources, often tied to a particular availability zone or hardware family.
+By evaluating these options, Karpenter selects the most efficient instance type that meets workload requirements while minimizing unused capacity.
+This approach ensures workloads are scheduled cost-effectively, helping to maximize savings without sacrificing performance.
+
+## Instance family
+
+To make workload management with CPU and Memory easier, Karpenter for Proxmox comes with a predefined list of instance types.
+
+By default, vCPU options are 1, 2, 4, 8, and 16 cores.
+The amount of memory is determined by the vCPU count, multiplied by a family-specific ratio of 2, 3, 4, or 8.
+
+Instance families are defined as follows:
+* `c1` family: with dedicated vCPU and Memory with 1:2 rate (e.g., c1.2VCPU-4GB, c1.4VCPU-8GB), calls as compute instances.
+* `t1` family: with dedicated vCPU and Memory with 1:3 rate (e.g., t1.2VCPU-6GB, t1.4VCPU-12GB).
+* `s1` family: with dedicated vCPU and Memory with 1:4 rate (e.g., s1.2VCPU-8GB, s1.4VCPU-16GB), calls as standard instances.
+* `m1` family: with dedicated vCPU and Memory with 1:8 rate (e.g., m1.2VCPU-16GB, m1.4VCPU-32GB), calls as memory optimized instances.
+* `x1` family: with dedicated vCPU and Memory with 1:16 rate (e.g., x1.2VCPU-32GB, x1.4VCPU-64GB), calls as in-memory application optimized instances.
+
+Instance types are named using the following convention: `<family>.<vCPU>VCPU-<memory>GB`.
+For example, `c1.4VCPU-8GB` represents an instance type from the `c1` family with `4` virtual CPUs and `8` GB of memory.
+
+## Customize instance types
+
+You can redefine the instance family and the list of instance types by providing a JSON configuration file.
+The controller includes the flag `-instance-types-file` or env `INSTANCE_TYPES_FILE`, which lets you specify the path to this custom instance types file.
+
+The file structure looks like this:
+
+```json
+[
+  {
+    "name": "c1.1VCPU-2GB",
+    "capacity": {
+      "cpu": "1",
+      "ephemeral-storage": "30Gi",
+      "memory": "2Gi",
+      "pods": "64"
+    },
+    "overhead": {
+      "KubeReserved": {
+        "cpu": "20m",
+        "memory": "384Mi"
+      },
+      "SystemReserved": {
+        "cpu": "10m",
+        "memory": "64Mi"
+      },
+      "EvictionThreshold": {
+        "memory": "100Mi"
+      }
+    }
+  }
+]
+```
+
+* `name`: The name of the instance type, following the convention `<family>.<size-of-instance>`.
+* `capacity`: The resource capacity of the instance type.
+  * `cpu`: The number of virtual CPUs.
+  * `ephemeral-storage`: The boot disk size.
+  * `memory`: The amount of memory.
+  * `pods`: The maximum number of pods.
+  * `hugepages-1Gi` (optional): The amount of hugepages with 1Gi size.
+  * `hugepages-2Mi` (optional): The amount of hugepages with 2Mi size.
+* `overhead`: The resource overhead for the instance type, applied in the kubelet configuration file.
+  * `KubeReserved`: The resources reserved for Kubernetes system components.
+    * `cpu`: The amount of CPU reserved for Kubernetes.
+    * `memory`: The amount of memory reserved for Kubernetes.
+  * `SystemReserved`: The resources reserved for the host system.
+    * `cpu`: The amount of CPU reserved for the host system.
+    * `memory`: The amount of memory reserved for the host system.
+  * `EvictionThreshold`: The eviction threshold for the instance type.
+    * `memory`: The minimum amount of free memory required before the eviction process is triggered.
+
+---
+
+# IP Address Management (IPAM)
+
+Source: https://github.com/sergelogvinov/karpenter-provider-proxmox/blob/main/docs/ipam.md
+
+# IP Address Management (IPAM)
+
+Karpenter Proxmox supports IP Address Management (IPAM) for VM network interfaceses.
+It allows you to define a pool of IP addresses that can be automatically assigned to VMs when they are created.
+
+## Simple IPAM mode
+
+In simple IPAM mode, you can define a pool of IP addresses directly in the virtual machine template (ProxmoxTemplate, ProxmoxUnmanagedTemplate).
+In the cloud-init section of the template, specify the `IP Config` fields with the desired IP address pool (ProxmoxUnmanagedTemplate case).
+
+* If the ip addresses is given subnet definition format (e.g., `192.168.0.0/24`), Karpenter Proxmox will use that subnet to allocate IP addresses.
+* Before assigning an address, it checks the existing IPs already in use on Proxmox and Kubernetes nodes to avoid conflicts.
+* If no gateway is specified, it defaults to using the IP address of the Proxmox node’s bridge as the gateway.
+* For IPv6, it uses SLAAC mechanism to assign addresses from the specified IPv6 subnet, the subnet can be less than /64.
+
+Example proxmox virtual machine configuration:
+
+```conf
+ipconfig0: ip=192.168.0.0/24,gw=192.168.0.1,ip6=fd00:1::0/64,gw6=fd00:1::1
+```
+
+Here:
+* `ip=192.168.0.0/24` the IPv4 address pool. Warning: `192.168.0.1/24` is not valid, because it specifies ip address with subnet mask.
+* `gw=192.168.0.1` specifies the IPv4 gateway.
+* `ip6=fd00:1::0/64` specifies the IPv6 address pool.
+* `gw6=fd00:1::1` specifies the IPv6 gateway.
+
+---
+
+# Karpenter CRD for Proxmox
+
+Source: https://github.com/sergelogvinov/karpenter-provider-proxmox/blob/main/docs/nodeclass.md
+
+# Karpenter CRD for Proxmox
+
+## Proxmox NodeClass Configuration
+
+The Proxmox NodeClass is a custom resource that defines the configuration for nodes in Karpenter.
+It specifies how VMs should be created and managed on Proxmox.
+
+```yaml
+apiVersion: karpenter.proxmox.sinextra.dev/v1alpha1
+kind: ProxmoxNodeClass
+metadata:
+  name: node-class-name
+spec:
+  # Region where this NodeClass is applied
+  # Optional: if not set, all regions will be used
+  region: cluster-1
+
+  # PlacementStrategy defines how VM should be placed across zones.
+  # Optional: if not set, Balanced strategy will be used
+  placementStrategy:
+    zoneBalance: Balanced|AvailabilityFirst
+
+  # InstanceTemplateRef is a reference to a Kubernetes Custom Resource
+  # that defines the virtual machine template used for creating instances.
+  # Required
+  instanceTemplateRef:
+    # Kind specifies the type of the instance template resource.
+    # Valid values: ProxmoxTemplate, ProxmoxUnmanagedTemplate
+    kind: ProxmoxUnmanagedTemplate
+    # Name of resource
+    name: k8s-node-vm-template
+
+  # BootDevice defines the root device for the VM
+  # Optional: If not specified, the system will use the storage device on which the template is stored.
+  bootDevice:
+    # Size of the boot device
+    # Valid formats: 50G, 50Gi
+    size: 50G
+
+    # Storage specifies the storage device where the boot disk for the virtual machine will be created.
+    storage: lvm
+
+  # Tags to apply to the VMs after creation
+  # Optional, in place update supported
+  tags:
+    - karpenter
+
+  # MetadataOptions contains parameters for specifying the cloud-init metadata
+  # Optional, defaults type is `none`
+  metadataOptions:
+    # Type of the metadata to expose to the VMs
+    # Valid values: none, cdrom
+    type: none
+
+    # SecretRef is used if the type is `cdrom`. It references a secret that contains cloud-init metadata.
+    # It can include the following keys, all of which are optional:
+    # - `user-data` - Userdata for cloud-init
+    # - `meta-data` - Metadata for cloud-init
+    # - `network-config` - Network configuration for cloud-init
+    templatesRef:
+      name: metadata-templates
+      namespace: kube-system
+
+    # valuesRef is a reference to user-defined values.
+    # All keys from this reference can be accessed in templates as .Values.<key>
+    # Optional
+    valuesRef:
+      name: user-data-values
+      namespace: kube-system
+
+  # SecurityGroups to apply to the VMs
+  # Optional, in place update supported
+  securityGroups:
+    - name: kubernetes
+      # Interface to apply the security group
+      interface: net0
+
+  # ResourcePool is the Proxmox resource pool name where VMs will be placed.
+  # Optional
+  resourcePool: k8s-pool
+```
+
+### Parameters:
+
+* `region` - The name of the region to use for this NodeClass. If not set, all regions will be used. Optional.
+
+* `placementStrategy` - The strategy to use for placing VMs across zones. Optional.
+  - `zoneBalance` - Balanced or AvailabilityFirst. Defaults to Balanced.
+
+* `instanceTemplateRef` - The template to use for creating VMs.
+  - `kind` - The kind of the instance template, either [ProxmoxTemplate](nodetemplateclass.md) or [ProxmoxUnmanagedTemplate](nodetemplateclass.md).
+  - `name` - The name of the instance template.
+
+    If `kind` is `ProxmoxUnmanagedTemplate`, then VM template should be prepared manually on proxmox side.
+
+* `bootDevice` - Defines the root device for the VM.
+  - `size` - The size of the boot device, in formats like `50G`, `50Gi`, `1T`, `1Ti`.
+  - `storage` - The Proxmox storage id where the boot device will be created.
+
+* `tags` - A list of tags to apply to the VMs after creation. Optional.
+  This option supports in-place update.
+
+* `metadataOptions` - Contains parameters for specifying the cloud-init metadata. Optional, defaults type is `none`.
+  - `type` - The type of the metadata to expose to the VMs. Valid values: `none` or `cdrom`.
+  - `templatesRef` - Used if the type is `cdrom`. It references a secret that contains cloud-init metadata templates.
+    - `name` - the secret name
+    - `namespace` - the namespace of the secret
+  - `valuesRef` - Used to reference a secret that contains user-defined values (Optional)
+    All keys from this reference can be accessed in templates as `.Values.<key>`
+    This is especially useful when working with FluxCD or other GitOps tools
+    - `name` - the secret name
+    - `namespace` - the namespace of the secret
+
+* `securityGroups` - A list of security groups to apply to the VMs. Optional.
+  This option supports in-place update.
+  - `name` - The name of the security group.
+  - `interface` - The interface to apply the security group.
+
+* `resourcePool` - The Proxmox resource pool name where VMs will be placed. Optional.
+  If specified, cloned VMs will be added to this pool during creation.
+  The pool must already exist in Proxmox.
+  Supports nested pools up to 3 levels (e.g., `parent/child/grandchild`).
+  Note: PVE 9+ requires pool names to start with a letter; PVE 8 allows names starting with digits but this is deprecated.
+  This option does __not__ trigger drift - changes to resourcePool are ignored during drift evaluation.
+
+Karpenter supports instance drift detection when an `ProxmoxNodeClass` is updated.
+If a change affects a node, Karpenter may replace (drift) the instance to align with the new configuration.
+However, some parameters __do not trigger__ drift.
+Changes to these fields are ignored during drift evaluation:
+* `tags`
+* `metadataOptions`
+* `securityGroups`
+* `resourcePool`
+
+The `ProxmoxTemplate` and `ProxmoxUnmanagedTemplate` resource definitions see [here](nodetemplateclass.md).
+
+## Cloud-Init metadata
+
+Cloud-Init automates the configuration of Kubernetes instances by using metadata provided by the user. This metadata can include user data, network settings, and other instance-specific options. It is usually defined in a YAML file and can be stored in a Kubernetes Secret, which is then referenced through the `secretRef` field in the `metadataOptions`.
+
+The provider supports go-templating for cloud-init metadata, allowing for dynamic configuration based on instance-specific variables.
+
+The secret must contain the following keys, each key is optional.
+- `user-data` - Userdata for cloud-init.
+- `meta-data` - Metadata for cloud-init.
+- `network-config` - Network configuration for cloud-init.
+
+### User-data key
+
+Official documentation can be found [here](https://cloudinit.readthedocs.io/en/latest/topics/examples.html#user-data).
+
+The default file contents are, it helps to understand accessible values in template:
+
+```yaml
+#cloud-config
+hostname: {{ .Metadata.Hostname }}
+manage_etc_hosts: true
+package_update: true
+packages:
+  - qemu-guest-agent
+runcmd:
+  - [ systemctl, enable, --now, qemu-guest-agent.service ]
+
+users:
+  - name: karpenter
+    gecos: Kubernetes User
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    groups: [users]
+    shell: /bin/bash
+    {{- with get .Values "SSHAuthorizedKeys" }}
+    ssh_authorized_keys:
+      {{- toYaml (split . ",") | nindent 6 }}
+    {{- end }}
+
+write_files:
+  - path: /etc/karpenter.yaml
+    content: |
+      {{- . | toYamlPretty | nindent 6  }}
+    owner: root:root
+```
+
+Accessible values in template:
+* `.Metadata.Hostname` - The hostname of the Proxmox VM.
+* `.Metadata.InstanceID` - The unique identifier for the Proxmox VM ID.
+* `.Metadata.InstanceUUID` - The unique identifier for the Proxmox VM UUID.
+* `.Metadata.InstanceType` - The type of the instance.
+* `.Metadata.ProviderID` - The provider-specific identifier `proxmox://<Region>/<VMID>`.
+* `.Metadata.Region` - The region where the VM is located.
+* `.Metadata.Zone` - The zone where the VM is located.
+* `.Metadata.Tags` - The tags associated with the NodeClass.
+* `.Kubernetes.RootCA` - The Kubernetes cluster root CA certificate.
+* `.Kubernetes.BootstrapToken` - The token used for bootstrapping the node.
+* `.Kubernetes.KubeletConfiguration` - The configuration for the Kubelet. Optional. See original [documentation](https://pkg.go.dev/k8s.io/kubelet/config/v1beta1#KubeletConfiguration) for more information.
+  - `CPUManagerPolicy` - The CPU manager policy
+  - `CPUCFSQuota` - The CFS quota
+  - `CPUCFSQuotaPeriod` - The CFS quota period
+  - `TopologyManagerPolicy` - The topology manager policy
+  - `TopologyManagerScope` - The topology manager scope
+  - `AllowedUnsafeSysctls` - The allowed unsafe sysctls list
+  - `ClusterDNS` - The DNS servers for the cluster.
+  - `MaxPods` - The maximum number of pods that can be run on the node.
+  - and many more, see crd file [here](/pkg/apis/v1alpha1/nodeclass.go).
+* `.Values.<key>` - User-defined values for the instance.
+
+Original template is located here [userdata.go](/pkg/providers/instance/cloudinit/userdata.go).
+
+### Meta-data key
+
+The `meta-data` key is used to provide additional information about the instance, such as its hostname, instance ID, and other relevant details.
+
+The default values are:
+
+```yaml
+hostname: {{ .Hostname }}
+local-hostname: {{ .Hostname }}
+instance-id: {{ .InstanceID }}
+{{- if .InstanceType }}
+instance-type: {{ .InstanceType }}
+{{- end }}
+{{- if .ProviderID }}
+provider-id: {{ .ProviderID }}
+{{- end }}
+region: {{ .Region }}
+zone: {{ .Zone }}
+availability-zone: {{ .Zone }}
+```
+
+This is go-template syntax, which allows for dynamic content generation based on the instance's metadata.
+
+Accessible values in template:
+* `Hostname` - The hostname of the Proxmox VM.
+* `InstanceID` - The unique identifier for the Proxmox VM ID.
+* `InstanceType` - The type of the instance.
+* `ProviderID` - The provider-specific identifier `proxmox://<Region>/<VMID>`.
+* `Region` - The region where the VM is located.
+* `Zone` - The zone where the VM is located.
+* `Tags` - The tags associated with the proxmox virtual machine.
+* `NodeClass` - The name of the NodeClass the VM is associated with.
+
+Original template is located here [metadata.go](/pkg/providers/instance/cloudinit/metadata.go).
+
+### Network-config key
+
+The `network-config` key is used to provide network configuration for the instance, such as IP addresses, routes, and DNS settings.
+
+The default file contents are:
+
+```yaml
+version: 1
+config:
+- type: physical
+  name:  eth0
+  mac_address: 00:11:22:33:44:55
+  subnets:
+  - type: dhcp
+```
+
+Original template is located here [network.go](/pkg/providers/instance/cloudinit/network.go).
+Currently the provider supports network config version 1.
+
+## Template functions
+
+The templates support several functions that let you customize Cloud-Init metadata based on the instance’s location or size.
+See descriptions and examples of all supported functions in the [Template function list](functions.md).
+
+---
+
+# Node resource allocation and optimization
+
+Source: https://github.com/sergelogvinov/karpenter-provider-proxmox/blob/main/docs/noderesource.md
+
+# Node resource allocation and optimization
+
+The Karpenter Proxmox provider supports two types of resource allocation and optimization modes: `simple` (default) and `static`.
+
+To change allocation mode, set flag `-node-policy` or env `NODE_POLICY` to either `simple` or `static`.
+
+## Simple allocation mode
+
+In this mode, the plugin periodically observes the Proxmox cluster resources and the currently running VMs. It calculates the available resources on each Proxmox node by subtracting the resources requested by running VMs from the total resources of the node.
+
+When scheduling new VMs, the plugin checks the available resources on each node to ensure that the requested resources can be allocated.
+
+If two or more VMs are using the same vCPUs on a Proxmox node (CPU affinity), the plugin merges their vCPUs to calculate the total vCPUs on that node.
+A new VM is scheduled only if the total vCPUs (including the new VM) does not exceed the total vCPUs capacity of the node.
+
+Memory overcommitment is not supported.
+
+Example:
+
+A Proxmox node has:
+* 16 vCPUs
+* 64 GB of memory
+
+Two running VMs are using:
+* vCPUs `0–3` and `2–4` respectively (via CPU affinity)
+* 16 GB and 16 GB of memory
+
+The available resources are calculated as:
+* vCPUs `0–4` are used (merged), so 11 vCPUs are available
+* 32 GB of memory is used, so 32 GB is available
+
+## Static allocation mode
+
+In this mode, the plugin does everything that `simple` mode does, but additionally sets `CPU pinning` (CPU affinity) and `NUMA node affinity` when creating a new VM.
+
+The CPU and NUMA placement is calculated based on the available resources on the Proxmox node.
+This ensures that the VM is pinned to specific CPU cores and NUMA nodes that have sufficient capacity, which improves performance and resource utilization.
+
+If a VM requires more than 1 vCPU, the plugin tries to:
+* Allocate vCPUs from the same physical core (using hyper-thread siblings) first.
+* Then allocate from the same NUMA node if more cores are needed.
+
+## Limitations and notes
+
+`static` mode requires root privileges (`root@pam`) to set CPU pinning for VMs.
+
+Proxmox does not expose CPU and NUMA topology via its API.
+As a result, the plugin tries to predict the CPU and NUMA topology based on information gathered from the Proxmox node.
+To improve the accuracy of this prediction, you can provide a custom node topology configuration file, as described below.
+
+## Customize node topology
+
+You can customize the node topology by providing a JSON configuration file.
+The controller includes the flag `-node-setting-file` or env `NODE_SETTING_FILE`, which lets you specify the path to this custom node resources file.
+
+The file structure looks like this:
+
+```json
+{
+  "region-1": {
+    "node1": {
+      "sockets": 1,
+      "threads": 2,
+      "uncorecaches": 1,
+      "nodes": {
+        "0": {
+          "cpus": "0-15",
+          "memory": 4294967296
+        },
+        "1": {
+          "cpus": "16-31",
+          "memory": 4294967296
+        }
+      },
+
+      "reservedcpus": [0,4],
+      "reservedmemory": 1073741824
+    },
+    "node2": {
+      "reservedcpus": [1,5],
+      "reservedmemory": 4294967296
+    },
+    "*": {
+      "reservedcpus": [1,5],
+      "reservedmemory": 4294967296
+    }
+  },
+  "region-2": {
+    "node3": {
+      "reservedcpus": [0,1],
+      "reservedmemory": 1073741824
+    }
+  }
+}
+```
+
+- The top-level keys are region names (as defined in the Proxmox cluster configuration).
+- The second-level keys are node names (as shown in the Proxmox VE dashboard). You can use `*` as a wildcard to apply settings to all nodes in the region.
+    * `reservedcpus`: An array of CPU core indices to reserve for system use on the node.
+    * `reservedmemory`: The amount of memory (in bytes) to reserve for system use on the node.
+
+- NUMA topology settings (optional):
+    * `sockets`: (Optional) The number of CPU sockets on the node.
+    * `threads`: (Optional) The number of threads per core on the node.
+    * `uncorecaches`: (Optional) The number of uncore cache levels on the node.
+    * `nodes`: (Optional) An object defining NUMA nodes on the system.
+        - The keys are NUMA node IDs.
+        - Each value is an object with:
+            * `cpus`: A string defining the CPU cores associated with the NUMA node (e.g., "0-15" for cores 0 to 15).
+            * `memory`: The amount of memory (in bytes) associated with the NUMA node.
+
+This configuration allows you to optimize resource allocation on your Proxmox nodes by reserving specific CPU cores and memory for system use, as well as defining the NUMA topology for better VM performance.
+
+`sockets` field defines how many physical CPU sockets are present on the node.
+
+`threads` field defines how many threads per core are available SMT/Hyper-Threading-wise.
+
+`uncorecaches` field defines how many uncore cache levels are present on the node.
+Use the `lscpu -e` command on the Proxmox node to gather this information (output column: L3 - get maximum number +1).
+
+`cpus` field supports both individual CPU indices and ranges (e.g., "0,2,4-6" for cores 0, 2, 4, 5, and 6).
+It can be gathered from the Proxmox VE dashboard or by using the `lscpu | grep NUMA` command on the Proxmox node.
+
+`memory` values are specified in bytes. To define memory on each NUMA node, you can use `numactl --hardware` command on the Proxmox node to get the memory distribution across NUMA nodes.
+
+---
+
+# Karpenter CRD for Proxmox Virtual Machine templates
+
+Source: https://github.com/sergelogvinov/karpenter-provider-proxmox/blob/main/docs/nodetemplateclass.md
+
+# Karpenter CRD for Proxmox Virtual Machine templates
+
+The project supports two types of template definitions:
+* `ProxmoxTemplate` - the plugin is responsible for creating and maintaining the template.
+* `ProxmoxUnmanagedTemplate` - the user is responsible for creating and managing the template.
+
+Changing templates can affect Karpenter [drift detection](https://karpenter.sh/docs/concepts/disruption/#drift). You can automatically upgrade the instances by changing the source image URL (for example, using FluxCD).
+
+## ProxmoxTemplate resource
+
+```yaml
+apiVersion: karpenter.proxmox.sinextra.dev/v1alpha1
+kind: ProxmoxTemplate
+metadata:
+  name: default
+spec:
+  # Source image parameters
+  # Proxmox will download it and store in the import directory.
+  sourceImage:
+    # Http(s) url of the image, qcow2/raw images are supported,
+    # Required value.
+    url: https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img
+    # The name of destination image, karpenter will add checksum to the name later.
+    # Required value.
+    imageName: ubuntu-amd64.qcow2
+    # After downloading, Proxmox can verify the image integrity by checking its checksum. (Optional)
+    checksum: <checksum>
+    # The checksum type (Optional)
+    # Can be one of md5, sha1, sha224, sha256, sha384, sha512
+    checksumType: md5
+
+  # Proxmox storage IDs where the downloaded image and template will be created.
+  # You can provide a list of storages, and the plugin will automatically select the most suitable one.
+  # The selected storages must support import and image content types, either separately or combined.
+  # Required value.
+  storageIDs:
+    - local
+    - system
+
+  #
+  # Proxmox common Virtual Machine parameters.
+  #
+
+  # Type of virtual machine (Optional)
+  # Can be one of pc, q35
+  machine: q35
+
+  agent:
+    # Enable/disable QEMU Guest Agent (Optional)
+    enabled: true
+    # Type of the guest agent (Optional)
+    # Can be one of virtio, isa
+    type: virtio
+    # Enable/disable freeze the filesystem on backup (Optional)
+    fsFreezeOnBackup: true
+    # Enable/disable fstrim for cloned disks (Optional)
+    fsTrimClonedDisks: false
+
+  # CPU configuration.
+  cpu:
+    # CPU type (Optional)
+    # Can be one of host kvm64, x86-64-v2, x86-64-v2-AES, x86-64-v3, x86-64-v4
+    # Default value is x86-64-v2-AES
+    type: x86-64-v2-AES
+    # CPU flags (Optional)
+    # See official documentation https://pve.proxmox.com/wiki/Manual:_qm.conf
+    flags: +pdpe1gb
+
+  # VGA configuration.
+  vga:
+    # Type of the VGA device (Optional)
+    # Can be one of none, serial0, std, vmware
+    type: serial0
+    # Memory of the device (Optional)
+    memory: 16
+
+  # List of network interfaces (Required)
+  # At least one network interface must be defined.
+  network:
+    - # Name of Proxmox interface netX, e.g. net0 (Optional)
+      name: net0
+      # Model of network hardware (Optional)
+      # Can be e1000, e1000e, rtl8139, virtio, vmxnet3
+      # Default is virtio
+      model: virtio
+      # Bridge to attach the network device to (Required)
+      bridge: vmbr0
+      # MTU of the interface (Optional)
+      mtu: 1500
+      # VLAN tag to apply to packets on this interface (Optional)
+      vlan: 15
+      # Interface should be protected by the firewall (Optional)
+      firewall: true
+
+      # IP configuration for this interface (Optional)
+      # If not specified, DHCP for IPv4 and Auto for IPv6 will be used.
+      # Address4 and Address6 must include the prefix length.
+      address4: 192.168.0.0/24
+      address6: fd00::/64
+      # Default gateway for IPv4 and IPv6 (Optional)
+      gateway4: 192.168.0.1
+      gateway6: fd00::1
+      # DNS servers for this interface (Optional)
+      dnsServers:
+        - 1.1.1.1
+        - 2001:4860:4860::8888
+
+  # List of PCI devices to attach to the VM template
+  # Supported Resource Mapping devices only.
+  pciDevices:
+    - # Mapping is the group
+      mapping: nvidia
+      # MDev Type (Optional)
+      mdev: nvidia-660
+      # Enable/disable PCIe (Optional)
+      pcie: true
+      # Use as default VGA (Optional)
+      xvga: false
+
+  # Tags to apply to the template (Optional)
+  tags:
+    - talos-k8s-proxmox
+    - karpenter
+```
+
+After applying the resource, Karpenter for Proxmox downloads the image from `spec.sourceImage.url` and stores it in the Proxmox `import` storage type.
+It then creates a virtual machine template on each node where this is supported.
+
+Proxmox has limitations when importing images. Not all image formats are supported.
+It is recommended to use `qcow2` or `raw` images.
+
+Image compression is not yet supported (Proxmox 8.4)
+
+## ProxmoxUnmanagedTemplate resource
+
+```yaml
+apiVersion: karpenter.proxmox.sinextra.dev/v1alpha1
+kind: ProxmoxUnmanagedTemplate
+metadata:
+  name: default
+spec:
+  # At least one of templateName or tags must be specified.
+
+  # The name of the Proxmox template (Optional)
+  templateName: linux-k8s-distribution
+
+  # Tags to find the Proxmox template (Optional)
+  # If specified, all tags must be present in the template.
+  tags:
+    - karpenter
+```
+
+The Karpenter plugin searches all Proxmox nodes for the specified template name.
+It then uses the matching templates to create VMs on nodes that support them.
+
+You can define as many different templates as needed, as long as they share the same name.
+
+### Example: manual
+
+The Proxmox Virtual Machine template:
+
+```yaml
+acpi: 1
+agent: enabled=0,fstrim_cloned_disks=0,type=virtio
+arch: x86_64
+bios: seabios
+boot: order=scsi0
+cicustom: user=local:snippets/common.yaml
+cores: 1
+cpu: cputype=host
+cpuunits: 1024
+ide2: local:1002/vm-1002-cloudinit.qcow2,media=cdrom
+ipconfig0: ip=dhcp,ip6=auto
+keyboard: en-us
+machine: q35
+memory: 512
+meta: creation-qemu=9.2.0,ctime=1754811620
+name: talos
+nameserver: 1.1.1.1 2001:4860:4860::8888
+net0: virtio=BC:24:11:7D:F3:15,bridge=vmbr0,firewall=1,mtu=1500
+numa: 1
+onboot: 0
+ostype: l26
+protection: 0
+scsi0: local:1002/vm-1002-disk-0.raw,aio=io_uring,backup=1,cache=none,discard=ignore,iothread=1,replicate=1,size=3G
+scsihw: virtio-scsi-single
+serial0: socket
+smbios1: uuid=e536baad-cf78-4543-9034-60295eed2b22
+sockets: 1
+tablet: 0
+template: 1
+vga: memory=16,type=serial0
+vmgenid: 0f832f6f-eb15-4e94-a44f-03698adee947
+```
+
+Do not forget to prepare cloud-init config `snippets/common.yaml` and virtual machine image `1002/vm-1002-disk-0.raw`
+
+### Example: terraform
+
+
+```hcl
+terraform {
+  required_providers {
+    proxmox = {
+      source  = "bpg/proxmox"
+      version = "0.66.3"
+    }
+  }
+}
+
+provider "proxmox" {
+  endpoint = "https://${var.proxmox_host}:8006/"
+  insecure = true
+}
+
+variable "release" {
+  type        = string
+  description = "The version of the Talos image"
+  default     = "1.10.5"
+}
+
+resource "proxmox_virtual_environment_download_file" "talos" {
+  for_each     = { for inx, zone in local.zones : zone => inx }
+  node_name    = each.key
+  content_type = "iso"
+  datastore_id = "local"
+  file_name    = "talos.raw.xz.img"
+  overwrite    = false
+
+  decompression_algorithm = "zst"
+  url                     = "https://factory.talos.dev/image/376567988ad370138ad8b2698212367b8edcb69b5fd68c80be1f2ec7d603b4ba/v${var.release}/nocloud-amd64.raw.xz"
+}
+
+resource "proxmox_virtual_environment_vm" "template" {
+  for_each    = { for inx, zone in local.zones : zone => inx }
+  name        = "talos"
+  node_name   = each.key
+  vm_id       = each.value + 1000
+  on_boot     = false
+  template    = true
+  description = "Talos ${var.release} template"
+
+  machine = "q35"
+  cpu {
+    architecture = "x86_64"
+    cores        = 1
+    sockets      = 1
+    numa         = true
+    type         = "host"
+  }
+
+  scsi_hardware = "virtio-scsi-single"
+  disk {
+    file_id      = proxmox_virtual_environment_download_file.talos[each.key].id
+    datastore_id = "local"
+    interface    = "scsi0"
+    size         = 3
+    file_format  = "raw"
+  }
+
+  network_device {
+    bridge   = "vmbr0"
+    mtu      = 1500
+    firewall = true
+  }
+
+  operating_system {
+    type = "l26"
+  }
+
+  initialization {
+    dns {
+      servers = ["1.1.1.1", "2001:4860:4860::8888"]
+    }
+    ip_config {
+      ipv4 {
+        address = "dhcp"
+      }
+      ipv6 {
+        address = "auto"
+      }
+    }
+
+    datastore_id = "local"
+    # user_data_file_id = proxmox_virtual_environment_file.machineconfig[each.key].id
+  }
+
+  serial_device {}
+  vga {
+    type = "serial0"
+  }
+}
+```
+
+# Reference
+
+* [Proxmox Virtual Machine Configuration](https://pve.proxmox.com/wiki/Manual:_qm.conf)
+* [Karpenter Documentation](https://karpenter.sh/docs/)
+
+---
+
+# Permissions for API Endpoints
+
+Source: https://github.com/sergelogvinov/karpenter-provider-proxmox/blob/main/docs/permission.md
+
+# Permissions for API Endpoints
+
+/nodes/%s/network -- any
+/nodes/%s/network/%s -- Sys.Audit
+/nodes/%s/qemu -- VM.Audit
+
+---
+
+# Make release
+
+Source: https://github.com/sergelogvinov/karpenter-provider-proxmox/blob/main/docs/release.md
+
+# Make release
+
+## Change release version
+
+```shell
+git commit --allow-empty -m "chore: release 2.0.0" -m "Release-As: 2.0.0"
+```
+
+## Update helm chart and documentation
+
+```shell
+git branch -D release-please--branches--main
+git checkout release-please--branches--main
+export `jq -r '"TAG=v"+.[]' .github/release-please-manifest.json`
+
+sh hack/bump-chart-version.sh karpenter-provider-proxmox false false true
+make helm-unit docs
+
+git add .
+git commit -s --amend
+```
+
+---
+
+# Proxmox Scheduler
+
+Source: https://github.com/sergelogvinov/karpenter-provider-proxmox/blob/main/docs/scheduler.md
+
+# Proxmox Scheduler
+
+The Proxmox Scheduler is a server component that monitors the Proxmox VE environment and makes scheduling decisions for virtual machines based on CPU and memory affinity rules defined in each VM configuration.
+
+Currently the scheduler focuses on VMs which have specific CPU affinity requirements defined in their configuration.
+All other VMs are left unaffined and can be scheduled on any available CPU cores by the default Proxmox scheduler.
+
+## Features
+
+- Pins VM vCPUs to specific physical CPU cores.
+- Adjusts CPU governor settings to improve performance.
+- Assigns IRQ or SR-IOV devices to the same CPU cores used by the VM.
+- Optionally provides node topology information for Karpenter.
+
+I hope some of these tasks may eventually be handled directly by Proxmox itself.
+
+## Environment Variables
+
+All command-line flags can be configured using environment variables. This is particularly useful for systemd service configuration or containerized deployments.
+
+| Flag | Environment Variable | Default Value |
+|---|---|---|
+| `--verbosity` | `VERBOSITY` | `0` |
+| `--watch-path` | `WATCH_PATH` | `/run/qemu-server` |
+| `--max-retries` | `MAX_RETRIES` | `5` |
+| `--resync-interval` | `RESYNC_INTERVAL` | `60m` |
+| `--cpu-governor-busy` | `CPU_GOVERNOR_BUSY` | `performance` |
+| `--cpu-governor-free` | `CPU_GOVERNOR_FREE` | `powersave` |
+
+### Verbosity
+
+Enable debug logging or troubleshoot issues by increasing the verbosity level.
+
+### CPU Governor Management
+
+Specify the CPU governor to apply to the CPU cores used by VMs and the idle CPU cores not assigned to any VM.
+It helps to optimize performance and power consumption based on allocated vCPU resources.
+
+**Common Values:**
+- `performance`: Maximum performance, highest power consumption
+- `powersave`: Lowest power consumption, reduced performance
+- `schedutil`: Scheduler-driven scaling based on CPU load
+
+## Feature Flags
+
+The Proxmox Scheduler can be configured using feature flags passed as environment variables or configured in the `/etc/default/proxmox-scheduler` file.
+
+- `PROXMOX_FEATURE_FLAGS` - A comma-separated list of feature flags to enable or disable specific features. Available flags:
+  - `karpenter` - Enables topology discovery for Karpenter integration.
+
+
+### Flag: karpenter
+
+When the karpenter feature flag is enabled, the Proxmox Scheduler creates a virtual machine that represents the full available capacity of the host.
+
+The `affinity` and `numa[n]` parameters are used to expose the node topology (CPU and memory layout) to Karpenter.
+This allows the Karpenter scheduler to understand the physical characteristics of the node.
+
+VM configuration example:
+
+```yaml
+#Karpenter discovery service
+affinity: 0-7,32-39,8-15,40-47,16-23,48-55,24-31,56-63
+cores: 64
+cpu: host
+memory: 507904
+name: node-capacity
+numa: 1
+numa0: cpus=0-15,hostnodes=0,memory=126976
+numa1: cpus=16-31,hostnodes=1,memory=126976
+numa2: cpus=32-47,hostnodes=2,memory=126976
+numa3: cpus=48-63,hostnodes=3,memory=126976
+tags: karpenter
+```
+
+The host has 4 NUMA nodes.
+- Each NUMA node has 16 CPU cores and 126,976 KB of memory.
+- The first NUMA node uses CPU cores 0–7 and 32–39, where:
+- 0–7 are physical cores.
+- 32–39 are their corresponding hyperthreads.
+
+If your environment does not allow running the scheduler daemon directly on the host, you can instead create a virtual machine with this configuration to expose the topology information.
+
+## Installation
+
+```shell
+sudo dpkg -i proxmox-scheduler_<version>_amd64.deb
+```
+
+---
+
+# Troubleshooting
+
+Source: https://github.com/sergelogvinov/karpenter-provider-proxmox/blob/main/docs/troubleshooting.md
+
+# Troubleshooting
+
+## Karpenter Proxmox Controller logs
+
+Ensure that the Karpenter Proxmox controller is running and has the necessary permissions to interact with the Proxmox API.
+Check the logs of the Karpenter Proxmox controller for any error messages or warnings that might indicate the cause of the issue.
+
+## Verify Custom Resource Definitions (CRDs) and Resources
+
+Check the status of the Custom Resource Definitions (CRDs) used by Karpenter to ensure they are have `Ready` status.
+
+```shell
+kubectl get ProxmoxTemplate -owide
+kubectl get ProxmoxUnmanagedTemplate -owide
+```
+
+Output example:
+
+```shell
+NAME      ZONES   MACHINE   CPU             VGA       READY   AGE
+default   3       q35       x86-64-v2-AES   serial0   True    2d5h
+
+NAME      ZONES   NAME    READY   AGE
+default   3       k8s     True    4d6h
+```
+
+* `ZONES` indicates the availability zones where the template can be used.
+* `READY` indicates whether the template is ready for use.
+
+If status is not `Ready`, describe the resource to see detailed information about the issue.
+
+```shell
+kubectl describe ProxmoxTemplate default
+kubectl describe ProxmoxUnmanagedTemplate default
+```
+
+```yaml
+...
+Status:
+  Conditions:
+    Last Transition Time:  2025-09-13T03:14:44Z
+    Message:
+    Observed Generation:   1
+    Reason:                ProxmoxVirtualMachineTemplateReady
+    Status:                True
+    Type:                  ProxmoxVirtualMachineTemplateReady
+    Last Transition Time:  2025-09-13T03:14:44Z
+    Message:
+    Observed Generation:   1
+    Reason:                Ready
+    Status:                True
+    Type:                  Ready
+  Image ID:                ubuntu-amd64-9606822589293882907.qcow2
+  Resources:
+    Zones:  3
+  Zones:
+    region-1/rnd-1/1004
+    region-1/rnd-3/1000
+    region-1/rnd-2/1005
+```
+
+Check the conditions for any errors or warnings.
+In this example, the template is ready and can be used in zones `region-1/rnd-1/1004`, `region-1/rnd-3/1000`, and `region-1/rnd-2/1005`.
+
+Where:
+* `region-1` is the Proxmox datacenter
+* `rnd-1`, `rnd-2`, and `rnd-3` are the Proxmox clusters
+* `1000`, `1004`, and `1005` are the Virtual Machine IDs.
+
+## Verify ProxmoxNodeClass and NodePool configurations
+
+Verify that the ProxmoxNodeClass and NodePool configurations are correct and match the available resources in your Proxmox environment.
+
+```shell
+kubectl get ProxmoxNodeClass -owide
+```
+
+Output example:
+
+```shell
+NAME      ZONES   BALANCE    TEMPLATE   METADATA   DISK   READY   AGE
+default   2       Balanced   default    cdrom      30Gi   True    15d
+```
+
+* `ZONES` indicates the availability zones where the node class can be used.
+* `READY` indicates whether the node class is ready for use.
+
+If status is not `Ready`, describe the resource to see detailed information about the issue.
+
+```shell
+kubectl describe ProxmoxNodeClass default
+```
+
+Output example:
+
+```yaml
+...
+Status:
+  Conditions:
+    Last Transition Time:  2025-09-13T03:28:47Z
+    Message:
+    Observed Generation:   49
+    Reason:                InstanceMetadataOptionsReady
+    Status:                True
+    Type:                  InstanceMetadataOptionsReady
+    Last Transition Time:  2025-09-15T05:12:05Z
+    Message:
+    Observed Generation:   49
+    Reason:                InstanceTemplateReady
+    Status:                True
+    Type:                  InstanceTemplateReady
+    Last Transition Time:  2025-09-15T07:52:05Z
+    Message:
+    Observed Generation:   49
+    Reason:                Ready
+    Status:                True
+    Type:                  Ready
+  Resources:
+    Zones:  2
+  Selected Zones:
+    region-1/rnd-2/1005
+    region-1/rnd-1/1004
+```
+
+Check the conditions for any errors or warnings.
+In this example, the node class is ready and can be used in zones `region-1/rnd-1/1004` and `region-1/rnd-2/1005`.
+
+```shell
+kubectl get NodePool -owide
+```
+
+Output example:
+
+```shell
+NAME      NODECLASS   NODES   READY   AGE
+default   default     1       True    15d
+```
+
+## Verify NodeClaims configurations
+
+Check the status of the NodeClaims created by Karpenter to see if they are being provisioned correctly.
+
+
+```shell
+kubectl get NodeClaims -owide
+```
+
+Output example:
+
+```shell
+NAME            TYPE           CAPACITY    ZONE    NODE            READY   AGE   IMAGEID                     ID                         NODEPOOL   NODECLASS   DRIFTED
+default-w6nxl   m1.1VCPU-8GB   on-demand   rnd-2   default-w6nxl   True    36m   1005-11881035043233139611   proxmox://region-1/20000   default    default
+```
+
+# References
+
+* [Kubernetes distribution examples](/examples/README.md)
+
+---
