@@ -1,0 +1,785 @@
+# Threshold ECDSA based on [CGGMP24] paper
+
+Source: https://github.com/lfdt-lockness/cggmp21/blob/cggmp24/m/README.md
+
+<!-- cargo-rdme start -->
+
+![License](https://img.shields.io/crates/l/cggmp24.svg)
+[![Discord](https://img.shields.io/discord/905194001349627914?logo=discord&logoColor=ffffff&label=Discord)][in Discord]
+
+# Threshold ECDSA based on [CGGMP24] paper
+
+<!-- TOC STARTS -->
+
+- [Running the protocol](#running-the-protocol)
+  * [Networking](#networking)
+    + [Signer indices](#signer-indices)
+  * [Execution ID](#execution-id)
+  * [Auxiliary info generation](#auxiliary-info-generation)
+    + [On reusability of the auxiliary data](#on-reusability-of-the-auxiliary-data)
+  * [Distributed Key Generation (DKG)](#distributed-key-generation-dkg)
+  * [Signing](#signing)
+- [Sync API](#sync-api)
+- [HD wallets support](#hd-wallets-support)
+- [SPOF code: Key Import and Export](#spof-code-key-import-and-export)
+- [Big integer implementation](#big-integer-implementation)
+- [no\_std compatability](#no_std-compatability)
+- [Differences between the implementation and CGGMP24](#differences-between-the-implementation-and-cggmp24)
+- [Timing attacks](#timing-attacks)
+- [Join us in Discord!](#join-us-in-discord)
+
+<!-- TOC ENDS -->
+
+[CGGMP24] is a state-of-art ECDSA TSS protocol that supports 1-round signing (requires 3 preprocessing rounds),
+identifiable abort, and a key refresh protocol.
+
+This crate implements:
+* Threshold (i.e., t-out-of-n) and non-threshold (i.e., n-out-of-n) key generation
+* (3+1)-round general threshold and non-threshold signing
+* Auxiliary info generation protocol
+* HD-wallets support based on [slip10] standard (compatible with [bip32]) \
+  Requires `hd-wallets` feature
+
+A self-contained description of the protocols we implemented is available [here][the spec].
+
+We also provide auxiliary tools like:
+* Secret key reconstruction (exporting key from TSS)
+* Trusted dealer (importing key into TSS)
+
+This crate **does not** (currently) support:
+* Key refresh for both threshold (i.e., t-out-of-n) and non-threshold (i.e., n-out-of-n) keys
+* Identifiable abort
+
+Our implementation has been audited by Kudelski. Report can be found [here][report].
+
+> About notion of threshold and non-threshold keys: originally, the CGGMP24 paper does not specify
+protocols for threshold t-out-of-n keys with arbitrary `t`, and only works with non-threshold
+n-out-of-n keys. We have added support for arbitrary threshold $2 \le t \le n$, however, we made
+it possible to opt out thresholdness so original CGGMP24 protocol can be carried out if needed.
+
+## Running the protocol
+
+### Networking
+The most essential part of running an interactive protocol is to define how parties can communicate with
+each other. Our `cggmp24` library is agnostic to the network layer and only requires you to provide two
+things: a stream of incoming messages and a sink for outgoing messages, i.e.:
+
+```rust
+let incoming: impl Stream<Item = Result<Incoming<Msg>>>;
+let outgoing: impl Sink<Outgoing<Msg>>;
+```
+
+where:
+* `Msg` is a protocol message (e.g., `signing::msg::Msg`)
+* `round_based::Incoming` and `round_based::Outgoing` wrap `Msg` and provide additional data (e.g., sender/recipient)
+* `futures::Stream` and `futures::Sink` are well-known async primitives.
+
+Once you have that, you can construct an `MpcParty`:
+
+
+```rust
+let delivery = (incoming, outgoing);
+let party = round_based::MpcParty::connected(delivery);
+```
+
+The concrete networking implementation to use will depend heavily on the specific application.
+Some applications may use libp2p; others may prefer having a central delivery server or a database
+(like Redis or Postgres); some specific applications may want to communicate over a public
+blockchain, and so on.
+
+Whatever networking implementation you use, keep in mind that:
+
+* All messages must be authenticated \
+  Whenever one party receives a message from another, the receiver should cryptographically
+  verify that the message comes from the claimed sender.
+* All p2p messages must be encrypted \
+  Only the designated recipient should be able to read the message
+
+#### Signer indices
+Our library uses indices to uniquely refer to particular signers sharing a key. Each index `i`
+is an unsigned integer `u16` with $0 \le i < n$ where `n` is the total number of parties.
+
+All signers should have the same view about each others' indices. For instance, if Signer A
+holds index 2, then all other signers must agree that i=2 corresponds to Signer A.
+
+Assuming some sort of PKI (which would anyway likely be used to ensure secure communication,
+as described above), each signer has a public key that uniquely identifies that signer.
+It is then possible to assign unique indices to the signers by lexicographically sorting the
+signers' public keys, and letting the index of a signer be the position of that signer's public
+key in the sorted list.
+
+### Execution ID
+Execution of our protocols requires all participants to agree on unique execution ID (aka
+session identifier) that is assumed never to repeat. This string provides context separation
+between different executions of the protocol to ensure that an adversary cannot replay messages
+from one execution to another.
+
+Once signers can talk to each other and share an execution ID, they're ready to do MPC!
+
+### Auxiliary info generation
+In the usual flow, signers run a protocol for auxiliary-data generation before running distributed
+key generation. This protocol sets up certain parameters (in particular, Paillier moduli
+for each of the signers) that will be used during the signing protocols. This protocol can be
+run as follows:
+
+```rust
+// Prime generation can take a while
+let pregenerated_primes = cggmp24::PregeneratedPrimes::generate(&mut OsRng);
+
+let eid = cggmp24::ExecutionId::new(b"execution id, unique per protocol execution");
+let i = /* signer index, same as at keygen */;
+let n = /* number of signers */;
+
+let aux_info = cggmp24::aux_info_gen(eid, i, n, pregenerated_primes)
+    .start(&mut OsRng, party)
+    .await?;
+```
+
+The auxiliary-data generation protocol is computationally heavy as it requires the generation
+of safe primes and involves several zero-knowledge (ZK) proofs.
+
+#### On reusability of the auxiliary data
+The CGGMP24 paper assumes that new auxiliary data is generated for each secret key that is shared.
+However, examination of the proof shows that this is not necessary, and a fixed group of signers
+can use the same auxiliary data for the secure sharing/usage of multiple keys.
+
+### Distributed Key Generation (DKG)
+The DKG protocol involves all signers who will co-share a key. All signers need to agree on
+some basic parameters including the participants' indices, the execution ID, and the
+threshold value (i.e., t). The protocol can be executed as
+
+```rust
+use cggmp24::supported_curves::Secp256k1;
+
+let eid = cggmp24::ExecutionId::new(b"execution id, unique per protocol execution");
+let i = /* signer index (0 <= i < n) */;
+let n = /* number of signers taking part in key generation */;
+let t = /* threshold */;
+
+let incomplete_key_share = cggmp24::keygen::<Secp256k1>(eid, i, n)
+    .set_threshold(t)
+    .start(&mut OsRng, party)
+    .await?;
+```
+
+The above produces an `IncompleteKeyShare`. An incomplete key share can be saved on disk by serializing using
+[`serde` crate][serde]. Treat this material appropriately as it contains sensitive information.
+
+Assuming auxiliary-data generation has already been done (see above), you can "complete" the
+key share using:
+
+```rust
+let key_share = cggmp24::KeyShare::from_parts((incomplete_key_share, aux_info))?;
+```
+
+### Signing
+Once signers have a set of "completed" key shares, they can sign or generate presignatures.
+In either case, exactly the threshold number (i.e., t) of signers must take part in the protocol.
+As in the DKG protocol, each signer needs to be assigned a unique index, now in the range from 0
+to t-1. But the signers also need to know which index each signer occupied at the time of keygen.
+
+In the example below, we do a full signing:
+```rust
+let eid = cggmp24::ExecutionId::new(b"execution id, unique per protocol execution");
+
+let i = /* signer index (0 <= i < min_signers) */;
+let parties_indexes_at_keygen: [u16; MIN_SIGNERS] =
+    /* parties_indexes_at_keygen[i] is the index the i-th party had at keygen */;
+let key_share = /* completed key share */;
+
+let data_to_sign = cggmp24::DataToSign::digest::<Sha256>(b"data to be signed");
+
+let signature = cggmp24::signing(eid, i, &parties_indexes_at_keygen, &key_share)
+    .sign(&mut OsRng, party, &data_to_sign)
+    .await?;
+```
+
+Alternatively, you can generate a presignature and later use it to sign:
+1. Use `SigningBuilder::generate_presignature` to run the presignature generation protocol
+2. Later, when a signing request is received, each signer issues a partial signature using
+   `Presignature::issue_partial_signature`
+3. A threshold number of partial signatures can be combined using `PartialSignature::combine` to
+   obtain a full signature
+
+**Never reuse presignatures!** If you use the same presignature to sign two different messages,
+the private key may be leaked.
+
+## Sync API
+Every protocol is defined as async function. If you need to run a protocol in non-async environment,
+library provides a wrapper that allows you to execute protocol using sync API only.
+
+To use it, you need to enable `state-machine` feature. Then, for every protocol definition, you can
+find a companion function that returns `StateMachine`
+which can be used to carry out the protocol. For instance, if you do presignature generation, use
+`signing::SigningBuilder::generate_presignature_sync`.
+
+## HD wallets support
+Library supports non-hardened deterministic key derivation based on [slip10] standard (compatible
+with [bip32]). It allows signers to generate a master key once, and then use it to instantaneously
+derive as many child keys as needed. Child key derivation takes place within signing protocol
+practically at no cost.
+
+In order to use HD wallets, `hd-wallets` feature must be enabled. Then, a master key needs to be
+generated by running a regular key generation protocol with `hd_wallet`
+set to `true`.
+
+When master key is generated, you can issue a signature for child key by setting
+derivation path in the signing.
+
+## SPOF code: Key Import and Export
+CGGMP24 protocol is designed to avoid Single Point of Failure by guaranteeing that attacker would
+need to compromise threshold amount of nodes to obtain a secret key. However, some use-cases may
+require you to create a SPOF, for instance, importing an existing key into TSS and exporting key
+from TSS.
+
+Such use-cases contradict to nature of MPC so we don't include those primitives by default.
+However, you may opt for them by enabling `spof` feature, then you can use `trusted_dealer`
+for key import and `key_share::reconstruct_secret_key` for key export.
+
+## Big integer implementation
+
+This protocol relies heavily on big integer arithmetic, and provides a
+choice between two backends: rug and num-bigint.
+
+- To use rug, select the feature `backend-rug`. This backend is faster, in
+some applications by several times, but requires an LGPL dependency
+- To use num-bigint, select the feature `backend-num-bigint` (selected as
+**default** feature)
+
+## no\_std compatability
+
+Every crate in this project is compatible with no\_std, provided that
+`num-bigint` backend is chosen. The presence of `alloc` is still required. This
+means that `cggmp24` and `cggmp24-keygen` can be run on a
+`wasm32-unknown-unknown` platform.
+
+To compile the crates for `no_std`, you need to disable the default feature
+"std" and instead enable `no_std` for some crates. The dependencies in your
+cargo file should look like this:
+
+```toml
+cggmp24 = { version = "0.7", default-features = false, features = ["no_std", "backend-num-bigint"] }
+cggmp24-keygen = { version = "0.7", default-features = false }
+key-share = { version = "0.6", default-features = false }
+```
+
+## Differences between the implementation and CGGMP24
+[CGGMP24] only defines a non-threshold protocol. To support general thresholds,
+we defined our own CGGMP24-like key generation and threshold signing
+protocols. However, we keep both
+threshold and non-threshold versions of the protocols in the crate, so if you opt for the non-threshold
+protocol, you will be running the original protocol defined in the paper.
+
+There are other (small) differences in the implementation compared to the original paper (mostly typo fixes);
+they are all documented in [the spec].
+
+[CGGMP24]: https://ia.cr/2021/060
+[the spec]: https://lfdt-lockness.github.io/cggmp21/cggmp24-spec.pdf
+[security guidelines]: #security-guidelines
+[slip10]: https://github.com/satoshilabs/slips/blob/master/slip-0010.md
+[bip32]: https://github.com/bitcoin/bips/blob/master/bip-0032.mediawiki
+[report]: https://github.com/LFDT-Lockness/cggmp21/blob/m/docs/audit_report.pdf
+[serde]: https://serde.rs/
+
+## Timing attacks
+Timing attacks are type of side-channel attacks that leak sensitive information through duration of
+execution. We consider timing attacks out of scope as they are nearly impossible to perform for such
+complicated protocol as CGGMP24 and impossible to do in our specific deployment. Thus, we intentionally
+don't do constant-time operations which gives us a significant performance boost.
+
+## Join us in Discord!
+Feel free to reach out to us [in Discord]!
+
+[in Discord]: https://discord.com/invite/hyperledger
+
+<!-- cargo-rdme end -->
+
+---
+
+# Migration Guide: Upgrading from `cggmp21 v0.6` to `cggmp24 v0.7`
+
+Source: https://github.com/lfdt-lockness/cggmp21/blob/cggmp24/m/CGGMP21_MIGRATION.md
+
+# Migration Guide: Upgrading from `cggmp21 v0.6` to `cggmp24 v0.7`
+
+This guide provides the necessary steps to migrate your project from the older `cggmp21` protocol
+implementation to the latest `cggmp24` version. This upgrade is essential to align with the most
+recent CGGMP24 paper revision.
+
+There's many breaking changes in this release, so for convinience, we split them into several `alpha`
+releases. This instruction guides you through updating `cggmp21 v0.6` → `cggmp24 v0.7.0-alpha.1` →
+`v0.7.0-alpha.2` → `v0.7.0-alpha.3`.
+
+## Step 1: Update `Cargo.toml` to use `cggmp24 v0.7.0-alpha.1`
+The first step is to update your project's dependencies. Modify your `Cargo.toml` file to point to the
+new version of the library.
+
+Replace the existing line for `cggmp21` with the following:
+
+```toml
+[dependencies]
+cggmp24 = "0.7.0-alpha.1"
+```
+
+If your `Cargo.toml` references `cggmp21-keygen` or `paillier-zk` crates, do the same with them:
+* `cggmp21-keygen` becomes `cggmp24-keygen`
+* New version for both crates is `0.7.0-alpha.1`
+
+## Step 2: Update Code References
+Next, you need to update all references to cggmp21 within your Rust source code. E.g. `cggmp21::keygen(eid, i, n)`
+should become `cggmp24::keygen(eid, i, n)`.
+
+You can perform this replacement automatically across your entire project by running the following
+shell command from your project's root directory:
+
+```bash
+find . -type f -name "*.rs" -exec sed -i -E 's/\bcggmp21\b/cggmp24/g; s/\bcggmp21_keygen\b/cggmp24_keygen/g; s/\bCGGMP21\b/CGGMP24/g' {} +
+```
+
+This command will find all .rs files and replace:
+* `cggmp21` with `cggmp24`
+* `cggmp21_keygen` with `cggmp24_keygen`
+* `CGGMP21` with `CGGMP24`
+
+See git diff to verify that command did not introduce any unwanted changes.
+
+## Step 3: Auxiliary Data Re-generation
+Due to breaking changes in the protocol, auxiliary data (`cggmp24::key_share::AuxInfo`) generated in
+`cggmp21` is no longer supported. You must re-generate this data.
+
+### New Auxiliary Data Generation
+
+Run the `cggmp24::aux_info_gen()` protocol to generate new auxiliary data.
+
+Important: This protocol is computationally intensive and may take several minutes to complete,
+depending on your hardware. However, as recommended, you should use the same auxiliary data for all
+keys. This makes it a one-time setup cost.
+
+### Recovering Existing Key Shares
+
+If you have stored a complete `cggmp24::KeyShare` from a previous version, you will not be
+able to deserialize it directly. To recover the essential data from serialized key shares,
+you need to extract the "incomplete" key share from them. To do that, you can use the
+`cggmp24::key_share::cggmp21_compat::ExtractCoreShare` utility structure: it provides a
+`serde::Deserialize` implementation that is compatible with the `cggmp21::KeyShare` format. This
+allows you, while still using the new version of the library, to read an old version of a key share,
+and extract the "core".
+
+Once you have the core key share, you can combine it with your newly generated auxiliary data to
+reconstruct a complete, compatible key share.
+
+## Step 4: Compile and Test
+
+At this point, your project should compile and work perfectly fine with `cggmp24 v0.7.0-alpha.1`.
+Make sure it is the case:
+
+```bash
+cargo clean
+cargo test
+```
+
+If there are issues, please fix them before proceeding to the next step.
+
+## Step 5: Update `Cargo.toml` to use `cggmp24 v0.7.0-alpha.2`
+Update version of `cggmp24`:
+
+```toml
+[dependencies]
+cggmp24 = "0.7.0-alpha.2"
+```
+
+## Step 6: Presignatures API changes
+
+From this version, our API explicitly prohibits using presignatures:
+* With "raw signing" (when we sign a hash of message, and original message is not known to the signer)
+* With HD wallet derivation
+
+In both cases, attacks have been found that break or significantly decrease security of the signing.
+Read the [vulnerability disclosure][vuln-disclosure] to learn more about these attacks.
+
+We changed API to prohibit "raw signing" with presignatures: now we provide `ccgmp24::{DataToSign,
+PrehashedDataToSign}`. `DataToSign` can only be constructed when original message is provided, by
+using `DataToSign::{digest, from_digest}` constructors that take an original message and a hash
+function, and they perform hashing internally.
+
+Now signing using presignature, i.e. `cggmp24::signing::Presignature::issue_partial_signature` **only**
+accepts `DataToSign`, which serves as a type-guard that original message has been observed.
+
+Otherwise, for regular signing via `cggmp24::signing().sign(...)` you can provide both `DataToSign` and
+`PrehashedDataToSign` (the latter can be constructed from any scalar/hash), as `.sign(..)` accepts
+`&dyn AnyDataToSign`.
+
+Note: although highly discouraged, you may bypass API type-guards and convert `PrehashedDataToSign`
+into `DataToSign`. To do that, you need to enable a feature `insecure-assume-preimage-known` in
+`cggmp24` crate and call method `PrehashedDataToSign::insecure_assume_preimage_known`. Use it
+only if you can completely trust the source of the prehashed data, and beware of possible attack
+described in the [blog][vuln-disclosure].
+
+Lastly, `Presignature::{set_derivation_path, set_derivation_path_with_algo}` methods have been removed to
+address second attack.
+
+[vuln-disclosure]: https://www.dfns.co/article/cggmp21-vulnerabilities-patched-and-explained
+
+Update your code to comply with the new API.
+
+## Step 7: Compile and Test
+
+At this point, your project should compile and work perfectly fine with `cggmp24 v0.7.0-alpha.2`.
+Make sure it is the case:
+
+```bash
+cargo clean
+cargo test
+```
+
+If there are issues, please fix them before proceeding to the next step.
+
+## Step 8: Update `Cargo.toml` to use `cggmp24 v0.7.0-alpha.3`
+Update version of `cggmp24`:
+
+```toml
+[dependencies]
+cggmp24 = "0.7.0-alpha.3"
+```
+
+## Step 9: Use the New Big Integer API
+Previously, cggmp lib has been relying on `rug` crate
+for big integer. Starting from this version, we use
+[`fast_paillier::backend::Integer`](https://docs.rs/fast-paillier/0.3/fast_paillier/backend/index.html)
+that internally uses either [`rug`](https://docs.rs/rug/latest/rug/) or
+[`num-bigint`](https://docs.rs/num-bigint/latest/num_bigint/) depending on
+enabled feature: by default, `num-bigint` is used, but you can change it back
+to `rug` by enabling `backend-rug` feature.
+
+Note: we re-export `fast-paillier` dependency as `cggmp24::fast_paillier`, and
+the backend it uses as `cggmp24::backend`, so you can reference integer using
+it.
+
+Integer type is exposed in library API, so you could have used it even if you
+don't have `rug` specified in your `Cargo.toml`. For instance,
+`cggmp24::key_share::DirtyAuxInfo` has fields `p` and `q` that are of type
+`Integer`.
+
+New `Integer` has different API from what `rug::Integer` has. For instance,
+serializing integer to bytes in MSF order looks like this:
+
+```rust
+let bytes: Vec<u8> = integer.to_digits::<u8>(rug::integer::Order::Msf);
+```
+
+With new API, it is done by calling `to_bytes_msf` method:
+```rust
+let bytes: Vec<u8> = integer.to_bytes_msf();
+```
+
+Also, note that we provide **limited stability guarantees** on Integer API that
+only applies to these methods:
+* `Integer::to_bytes_lsf`
+* `Integer::to_bytes_msf`
+* `Integer::from_bytes_msf`
+* `Integer::to_str_radix`
+* `Integer::from_str_radix`
+* `Integer::{to_num_bigint, from_num_bigint}`
+* `Integer::{to_rug, from_rug}`
+
+All other methods are unstable. We may introduce breaking changes on minor
+release as long as it doesn't break
+compilation of `cggmp24`.
+
+If you performed non-trivial operations on the rug integers previously, you may
+select the `backend-rug` feature and continue doing so, but you will need to
+use `Integer::to_rug` and `Integer::from_rug` methods to convert the numbers
+first.
+
+## Step 10: Compile and Test
+
+At this point, your project should compile and work perfectly fine with `cggmp24 v0.7.0-alpha.3`.
+Make sure it is the case:
+
+```bash
+cargo clean
+cargo test
+```
+
+## Step 11: Update `Cargo.toml` to use `cggmp24 v0.7.0-alpha.4`
+Update version of `cggmp24`:
+
+```toml
+[dependencies]
+cggmp24 = "0.7.0-alpha.4"
+```
+
+## Step 12: New release of `generic-ec`
+In this release, a few deps were updated:
+* `generic-ec` to `v0.5`
+* `key-share` to `v0.7`
+
+If you use one of those dependency directly, make sure to update your `Cargo.toml`:
+
+```toml
+[dependencies]
+generic-ec = "0.5" # only if you're using
+key-share = "0.7"  # them directly
+```
+
+Although the releases contain breaking changes, they are minimal, you're not likely to encounter
+any problems unless you implemented your own `generic_ec::Curve` (in this case, you need to change
+implementation of a few traits but that's it). Resolve any errors before proceeding.
+
+## Step 13: Compile and Test
+
+At this point, your project should compile and work perfectly fine with `cggmp24 v0.7.0-alpha.3`.
+Make sure it is the case:
+
+```bash
+cargo clean
+cargo test
+```
+
+If it compiles and all tests pass successfully, then you've completed migration!
+
+---
+
+# Contributing Guide
+
+Source: https://github.com/lfdt-lockness/cggmp21/blob/cggmp24/m/CONTRIBUTING.md
+
+# Contributing Guide
+
+Thanks for taking interest to contributing to our project!
+
+## Join us in Discord!
+We welcome all contributors to communicate with us [in Discord]! Please, reach out to us
+in `#lockness-contribute` room.
+
+## Pull Requests
+Prior to making a PR, we ask you to communicate it with us, either [in Discord] or, if you
+prefer, by opening an issue in the repo. This would help to keep your work aligned with the
+maintainers view and avoid situations in which we can't accept your contribution.
+
+All commits are required to be signed via verified GPG key. You can read about commit signing
+in [this series of articles](https://docs.github.com/en/authentication/managing-commit-signature-verification)
+(we recommend using a hardware GPG token).
+
+All commits are required to be signed off by including `Signed-off-by: YOUR NAME <your_email@example.com>` line.
+By doing this, you certify that the commit is compliant with [Developer Certificate of Origin (DCO)](https://developercertificate.org/),
+meaning that you wrote the code or otherwise have the right to submit the code you are
+contributing to the project.
+
+```text
+Developer Certificate of Origin
+Version 1.1
+
+Copyright (C) 2004, 2006 The Linux Foundation and its contributors.
+
+Everyone is permitted to copy and distribute verbatim copies of this
+license document, but changing it is not allowed.
+
+
+Developer's Certificate of Origin 1.1
+
+By making a contribution to this project, I certify that:
+
+(a) The contribution was created in whole or in part by me and I
+    have the right to submit it under the open source license
+    indicated in the file; or
+
+(b) The contribution is based upon previous work that, to the best
+    of my knowledge, is covered under an appropriate open source
+    license and I have the right under that license to submit that
+    work with modifications, whether created in whole or in part
+    by me, under the same open source license (unless I am
+    permitted to submit under a different license), as indicated
+    in the file; or
+
+(c) The contribution was provided directly to me by some other
+    person who certified (a), (b) or (c) and I have not modified
+    it.
+
+(d) I understand and agree that this project and the contribution
+    are public and that a record of the contribution (including all
+    personal information I submit with it, including my sign-off) is
+    maintained indefinitely and may be redistributed consistent with
+    this project or the open source license(s) involved.
+```
+
+Commits can be automatically signed off automatically by using `-s` flag (i.e. `git commit -s`).
+
+## Issues
+Feel free to open an issue if you found a bug, have a suggestion, or wish to
+communicate with us for other reasons.
+
+However, if you want to report something that you believe might be a security
+vulnerability or a security flaw in this or any upstream project, please report
+it following the procedure described in [SECURITY.md](./SECURITY.md).
+
+Feel free to reach out to us [in Discord] as well.
+
+[in Discord]: https://discord.com/invite/hyperledger
+
+---
+
+# enforce_reliable_broadcast.md
+
+Source: https://github.com/lfdt-lockness/cggmp21/blob/cggmp24/m/docs/enforce_reliable_broadcast.md
+
+Ensures reliability of broadcast channel by adding one extra communication round
+
+CGGMP24 protocol requires message in the first round to be sent over reliable
+broadcast channel. We ensure reliability of the broadcast channel by introducing extra
+communication round (at cost of additional latency). You may disable it, for instance,
+if your transport layer is reliable by construction (e.g. you use blockchain for
+communications).
+
+Default: `true`.
+
+---
+
+# incomplete_key_share.md
+
+Source: https://github.com/lfdt-lockness/cggmp21/blob/cggmp24/m/docs/incomplete_key_share.md
+
+Core key share is obtained as an output of [key generation protocol](crate::keygen()).
+It can not be used in signing protocol as it lacks of required auxiliary information.
+You need to carry out [key refresh protocol](crate::key_refresh()) to obtain "completed"
+[KeyShare].
+
+---
+
+# key_share.md
+
+Source: https://github.com/lfdt-lockness/cggmp21/blob/cggmp24/m/docs/key_share.md
+
+Key share is obtained as output of [key refresh protocol](mod@crate::key_refresh).
+It contains a [core share](IncompleteKeyShare) and auxiliary data required to
+carry out signing.
+
+Compared to the paper, we removed the El-Gamal private key as it's not used
+for 3-round presigning, which is the only one we provide
+
+---
+
+# mpc_message.md
+
+Source: https://github.com/lfdt-lockness/cggmp21/blob/cggmp24/m/docs/mpc_message.md
+
+MPC network messages
+
+This module contains types that define MPC messages that signers exchange
+during the protocol
+
+---
+
+# README.md
+
+Source: https://github.com/lfdt-lockness/cggmp21/blob/cggmp24/m/docs/README.md
+
+Files in this folder are used internally to build the docs by `cargo doc`.
+
+If you're looking for documentation, please refer to the docs hosted
+on [docs.rs](https://docs.rs/cggmp24), or you can also build docs locally
+via `make docs-open`.
+
+---
+
+# toc-cggmp24.md
+
+Source: https://github.com/lfdt-lockness/cggmp21/blob/cggmp24/m/docs/toc-cggmp24.md
+
+<!-- TOC STARTS -->
+
+- [Running the protocol](#running-the-protocol)
+  * [Networking](#networking)
+    + [Signer indices](#signer-indices)
+  * [Execution ID](#execution-id)
+  * [Auxiliary info generation](#auxiliary-info-generation)
+    + [On reusability of the auxiliary data](#on-reusability-of-the-auxiliary-data)
+  * [Distributed Key Generation (DKG)](#distributed-key-generation-dkg)
+  * [Signing](#signing)
+- [Sync API](#sync-api)
+- [HD wallets support](#hd-wallets-support)
+- [SPOF code: Key Import and Export](#spof-code-key-import-and-export)
+- [Big integer implementation](#big-integer-implementation)
+- [no\_std compatability](#no_std-compatability)
+- [Differences between the implementation and CGGMP24](#differences-between-the-implementation-and-cggmp24)
+- [Timing attacks](#timing-attacks)
+- [Join us in Discord!](#join-us-in-discord)
+
+<!-- TOC ENDS -->
+
+---
+
+# validated_key_share_disclaimer.md
+
+Source: https://github.com/lfdt-lockness/cggmp21/blob/cggmp24/m/docs/validated_key_share_disclaimer.md
+
+##### CRT and multiexponent optimizations
+
+[CRT parameters] and [multiexponentiation tables] are not checked for correctness
+as there's no simple and/or efficient way to do so. If you have chosen to 
+benefit from those optimizations, be aware that invalid/inconsistent data
+may lead to unexpected and unverbose protocol termination and as well to
+security breach.
+
+[CRT parameters]: PedersenParams::crt
+[multiexponentiation tables]: PedersenParams::multiexp
+
+---
+
+# validated_key_share_note.md
+
+Source: https://github.com/lfdt-lockness/cggmp21/blob/cggmp24/m/docs/validated_key_share_note.md
+
+### Correctness
+
+This key share was checked to be valid and consistent. In order to
+keep it valid and consistent, only immutable access to its fields is
+provided. In case mutable access is needed, it can be converted into
+dirty key share using [`.into_inner()`](Valid::into_inner) method.
+
+
+---
+
+# Maintainers
+
+Source: https://github.com/lfdt-lockness/cggmp21/blob/cggmp24/m/MAINTAINERS.md
+
+# Maintainers
+
+| Name               | Github        |
+|--------------------|---------------|
+| Denis Varlakov     | [@survived]   |
+| Nikita Sorokovikov | [@maurges]    |
+
+[@survived]: https://github.com/survived
+[@maurges]: https://github.com/maurges
+
+
+---
+
+# Security Policy
+
+Source: https://github.com/lfdt-lockness/cggmp21/blob/cggmp24/m/SECURITY.md
+
+# Security Policy
+
+## Supported Versions
+
+Only the latest version of the library is supported.
+
+## Reporting a Vulnerability
+
+We highly welcome vulnerabilities reported through either:
+
+1. Github, in the "Security" tab, using the "Report a vulnerability" button.
+2. Email, security@dfns.co
+
+After receiving the report, it will take us up to 2 working days to respond. 
+We will evaluate the reported vulnerability, determine whether it needs to 
+be addressed, and (if so) and provide an estimated timeline for addressing it.
+
+After vulnerability was fixed and the new version of CGGMP24 protocol was
+properly tested, we publish the fix, and publicly disclose the vulnerability
+(credits for finding the issue go to the reporter).
+
+---
