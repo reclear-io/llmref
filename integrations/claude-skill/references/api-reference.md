@@ -51,6 +51,27 @@ Body:
 Response: `{ "chunks": [ { id, project, version, page_url, heading, content, token_count } ] }`.
 Search disabled on the server → `{ "chunks": [] }` (not an error).
 
+### Best-effort discovery reports
+
+`POST /documentation-reports` accepts the same fields as `report_missing_docs`.
+Only the public project name is required. URLs must be public HTTPS links with
+no credentials or query strings; `llms_txt_url` must name an observed llms.txt,
+including any nested docs/version path. No URL is fetched during intake.
+
+A durable receipt returns `202` and
+`{"accepted":true,"status":"recorded","report_id":"..."}`. Validation, capacity
+or service failures return `accepted:false`; callers should discard failures and
+continue their task. MCP returns this as an ordinary tool result, not a retrieval
+error. It is a metadata write (`readOnlyHint:false`, `destructiveHint:false`,
+`idempotentHint:true`), rather than a fifth read-only lookup.
+
+Reports are deduplicated, retained privately for up to 90 days after their last
+observation, and capped at 200 new reports per rolling 24 hours and 20,000 rows.
+The worker imports at most 20 per run. Hints pass the normal source, version,
+license and verification requirements; new source domains still need review.
+Reports without URLs are retained as unmet demand until a URL hint is supplied.
+No conversation, code, reporter identifier or IP is stored in the report record.
+
 ### Status codes
 
 `200` ok · `401` invalid key · `404` unknown project/version/artifact ·
@@ -71,8 +92,8 @@ key). Key goes in `Authorization: Bearer <key>` (or `x-api-key` alias).
 ## MCP server
 
 Endpoint: `GET|POST https://api.llmref.org/v1/mcp` (streamable HTTP, protocol
-`2024-11-05`, advertises as `llmref`). Four read-only tools; each returns
-pretty-printed JSON as a text block.
+`2024-11-05`, advertises as `llmref`). Four read-only retrieval tools plus one optional reporting tool; each returns
+JSON as a text block.
 
 | Tool | Params |
 |---|---|
@@ -80,6 +101,7 @@ pretty-printed JSON as a text block.
 | `list_versions` | `project` (req) |
 | `resolve_docs` | `project` (req), `version` (req; or `latest`) |
 | `search_docs` | `project`, `version`, `query` (req); `top_k?`, `token_budget?` |
+| `report_missing_docs` | `project` (public name); `version?`, `docs_url?`, `llms_txt_url?` |
 
 `resolve_docs` returns underscore artifact keys (`llms_txt`, `llms_full_txt`,
 `meta_json`, `dumps`) — same URLs as the HTTP `/resolve` filenames.
