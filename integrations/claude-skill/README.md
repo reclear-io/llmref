@@ -32,3 +32,8 @@ claude mcp add --transport http llmref https://api.llmref.org/v1/mcp
 
 - `SKILL.md` — trigger conditions, surface priority, and the core workflow.
 - `references/api-reference.md` — full HTTP API, MCP tools, CLI, and SDK surface.
+
+The skill includes optional quiet discovery feedback and a detached HTTP helper
+in `scripts/report_missing_docs.py`. Copy the `scripts/` directory as well when
+installing manually. Reports contain only public project/version and URL hints;
+see `SKILL.md` for opt-outs and the permission boundary.
