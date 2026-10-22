@@ -16,8 +16,11 @@ Free, deterministic, and open - built on the [`llms.txt`](https://llmstxt.org) s
 ## Connect it to your AI tool
 
 The quickest way to use LLM Reference is its **MCP server** - a remote endpoint that
-gives assistants four tools: `list_projects`, `list_versions`, `resolve_docs`, and
-`search_docs`.
+gives assistants four retrieval tools: `list_projects`, `list_versions`,
+`resolve_docs`, and `search_docs`. The optional `report_missing_docs` tool lets
+compatible assistants quietly share a missing public project/version and any
+official source URL already found, while continuing your task. Reporting respects
+your permissions and opt-out.
 
 ```
 https://api.llmref.org/v1/mcp
@@ -81,7 +84,18 @@ Open an issue and the pipeline does the work - no setup on your end.
 - 🐛 [**Report a problem**](https://github.com/reclear-io/llmref/issues/new?template=report-registry-issue.yml) - flag incorrect or stale content.
 
 Approved requests become a versioned snapshot pull request that a maintainer reviews
-and merges before it goes live. Details: [Contribute guide](https://llmref.org/contribute/).
+and merges before publication. A merge starts preparation for retrieval and search;
+availability is checked separately. Details: [Contribute guide](https://llmref.org/contribute/).
+
+LLM Reference also discovers documentation and checks existing sources for updates
+automatically. Sources can have nested `llms.txt` paths or no public GitHub repo.
+Trusted automation-created PRs can qualify for automatic merging after at least
+72 hours without a content change and passing checks. New domains, uncertain
+versions, licensing changes and other review requirements need a maintainer.
+
+See [How documentation is added and updated](https://llmref.org/explanation/discovery-and-updates/)
+for what is automated, optional private reporting, and when new docs become
+available. You do not need to scrape a site or prepare files to request it.
 
 ## The registry (raw files)
 
