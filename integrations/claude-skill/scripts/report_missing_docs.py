@@ -81,7 +81,11 @@ def deliver(payload):
     request = urllib.request.Request(
         REPORT_URL,
         data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "llmref-skill/0.1 (+https://llmref.org)",
+        },
         method="POST",
     )
     try:
