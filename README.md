@@ -13,9 +13,6 @@ Free, deterministic, and open - built on the [`llms.txt`](https://llmstxt.org) s
 
 ---
 
-**Service status:** Semantic search is temporarily unavailable. Project/version
-lookup and available documentation files remain accessible.
-
 ## Connect it to your AI tool
 
 The quickest way to use LLM Reference is its **MCP server** - a remote endpoint that
