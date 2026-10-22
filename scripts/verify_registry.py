@@ -293,8 +293,17 @@ def validate_snapshot(tech_id: str, version: str, snapshot_dir: Path) -> tuple[b
     ok = license_ok and ok
 
     has_full = (snapshot_dir / "llms-full.txt").is_file()
+    revision = meta.get("revision_id")
+    history_backed = meta.get("artifact_storage") == "llmref-snapshot-v1"
+    if revision is not None or history_backed:
+        if not history_backed or not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{64}", revision):
+            error(f"{snapshot_dir}: immutable storage requires a valid revision_id and artifact_storage")
+            ok = False
+        if has_full:
+            error(f"{snapshot_dir}: immutable storage must reference shared content instead of copying llms-full.txt")
+            ok = False
     if has_license:
-        if redistribution and not has_full:
+        if redistribution and not has_full and not history_backed:
             error(f"{snapshot_dir}: license permits redistribution but llms-full.txt is missing")
             ok = False
         if not redistribution and has_full:
@@ -303,7 +312,7 @@ def validate_snapshot(tech_id: str, version: str, snapshot_dir: Path) -> tuple[b
                 "must be omitted from the registry"
             )
             ok = False
-    elif not has_full:
+    elif not has_full and not history_backed:
         # Legacy snapshot without a license block: full text is required.
         error(f"{snapshot_dir}: missing required file: llms-full.txt")
         return False, None
