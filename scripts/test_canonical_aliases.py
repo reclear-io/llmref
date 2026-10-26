@@ -85,5 +85,22 @@ class CanonicalAliasTests(unittest.TestCase):
             self.assertFalse(verifier.validate_meta({**baseline,"capture_status":"misqualified"},"demo","1",Path("demo/1"),"",False,"# Docs\\n- [Intro](https://docs.example.org/intro)"))
             self.assertTrue(verifier.validate_meta({**baseline,"capture_status":"misqualified","capture_reason":"Wrong scope","replacement_project":"official-demo"},"demo","1",Path("demo/1"),"",False,"# Docs\\n- [Intro](https://docs.example.org/intro)"))
 
+    def test_retired_records_withhold_text_without_inventing_a_pin_or_changing_permission(self):
+        import contextlib,io,tempfile,json,hashlib
+        from pathlib import Path
+        import verify_registry as verifier
+        full=b"Retained original documentation.\\n"
+        for field,reason,value in [("archive_status","archive_reason","unavailable"),("capture_status","capture_reason","misqualified")]:
+            for permission in (True,False,None):
+                with tempfile.TemporaryDirectory() as temporary,contextlib.redirect_stderr(io.StringIO()):
+                    folder=Path(temporary)/"demo"/"1";folder.mkdir(parents=True)
+                    meta={"project":"demo","project_version":"1","snapshot_id":"00000000-0000-4000-8000-000000000000","snapshot_at":"2026-07-02T00:00:00Z","source_last_seen_at":"2026-07-02T00:00:00Z","content_fingerprint":hashlib.sha256(full).hexdigest(),"page_count":1,"source_root":"https://docs.example.org","embedding_model":"local","chunking_profile":"docs-v2","generator_version":"test",field:value,reason:"Reviewed historical capture is withheld"}
+                    if permission is not None:meta["license"]={"spdx":"MIT" if permission else "unknown","redistribution_allowed":permission}
+                    (folder/"meta.json").write_text(json.dumps(meta));(folder/"llms.txt").write_text("# Docs\\n\\n- [Guide](https://docs.example.org/guide)\\n")
+                    self.assertTrue(verifier.validate_snapshot("demo","1",folder)[0])
+                    (folder/"llms-full.txt").write_bytes(full)
+                    self.assertFalse(verifier.validate_snapshot("demo","1",folder)[0])
+
 if __name__=="__main__":
     unittest.main()
+

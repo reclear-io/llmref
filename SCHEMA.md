@@ -156,3 +156,6 @@ valid project ID. This is distinct from an unavailable original. HTTP/MCP
 resolution retains these annotations while full text and search fail closed.
 The index repeats `capture_status` and `archive_status` when present.
 Catalog annotations do not alter immutable revision identities.
+
+Declared retired captures withhold public `llms-full.txt` regardless of the retained license permission. Their metadata, fingerprint and routing remain, without inventing an immutable pin when none existed. Public text removal requires separately verified private preservation; the declaration itself is not proof of preservation.
+
