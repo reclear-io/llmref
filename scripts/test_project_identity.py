@@ -24,8 +24,9 @@ class ProjectIdentityTests(unittest.TestCase):
     def test_unchanged_historical_route_can_receive_metadata_repairs(self):
         self.assertFalse(check_project("adk", self.mixed, [{**self.elixir, "license": {}}]))
 
-    def test_google_refresh_remains_allowed(self):
-        self.assertFalse(check_project("adk", self.mixed, [capture("https://adk.dev/agents", "2026.10.22")]))
+    def test_latest_capture_does_not_establish_ownership(self):
+        self.assertTrue(check_project("adk", self.mixed, [capture("https://adk.dev/agents", "2026.10.22")]))
+        self.assertFalse(check_project("adk", self.mixed, [capture("https://adk.dev/agents", "2026.10.22")], approved_move=True))
 
     def test_shared_host_is_not_project_identity(self):
         for old, new in [("https://github.com/google/adk-java", "https://github.com/other/adk"), ("https://rubydoc.info/gems/paperclip", "https://rubydoc.info/gems/other")]:

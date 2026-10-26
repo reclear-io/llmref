@@ -7,7 +7,6 @@ import json
 import re
 import subprocess
 import sys
-from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -39,13 +38,9 @@ def contains(old: dict, new: dict) -> bool:
 def canonical_versions(versions: list[dict]) -> list[dict]:
     if len({source_scope(v["source_root"], v["version"]) for v in versions}) <= 1:
         return versions
-    # Preserve legacy routes, but an older collision cannot authorize a refresh.
-    dated = [(datetime.fromisoformat(v["snapshot_at"].replace("Z", "+00:00")), v) for v in versions]
-    latest = max(date for date, _ in dated)
-    current = [v for date, v in dated if date == latest]
-    if len({source_scope(v["source_root"], v["version"]) for v in current}) != 1:
-        raise ValueError("Conflicting source identities have the same observation date")
-    return [v for v in versions if contains(current[0], v)]
+    if any(all(contains(root, v) for v in versions) for root in versions):
+        return versions
+    raise ValueError("Conflicting source identities require explicit maintainer review; capture dates do not establish ownership")
 
 
 def check_project(project: str, previous: list[dict], proposed: list[dict], *, approved_move: bool = False) -> list[str]:
@@ -63,7 +58,7 @@ def check_project(project: str, previous: list[dict], proposed: list[dict], *, a
     if not new_captures:
         return errors
     try:
-        allowed = canonical_versions(previous) if previous else [new_captures[0]]
+        allowed = canonical_versions(previous) if previous and not approved_move else [new_captures[0]]
         for capture in new_captures:
             if not any(contains(old, capture) for old in allowed) and not (previous and approved_move):
                 errors.append(f"{project}@{capture['version']}: documentation belongs to a different source; use a distinct project ID or obtain reviewed source-move approval")

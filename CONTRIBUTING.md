@@ -79,8 +79,9 @@ Maintainers verify metadata consistency, artifact completeness, and checklist it
 One project ID belongs to one documentation source. A matching name or an older
 misassigned version does not authorize attaching another library to that ID.
 Use a distinct ID for unrelated projects (for example, `adk-elixir` and `adk`).
-CI compares new captures with the most recently observed source in the base
-catalog, while preserving unchanged historical routes. Shared hosts such as
+CI compares new captures with the source in the base catalog, while preserving
+unchanged historical routes. Conflicting historical sources require explicit
+maintainer review; a later capture does not establish ownership. Shared hosts such as
 GitHub and RubyDoc retain their repository or package boundary.
 
 For an intentional move to a new docs domain or a broader scope, a maintainer
