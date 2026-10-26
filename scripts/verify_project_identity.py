@@ -59,6 +59,8 @@ def check_project(project: str, previous: list[dict], proposed: list[dict], *, a
         # A license/storage metadata repair can retain an old explicit route.
         if prior and all(prior.get(k) == capture.get(k) for k in ("source_root", "content_fingerprint", "snapshot_at")):
             continue
+        if capture.get("capture_status") == "misqualified":
+            continue
         if urlparse(capture["source_root"]).scheme != "https":
             errors.append(f"{project}@{capture['version']}: new captures require HTTPS")
         new_captures.append(capture)
@@ -166,3 +168,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+

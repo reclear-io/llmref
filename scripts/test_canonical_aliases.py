@@ -76,6 +76,14 @@ class CanonicalAliasTests(unittest.TestCase):
         self.assertFalse(check_project("demo",[old],[{**old,"capture_reason":"Clarified reason"}]))
         self.assertTrue(check_project("demo",[old],[entry("https://blog.example.org","2")]))
 
+    def test_quarantined_history_does_not_set_a_new_canonical_namespace_source(self):
+        retired={**entry("https://docs.example.org/server/old-sdk"),"capture_status":"misqualified","capture_reason":"Captured the broader site"}
+        clean=entry("https://docs.example.org/server/current-sdk","2")
+        for captures in ([retired,clean],[clean,retired]):
+            self.assertEqual(check_project("qualified-sdk",[],captures),[])
+            foreign=entry("https://unrelated.example.org","3")
+            self.assertTrue(check_project("qualified-sdk",[],[*captures,foreign]))
+
     def test_capture_annotation_validation_and_index_parity(self):
         import contextlib,io,tempfile
         from pathlib import Path
