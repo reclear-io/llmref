@@ -128,3 +128,24 @@ Snapshots are maintained by content fingerprint, not by schedule:
 1. Each normalized page produces a page-level fingerprint.
 2. Page fingerprints combine into a whole-docset `content_fingerprint`.
 3. On refresh, a changed fingerprint triggers an update; an unchanged fingerprint means the docset is current.
+
+## Historical compatibility aliases
+
+A reviewed identity migration can retain old project/version routes as
+compatibility aliases. Metadata and index entries both carry
+`canonical_target: {"project": "qualified-id", "version": "exact-version"}`.
+The target must exist as a leaf record with the exact same source URL and
+original SHA-256. Missing targets, chains, cycles and changed originals fail
+validation. An alias-only namespace has exactly one `legacy_default: true`,
+freezing its previously served bare-name default. New ordinary captures use
+the qualified IDs.
+
+Changing a canonical target or frozen default requires the existing explicit
+`source-move-approved` maintainer review. Policy-only maintenance of an unchanged
+compatibility record retains its routes. This does not merge unrelated release
+sequences or infer ownership from capture dates.
+
+When an exact original is unavailable in the checked retained sources, metadata
+may carry `archive_status: "unavailable"` with an explicit `archive_reason`.
+Its fingerprint and routing remain retained. Serving and reconciliation expose
+that state explicitly rather than substituting different bytes.

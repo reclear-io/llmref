@@ -10,6 +10,8 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
+from verify_project_identity import alias_catalog_errors
+
 ROOT = Path(__file__).resolve().parents[1]
 REGISTRY = ROOT / "registry"
 INDEX_PATH = REGISTRY / "index.json"
@@ -178,6 +180,22 @@ def validate_meta(meta: dict, tech_id: str, version: str, snapshot_dir: Path, ll
             f"{meta_path}: project_version '{meta.get('project_version')}' "
             f"does not match directory '{version}'"
         )
+        ok = False
+
+    if meta.get("archive_status") is not None:
+        if meta["archive_status"] != "unavailable" or not isinstance(meta.get("archive_reason"), str) or not meta["archive_reason"].strip():
+            error(f"{meta_path}: unavailable archives require a clear archival reason")
+            ok = False
+    if "legacy_default" in meta and not isinstance(meta["legacy_default"], bool):
+        error(f"{meta_path}: legacy_default must be boolean")
+        ok = False
+    target = meta.get("canonical_target")
+    if target is not None:
+        if not isinstance(target, dict) or set(target) != {"project", "version"} or not isinstance(target.get("project"), str) or not TECH_ID_RE.fullmatch(target["project"]) or not isinstance(target.get("version"), str) or target["version"] in {".", ".."} or not re.fullmatch(r"[A-Za-z0-9._+-]+", target["version"]) or target["project"] == tech_id:
+            error(f"{meta_path}: invalid canonical target")
+            ok = False
+    elif meta.get("legacy_default"):
+        error(f"{meta_path}: a legacy default requires a canonical target")
         ok = False
 
     source_root = meta.get("source_root", "")
@@ -382,6 +400,10 @@ def validate_index(snapshots: list[tuple[str, str, Path]], metas: dict[tuple[str
         error(f"{INDEX_PATH}: projects must be an array")
         return False
 
+    for message in alias_catalog_errors(index):
+        error(f"{INDEX_PATH}: {message}")
+        ok = False
+
     indexed: set[tuple[str, str]] = set()
     seen_project_ids: set[str] = set()
 
@@ -441,6 +463,12 @@ def validate_index(snapshots: list[tuple[str, str, Path]], metas: dict[tuple[str
                         error(f"{INDEX_PATH}: {tech_id}/{version} {field} does not match meta.json")
                         ok = False
                 elif index_value != meta_value:
+                    error(f"{INDEX_PATH}: {tech_id}/{version} {field} does not match meta.json")
+                    ok = False
+
+            for field in ("canonical_target", "legacy_default"):
+                default = False if field == "legacy_default" else None
+                if entry.get(field, default) != meta.get(field, default):
                     error(f"{INDEX_PATH}: {tech_id}/{version} {field} does not match meta.json")
                     ok = False
 
