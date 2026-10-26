@@ -10,8 +10,6 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
-from verify_project_identity import alias_catalog_errors
-
 ROOT = Path(__file__).resolve().parents[1]
 REGISTRY = ROOT / "registry"
 INDEX_PATH = REGISTRY / "index.json"
@@ -411,6 +409,10 @@ def validate_index(snapshots: list[tuple[str, str, Path]], metas: dict[tuple[str
     if not isinstance(projects, list):
         error(f"{INDEX_PATH}: projects must be an array")
         return False
+
+    # Workers load this file alone for per-snapshot checks. Only whole-catalog
+    # validation needs the sibling identity module.
+    from verify_project_identity import alias_catalog_errors
 
     for message in alias_catalog_errors(index):
         error(f"{INDEX_PATH}: {message}")
