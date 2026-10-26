@@ -10,6 +10,8 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
+from verify_project_identity import alias_catalog_errors
+
 ROOT = Path(__file__).resolve().parents[1]
 REGISTRY = ROOT / "registry"
 INDEX_PATH = REGISTRY / "index.json"
@@ -180,6 +182,30 @@ def validate_meta(meta: dict, tech_id: str, version: str, snapshot_dir: Path, ll
         )
         ok = False
 
+    if meta.get("archive_status") is not None:
+        if meta["archive_status"] != "unavailable" or not isinstance(meta.get("archive_reason"), str) or not meta["archive_reason"].strip():
+            error(f"{meta_path}: unavailable archives require a clear archival reason")
+            ok = False
+    if meta.get("capture_status") is not None:
+        if meta["capture_status"] != "misqualified" or not isinstance(meta.get("capture_reason"), str) or not meta["capture_reason"].strip():
+            error(f"{meta_path}: misqualified captures require a clear qualification reason")
+            ok = False
+    replacement = meta.get("replacement_project")
+    if replacement is not None and (not isinstance(replacement, str) or not TECH_ID_RE.fullmatch(replacement)):
+        error(f"{meta_path}: invalid replacement project")
+        ok = False
+    if "legacy_default" in meta and not isinstance(meta["legacy_default"], bool):
+        error(f"{meta_path}: legacy_default must be boolean")
+        ok = False
+    target = meta.get("canonical_target")
+    if target is not None:
+        if not isinstance(target, dict) or set(target) != {"project", "version"} or not isinstance(target.get("project"), str) or not TECH_ID_RE.fullmatch(target["project"]) or not isinstance(target.get("version"), str) or target["version"] in {".", ".."} or not re.fullmatch(r"[A-Za-z0-9._+-]+", target["version"]) or target["project"] == tech_id:
+            error(f"{meta_path}: invalid canonical target")
+            ok = False
+    elif meta.get("legacy_default"):
+        error(f"{meta_path}: a legacy default requires a canonical target")
+        ok = False
+
     source_root = meta.get("source_root", "")
     if not isinstance(source_root, str) or not is_https_url(source_root):
         error(f"{meta_path}: source_root must be an https URL")
@@ -293,6 +319,10 @@ def validate_snapshot(tech_id: str, version: str, snapshot_dir: Path) -> tuple[b
     ok = license_ok and ok
 
     has_full = (snapshot_dir / "llms-full.txt").is_file()
+    retired = bool(meta.get("archive_status") or meta.get("capture_status"))
+    if retired and has_full:
+        error(f"{snapshot_dir}: retired captures must withhold public full text")
+        ok = False
     revision = meta.get("revision_id")
     history_backed = meta.get("artifact_storage") == "llmref-snapshot-v1"
     if revision is not None or history_backed:
@@ -303,7 +333,7 @@ def validate_snapshot(tech_id: str, version: str, snapshot_dir: Path) -> tuple[b
             error(f"{snapshot_dir}: immutable storage must reference shared content instead of copying llms-full.txt")
             ok = False
     if has_license:
-        if redistribution and not has_full and not history_backed:
+        if redistribution and not has_full and not history_backed and not retired:
             error(f"{snapshot_dir}: license permits redistribution but llms-full.txt is missing")
             ok = False
         if not redistribution and has_full:
@@ -312,7 +342,7 @@ def validate_snapshot(tech_id: str, version: str, snapshot_dir: Path) -> tuple[b
                 "must be omitted from the registry"
             )
             ok = False
-    elif not has_full and not history_backed:
+    elif not has_full and not history_backed and not retired:
         # Legacy snapshot without a license block: full text is required.
         error(f"{snapshot_dir}: missing required file: llms-full.txt")
         return False, None
@@ -382,6 +412,10 @@ def validate_index(snapshots: list[tuple[str, str, Path]], metas: dict[tuple[str
         error(f"{INDEX_PATH}: projects must be an array")
         return False
 
+    for message in alias_catalog_errors(index):
+        error(f"{INDEX_PATH}: {message}")
+        ok = False
+
     indexed: set[tuple[str, str]] = set()
     seen_project_ids: set[str] = set()
 
@@ -441,6 +475,12 @@ def validate_index(snapshots: list[tuple[str, str, Path]], metas: dict[tuple[str
                         error(f"{INDEX_PATH}: {tech_id}/{version} {field} does not match meta.json")
                         ok = False
                 elif index_value != meta_value:
+                    error(f"{INDEX_PATH}: {tech_id}/{version} {field} does not match meta.json")
+                    ok = False
+
+            for field in ("canonical_target", "legacy_default", "archive_status", "capture_status"):
+                default = False if field == "legacy_default" else None
+                if entry.get(field, default) != meta.get(field, default):
                     error(f"{INDEX_PATH}: {tech_id}/{version} {field} does not match meta.json")
                     ok = False
 
@@ -516,3 +556,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
