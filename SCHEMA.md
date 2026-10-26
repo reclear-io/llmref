@@ -149,3 +149,10 @@ When an exact original is unavailable in the checked retained sources, metadata
 may carry `archive_status: "unavailable"` with an explicit `archive_reason`.
 Its fingerprint and routing remain retained. Serving and reconciliation expose
 that state explicitly rather than substituting different bytes.
+
+Captures from the wrong documentation scope use `capture_status: misqualified`
+and a nonempty `capture_reason`; an optional `replacement_project` names a
+valid project ID. This is distinct from an unavailable original. HTTP/MCP
+resolution retains these annotations while full text and search fail closed.
+The index repeats `capture_status` and `archive_status` when present.
+Catalog annotations do not alter immutable revision identities.

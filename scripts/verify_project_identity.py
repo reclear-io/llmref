@@ -19,6 +19,12 @@ def source_scope(url: str, version: str) -> tuple[str, str]:
     if path.lower().endswith("/llms.txt"):
         path = path.rsplit("/", 1)[0]
     parts = path.split("/")
+    if parsed.hostname == "docs.rs":
+        segments = [part for part in parts if part]
+        if not segments or (segments[0] == "crate" and len(segments) < 2):
+            raise ValueError("docs.rs documentation requires a crate identity")
+        tenant = segments[1] if segments[0] == "crate" else segments[0]
+        return parsed.netloc.lower(), "/" + tenant
     protected = 2 if (
         parsed.hostname in {"github.com", "rubydoc.info", "www.rubydoc.info"}
         or (len(parts) > 1 and parts[1] in {"gems", "packages", "projects"})
@@ -36,7 +42,7 @@ def contains(old: dict, new: dict) -> bool:
 
 
 def canonical_versions(versions: list[dict]) -> list[dict]:
-    versions = [v for v in versions if not v.get("canonical_target")]
+    versions = [v for v in versions if not v.get("canonical_target") and v.get("capture_status") != "misqualified"]
     if len({source_scope(v["source_root"], v["version"]) for v in versions}) <= 1:
         return versions
     if any(all(contains(root, v) for v in versions) for root in versions):

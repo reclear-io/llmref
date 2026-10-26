@@ -65,6 +65,25 @@ class CanonicalAliasTests(unittest.TestCase):
         data=catalog();data["projects"][0]["versions"][0]["canonical_target"]["version"]="../escape"
         self.assertTrue(alias_catalog_errors(data))
 
+    def test_docs_rs_crate_identity_is_stable_and_tenant_scoped(self):
+        from verify_project_identity import source_scope
+        self.assertEqual(source_scope("https://docs.rs/crate/permutation/0.4.1/source","0.4.1"),source_scope("https://docs.rs/permutation","2026.10.26"))
+        self.assertNotEqual(source_scope("https://docs.rs/other","1"),source_scope("https://docs.rs/permutation","1"))
+        with self.assertRaises(ValueError):source_scope("https://docs.rs","1")
+
+    def test_retired_capture_cannot_authorize_new_capture(self):
+        old={**entry("https://blog.example.org"),"capture_status":"misqualified","capture_reason":"Wrong corpus"}
+        self.assertFalse(check_project("demo",[old],[{**old,"capture_reason":"Clarified reason"}]))
+        self.assertTrue(check_project("demo",[old],[entry("https://blog.example.org","2")]))
+
+    def test_capture_annotation_validation_and_index_parity(self):
+        import contextlib,io,tempfile
+        from pathlib import Path
+        import verify_registry as verifier
+        baseline={"project":"demo","project_version":"1","snapshot_id":"00000000-0000-4000-8000-000000000000","snapshot_at":"2026-07-02T00:00:00Z","source_last_seen_at":"2026-07-02T00:00:00Z","content_fingerprint":"a"*64,"page_count":1,"source_root":"https://docs.example.org","embedding_model":"local","chunking_profile":"docs-v2","generator_version":"test"}
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertFalse(verifier.validate_meta({**baseline,"capture_status":"misqualified"},"demo","1",Path("demo/1"),"",False,"# Docs\\n- [Intro](https://docs.example.org/intro)"))
+            self.assertTrue(verifier.validate_meta({**baseline,"capture_status":"misqualified","capture_reason":"Wrong scope","replacement_project":"official-demo"},"demo","1",Path("demo/1"),"",False,"# Docs\\n- [Intro](https://docs.example.org/intro)"))
 
 if __name__=="__main__":
     unittest.main()

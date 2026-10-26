@@ -186,6 +186,14 @@ def validate_meta(meta: dict, tech_id: str, version: str, snapshot_dir: Path, ll
         if meta["archive_status"] != "unavailable" or not isinstance(meta.get("archive_reason"), str) or not meta["archive_reason"].strip():
             error(f"{meta_path}: unavailable archives require a clear archival reason")
             ok = False
+    if meta.get("capture_status") is not None:
+        if meta["capture_status"] != "misqualified" or not isinstance(meta.get("capture_reason"), str) or not meta["capture_reason"].strip():
+            error(f"{meta_path}: misqualified captures require a clear qualification reason")
+            ok = False
+    replacement = meta.get("replacement_project")
+    if replacement is not None and (not isinstance(replacement, str) or not TECH_ID_RE.fullmatch(replacement)):
+        error(f"{meta_path}: invalid replacement project")
+        ok = False
     if "legacy_default" in meta and not isinstance(meta["legacy_default"], bool):
         error(f"{meta_path}: legacy_default must be boolean")
         ok = False
@@ -466,7 +474,7 @@ def validate_index(snapshots: list[tuple[str, str, Path]], metas: dict[tuple[str
                     error(f"{INDEX_PATH}: {tech_id}/{version} {field} does not match meta.json")
                     ok = False
 
-            for field in ("canonical_target", "legacy_default"):
+            for field in ("canonical_target", "legacy_default", "archive_status", "capture_status"):
                 default = False if field == "legacy_default" else None
                 if entry.get(field, default) != meta.get(field, default):
                     error(f"{INDEX_PATH}: {tech_id}/{version} {field} does not match meta.json")
