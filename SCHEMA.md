@@ -128,3 +128,34 @@ Snapshots are maintained by content fingerprint, not by schedule:
 1. Each normalized page produces a page-level fingerprint.
 2. Page fingerprints combine into a whole-docset `content_fingerprint`.
 3. On refresh, a changed fingerprint triggers an update; an unchanged fingerprint means the docset is current.
+
+## Historical compatibility aliases
+
+A reviewed identity migration can retain old project/version routes as
+compatibility aliases. Metadata and index entries both carry
+`canonical_target: {"project": "qualified-id", "version": "exact-version"}`.
+The target must exist as a leaf record with the exact same source URL and
+original SHA-256. Missing targets, chains, cycles and changed originals fail
+validation. An alias-only namespace has exactly one `legacy_default: true`,
+freezing its previously served bare-name default. New ordinary captures use
+the qualified IDs.
+
+Changing a canonical target or frozen default requires the existing explicit
+`source-move-approved` maintainer review. Policy-only maintenance of an unchanged
+compatibility record retains its routes. This does not merge unrelated release
+sequences or infer ownership from capture dates.
+
+When an exact original is unavailable in the checked retained sources, metadata
+may carry `archive_status: "unavailable"` with an explicit `archive_reason`.
+Its fingerprint and routing remain retained. Serving and reconciliation expose
+that state explicitly rather than substituting different bytes.
+
+Captures from the wrong documentation scope use `capture_status: misqualified`
+and a nonempty `capture_reason`; an optional `replacement_project` names a
+valid project ID. This is distinct from an unavailable original. HTTP/MCP
+resolution retains these annotations while full text and search fail closed.
+The index repeats `capture_status` and `archive_status` when present.
+Catalog annotations do not alter immutable revision identities.
+
+Declared retired captures withhold public `llms-full.txt` regardless of the retained license permission. Their metadata, fingerprint and routing remain, without inventing an immutable pin when none existed. Public text removal requires separately verified private preservation; the declaration itself is not proof of preservation.
+
